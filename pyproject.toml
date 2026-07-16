@@ -1,0 +1,14 @@
+[project]
+name = "sn56-forge-toolkit"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["pyyaml", "Pillow", "numpy", "safetensors"]
+
+[tool.setuptools.packages.find]
+include = ["forge*"]
+
+[tool.setuptools.package-data]
+forge = ["templates/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
