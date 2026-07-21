@@ -152,13 +152,12 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
         mk["text_encoder_path"] = _KREA2_TE
         # Krea2Model appends the "vae" subfolder itself → pass the model DIR.
         mk["vae_path"] = spec.cached_model_dir
-        # Calibrated Jul 16 (real photos, true holdout, validator's scorer):
-        # krea2's objective starts near-converged and barely trains — at the
-        # template 1e-4 and at 5e-5 the score is FLAT at the zero-LoRA
-        # baseline (0.0494) for 8..128 steps. Only lr 1e-3 moved it, and only
-        # in the right direction: 0.0482 combined, caption term -16% on one
-        # holdout image, reconstruction term unharmed at every depth tested.
-        p["train"]["lr"] = 1e-3
+        # LR OVERRIDE REMOVED (Jul-20 postmortem): the 1e-3 override came from
+        # a 128-step / 2-holdout-image probe and failed at tournament scale —
+        # our R2 krea2 (lr 1e-3, 367 steps, final-export) scored 0.1420 vs the
+        # opponent's 0.0525 on template lr 1e-4 with a deep run + EARLY
+        # selected checkpoint. Template LR stands; the real gap is checkpoint
+        # SELECTION for image exports (see postmortem handoff).
     return cfg
 
 

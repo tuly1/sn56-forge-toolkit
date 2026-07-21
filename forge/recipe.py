@@ -85,12 +85,16 @@ def kill_safe_save_every(steps, template_save_every):
     """Cadence for periodic {repo}_{step}.safetensors saves — the sole kill-safety
     mechanism (INV-2). The FIRST save must land EARLY: the deadline monitor (or a
     crash) can cut a short/slower-than-modeled run before the template's ~200-250
-    cadence, leaving _finalize with no LoRA → forfeit. We cap at 100 (and steps//8)
-    so a scoreable checkpoint exists well before 25% of the schedule, at negligible
-    I/O (max_step_saves_to_keep caps retained files). Floored at 1. Never raises.
+    cadence, leaving _finalize with no LoRA → forfeit.
+
+    Jul-20 postmortem: saves cost ~46-63s each on H100 and steps//8 cadence made
+    checkpointing consume 46-49% OF TOTAL WALL TIME on both tournament runs.
+    Floor raised to 25 (≈2-4 saves on short runs): kill-safety still lands a
+    checkpoint before ~30% of the schedule, at <15% I/O overhead.
     """
     try:
-        return max(1, min(int(template_save_every), max(1, int(steps) // 8), 100))
+        s = max(1, int(steps))
+        return max(1, min(int(template_save_every), max(25, s // 8), 100, s))
     except Exception:
         try:
             return int(template_save_every)

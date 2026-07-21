@@ -242,7 +242,10 @@ def test_recipe_save_every():
     # capped at 100 so the FIRST checkpoint always lands early (kill-safety)
     assert recipe.kill_safe_save_every(2000, 250) == 100
     assert recipe.kill_safe_save_every(700, 250) == 87  # steps//8
-    assert recipe.kill_safe_save_every(2, 250) == 1  # floor >= 1
+    # Jul-20 postmortem: cadence floor 25 — saves cost ~50s each; steps//8 on
+    # short runs burned half the wall time on I/O
+    assert recipe.kill_safe_save_every(86, 250) == 25
+    assert recipe.kill_safe_save_every(2, 250) == 2  # never exceeds steps (kill-safety)
 
 
 # --------------------------------------------------------------------------- #
