@@ -1,4 +1,4 @@
-"""ai-toolkit LoRA training (flux / krea2 / ideogram4).
+"""ai-toolkit LoRA training for all five validator-supported image types.
 
 We wrap ai-toolkit's ``run.py <config.yaml>`` (the validator's proven trainer)
 rather than reinventing a diffusion loop — our edge lives in the config (see
@@ -6,19 +6,17 @@ forge/config.py + forge/recipe.py) and the orchestration here.
 
 Pacing / kill-safety (INV-2): ai-toolkit trains to a fixed step count and can't be
 stopped by a Python callback mid-run, so we launch it as a subprocess and
-TERMINATE it when the wall-clock reserve is hit. The kill-safe ``save_every``
-guarantees a periodic ``{repo}_{step:09d}.safetensors`` on disk, and
-``_finalize`` promotes the final/highest-step LoRA to ``{save_root}/last.safetensors``
-— the filename the evaluator matches FIRST (immune to the repo-name-ends-in-digit
-step-misparse trap). This is the #1 zero-score guard.
+TERMINATE it when the wall-clock reserve is hit. The fixed-candidate
+``save_every`` policy leaves periodic saves on disk. Finalization considers only
+files created or replaced by this attempt, applies the conservative selection
+policy in ``forge.tasks.checkpoints``, and atomically promotes the result to
+``{save_root}/last.safetensors`` — the filename the evaluator matches first.
 """
 
 from __future__ import annotations
 
-import glob
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -28,7 +26,7 @@ import time
 from forge import telemetry
 from forge.clock import Deadline
 from forge.config import build_config, resolve_base_model, write_config
-from forge.tasks.integrity import valid_safetensors
+from forge.tasks import checkpoints
 from forge.data import dataset
 from forge.data.schema import ImageSpec
 
@@ -47,6 +45,13 @@ _STOP_MARGIN_S = 45
 def run(spec: ImageSpec, deadline: Deadline) -> None:
     os.makedirs(spec.save_root, exist_ok=True)
     os.makedirs(spec.training_folder, exist_ok=True)
+    # Snapshot before ANY fallible preparation.  If dataset/model preparation
+    # fails, the CLI fallback can distinguish an intact previous-run artifact
+    # from output produced by this attempt.
+    # The CLI scopes before dispatch so import/preparation failures are covered;
+    # direct handler calls create the same durable scope here.  Reusing it is
+    # essential: beginning twice would lose the first quarantine journal.
+    scope = checkpoints.ensure_run(spec.save_root, spec.expected_repo_name)
 
     base_model = resolve_base_model(spec.cached_model_dir)
     images_dir, pairs = dataset.prepare_aitoolkit_dataset(
@@ -67,22 +72,31 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     cfg = build_config(spec, num_images=pairs, hours_to_complete=hours)
     p = cfg["config"]["process"][0]
     steps = p["train"]["steps"]
+    scope = checkpoints.set_planned_steps(spec.save_root, scope, steps)
     telemetry.set_meta(
         steps=steps, num_images=pairs, save_every=p["save"]["save_every"]
     )
     write_config(cfg, spec.config_path)
 
-    _run_toolkit(spec.config_path, deadline, spec)
-    _finalize(spec)
+    _run_toolkit(spec.config_path, deadline, spec, scope)
+    _finalize(spec, scope)
 
 
-def _run_toolkit(cfg_path: str, deadline: Deadline, spec: ImageSpec) -> None:
+def _run_toolkit(
+    cfg_path: str,
+    deadline: Deadline,
+    spec: ImageSpec,
+    scope: dict,
+) -> None:
     # Run ai-toolkit's run.py with the CURRENT interpreter, not a bare `python3`:
     # in the validator's Docker image sys.executable IS the env python with torch,
     # and in a local venv test it's the venv python — either way it has ai-toolkit's
     # deps, whereas a bare `python3` may resolve to a torch-less system python.
     cmd = [sys.executable, "run.py", cfg_path]
-    log_path = os.path.join(spec.training_folder, "aitoolkit.log")
+    # Logs are diagnostics, not evaluator artifacts. Keep them outside the
+    # uploaded repo and make the name run-specific so concurrent/retried jobs
+    # cannot truncate one another or leak another run's tail into telemetry.
+    log_path = _toolkit_log_path(spec)
     telemetry.event("toolkit_start")
     started = time.monotonic()
 
@@ -157,105 +171,81 @@ def _run_toolkit(cfg_path: str, deadline: Deadline, spec: ImageSpec) -> None:
     # A clean exit (0) or a deadline stop are both success: a checkpoint should be
     # on disk. A nonzero exit we did NOT trigger means ai-toolkit failed — but if
     # it still wrote a LoRA we keep it; the CLI fallback covers the empty case.
-    if rc not in (0, None) and not stopped_by_deadline and not _has_lora(spec):
+    if (
+        rc not in (0, None)
+        and not stopped_by_deadline
+        and not _has_current_lora(spec, scope)
+    ):
         _tail_log(log_path)
         raise RuntimeError(f"ai-toolkit failed (rc={rc}) with no checkpoint")
 
 
+def _toolkit_log_path(spec: ImageSpec) -> str:
+    log_dir = os.path.join(os.path.dirname(spec.config_path), "forge-logs")
+    os.makedirs(log_dir, exist_ok=True)
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", spec.task_id)
+    safe_repo = re.sub(r"[^A-Za-z0-9_.-]+", "_", spec.expected_repo_name)
+    return os.path.join(
+        log_dir, f"{safe_task}-{safe_repo}-{os.getpid()}-{time.time_ns()}.log"
+    )
+
+
 def _parse_toolkit_log(log_path: str):
-    """ai-toolkit prints per-step 'loss: 0.0xxx' style lines. Best-effort — the
-    exact token format isn't pinned from source; telemetry gaps are acceptable.
+    """Read the last progress/loss pair from ai-toolkit's console log.
+
+    Current Krea2 prints losses in scientific notation (for example
+    ``2.531e-02``).  Keep exponent handling explicit: silently recording that as
+    ``2.531`` makes the flight recorder wrong by two orders of magnitude.
     """
     loss = step = None
     try:
         with open(log_path, encoding="utf-8", errors="ignore") as fh:
             text = fh.read()
-        losses = re.findall(r"loss[=:]\s*([0-9]*\.?[0-9]+)", text, re.IGNORECASE)
+        number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+        losses = re.findall(rf"loss[=:]\s*({number})", text, re.IGNORECASE)
         if losses:
             loss = float(losses[-1])
-        steps = re.findall(r"(\d+)\s*/\s*\d+", text)  # progress-bar cur/total
-        if steps:
-            step = int(steps[-1])
+        progress = re.findall(r"(\d+)\s*/\s*(\d+)", text)
+        if progress:
+            current, total = (int(value) for value in progress[-1])
+            step = current
+            # ai-toolkit's tqdm counter is zero-based in the final visible loss
+            # line (35/36 for the 36th update).  Its subsequent unnumbered
+            # terminal save is the durable proof that all planned steps landed.
+            saves = re.findall(
+                r"Saved checkpoint to\s+([^\r\n]+\.safetensors)", text
+            )
+            if saves and not re.search(
+                r"_\d{9}\.safetensors$", os.path.basename(saves[-1].strip())
+            ):
+                step = total
     except Exception:
         pass
     return loss, step
 
 
-def _finalize(spec: ImageSpec) -> None:
-    """Guarantee {save_root}/last.safetensors from the final/highest-step LoRA.
-
-    Raises ONLY when zero LoRA exists → the CLI fallback then accepts -1.
-    """
-    loras = _loras(spec)
-    if not loras:
-        raise RuntimeError("ai-toolkit produced no LoRA safetensors")
-    last = os.path.join(spec.save_root, "last.safetensors")
-    if not os.path.isfile(last):
-        _atomic_copy(_pick_final(loras, spec.expected_repo_name), last)
-    telemetry.event("checkpoint_finalized", files=len(loras))
+def _finalize(spec: ImageSpec, scope: dict | None = None) -> None:
+    """Promote a selected current-run LoRA or explicitly retain a prior one."""
+    record = checkpoints.finalize(
+        spec.save_root,
+        spec.expected_repo_name,
+        scope,
+        context="training",
+    )
+    if record is None:
+        raise RuntimeError("ai-toolkit produced no valid current or prior LoRA")
+    telemetry.event(
+        "checkpoint_finalized",
+        status=record["status"],
+        source=record["source"],
+        selected_step=record["selected_step"],
+    )
     telemetry.note_peak_memory()
     telemetry.write_into(spec.output_dir)
 
 
-def _loras(spec: ImageSpec) -> list[str]:
-    if not os.path.isdir(spec.save_root):
-        return []
-    return [
-        p
-        for p in glob.glob(os.path.join(spec.save_root, "*.safetensors"))
-        if os.path.basename(p) != "last.safetensors"
-    ]
-
-
-def _pick_final(loras: list[str], repo: str) -> str:
-    """Prefer the exact {repo}.safetensors (final unconditioned save). Else the
-    highest {repo}_{step:09d}. Matching the KNOWN repo name disambiguates the
-    digit-trap safely (repo name ending in a digit can't misparse as a step).
-
-    Candidates are integrity-checked: a deadline kill mid-save leaves the
-    NEWEST file truncated, and promoting it would zero-score a task with an
-    intact older checkpoint next to it — step down to the newest valid one.
-    """
-    final = os.path.join(os.path.dirname(loras[0]), f"{repo}.safetensors")
-    for p in loras:
-        if p == final and valid_safetensors(p):
-            return p
-
-    def step_of(p: str) -> int:
-        m = re.search(r"_(\d+)\.safetensors$", os.path.basename(p))
-        return int(m.group(1)) if m else -1
-
-    for p in sorted(loras, key=step_of, reverse=True):
-        if valid_safetensors(p):
-            return p
-    telemetry.event("no_valid_checkpoint", candidates=len(loras))
-    return max(loras, key=step_of)
-
-
-def _has_lora(spec: ImageSpec) -> bool:
-    return bool(_loras(spec))
-
-
-def _atomic_copy(src: str, dst: str) -> None:
-    """Copy to a temp file on the SAME dir/fs, then os.replace onto dst.
-
-    last.safetensors is the evaluator's FIRST-matched submission, so a mid-copy
-    kill onto the final path would leave a TRUNCATED file that is loaded in
-    preference to the intact periodic checkpoints → zero score. os.replace is
-    atomic within save_root, so a kill leaves either the old file or the complete
-    one, never a partial. Mirrors telemetry.write_into's tmp+replace.
-    """
-    tmp = dst + ".tmp"
-    try:
-        shutil.copy(src, tmp)
-        os.replace(tmp, dst)
-    except BaseException:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
-        raise
+def _has_current_lora(spec: ImageSpec, scope: dict) -> bool:
+    return bool(checkpoints.current_loras(spec.save_root, scope))
 
 
 def _terminate(proc: subprocess.Popen) -> None:

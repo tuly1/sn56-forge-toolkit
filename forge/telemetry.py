@@ -17,13 +17,59 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 _FILENAME = "forge_run.json"
 _MAX_EVENTS = 200
 _MAX_CURVE_POINTS = 300
 _MAX_SAMPLES = 120
+_SENSITIVE_KEYS = {
+    "authorization",
+    "cookie",
+    "credential",
+    "credentials",
+    "password",
+    "passwd",
+    "secret",
+    "session",
+    "signature",
+    "token",
+}
+_SENSITIVE_COLLAPSED_KEYS = {
+    "apikey",
+    "accesskey",
+    "authkey",
+    "privatekey",
+    "secretkey",
+    "sessionid",
+    "sessionkey",
+    "sessiontoken",
+}
+_BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+")
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)\b((?:proxy-)?authorization\s*:\s*)"
+    r"(?:(?:basic|bearer|digest)\s+)?[^\s,;]+"
+)
+_COOKIE_HEADER_RE = re.compile(r"(?im)^(\s*(?:set-)?cookie\s*:)[^\r\n]*")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b("
+    r"api[_-]?key|access[_-]?key|auth[_-]?key|cookie|"
+    r"aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|credentials?|"
+    r"password|passwd|private[_-]?key|secret(?:[_-]?key)?|"
+    r"(?:access|refresh|id)[_-]?token|"
+    r"session(?:[_-]?(?:id|key|token))?|signature|token"
+    r")\s*([:=])\s*([^\s,;&]+)"
+)
+_KNOWN_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"github_pat_[A-Za-z0-9_]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"hf_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}"
+    r")(?![A-Za-z0-9])"
+)
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
 
 _t0 = time.monotonic()
 _data: dict[str, Any] = {
@@ -43,7 +89,9 @@ def _rel() -> float:
 
 def init(**meta: Any) -> None:
     try:
-        _data["meta"].update({k: v for k, v in meta.items() if v is not None})
+        _data["meta"].update(
+            {k: _sanitize_value(v, key=k) for k, v in meta.items() if v is not None}
+        )
         _data["meta"].setdefault("started_unix", int(time.time()))
     except Exception:
         pass
@@ -57,7 +105,8 @@ def event(name: str, **kv: Any) -> None:
     try:
         if len(_data["events"]) >= _MAX_EVENTS:
             return
-        _data["events"].append({"t": _rel(), "name": name, **kv})
+        safe = {k: _sanitize_value(v, key=k) for k, v in kv.items()}
+        _data["events"].append({"t": _rel(), "name": name, **safe})
     except Exception:
         pass
 
@@ -141,9 +190,69 @@ def write_into(output_dir: str) -> None:
         tmp = os.path.join(output_dir, _FILENAME + ".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(_data, fh, separators=(",", ":"), default=str)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, os.path.join(output_dir, _FILENAME))
+        _fsync_directory(output_dir)
     except Exception:
         pass
+
+
+def _fsync_directory(path: str) -> None:
+    """Best-effort durability for the atomic telemetry rename."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sanitize_value(value: Any, *, key: str = "") -> Any:
+    """Redact credentials before public run telemetry is persisted."""
+    key_parts = [
+        part for part in re.split(r"[^a-z0-9]+", key.lower()) if part
+    ]
+    collapsed_key = "".join(key_parts)
+    if any(part in _SENSITIVE_KEYS for part in key_parts) or any(
+        marker in collapsed_key for marker in _SENSITIVE_COLLAPSED_KEYS
+    ):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {str(k): _sanitize_value(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_value(v, key=key) for v in value]
+    if not isinstance(value, str):
+        return value
+
+    text = _COOKIE_HEADER_RE.sub(r"\1<redacted>", value)
+    text = _AUTH_HEADER_RE.sub(r"\1<redacted>", text)
+    text = _BEARER_RE.sub(r"\1<redacted>", text)
+
+    def _strip_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        suffix = ""
+        while raw and raw[-1] in ".,);]":
+            suffix = raw[-1] + suffix
+            raw = raw[:-1]
+        try:
+            parts = urlsplit(raw)
+            netloc = parts.netloc
+            if parts.username is not None or parts.password is not None:
+                host = parts.hostname or ""
+                if ":" in host and not host.startswith("["):
+                    host = f"[{host}]"
+                netloc = host
+                if parts.port is not None:
+                    netloc += f":{parts.port}"
+            clean = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+            return clean + suffix
+        except Exception:
+            return "<redacted-url>" + suffix
+
+    text = _URL_RE.sub(_strip_url, text)
+    text = _KNOWN_TOKEN_RE.sub("<redacted-token>", text)
+    return _SECRET_ASSIGNMENT_RE.sub(r"\1\2<redacted>", text)
 
 
 def make_trainer_callback(output_dir: str):

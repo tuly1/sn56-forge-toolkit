@@ -1,8 +1,7 @@
-"""Map a model type to its training handler.
+"""Map current image model types to the shared ai-toolkit training handler.
 
-The 3 implemented ai-toolkit types route to the ai-toolkit trainer; anything else
-(z-image / qwen-image / unknown) returns None so the CLI degrades to the fallback
-floor instead of forfeiting.
+Anything outside the five validator-supported types returns ``None`` so the CLI
+degrades to the fallback floor instead of forfeiting.
 """
 
 from __future__ import annotations
@@ -20,4 +19,4 @@ def for_model_type(model_type: str) -> Handler | None:
         from forge.tasks.aitoolkit import run
 
         return run
-    return None  # z-image / qwen-image / unknown → fallback floor
+    return None  # unknown future/retired type → fallback floor

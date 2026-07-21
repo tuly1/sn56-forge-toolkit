@@ -16,8 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# The 3 boss/gate-critical ai-toolkit types this build implements. z-image and
-# qwen-image are deferred (dispatch returns None → fallback floor).
+# Every current ai-toolkit image type routes through the same hardened runner.
 KNOWN_MODEL_TYPES = ("flux", "krea2", "ideogram4", "z-image", "qwen-image")
 
 
