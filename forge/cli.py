@@ -105,6 +105,17 @@ def _run(spec: ImageSpec, deadline: Deadline) -> None:
     the handler lazily so heavy diffusion deps don't load for a model type this
     build doesn't implement, and we catch everything.
     """
+    # Scope checkpoint discovery before dispatch so even import failures and
+    # unknown future model types cannot promote stale files from a prior retry.
+    try:
+        from forge.tasks import checkpoints
+
+        checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+    except Exception as exc:
+        telemetry.event(
+            "checkpoint_scope_failed", error=f"{type(exc).__name__}: {exc}"
+        )
+
     handler = None
     try:
         from forge.tasks import dispatch

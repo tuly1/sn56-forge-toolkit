@@ -20,7 +20,7 @@ TEMPLATES_DIR = os.path.join(REPO_ROOT, "forge", "templates")
 from forge import config, recipe  # noqa: E402
 from forge.data import dataset  # noqa: E402
 from forge.data.schema import ImageSpec  # noqa: E402
-from forge.tasks import aitoolkit, dispatch, fallback  # noqa: E402
+from forge.tasks import aitoolkit, checkpoints, dispatch, fallback  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -72,6 +72,36 @@ def test_schema_paths():
     assert s.save_root == "/app/checkpoints/t1/myrepo"
     assert s.output_dir == s.save_root
     assert s.config_path == "/dataset/configs/t1.yaml"
+
+
+def test_toolkit_log_path_is_run_unique_and_not_under_upload_root(tmp_path, monkeypatch):
+    s = _spec(expected_repo_name="repo")
+    config_path = tmp_path / "configs" / "task.yaml"
+    save_root = tmp_path / "checkpoints" / "repo"
+    save_root.mkdir(parents=True)
+    monkeypatch.setattr(type(s), "config_path", property(lambda self: str(config_path)))
+    monkeypatch.setattr(type(s), "save_root", property(lambda self: str(save_root)))
+    first = aitoolkit._toolkit_log_path(s)
+    second = aitoolkit._toolkit_log_path(s)
+
+    assert first != second
+    assert str(save_root) not in first
+    assert str(config_path.parent / "forge-logs") in first
+    assert "repo" in os.path.basename(first)
+
+
+def test_toolkit_log_parser_preserves_exponent_and_terminal_step(tmp_path):
+    log = tmp_path / "toolkit.log"
+    log.write_text(
+        "krea: 97%|#########7| 35/36 [loss: 2.531e-02]\n"
+        "Saved checkpoint to /outputs/krea.safetensors\n",
+        encoding="utf-8",
+    )
+
+    loss, step = aitoolkit._parse_toolkit_log(str(log))
+
+    assert loss == pytest.approx(0.02531)
+    assert step == 36
 
 
 def test_schema_model_type_normalized():
@@ -239,13 +269,16 @@ def test_recipe_budget_cap_example():
 
 
 def test_recipe_save_every():
-    # capped at 100 so the FIRST checkpoint always lands early (kill-safety)
-    assert recipe.kill_safe_save_every(2000, 250) == 100
-    assert recipe.kill_safe_save_every(700, 250) == 87  # steps//8
-    # Jul-20 postmortem: cadence floor 25 — saves cost ~50s each; steps//8 on
-    # short runs burned half the wall time on I/O
+    # Fixed four-candidate budget, including runs longer than template cadence.
+    assert recipe.kill_safe_save_every(2000, 250) == 401
+    assert recipe.kill_safe_save_every(700, 250) == 141
+    # Actual Jul-20 tournament shapes: three/four periodic saves, respectively.
     assert recipe.kill_safe_save_every(86, 250) == 25
-    assert recipe.kill_safe_save_every(2, 250) == 2  # never exceeds steps (kill-safety)
+    assert (86 - 1) // recipe.kill_safe_save_every(86, 250) == 3
+    assert recipe.kill_safe_save_every(367, 200) == 74
+    assert (367 - 1) // recipe.kill_safe_save_every(367, 200) == 4
+    assert recipe.kill_safe_save_every(24, 250) == 12  # one mid-run recovery point
+    assert recipe.kill_safe_save_every(2, 250) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -268,8 +301,8 @@ def test_config_flux():
     assert p["trigger_word"] == "tok"
     # arch preserved
     assert p["model"]["is_flux"] is True
-    # save_every kill-safe, capped at 100 (min(250, 1100//8=137, 100) = 100)
-    assert p["save"]["save_every"] == 100
+    # Four periodic candidates plus final: floor(1100/5) + 1 = 221.
+    assert p["save"]["save_every"] == 221
 
 
 def test_config_krea2():
@@ -336,59 +369,438 @@ def test_resolve_base_model_dir(tmp_path):
 # 10. finalize picks/creates last.safetensors
 # --------------------------------------------------------------------------- #
 def _write_st(path, tag=""):
-    """Write a minimal VALID safetensors file (header-only) and return its bytes."""
+    """Write a minimal valid one-tensor safetensors file and return its bytes."""
     import json as _json
     import struct as _struct
 
-    header = _json.dumps({"__metadata__": {"tag": tag}}).encode()
-    path.write_bytes(_struct.pack("<Q", len(header)) + header)
+    header = _json.dumps(
+        {
+            "__metadata__": {"tag": tag},
+            "weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        }
+    ).encode()
+    path.write_bytes(_struct.pack("<Q", len(header)) + header + _struct.pack("<f", 0.0))
     return path.read_bytes()
 
 
-def test_pick_final_prefers_exact_repo(tmp_path):
-    root = tmp_path
-    p1 = root / "repo_000000700.safetensors"
-    p2 = root / "repo.safetensors"
-    _write_st(p1)
-    _write_st(p2)
-    loras = [str(p1), str(p2)]
-    assert aitoolkit._pick_final(loras, "repo") == str(p2)
+def _read_selection(root):
+    import json
+
+    return json.loads((root / "forge_checkpoint_selection.json").read_text())
 
 
-def test_pick_final_highest_step_when_no_exact(tmp_path):
-    root = tmp_path
-    p1 = root / "repo_000000200.safetensors"
-    p2 = root / "repo_000000600.safetensors"
-    _write_st(p1)
-    _write_st(p2)
-    assert aitoolkit._pick_final([str(p1), str(p2)], "repo") == str(p2)
+def _sha256(path):
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_pick_final_digit_trap(tmp_path):
-    # repo name ends in a digit — exact-match branch must win over step regex
-    root = tmp_path
-    exact = root / "repo9.safetensors"
-    periodic = root / "repo9_000000500.safetensors"
-    _write_st(exact)
-    _write_st(periodic)
-    assert aitoolkit._pick_final([str(periodic), str(exact)], "repo9") == str(exact)
+def _write_loss_db(path, state, losses):
+    """Write the real ai-toolkit recorder schema used in tournament artifacts."""
+    import sqlite3
+
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE steps (step INTEGER PRIMARY KEY, wall_time REAL NOT NULL);
+            CREATE TABLE metric_keys (
+                key TEXT PRIMARY KEY, first_seen_step INTEGER, last_seen_step INTEGER
+            );
+            CREATE TABLE metrics (
+                step INTEGER NOT NULL, key TEXT NOT NULL, value_real REAL,
+                value_text TEXT, PRIMARY KEY (step, key)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO metric_keys VALUES ('loss/loss', 1, ?)", (len(losses),)
+        )
+        for step, loss in enumerate(losses, 1):
+            conn.execute(
+                "INSERT INTO steps VALUES (?, ?)",
+                (step, state["started_unix"] + step / 1000.0),
+            )
+            conn.execute(
+                "INSERT INTO metrics VALUES (?, 'loss/loss', ?, NULL)",
+                (step, loss),
+            )
 
 
-def test_pick_final_skips_truncated_newest(tmp_path):
-    # deadline kill mid-save: newest file truncated → step down to valid older
-    ok = tmp_path / "repo_000000200.safetensors"
-    trunc = tmp_path / "repo_000000600.safetensors"
-    _write_st(ok)
-    trunc.write_bytes(b"x")  # not a valid safetensors
-    assert aitoolkit._pick_final([str(ok), str(trunc)], "repo") == str(ok)
+def test_default_selection_prefers_current_exact_final(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo9")
+    state = checkpoints.set_planned_steps(str(tmp_path), state, 500)
+    _write_st(tmp_path / "repo9_000000500.safetensors", tag="periodic")
+    final_bytes = _write_st(tmp_path / "repo9.safetensors", tag="final")
+    record = checkpoints.finalize(str(tmp_path), "repo9", state)
+    assert (tmp_path / "last.safetensors").read_bytes() == final_bytes
+    assert record["source"] == "exact_final"
+    assert record["selected_step"] == 500
+    assert record["sha256"]
 
 
-def test_pick_final_skips_corrupt_exact_final(tmp_path):
-    exact = tmp_path / "repo.safetensors"
-    periodic = tmp_path / "repo_000000500.safetensors"
-    exact.write_bytes(b"x")  # corrupt final save
-    _write_st(periodic)
-    assert aitoolkit._pick_final([str(exact), str(periodic)], "repo") == str(periodic)
+def test_default_selection_highest_valid_periodic(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    _write_st(tmp_path / "repo_000000200.safetensors", tag="old")
+    newest = _write_st(tmp_path / "repo_000000600.safetensors", tag="new")
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+    assert (tmp_path / "last.safetensors").read_bytes() == newest
+    assert record["source"] == "highest_valid_periodic"
+    assert record["selected_step"] == 600
+
+
+def test_selection_skips_truncated_current_newest(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    ok = _write_st(tmp_path / "repo_000000200.safetensors", tag="ok")
+    (tmp_path / "repo_000000600.safetensors").write_bytes(b"truncated")
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+    assert (tmp_path / "last.safetensors").read_bytes() == ok
+    assert record["current_candidates_discovered"] == 2
+    assert record["current_candidates_valid"] == 1
+
+
+def test_same_task_retry_ignores_stale_last_and_higher_step(tmp_path):
+    old_last = _write_st(tmp_path / "last.safetensors", tag="previous")
+    stale_high = _write_st(tmp_path / "repo_000000900.safetensors", tag="stale")
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    current = _write_st(tmp_path / "repo_000000100.safetensors", tag="current")
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+    assert old_last != current != stale_high
+    assert (tmp_path / "last.safetensors").read_bytes() == current
+    assert record["selected_step"] == 100
+    assert record["current_candidates_discovered"] == 1
+
+
+def test_begin_run_blocks_aitoolkit_zero_step_autoresume(tmp_path):
+    """Every model and fixed-name training state must be absent at launch."""
+    prior_exact = _write_st(tmp_path / "repo.safetensors", tag="prior-final")
+    _write_st(tmp_path / "repo_000000900.safetensors", tag="prior-periodic")
+    (tmp_path / "repo.pt").write_bytes(b"old-state")
+    (tmp_path / "repo_state").mkdir()
+    (tmp_path / "optimizer.pt").write_bytes(b"old-optimizer")
+    (tmp_path / "learnable_snr.json").write_text("{}", encoding="utf-8")
+
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+
+    assert state["quarantine_complete"] is True
+    assert set(state["quarantined"]) == {
+        "learnable_snr.json",
+        "optimizer.pt",
+        "repo.pt",
+        "repo.safetensors",
+        "repo_000000900.safetensors",
+        "repo_state",
+    }
+    assert not any(path.name.startswith("repo") for path in tmp_path.iterdir())
+    assert not (tmp_path / "optimizer.pt").exists()
+    assert not (tmp_path / "learnable_snr.json").exists()
+    assert (tmp_path / "last.safetensors").read_bytes() == prior_exact
+    # Handler reuse must not start a second journal or disturb the fallback.
+    assert checkpoints.ensure_run(str(tmp_path), "repo") == state
+
+
+def test_fresh_process_tombstone_blocks_stale_scope_after_early_failure(
+    tmp_path, monkeypatch
+):
+    """The previous process's complete journal must never authorize training."""
+    old_state = checkpoints.begin_run(str(tmp_path), "repo")
+    _write_st(tmp_path / "repo.safetensors", tag="stale-model")
+    (tmp_path / "optimizer.pt").write_bytes(b"stale-optimizer")
+
+    checkpoints._ACTIVE_RUNS.clear()
+    monkeypatch.setattr(checkpoints, "_PROCESS_NONCE", "fresh-process")
+
+    def fail_before_inventory(_save_root, _repo):
+        raise OSError("forced early setup failure")
+
+    monkeypatch.setattr(checkpoints, "_ensure_prior_last", fail_before_inventory)
+
+    with pytest.raises(OSError, match="forced early setup failure"):
+        checkpoints.begin_run(str(tmp_path), "repo")
+
+    active = checkpoints._ACTIVE_RUNS[os.path.abspath(tmp_path)]
+    assert active["attempt_nonce"] != old_state["attempt_nonce"]
+    assert active["process_nonce"] == "fresh-process"
+    assert active["quarantine_complete"] is False
+    with open(tmp_path / ".forge_checkpoint_scope.json", encoding="utf-8") as fh:
+        import json
+
+        durable = json.load(fh)
+    assert durable["attempt_nonce"] == active["attempt_nonce"]
+    assert durable["quarantine_complete"] is False
+
+    # Stale files may remain after an early I/O failure, but neither the handler
+    # nor fallback is allowed to classify or consume them under this attempt.
+    assert (tmp_path / "optimizer.pt").exists()
+    with pytest.raises(RuntimeError, match="initialization is incomplete"):
+        checkpoints.ensure_run(str(tmp_path), "repo")
+    assert checkpoints.current_loras(str(tmp_path), active) == []
+    assert checkpoints.finalize(str(tmp_path), "repo") is None
+    assert not (tmp_path / "last.safetensors").exists()
+
+
+def test_abandoned_quarantine_prune_failure_is_nonfatal_and_retry_isolated(
+    tmp_path, monkeypatch
+):
+    old_state = checkpoints.begin_run(str(tmp_path), "repo")
+    prior = _write_st(tmp_path / "repo.safetensors", tag="prior-final")
+    (tmp_path / "optimizer.pt").write_bytes(b"stale-optimizer")
+
+    quarantine_root = checkpoints._quarantine_root(str(tmp_path))
+    abandoned = os.path.join(quarantine_root, "abandoned")
+    os.makedirs(abandoned)
+    with open(os.path.join(abandoned, "marker"), "wb") as fh:
+        fh.write(b"old")
+
+    checkpoints._ACTIVE_RUNS.clear()
+    monkeypatch.setattr(checkpoints, "_PROCESS_NONCE", "fresh-process")
+
+    import shutil
+
+    real_rmtree = shutil.rmtree
+    failed = False
+
+    def fail_abandoned_once(path, *args, **kwargs):
+        nonlocal failed
+        if os.path.abspath(path) == os.path.abspath(abandoned) and not failed:
+            failed = True
+            raise OSError("forced abandoned-quarantine failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", fail_abandoned_once)
+
+    state = checkpoints.ensure_run(str(tmp_path), "repo")
+
+    assert failed is True
+    assert state["attempt_nonce"] != old_state["attempt_nonce"]
+    assert state["process_nonce"] == "fresh-process"
+    assert state["quarantine_complete"] is True
+    assert set(state["quarantined"]) == {"optimizer.pt", "repo.safetensors"}
+    assert (tmp_path / "last.safetensors").read_bytes() == prior
+    assert os.path.isdir(abandoned)
+    assert not (tmp_path / "optimizer.pt").exists()
+    assert not (tmp_path / "repo.safetensors").exists()
+    assert os.path.isfile(os.path.join(state["quarantine"], "optimizer.pt"))
+    assert os.path.isfile(os.path.join(state["quarantine"], "repo.safetensors"))
+    with open(tmp_path / ".forge_checkpoint_scope.json", encoding="utf-8") as fh:
+        import json
+
+        durable = json.load(fh)
+    assert durable["attempt_nonce"] == state["attempt_nonce"]
+    assert durable["quarantine_complete"] is True
+
+
+def test_same_size_overwrite_with_restored_mtime_is_current_via_ctime(tmp_path):
+    import time
+
+    path = tmp_path / "repo_000000100.safetensors"
+    old = _write_st(path, tag="old1")
+    old_stat = path.stat()
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    # Model an unusual deterministic writer that restores mtime and produces the
+    # same byte length.  ctime still changes on supported validator filesystems.
+    time.sleep(0.002)
+    new = _write_st(path, tag="new1")
+    assert len(old) == len(new)
+    os.utime(path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    assert path.stat().st_mtime_ns == old_stat.st_mtime_ns
+    assert checkpoints.current_loras(str(tmp_path), state) == [str(path)]
+
+
+def test_failed_retry_explicitly_preserves_previous_last(tmp_path):
+    prior = _write_st(tmp_path / "last.safetensors", tag="previous")
+    _write_st(tmp_path / "repo_000000900.safetensors", tag="stale-periodic")
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    (tmp_path / "repo_000000100.safetensors").write_bytes(b"failed-partial-save")
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+    assert (tmp_path / "last.safetensors").read_bytes() == prior
+    assert record["status"] == "preserved_previous_run"
+    assert record["source"] == "previous_run_fallback"
+    assert record["current_candidates_discovered"] == 1
+    assert record["current_candidates_valid"] == 0
+    assert "no valid checkpoint" in record["reason"]
+
+
+def test_heldout_manifest_selects_scored_checkpoint(tmp_path):
+    import json
+
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    best = _write_st(tmp_path / "repo_000000100.safetensors", tag="best")
+    _write_st(tmp_path / "repo_000000200.safetensors", tag="worse")
+    _write_st(tmp_path / "repo.safetensors", tag="final")
+    (tmp_path / "forge_holdout_scores.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "source": "heldout",
+                "complete": True,
+                "metric": "validator_combined_proxy",
+                "direction": "min",
+                "scores": [
+                    {
+                        "checkpoint": "repo_000000100.safetensors",
+                        "score": 0.05,
+                        "sha256": _sha256(tmp_path / "repo_000000100.safetensors"),
+                    },
+                    {
+                        "checkpoint": "repo_000000200.safetensors",
+                        "score": 0.08,
+                        "sha256": _sha256(tmp_path / "repo_000000200.safetensors"),
+                    },
+                    {
+                        "checkpoint": "repo.safetensors",
+                        "score": 0.12,
+                        "sha256": _sha256(tmp_path / "repo.safetensors"),
+                    },
+                ],
+            }
+        )
+    )
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+    assert (tmp_path / "last.safetensors").read_bytes() == best
+    assert record["source"] == "heldout_manifest"
+    assert record["selected_step"] == 100
+    assert record["score"] == 0.05
+
+
+def test_incomplete_heldout_manifest_cannot_override_final(tmp_path):
+    import json
+
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    early = tmp_path / "repo_000000100.safetensors"
+    _write_st(early, tag="early")
+    final = _write_st(tmp_path / "repo.safetensors", tag="final")
+    (tmp_path / "forge_holdout_scores.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "source": "heldout",
+                "complete": False,
+                "direction": "min",
+                "scores": [
+                    {
+                        "checkpoint": early.name,
+                        "score": 0.01,
+                        "sha256": _sha256(early),
+                    }
+                ],
+            }
+        )
+    )
+
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert (tmp_path / "last.safetensors").read_bytes() == final
+    assert record["source"] == "exact_final"
+
+
+def test_stale_holdout_manifest_is_ignored_on_retry(tmp_path):
+    import json
+
+    (tmp_path / "forge_holdout_scores.json").write_text(
+        json.dumps(
+            {
+                "source": "heldout",
+                "direction": "min",
+                "scores": [
+                    {"checkpoint": "repo_000000100.safetensors", "score": 0.01}
+                ],
+            }
+        )
+    )
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    _write_st(tmp_path / "repo_000000100.safetensors", tag="periodic")
+    final = _write_st(tmp_path / "repo.safetensors", tag="final")
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+    assert (tmp_path / "last.safetensors").read_bytes() == final
+    assert record["source"] == "exact_final"
+
+
+def test_clear_sustained_training_loss_divergence_selects_early(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    _write_st(tmp_path / "repo_000000045.safetensors", tag="45")
+    best = _write_st(tmp_path / "repo_000000090.safetensors", tag="90")
+    _write_st(tmp_path / "repo_000000135.safetensors", tag="135")
+    _write_st(tmp_path / "repo.safetensors", tag="final")
+    losses = [0.16] * 45 + [0.10] * 45 + [0.18] * 45 + [0.60] * 45
+    _write_loss_db(tmp_path / "loss_log.db", state, losses)
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+    assert (tmp_path / "last.safetensors").read_bytes() == best
+    assert record["source"] == "training_loss_divergence"
+    assert record["selected_step"] == 90
+    assert record["training_loss_is_proxy_not_validator_metric"] is True
+
+
+def test_stable_improving_training_loss_keeps_final(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    _write_st(tmp_path / "repo_000000045.safetensors", tag="45")
+    _write_st(tmp_path / "repo_000000090.safetensors", tag="90")
+    _write_st(tmp_path / "repo_000000135.safetensors", tag="135")
+    final = _write_st(tmp_path / "repo.safetensors", tag="final")
+    losses = [1.0 - step * 0.004 for step in range(1, 181)]
+    _write_loss_db(tmp_path / "loss_log.db", state, losses)
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+    assert (tmp_path / "last.safetensors").read_bytes() == final
+    assert record["source"] == "exact_final"
+
+
+def test_loss_reader_accepts_current_uncheckpointed_sqlite_wal(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "loss_log.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(
+            """
+            CREATE TABLE steps (step INTEGER PRIMARY KEY, wall_time REAL NOT NULL);
+            CREATE TABLE metric_keys (
+                key TEXT PRIMARY KEY, first_seen_step INTEGER, last_seen_step INTEGER
+            );
+            CREATE TABLE metrics (
+                step INTEGER NOT NULL, key TEXT NOT NULL, value_real REAL,
+                value_text TEXT, PRIMARY KEY (step, key)
+            );
+            INSERT INTO metric_keys VALUES ('loss/loss', 1, 1);
+            """
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO steps VALUES (?, ?)",
+            (1, state["started_unix"] + 0.1),
+        )
+        conn.execute(
+            "INSERT INTO metrics VALUES (?, 'loss/loss', ?, NULL)", (1, 0.25)
+        )
+        conn.commit()
+        assert (tmp_path / "loss_log.db-wal").is_file()
+        # Model the deadline state where only WAL freshness is observable.
+        state["before"]["loss_log.db"] = checkpoints._signature(str(db))
+
+        assert checkpoints._loss_points(str(tmp_path), state) == [(1, 0.25)]
+    finally:
+        conn.close()
+
+
+def test_atomic_records_and_promotion_fsync_parent_directory(tmp_path, monkeypatch):
+    import stat
+
+    real_fsync = os.fsync
+    fsynced_directory = []
+
+    def _spy(fd):
+        fsynced_directory.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _spy)
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    _write_st(tmp_path / "repo_000000100.safetensors", tag="current")
+    checkpoints.finalize(str(tmp_path), "repo", state)
+    assert any(fsynced_directory)
 
 
 def test_valid_safetensors():
@@ -416,15 +828,92 @@ def test_valid_safetensors():
         assert not valid_safetensors(str(cut))
 
 
+def test_valid_safetensors_rejects_metadata_only_and_invalid_offsets(tmp_path):
+    import json
+    import struct
+
+    from forge.tasks.integrity import valid_safetensors
+
+    metadata_header = json.dumps({"__metadata__": {"format": "pt"}}).encode()
+    metadata_only = tmp_path / "metadata-only.safetensors"
+    metadata_only.write_bytes(struct.pack("<Q", len(metadata_header)) + metadata_header)
+    assert not valid_safetensors(str(metadata_only))
+
+    bad_header = json.dumps(
+        {"weight": {"dtype": "F32", "shape": [1], "data_offsets": [-1, 3]}}
+    ).encode()
+    bad_offsets = tmp_path / "bad-offsets.safetensors"
+    bad_offsets.write_bytes(struct.pack("<Q", len(bad_header)) + bad_header + b"abc")
+    assert not valid_safetensors(str(bad_offsets))
+
+    invalid_metadata_header = json.dumps(
+        {
+            "__metadata__": {"step": 1},
+            "weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        }
+    ).encode()
+    invalid_metadata = tmp_path / "invalid-metadata.safetensors"
+    invalid_metadata.write_bytes(
+        struct.pack("<Q", len(invalid_metadata_header))
+        + invalid_metadata_header
+        + b"\0" * 4
+    )
+    assert not valid_safetensors(str(invalid_metadata))
+
+
+@pytest.mark.parametrize(
+    "header,payload",
+    [
+        (
+            {"weight": {"dtype": "BOGUS", "shape": [1], "data_offsets": [0, 4]}},
+            b"\0" * 4,
+        ),
+        (
+            {"weight": {"dtype": "F32", "shape": [-1], "data_offsets": [0, 4]}},
+            b"\0" * 4,
+        ),
+        (
+            {
+                "a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+                "b": {"dtype": "F32", "shape": [1], "data_offsets": [2, 6]},
+            },
+            b"\0" * 6,
+        ),
+        (
+            {"weight": {"dtype": "F32", "shape": [2], "data_offsets": [0, 4]}},
+            b"\0" * 4,
+        ),
+        (
+            {"weight": {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]}},
+            b"\0" * 8,
+        ),
+    ],
+)
+def test_valid_safetensors_rejects_bad_dtype_shape_and_layout(
+    tmp_path, header, payload
+):
+    import json
+    import struct
+
+    from forge.tasks.integrity import valid_safetensors
+
+    encoded = json.dumps(header).encode()
+    path = tmp_path / "malformed.safetensors"
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+
+    assert not valid_safetensors(str(path))
+
+
 def test_finalize_creates_last(tmp_path, monkeypatch):
     s = _spec(expected_repo_name="repo")
     save_root = tmp_path / "repo"
     save_root.mkdir()
+    scope = checkpoints.begin_run(str(save_root), "repo")
     _write_st(save_root / "repo_000000700.safetensors", tag="weights")
     final_bytes = _write_st(save_root / "repo.safetensors", tag="final")
     monkeypatch.setattr(type(s), "save_root", property(lambda self: str(save_root)))
     monkeypatch.setattr(type(s), "output_dir", property(lambda self: str(save_root)))
-    aitoolkit._finalize(s)
+    aitoolkit._finalize(s, scope)
     last = save_root / "last.safetensors"
     assert last.is_file()
     assert last.read_bytes() == final_bytes
@@ -434,9 +923,10 @@ def test_finalize_raises_when_empty(tmp_path, monkeypatch):
     s = _spec(expected_repo_name="repo")
     save_root = tmp_path / "repo"
     save_root.mkdir()
+    scope = checkpoints.begin_run(str(save_root), "repo")
     monkeypatch.setattr(type(s), "save_root", property(lambda self: str(save_root)))
     with pytest.raises(RuntimeError):
-        aitoolkit._finalize(s)
+        aitoolkit._finalize(s, scope)
 
 
 # --------------------------------------------------------------------------- #
@@ -446,16 +936,18 @@ def test_fallback_promotes(tmp_path, monkeypatch):
     s = _spec(expected_repo_name="repo")
     save_root = tmp_path / "repo"
     save_root.mkdir()
-    (save_root / "repo_000000300.safetensors").write_bytes(b"w")
+    checkpoints.begin_run(str(save_root), "repo")
+    expected = _write_st(save_root / "repo_000000300.safetensors", tag="current")
     monkeypatch.setattr(type(s), "save_root", property(lambda self: str(save_root)))
     fallback.emit_untrained_copy(s)
-    assert (save_root / "last.safetensors").is_file()
+    assert (save_root / "last.safetensors").read_bytes() == expected
 
 
 def test_fallback_empty_no_raise(tmp_path, monkeypatch):
     s = _spec(expected_repo_name="repo")
     save_root = tmp_path / "repo"
     save_root.mkdir()
+    checkpoints.begin_run(str(save_root), "repo")
     monkeypatch.setattr(type(s), "save_root", property(lambda self: str(save_root)))
     # must not raise
     fallback.emit_untrained_copy(s)
@@ -543,6 +1035,7 @@ def test_fallback_skips_truncated_newest(tmp_path, monkeypatch):
     s = _spec(expected_repo_name="repo")
     save_root = tmp_path / "repo"
     save_root.mkdir()
+    checkpoints.begin_run(str(save_root), "repo")
     ok_bytes = _write_st(save_root / "repo_000000100.safetensors", tag="ok")
     (save_root / "repo_000000900.safetensors").write_bytes(b"trunc")
     monkeypatch.setattr(type(s), "save_root", property(lambda self: str(save_root)))
@@ -588,3 +1081,20 @@ def test_new_types_dispatchable():
     for mt in ("z-image", "qwen-image"):
         s = _spec(model_type=mt)
         assert s.model_type == mt
+
+
+def test_image_dockerfiles_repin_torchcodec_for_torch26():
+    """Keep ai-toolkit's media extension on the ABI G.O.D actually ships."""
+    names = (
+        "standalone-image-trainer.dockerfile",
+        "standalone-image-toolkit-trainer.dockerfile",
+    )
+    contents = []
+    for name in names:
+        path = os.path.join(REPO_ROOT, "ops", "docker", name)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        assert "torch==2.6.0" in text
+        assert "torchcodec==0.2.1" in text
+        contents.append(text)
+    assert contents[0] == contents[1]

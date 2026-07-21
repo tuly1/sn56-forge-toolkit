@@ -82,19 +82,30 @@ def size_scaled_steps(model_type, num_images, hours_to_complete, template_steps)
 
 
 def kill_safe_save_every(steps, template_save_every):
-    """Cadence for periodic {repo}_{step}.safetensors saves — the sole kill-safety
-    mechanism (INV-2). The FIRST save must land EARLY: the deadline monitor (or a
-    crash) can cut a short/slower-than-modeled run before the template's ~200-250
-    cadence, leaving _finalize with no LoRA → forfeit.
+    """Budget about four useful periodic candidates plus the exact final.
 
-    Jul-20 postmortem: saves cost ~46-63s each on H100 and steps//8 cadence made
-    checkpointing consume 46-49% OF TOTAL WALL TIME on both tournament runs.
-    Floor raised to 25 (≈2-4 saves on short runs): kill-safety still lands a
-    checkpoint before ~30% of the schedule, at <15% I/O overhead.
+    Saving is the only mid-run kill-safety, but each tournament save took tens of
+    seconds.  A fixed candidate budget is easier to reason about than ``steps//8``:
+    target four periodic saves and do not save more often than every 25 steps on
+    short jobs.  The first ordinary candidate lands at about 20% of the planned
+    run, while the very-short-run branch emits a recovery point near halfway.
     """
     try:
         s = max(1, int(steps))
-        return max(1, min(int(template_save_every), max(25, s // 8), 100, s))
+        template = max(1, int(template_save_every))
+        if s < 25:
+            # A heavily time-capped run still needs one mid-run recovery point;
+            # waiting until its terminal step is not kill-safe.
+            return max(1, min(template, max(1, s // 2), s))
+        # floor(steps / (4 periodic + 1 final interval)) + 1 keeps the fifth
+        # periodic save beyond the terminal step, even when steps is divisible
+        # by five.  The 86/367-step tournament shapes produce cadences of 25 and
+        # 74 respectively (3 and 4 periodic saves).
+        candidate_interval = s // 5 + 1
+        return max(
+            1,
+            min(max(25, candidate_interval), s),
+        )
     except Exception:
         try:
             return int(template_save_every)

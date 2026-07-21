@@ -106,12 +106,12 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
                 mk["vae_path"] = spec.cached_model_dir
         except Exception:
             pass
-        # Kill-safe save cadence separately: the raw template's save_every
-        # (200-250) would put the FIRST checkpoint after most short budgets.
+        # Apply the same fixed candidate/I/O budget even on the degraded path;
+        # the raw template's 200-250 cadence would miss most short jobs.
         try:
             p = cfg["config"]["process"][0]
-            p["save"]["save_every"] = min(
-                int(p["save"].get("save_every", 250)), 50
+            p["save"]["save_every"] = recipe.kill_safe_save_every(
+                p["train"]["steps"], p["save"].get("save_every", 250)
             )
         except Exception:
             pass
