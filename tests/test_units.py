@@ -498,6 +498,97 @@ def test_begin_run_blocks_aitoolkit_zero_step_autoresume(tmp_path):
     assert checkpoints.ensure_run(str(tmp_path), "repo") == state
 
 
+def test_fresh_process_tombstone_blocks_stale_scope_after_early_failure(
+    tmp_path, monkeypatch
+):
+    """The previous process's complete journal must never authorize training."""
+    old_state = checkpoints.begin_run(str(tmp_path), "repo")
+    _write_st(tmp_path / "repo.safetensors", tag="stale-model")
+    (tmp_path / "optimizer.pt").write_bytes(b"stale-optimizer")
+
+    checkpoints._ACTIVE_RUNS.clear()
+    monkeypatch.setattr(checkpoints, "_PROCESS_NONCE", "fresh-process")
+
+    def fail_before_inventory(_save_root, _repo):
+        raise OSError("forced early setup failure")
+
+    monkeypatch.setattr(checkpoints, "_ensure_prior_last", fail_before_inventory)
+
+    with pytest.raises(OSError, match="forced early setup failure"):
+        checkpoints.begin_run(str(tmp_path), "repo")
+
+    active = checkpoints._ACTIVE_RUNS[os.path.abspath(tmp_path)]
+    assert active["attempt_nonce"] != old_state["attempt_nonce"]
+    assert active["process_nonce"] == "fresh-process"
+    assert active["quarantine_complete"] is False
+    with open(tmp_path / ".forge_checkpoint_scope.json", encoding="utf-8") as fh:
+        import json
+
+        durable = json.load(fh)
+    assert durable["attempt_nonce"] == active["attempt_nonce"]
+    assert durable["quarantine_complete"] is False
+
+    # Stale files may remain after an early I/O failure, but neither the handler
+    # nor fallback is allowed to classify or consume them under this attempt.
+    assert (tmp_path / "optimizer.pt").exists()
+    with pytest.raises(RuntimeError, match="initialization is incomplete"):
+        checkpoints.ensure_run(str(tmp_path), "repo")
+    assert checkpoints.current_loras(str(tmp_path), active) == []
+    assert checkpoints.finalize(str(tmp_path), "repo") is None
+    assert not (tmp_path / "last.safetensors").exists()
+
+
+def test_abandoned_quarantine_prune_failure_is_nonfatal_and_retry_isolated(
+    tmp_path, monkeypatch
+):
+    old_state = checkpoints.begin_run(str(tmp_path), "repo")
+    prior = _write_st(tmp_path / "repo.safetensors", tag="prior-final")
+    (tmp_path / "optimizer.pt").write_bytes(b"stale-optimizer")
+
+    quarantine_root = checkpoints._quarantine_root(str(tmp_path))
+    abandoned = os.path.join(quarantine_root, "abandoned")
+    os.makedirs(abandoned)
+    with open(os.path.join(abandoned, "marker"), "wb") as fh:
+        fh.write(b"old")
+
+    checkpoints._ACTIVE_RUNS.clear()
+    monkeypatch.setattr(checkpoints, "_PROCESS_NONCE", "fresh-process")
+
+    import shutil
+
+    real_rmtree = shutil.rmtree
+    failed = False
+
+    def fail_abandoned_once(path, *args, **kwargs):
+        nonlocal failed
+        if os.path.abspath(path) == os.path.abspath(abandoned) and not failed:
+            failed = True
+            raise OSError("forced abandoned-quarantine failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", fail_abandoned_once)
+
+    state = checkpoints.ensure_run(str(tmp_path), "repo")
+
+    assert failed is True
+    assert state["attempt_nonce"] != old_state["attempt_nonce"]
+    assert state["process_nonce"] == "fresh-process"
+    assert state["quarantine_complete"] is True
+    assert set(state["quarantined"]) == {"optimizer.pt", "repo.safetensors"}
+    assert (tmp_path / "last.safetensors").read_bytes() == prior
+    assert os.path.isdir(abandoned)
+    assert not (tmp_path / "optimizer.pt").exists()
+    assert not (tmp_path / "repo.safetensors").exists()
+    assert os.path.isfile(os.path.join(state["quarantine"], "optimizer.pt"))
+    assert os.path.isfile(os.path.join(state["quarantine"], "repo.safetensors"))
+    with open(tmp_path / ".forge_checkpoint_scope.json", encoding="utf-8") as fh:
+        import json
+
+        durable = json.load(fh)
+    assert durable["attempt_nonce"] == state["attempt_nonce"]
+    assert durable["quarantine_complete"] is True
+
+
 def test_same_size_overwrite_with_restored_mtime_is_current_via_ctime(tmp_path):
     import time
 

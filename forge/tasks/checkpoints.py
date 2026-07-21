@@ -39,13 +39,14 @@ _SCOPE_FILE = ".forge_checkpoint_scope.json"
 _SELECTION_FILE = "forge_checkpoint_selection.json"
 _HOLDOUT_FILE = "forge_holdout_scores.json"
 _LOSS_DB_FILE = "loss_log.db"
-_SCOPE_SCHEMA = 1
+_SCOPE_SCHEMA = 2
 _SELECTION_SCHEMA = 1
 # ai-toolkit consumes these fixed-name files even when no repo-prefixed model
 # checkpoint remains.  In particular, BaseSDTrainProcess loads ``optimizer.pt``
 # unconditionally during optimizer setup; leaving it behind contaminates a
 # validator retry with the previous attempt's momentum/variance state.
 _AUTO_RESUME_FIXED_NAMES = frozenset({"optimizer.pt", "learnable_snr.json"})
+_PROCESS_NONCE = uuid.uuid4().hex
 _ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
 
 
@@ -74,7 +75,33 @@ def begin_run(save_root: str, repo: str) -> dict[str, Any]:
     """
     if not repo or os.path.basename(repo) != repo or repo in (".", ".."):
         raise ValueError("checkpoint repo name must be one safe path component")
+    key = os.path.abspath(save_root)
+    attempt_nonce = uuid.uuid4().hex
+    quarantine = os.path.join(_quarantine_root(save_root), attempt_nonce)
+    state: dict[str, Any] = {
+        "schema": _SCOPE_SCHEMA,
+        "repo": repo,
+        "process_nonce": _PROCESS_NONCE,
+        "attempt_nonce": attempt_nonce,
+        "started_unix": time.time(),
+        "before": {},
+        "quarantine": quarantine,
+        "quarantine_complete": False,
+    }
+    # Install the incomplete attempt in memory before *any* filesystem work.
+    # If even mkdir or the first journal write fails, the handler cannot revive
+    # a complete scope left by a previous process and train on its optimizer.
+    _ACTIVE_RUNS[key] = state
     os.makedirs(save_root, exist_ok=True)
+    scope_path = os.path.join(save_root, _SCOPE_FILE)
+    # Atomic replacement is the durable tombstone. If persistence is full, the
+    # in-process state still fails closed, and a later process ignores the old
+    # journal because its process nonce cannot match.
+    try:
+        _atomic_json(scope_path, state)
+    except Exception as exc:
+        _event("checkpoint_scope_persist_failed", error=f"{type(exc).__name__}: {exc}")
+
     _ensure_prior_last(save_root, repo)
     _prune_old_quarantines(save_root)
     before = {
@@ -82,25 +109,8 @@ def begin_run(save_root: str, repo: str) -> dict[str, Any]:
         for name in _tracked_names(save_root)
         if (sig := _signature(os.path.join(save_root, name))) is not None
     }
-    quarantine = os.path.join(_quarantine_root(save_root), uuid.uuid4().hex)
-    state: dict[str, Any] = {
-        "schema": _SCOPE_SCHEMA,
-        "repo": repo,
-        "started_unix": time.time(),
-        "before": before,
-        "quarantine": quarantine,
-        "quarantine_complete": False,
-    }
-    key = os.path.abspath(save_root)
+    state["before"] = before
     _ACTIVE_RUNS[key] = state
-    scope_path = os.path.join(save_root, _SCOPE_FILE)
-    # Do not let a previous attempt's scope survive a failed new scope write.
-    # The in-process copy still protects this attempt if persistence is full.
-    try:
-        if os.path.exists(scope_path):
-            os.remove(scope_path)
-    except Exception as exc:
-        _event("checkpoint_old_scope_clear_failed", error=f"{type(exc).__name__}: {exc}")
     try:
         _atomic_json(scope_path, state)
     except Exception as exc:
@@ -153,13 +163,19 @@ def begin_run(save_root: str, repo: str) -> dict[str, Any]:
 
 
 def ensure_run(save_root: str, repo: str) -> dict[str, Any]:
-    """Reuse the CLI-created scope, or create one when called directly."""
-    state = load_run(save_root)
-    if (
-        state is not None
-        and state.get("repo") == repo
-        and state.get("quarantine_complete") is True
-    ):
+    """Reuse only this process's CLI scope, or create a direct-call scope.
+
+    A completed journal found only on disk belongs to an earlier process and is
+    never proof that this retry quarantined its own auto-resume inputs.
+    """
+    state = _ACTIVE_RUNS.get(os.path.abspath(save_root))
+    if state is not None:
+        if state.get("repo") != repo:
+            raise RuntimeError("active checkpoint scope belongs to another repo")
+        if state.get("process_nonce") != _PROCESS_NONCE:
+            raise RuntimeError("active checkpoint scope belongs to another process")
+        if state.get("quarantine_complete") is not True:
+            raise RuntimeError("checkpoint scope initialization is incomplete")
         return state
     return begin_run(save_root, repo)
 
@@ -167,17 +183,28 @@ def ensure_run(save_root: str, repo: str) -> dict[str, Any]:
 def load_run(save_root: str) -> dict[str, Any] | None:
     active = _ACTIVE_RUNS.get(os.path.abspath(save_root))
     if active is not None:
-        return active
+        return active if _scope_is_current_process(active) else None
     try:
         with open(os.path.join(save_root, _SCOPE_FILE), encoding="utf-8") as fh:
             state = json.load(fh)
-        if state.get("schema") != _SCOPE_SCHEMA or not isinstance(
-            state.get("before"), dict
-        ):
-            return None
-        return state
+        return state if _scope_is_current_process(state) else None
     except Exception:
         return None
+
+
+def _scope_is_current_process(state: Any) -> bool:
+    return bool(
+        isinstance(state, dict)
+        and state.get("schema") == _SCOPE_SCHEMA
+        and state.get("process_nonce") == _PROCESS_NONCE
+        and isinstance(state.get("attempt_nonce"), str)
+        and bool(state["attempt_nonce"])
+        and isinstance(state.get("before"), dict)
+    )
+
+
+def _scope_is_complete(state: Any) -> bool:
+    return _scope_is_current_process(state) and state.get("quarantine_complete") is True
 
 
 def set_planned_steps(
@@ -196,7 +223,7 @@ def set_planned_steps(
 
 def current_loras(save_root: str, state: dict[str, Any] | None) -> list[str]:
     """Return only validly named LoRAs created or replaced in this run."""
-    if state is None or not os.path.isdir(save_root):
+    if not _scope_is_complete(state) or not os.path.isdir(save_root):
         return []
     repo = str(state.get("repo") or "")
     periodic = re.compile(rf"^{re.escape(repo)}_\d+\.safetensors$")
@@ -223,6 +250,9 @@ def finalize(
     current run nor a prior attempt left a valid artifact.
     """
     state = state or load_run(save_root)
+    if state is not None and not _scope_is_complete(state):
+        _event("checkpoint_scope_incomplete", context=context)
+        return None
     if state is not None and state.get("repo") != repo:
         _event(
             "checkpoint_scope_repo_mismatch",
@@ -580,21 +610,18 @@ def _is_prior_valid_last(path: str, state: dict[str, Any] | None) -> bool:
 
 
 def _tracked_names(save_root: str) -> list[str]:
-    try:
-        return [
-            name
-            for name in os.listdir(save_root)
-            if name.endswith(".safetensors")
-            or name
-            in (
-                _HOLDOUT_FILE,
-                _LOSS_DB_FILE,
-                _LOSS_DB_FILE + "-wal",
-                _LOSS_DB_FILE + "-shm",
-            )
-        ]
-    except Exception:
-        return []
+    return [
+        name
+        for name in os.listdir(save_root)
+        if name.endswith(".safetensors")
+        or name
+        in (
+            _HOLDOUT_FILE,
+            _LOSS_DB_FILE,
+            _LOSS_DB_FILE + "-wal",
+            _LOSS_DB_FILE + "-shm",
+        )
+    ]
 
 
 def _ensure_prior_last(save_root: str, repo: str) -> None:
@@ -671,7 +698,13 @@ def _prune_old_quarantines(save_root: str) -> None:
         except OSError:
             pass
     except Exception as exc:
-        raise RuntimeError(f"could not clear prior checkpoint quarantine: {exc}") from exc
+        # These are sibling directories, never ai-toolkit resume inputs. A
+        # cleanup failure costs disk only and must not block quarantining the
+        # current attempt's live inputs.
+        _event(
+            "checkpoint_quarantine_prune_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _quarantine_root(save_root: str) -> str:
