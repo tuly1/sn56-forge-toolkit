@@ -152,14 +152,16 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
         mk["text_encoder_path"] = _KREA2_TE
         # Krea2Model appends the "vae" subfolder itself → pass the model DIR.
         mk["vae_path"] = spec.cached_model_dir
-        # GATE-B CALIBRATED LR (Jul-21/22, H100, tournament-shape fixture:
-        # 36 DreamBooth pairs, 8 arms x 5 candidates, ALL 40 rescored by the
-        # pinned exact G.O.D/Comfy evaluator): winner = 367 steps @ lr 2e-4,
-        # guidance ON, final export (0.02711) vs rank-5 for the old
-        # 1e-4/367/final (0.02842). Evidence: SN56-GATE-B-H100-RESULTS.md §5.
-        # (History: a 1e-3 override from an under-powered probe lost R2 wk-3
-        # and was reverted; THIS override is exact-evaluator evidence at task
-        # shape. Guidance stays ON per the same ladder.)
+        # GATE-B PROVISIONAL LR (Jul-21/22 H100 ladder; single public fixture,
+        # single training seed — REVERSIBLE, revisit with a second fixture):
+        # 8 arms x 5 candidates, all 40 rescored by the pinned exact evaluator.
+        # Best condition: 367 steps @ 2e-4, guidance on, final export (0.02711);
+        # the restored 1e-4 baseline arm scored 0.02842 (-4.63%), all 4 external
+        # holdout images improved. Note the LRxGUIDANCE INTERACTION: guidance-on
+        # wins at 2e-4 but guidance-off edged it at 1e-4/5e-5 — this pins the
+        # best measured PAIR, not a universal guidance rule. Evidence record:
+        # project docs SN56-GATE-B-H100-RESULTS.md §5 (kept outside this public
+        # repo deliberately — counter-intel).
         p["train"]["lr"] = 2e-4
     return cfg
 

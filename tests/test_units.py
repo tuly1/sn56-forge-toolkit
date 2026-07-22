@@ -1267,3 +1267,15 @@ def test_image_dockerfiles_repin_torchcodec_for_torch26():
         assert "torchcodec==0.2.1" in text
         contents.append(text)
     assert contents[0] == contents[1]
+
+
+# --------------------------------------------------------------------------- #
+# Gate-B provisional recipe pin (PR #3)
+# --------------------------------------------------------------------------- #
+def test_krea2_gate_b_provisional_lr():
+    # PROVISIONAL, reversible: single fixture, single training seed (Gate-B
+    # ladder, 40 exact-evaluator-rescored candidates). Revisit with a second
+    # fixture/seed; if reverted, template lr 1e-4 is the fallback.
+    s = _spec(model_type="krea2", expected_repo_name="r")
+    cfg = config.build_config(s, num_images=36, hours_to_complete=1.0)
+    assert cfg["config"]["process"][0]["train"]["lr"] == pytest.approx(2e-4)
