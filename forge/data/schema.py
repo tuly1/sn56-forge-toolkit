@@ -15,6 +15,7 @@ vs the legacy SDXL/kohya schema: there is NO ``checkpoint/`` subfolder and NO
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 
 # Every current ai-toolkit image type routes through the same hardened runner.
 KNOWN_MODEL_TYPES = ("flux", "krea2", "ideogram4", "z-image", "qwen-image")
@@ -48,6 +49,15 @@ class ImageSpec:
     def dataset_images_dir(self) -> str:
         # ai-toolkit dataset format: a FLAT folder of image + same-basename .txt.
         return "/dataset/images"
+
+    @property
+    def dataset_holdout_dir(self) -> str:
+        # Kept outside the training folder.  The scorer expands these reserved
+        # pairs into its own nonce-scoped probe dataset after training. Hashing
+        # the untrusted task id also prevents path traversal and cross-task
+        # contamination in a reused container.
+        task_key = hashlib.sha256(self.task_id.encode("utf-8")).hexdigest()[:12]
+        return f"/dataset/forge-holdout-{task_key}"
 
     @property
     def training_folder(self) -> str:

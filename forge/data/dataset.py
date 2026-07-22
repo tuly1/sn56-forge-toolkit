@@ -19,6 +19,8 @@ Pure stdlib — no torch — so it is cheap to unit-test.
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import shutil
 import zipfile
@@ -94,6 +96,169 @@ def prepare_aitoolkit_dataset(
     except Exception:
         pass
     return images_dir, pairs
+
+
+def reserve_holdout(
+    images_dir: str,
+    *,
+    holdout_dir: str,
+    min_training_pairs: int = 3,
+    max_holdout_pairs: int = 4,
+) -> int:
+    """Move a deterministic post-dedup subset out of the training directory.
+
+    Selection must never score examples used for optimization.  We rank pairs
+    by a content digest (image bytes plus caption bytes), not by caller-provided
+    filenames, and reserve roughly ten percent: one pair at the current minimum
+    tournament size and at most four for larger tasks.
+
+    This helper is deliberately fail-open for *training* and fail-closed for
+    *selection*.  It copies every chosen pair before deleting any source.  On
+    any error it restores the original training directory, clears the holdout,
+    and returns zero, so the ordinary exact-final selection path remains usable.
+    """
+    copied: list[tuple[str, str]] = []
+    removed: list[tuple[str, str]] = []
+    chosen: list[tuple[str, str]] = []
+    original_digests: dict[tuple[str, str], str] = {}
+    try:
+        pairs = _flat_pairs(images_dir)
+        min_training_pairs = max(1, int(min_training_pairs))
+        max_holdout_pairs = max(0, int(max_holdout_pairs))
+        if len(pairs) <= min_training_pairs or max_holdout_pairs == 0:
+            _strict_reset_dir(holdout_dir)
+            _holdout_event("holdout_unavailable", pairs=len(pairs))
+            return 0
+
+        count = min(
+            max_holdout_pairs,
+            max(1, int(math.ceil(len(pairs) * 0.10))),
+            len(pairs) - min_training_pairs,
+        )
+        ranked = sorted(
+            pairs,
+            key=lambda pair: (_pair_digest(*pair), os.path.basename(pair[0])),
+        )
+        chosen = ranked[:count]
+        original_digests = {
+            pair: _pair_digest(*pair)
+            for pair in chosen
+        }
+        _strict_reset_dir(holdout_dir)
+
+        # Copy the complete set first.  A partial copy cannot shrink training.
+        for image_path, caption_path in chosen:
+            holdout_image = os.path.join(
+                holdout_dir, os.path.basename(image_path)
+            )
+            holdout_caption = os.path.join(
+                holdout_dir, os.path.basename(caption_path)
+            )
+            shutil.copy2(
+                image_path,
+                holdout_image,
+            )
+            shutil.copyfile(caption_path, holdout_caption)
+            copied.extend(
+                ((image_path, holdout_image), (caption_path, holdout_caption))
+            )
+
+        for source, holdout_copy in copied:
+            os.remove(source)
+            removed.append((source, holdout_copy))
+
+        _holdout_event(
+            "holdout_reserved",
+            heldout=count,
+            training_pairs=len(pairs) - count,
+        )
+        return count
+    except BaseException as exc:
+        # Restore only current-run sources that we ourselves removed. Never
+        # trust or import arbitrary files found in a reused holdout directory.
+        for source, holdout_copy in removed:
+            try:
+                if not os.path.exists(source) and os.path.isfile(holdout_copy):
+                    shutil.copy2(holdout_copy, source)
+            except Exception:
+                pass
+        shutil.rmtree(holdout_dir, ignore_errors=True)
+        try:
+            os.makedirs(holdout_dir, exist_ok=True)
+        except Exception:
+            pass
+        rollback_errors = []
+        for pair in chosen:
+            try:
+                if (
+                    not all(os.path.isfile(path) for path in pair)
+                    or _pair_digest(*pair) != original_digests[pair]
+                ):
+                    rollback_errors.append(os.path.basename(pair[0]))
+            except Exception:
+                rollback_errors.append(os.path.basename(pair[0]))
+        _holdout_event(
+            "holdout_reservation_failed", error=f"{type(exc).__name__}: {exc}"
+        )
+        if rollback_errors:
+            _holdout_event(
+                "holdout_rollback_incomplete",
+                pairs=sorted(set(rollback_errors)),
+            )
+            raise RuntimeError(
+                "holdout reservation failed and training inputs could not be "
+                f"restored byte-exactly: {sorted(set(rollback_errors))}"
+            ) from exc
+        return 0
+
+
+def _strict_reset_dir(path: str) -> None:
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+    os.makedirs(path)
+
+
+def _flat_pairs(directory: str) -> list[tuple[str, str]]:
+    if not os.path.isdir(directory):
+        return []
+    out: list[tuple[str, str]] = []
+    seen_stems: set[str] = set()
+    for name in sorted(os.listdir(directory)):
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in _IMAGE_EXTS:
+            continue
+        stem_key = stem.casefold()
+        if stem_key in seen_stems:
+            raise RuntimeError(
+                f"ambiguous image stem in flat dataset: {stem!r}"
+            )
+        image_path = os.path.join(directory, name)
+        caption_path = os.path.join(directory, stem + ".txt")
+        if os.path.isfile(image_path) and os.path.isfile(caption_path):
+            seen_stems.add(stem_key)
+            out.append((image_path, caption_path))
+    return out
+
+
+def _pair_digest(image_path: str, caption_path: str) -> str:
+    digest = hashlib.sha256()
+    for path in (image_path, caption_path):
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(block)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _holdout_event(name: str, **values) -> None:
+    try:
+        from forge import telemetry
+
+        telemetry.event(name, **values)
+    except Exception:
+        pass
 
 
 def _collect_flat(root: str, dest: str) -> str | None:
