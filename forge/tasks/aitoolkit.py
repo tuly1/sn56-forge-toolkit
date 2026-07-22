@@ -23,10 +23,10 @@ import sys
 import threading
 import time
 
-from forge import telemetry
+from forge import recipe, telemetry
 from forge.clock import Deadline
 from forge.config import build_config, resolve_base_model, write_config
-from forge.tasks import checkpoints
+from forge.tasks import checkpoints, holdout
 from forge.data import dataset
 from forge.data.schema import ImageSpec
 
@@ -39,7 +39,7 @@ _POLL_SECONDS = 5
 # is stopped ~(reserve + _STOP_MARGIN_S) before the hard kill. That preserves the
 # full 180s export reserve for _terminate + _finalize (promote-to-last), instead
 # of squeezing finalize into a hand-picked 45s window off the hard stop.
-_STOP_MARGIN_S = 45
+_STOP_MARGIN_S = holdout.boundary_margin_s()
 
 
 def run(spec: ImageSpec, deadline: Deadline) -> None:
@@ -54,32 +54,112 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     scope = checkpoints.ensure_run(spec.save_root, spec.expected_repo_name)
 
     base_model = resolve_base_model(spec.cached_model_dir)
-    images_dir, pairs = dataset.prepare_aitoolkit_dataset(
+    images_dir, total_pairs = dataset.prepare_aitoolkit_dataset(
         spec.cached_zip_path,
         images_dir=spec.dataset_images_dir,
         trigger_word=spec.trigger_word,
     )
+    holdout_feature_ready = holdout.budget_allows(
+        spec.model_type,
+        deadline.remaining(),
+    )
+    if holdout.enabled_for(spec.model_type) and not holdout_feature_ready:
+        telemetry.event(
+            "holdout_scoring_skipped",
+            reason="insufficient_total_budget_before_split",
+            remaining_s=round(deadline.remaining(), 1),
+        )
+    holdout_pairs = (
+        dataset.reserve_holdout(
+            images_dir,
+            holdout_dir=spec.dataset_holdout_dir,
+        )
+        if holdout_feature_ready
+        else 0
+    )
+    pairs = total_pairs - holdout_pairs
     telemetry.collect_env()
     telemetry.set_meta(
         model_type=spec.model_type,
         pairs=pairs,
+        total_pairs=total_pairs,
+        holdout_pairs=holdout_pairs,
         base_model=os.path.basename(base_model),
         trigger_word=spec.trigger_word,
     )
-    telemetry.event("dataset_ready", pairs=pairs)
+    telemetry.event(
+        "dataset_ready",
+        pairs=pairs,
+        total_pairs=total_pairs,
+        holdout_pairs=holdout_pairs,
+    )
 
-    hours = deadline.remaining_hard() / 3600.0
+    scoring_reserve_s = (
+        holdout.scoring_reserve_s(spec.model_type) if holdout_pairs > 0 else 0.0
+    )
+    # The recipe's wall-clock cap must not plan optimizer steps inside time
+    # explicitly reserved for checkpoint scoring. It already accounts for the
+    # ordinary export reserve itself.
+    hours = _recipe_hours(deadline, scoring_reserve_s)
     cfg = build_config(spec, num_images=pairs, hours_to_complete=hours)
     p = cfg["config"]["process"][0]
     steps = p["train"]["steps"]
-    scope = checkpoints.set_planned_steps(spec.save_root, scope, steps)
+    scope = checkpoints.set_planned_steps(
+        spec.save_root,
+        scope,
+        steps,
+        model_type=spec.model_type,
+    )
     telemetry.set_meta(
-        steps=steps, num_images=pairs, save_every=p["save"]["save_every"]
+        steps=steps,
+        num_images=pairs,
+        save_every=p["save"]["save_every"],
+        scoring_reserve_s=scoring_reserve_s,
     )
     write_config(cfg, spec.config_path)
 
-    _run_toolkit(spec.config_path, deadline, spec, scope)
+    scoring_budget_ready = _run_toolkit(
+        spec.config_path,
+        deadline,
+        spec,
+        scope,
+        scoring_reserve_s=scoring_reserve_s,
+    )
+    if scoring_budget_ready:
+        holdout.produce(
+            spec,
+            cfg,
+            scope,
+            deadline,
+            holdout_pairs=holdout_pairs,
+        )
+    elif holdout_pairs > 0:
+        telemetry.event(
+            "holdout_scoring_skipped",
+            reason="scoring_budget_not_reserved",
+        )
     _finalize(spec, scope)
+
+
+def _recipe_hours(deadline: Deadline, scoring_reserve_s: float) -> float:
+    """Return the recipe budget, preserving exact pre-Gate-B dormancy.
+
+    The boundary margin belongs to the optional scorer reserve.  Charging that
+    margin when no true holdout was reserved silently shortens ordinary runs,
+    even though the feature is disabled.  Keep both deductions conditional on
+    a positive scorer reserve so the unset/declined feature is byte-for-byte
+    equivalent at config-planning time.
+    """
+    reserve_before_recipe_margin = 0.0
+    if scoring_reserve_s > 0.0:
+        reserve_before_recipe_margin = (
+            (scoring_reserve_s + _STOP_MARGIN_S)
+            / max(0.01, float(recipe.MARGIN))
+        )
+    return max(
+        0.0,
+        deadline.remaining_hard() - reserve_before_recipe_margin,
+    ) / 3600.0
 
 
 def _run_toolkit(
@@ -87,7 +167,9 @@ def _run_toolkit(
     deadline: Deadline,
     spec: ImageSpec,
     scope: dict,
-) -> None:
+    *,
+    scoring_reserve_s: float = 0.0,
+) -> bool:
     # Run ai-toolkit's run.py with the CURRENT interpreter, not a bare `python3`:
     # in the validator's Docker image sys.executable IS the env python with torch,
     # and in a local venv test it's the venv python — either way it has ai-toolkit's
@@ -127,6 +209,7 @@ def _run_toolkit(
         gpu_thread = None
 
     stopped_by_deadline = False
+    scoring_decision: bool | None = None
     with open(log_path, "w", encoding="utf-8") as log:
         # New session → we can signal the whole process GROUP, so ai-toolkit's
         # DataLoader workers can't outlive the kill holding GPU memory while
@@ -139,7 +222,32 @@ def _run_toolkit(
             # remaining() already subtracts the 180s export reserve, so we begin
             # terminating ~(reserve + margin) before the hard kill — leaving the
             # whole reserve for _terminate + finalize rather than a 45s sliver.
-            if deadline.remaining() <= _STOP_MARGIN_S:
+            remaining = deadline.remaining()
+            reserve = 0.0
+            if (
+                scoring_reserve_s > 0
+                and scoring_decision is None
+                and remaining <= _STOP_MARGIN_S + scoring_reserve_s
+            ):
+                # Decide once at the reserve boundary. Enabling the scorer later
+                # would give it less time than the measured reserve and turn the
+                # reserve into a predictable timeout.
+                scoring_decision = _latch_scoring_decision(
+                    scoring_decision,
+                    remaining=remaining,
+                    reserve_s=scoring_reserve_s,
+                    candidates_ready=holdout.has_scoring_candidates(
+                        spec.save_root, scope
+                    ),
+                )
+                telemetry.event(
+                    "holdout_scoring_budget_decided",
+                    reserved=scoring_decision,
+                    remaining_s=round(remaining, 1),
+                )
+            if scoring_decision is True:
+                reserve = scoring_reserve_s
+            if remaining <= _STOP_MARGIN_S + reserve:
                 stopped_by_deadline = True
                 _terminate(proc)
                 break
@@ -178,6 +286,33 @@ def _run_toolkit(
     ):
         _tail_log(log_path)
         raise RuntimeError(f"ai-toolkit failed (rc={rc}) with no checkpoint")
+
+    if scoring_reserve_s <= 0:
+        return False
+    if scoring_decision is not None:
+        return scoring_decision
+    # Natural completion before the reserve boundary may create the exact final
+    # without ever entering the loop's boundary branch. Score only when the
+    # full measured reserve still remains and at least two candidates exist.
+    return (
+        deadline.remaining() >= scoring_reserve_s + _STOP_MARGIN_S
+        and holdout.has_scoring_candidates(spec.save_root, scope)
+    )
+
+
+def _latch_scoring_decision(
+    decision: bool | None,
+    *,
+    remaining: float,
+    reserve_s: float,
+    candidates_ready: bool,
+) -> bool | None:
+    """Make the scorer-budget decision once; never enable it late."""
+    if decision is not None:
+        return decision
+    if reserve_s > 0 and remaining <= _STOP_MARGIN_S + reserve_s:
+        return bool(candidates_ready)
+    return None
 
 
 def _toolkit_log_path(spec: ImageSpec) -> str:

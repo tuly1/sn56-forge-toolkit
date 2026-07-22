@@ -68,6 +68,7 @@ def test_schema_paths():
     assert s.cached_model_dir == "/cache/models/stabilityai--x"
     assert s.cached_zip_path == "/cache/datasets/t1_tourn.zip"
     assert s.dataset_images_dir == "/dataset/images"
+    assert s.dataset_holdout_dir.startswith("/dataset/forge-holdout-")
     assert s.training_folder == "/app/checkpoints/t1"
     assert s.save_root == "/app/checkpoints/t1/myrepo"
     assert s.output_dir == s.save_root
@@ -633,7 +634,7 @@ def test_heldout_manifest_selects_scored_checkpoint(tmp_path):
                 "schema": 1,
                 "source": "heldout",
                 "complete": True,
-                "metric": "validator_combined_proxy",
+                "metric": "validator_exact_combined",
                 "direction": "min",
                 "scores": [
                     {
@@ -660,6 +661,44 @@ def test_heldout_manifest_selects_scored_checkpoint(tmp_path):
     assert record["source"] == "heldout_manifest"
     assert record["selected_step"] == 100
     assert record["score"] == 0.05
+
+
+def test_unknown_self_named_heldout_metric_cannot_bypass_proxy_guard(tmp_path):
+    import json
+
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    early = tmp_path / "repo_000000100.safetensors"
+    _write_st(early, tag="early")
+    final = tmp_path / "repo.safetensors"
+    _write_st(final, tag="final")
+    (tmp_path / "forge_holdout_scores.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "source": "heldout",
+                "complete": True,
+                "metric": "renamed_training_objective",
+                "direction": "min",
+                "scores": [
+                    {
+                        "checkpoint": early.name,
+                        "score": 0.01,
+                        "sha256": _sha256(early),
+                    },
+                    {
+                        "checkpoint": final.name,
+                        "score": 0.20,
+                        "sha256": _sha256(final),
+                    },
+                ],
+            }
+        )
+    )
+
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert record["source"] == "exact_final"
+    assert (tmp_path / "last.safetensors").read_bytes() == final.read_bytes()
 
 
 def test_incomplete_heldout_manifest_cannot_override_final(tmp_path):
@@ -728,6 +767,136 @@ def test_clear_sustained_training_loss_divergence_selects_early(tmp_path):
     assert record["source"] == "training_loss_divergence"
     assert record["selected_step"] == 90
     assert record["training_loss_is_proxy_not_validator_metric"] is True
+
+
+def test_uncalibrated_proxy_manifest_does_not_disable_divergence_fallback(tmp_path):
+    import json
+
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    paths = [
+        tmp_path / "repo_000000045.safetensors",
+        tmp_path / "repo_000000090.safetensors",
+        tmp_path / "repo_000000135.safetensors",
+        tmp_path / "repo.safetensors",
+    ]
+    for path, tag in zip(paths, ("45", "90", "135", "final")):
+        _write_st(path, tag=tag)
+    losses = [0.16] * 45 + [0.10] * 45 + [0.18] * 45 + [0.60] * 45
+    _write_loss_db(tmp_path / "loss_log.db", state, losses)
+    (tmp_path / "forge_holdout_scores.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "source": "heldout",
+                "complete": True,
+                "metric": "heldout_diffusion_loss_proxy_v2",
+                "proxy_not_validator_metric": True,
+                "model_type": "krea2",
+                "direction": "min",
+                "scores": [
+                    {
+                        "checkpoint": path.name,
+                        "score": 0.01 + index * 0.01,
+                        "sha256": _sha256(path),
+                    }
+                    for index, path in enumerate(paths)
+                ],
+            }
+        )
+    )
+
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert record["source"] == "training_loss_divergence"
+    assert record["selected_step"] == 90
+    assert (tmp_path / "last.safetensors").read_bytes() == paths[1].read_bytes()
+
+
+@pytest.mark.parametrize("invalid_case", ["below_min_pairs", "negative_stddev"])
+def test_invalid_calibrated_proxy_preserves_divergence_fallback(
+    tmp_path, monkeypatch, invalid_case
+):
+    import json
+
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    state = checkpoints.set_planned_steps(
+        str(tmp_path), state, 180, model_type="krea2"
+    )
+    paths = [
+        tmp_path / "repo_000000045.safetensors",
+        tmp_path / "repo_000000090.safetensors",
+        tmp_path / "repo_000000135.safetensors",
+        tmp_path / "repo.safetensors",
+    ]
+    for path, tag in zip(paths, ("45", "90", "135", "final")):
+        _write_st(path, tag=tag)
+    losses = [0.16] * 45 + [0.10] * 45 + [0.18] * 45 + [0.60] * 45
+    _write_loss_db(tmp_path / "loss_log.db", state, losses)
+    policy = {
+        "name": "test-margin",
+        "calibration_id": "unit-test-only",
+        "absolute_floor": 0.001,
+        "relative_floor": 0.01,
+        "dispersion_multiplier": 2.0,
+        "min_holdout_pairs": 2 if invalid_case == "below_min_pairs" else 1,
+        "max_holdout_pairs": 4,
+        "seed": 42565431,
+        "direction": "min",
+        "captioned_weight": 0.25,
+        "blank_caption_weight": 0.75,
+        "probe_epochs": 2,
+        "reference_sources": ["exact_final"],
+    }
+    monkeypatch.setitem(
+        checkpoints._HELDOUT_PROXY_POLICIES,
+        ("heldout_diffusion_loss_proxy_v2", "krea2"),
+        policy,
+    )
+    rows = []
+    for index, path in enumerate(paths):
+        score = 0.05 + index * 0.05
+        rows.append(
+            {
+                "checkpoint": path.name,
+                "sha256": _sha256(path),
+                "score": score,
+                "points": 4,
+                "captioned_score": score,
+                "blank_caption_score": score,
+                "captioned_points": 2,
+                "blank_caption_points": 2,
+                "captioned_stddev": (
+                    -0.1 if invalid_case == "negative_stddev" and index == 0 else 0.01
+                ),
+                "blank_caption_stddev": 0.01,
+            }
+        )
+    (tmp_path / "forge_holdout_scores.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "source": "heldout",
+                "complete": True,
+                "metric": "heldout_diffusion_loss_proxy_v2",
+                "proxy_not_validator_metric": True,
+                "model_type": "krea2",
+                "direction": "min",
+                "seed": 42565431,
+                "holdout_pairs": 1,
+                "probe_epochs": 2,
+                "captioned_weight": 0.25,
+                "blank_caption_weight": 0.75,
+                "strata_scored_separately": True,
+                "scores": rows,
+            }
+        )
+    )
+
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert record["source"] == "training_loss_divergence"
+    assert record["selected_step"] == 90
+    assert (tmp_path / "last.safetensors").read_bytes() == paths[1].read_bytes()
 
 
 def test_stable_improving_training_loss_keeps_final(tmp_path):

@@ -48,6 +48,13 @@ _SELECTION_SCHEMA = 1
 _AUTO_RESUME_FIXED_NAMES = frozenset({"optimizer.pt", "learnable_snr.json"})
 _PROCESS_NONCE = uuid.uuid4().hex
 _ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
+# Only names whose values are produced by the validator's exact scoring code may
+# bypass proxy calibration. Unknown/self-declared metric names fail closed.
+_EXACT_HELDOUT_METRICS = frozenset({"validator_exact_combined"})
+# Frozen, consumer-owned promotion gates. A producer manifest cannot declare
+# its own safety threshold. Entries are added only after exact Comfy evaluator
+# calibration, keyed by (metric, model_type); an empty map is telemetry-only.
+_HELDOUT_PROXY_POLICIES: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,13 @@ class Selection:
     metric: str | None = None
     direction: str | None = None
     is_training_loss_proxy: bool = False
+    is_metric_proxy: bool = False
+    reference_file: str | None = None
+    reference_score: float | None = None
+    score_advantage: float | None = None
+    required_advantage: float | None = None
+    margin_policy: str | None = None
+    calibration_id: str | None = None
 
 
 def begin_run(save_root: str, repo: str) -> dict[str, Any]:
@@ -208,12 +222,18 @@ def _scope_is_complete(state: Any) -> bool:
 
 
 def set_planned_steps(
-    save_root: str, state: dict[str, Any], steps: int
+    save_root: str,
+    state: dict[str, Any],
+    steps: int,
+    *,
+    model_type: str | None = None,
 ) -> dict[str, Any]:
     """Add the planned terminal step so an unnumbered exact final is traceable."""
     updated = dict(state)
     try:
         updated["planned_steps"] = max(1, int(steps))
+        if model_type:
+            updated["model_type"] = str(model_type).strip().lower()
         _ACTIVE_RUNS[os.path.abspath(save_root)] = updated
         _atomic_json(os.path.join(save_root, _SCOPE_FILE), updated)
     except Exception as exc:
@@ -333,7 +353,7 @@ def select(
     """Choose among already integrity-checked current-run candidates."""
     default = _default_selection(valid, repo, state)
 
-    heldout = _select_from_holdout(valid, save_root, state)
+    heldout = _select_from_holdout(valid, save_root, state, default)
     if heldout is not None:
         return heldout
 
@@ -370,7 +390,10 @@ def _default_selection(
 
 
 def _select_from_holdout(
-    valid: list[str], save_root: str, state: dict[str, Any] | None
+    valid: list[str],
+    save_root: str,
+    state: dict[str, Any] | None,
+    default: Selection,
 ) -> Selection | None:
     path = os.path.join(save_root, _HOLDOUT_FILE)
     if not _is_current(path, state):
@@ -388,11 +411,16 @@ def _select_from_holdout(
         if direction not in ("min", "max"):
             raise ValueError("direction must be min or max")
         metric = str(data.get("metric") or "heldout_score")
+        is_proxy = (
+            data.get("proxy_not_validator_metric") is True
+            or metric not in _EXACT_HELDOUT_METRICS
+        )
         by_name = {os.path.basename(path): path for path in valid}
         rows = data.get("scores")
         if not isinstance(rows, list):
             raise ValueError("scores must be a list")
         scored: list[tuple[float, str, int | None]] = []
+        row_by_path: dict[str, dict[str, Any]] = {}
         seen: set[str] = set()
         for row in rows:
             try:
@@ -427,6 +455,7 @@ def _select_from_holdout(
                         step if step is not None and step >= 0 else None,
                     )
                 )
+                row_by_path[candidate] = row
             except (AttributeError, TypeError, ValueError) as exc:
                 raise ValueError(f"invalid heldout score row: {exc}") from exc
         if seen != set(by_name):
@@ -438,6 +467,141 @@ def _select_from_holdout(
             if direction == "min"
             else max(scored, key=lambda item: item[0])
         )
+        default_row = next(
+            (row for row in scored if row[1] == default.path),
+            None,
+        )
+        if default_row is None:
+            raise ValueError("default current-run checkpoint has no score")
+        default_score, _default_path, _default_step = default_row
+        advantage = (
+            default_score - score if direction == "min" else score - default_score
+        )
+
+        if is_proxy:
+            if data.get("proxy_not_validator_metric") is not True:
+                _event(
+                    "heldout_proxy_telemetry_only",
+                    reason="proxy disclosure was missing or false",
+                )
+                return None
+            model_type = str(data.get("model_type") or "").strip().lower()
+            policy = _HELDOUT_PROXY_POLICIES.get((metric, model_type))
+            if policy is None:
+                _event(
+                    "heldout_proxy_telemetry_only",
+                    reason=(
+                        "no frozen calibration policy exists for "
+                        f"{model_type or 'unknown'}"
+                    ),
+                )
+                return None
+            scoped_model_type = str(
+                (state or {}).get("model_type") or ""
+            ).strip().lower()
+            if not scoped_model_type or model_type != scoped_model_type:
+                _event(
+                    "heldout_proxy_telemetry_only",
+                    reason="manifest model type is not bound to this run scope",
+                )
+                return None
+            allowed_sources = policy.get("reference_sources", ("exact_final",))
+            if (
+                not isinstance(allowed_sources, (list, tuple, set, frozenset))
+                or default.source not in {str(value) for value in allowed_sources}
+            ):
+                _event(
+                    "heldout_proxy_telemetry_only",
+                    reason=f"policy does not cover reference source {default.source}",
+                )
+                return None
+            try:
+                _validate_proxy_contract(policy, data, row_by_path)
+            except (KeyError, TypeError, ValueError) as exc:
+                _event(
+                    "heldout_proxy_telemetry_only",
+                    reason=f"proxy contract invalid: {exc}",
+                )
+                return None
+            if candidate == default.path:
+                return Selection(
+                    path=default.path,
+                    source="heldout_manifest",
+                    reason=(
+                        f"the conservative default is also best on {metric}; "
+                        "no proxy-based checkpoint change was needed"
+                    ),
+                    step=default.step,
+                    score=default_score,
+                    metric=metric,
+                    direction=direction,
+                    is_metric_proxy=True,
+                    reference_file=os.path.basename(default.path),
+                    reference_score=default_score,
+                    score_advantage=0.0,
+                    required_advantage=0.0,
+                    margin_policy=str(policy.get("name") or "calibrated_proxy_margin"),
+                    calibration_id=str(policy.get("calibration_id") or ""),
+                )
+            try:
+                required = _proxy_required_advantage(
+                    policy,
+                    data,
+                    row_by_path[candidate],
+                    row_by_path[default.path],
+                    default_score,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                _event(
+                    "heldout_proxy_telemetry_only",
+                    reason=f"calibrated-gate evidence was invalid: {exc}",
+                )
+                return None
+            if advantage <= required:
+                return _guarded_proxy_default(
+                    default,
+                    metric,
+                    direction,
+                    default_score,
+                    "proxy advantage did not strictly exceed the calibrated gate",
+                    advantage=advantage,
+                    required=required,
+                    policy=policy,
+                )
+            return Selection(
+                path=candidate,
+                source="heldout_manifest",
+                reason=(
+                    f"selected best {metric}; proxy advantage {advantage:.8g} "
+                    f"strictly exceeded calibrated gate {required:.8g}"
+                ),
+                step=step,
+                score=score,
+                metric=metric,
+                direction=direction,
+                is_metric_proxy=True,
+                reference_file=os.path.basename(default.path),
+                reference_score=default_score,
+                score_advantage=advantage,
+                required_advantage=required,
+                margin_policy=str(policy.get("name") or "calibrated_proxy_margin"),
+                calibration_id=str(policy.get("calibration_id") or ""),
+            )
+
+        # Non-proxy held-out metrics retain the pre-Gate-B exact-score contract.
+        if candidate != default.path and advantage == 0.0:
+            return Selection(
+                path=default.path,
+                source="heldout_manifest_near_tie",
+                reason=(
+                    f"{metric} tied the conservative default exactly; retained "
+                    "the exact-final/default checkpoint"
+                ),
+                step=default.step,
+                score=default_score,
+                metric=metric,
+                direction=direction,
+            )
         return Selection(
             path=candidate,
             source="heldout_manifest",
@@ -453,6 +617,142 @@ def _select_from_holdout(
     except Exception as exc:
         _event("holdout_manifest_ignored", error=f"{type(exc).__name__}: {exc}")
         return None
+
+
+def _guarded_proxy_default(
+    default: Selection,
+    metric: str,
+    direction: str,
+    default_score: float,
+    detail: str,
+    *,
+    advantage: float | None = None,
+    required: float | None = None,
+    policy: dict[str, Any] | None = None,
+) -> Selection:
+    return Selection(
+        path=default.path,
+        source="heldout_proxy_guarded_default",
+        reason=f"retained conservative default because {detail}",
+        step=default.step,
+        score=default_score,
+        metric=metric,
+        direction=direction,
+        is_metric_proxy=True,
+        reference_file=os.path.basename(default.path),
+        reference_score=default_score,
+        score_advantage=advantage,
+        required_advantage=required,
+        margin_policy=(str(policy.get("name")) if policy else None),
+        calibration_id=(str(policy.get("calibration_id")) if policy else None),
+    )
+
+
+def _validate_proxy_contract(
+    policy: dict[str, Any],
+    manifest: dict[str, Any],
+    rows: dict[str, dict[str, Any]],
+) -> None:
+    direction = str(manifest.get("direction") or "").lower()
+    if direction != str(policy.get("direction") or "").lower():
+        raise ValueError("direction does not match frozen policy")
+    captioned_weight = float(manifest.get("captioned_weight"))
+    blank_weight = float(manifest.get("blank_caption_weight"))
+    expected_captioned = float(policy.get("captioned_weight"))
+    expected_blank = float(policy.get("blank_caption_weight"))
+    if (
+        not math.isclose(captioned_weight, expected_captioned, rel_tol=0.0, abs_tol=1e-12)
+        or not math.isclose(blank_weight, expected_blank, rel_tol=0.0, abs_tol=1e-12)
+        or not math.isclose(captioned_weight + blank_weight, 1.0, abs_tol=1e-12)
+        or manifest.get("strata_scored_separately") is not True
+    ):
+        raise ValueError("stratum weighting does not match frozen policy")
+    epochs = int(manifest.get("probe_epochs"))
+    if epochs != int(policy.get("probe_epochs")) or epochs <= 0:
+        raise ValueError("probe epoch count does not match frozen policy")
+    seed = int(manifest.get("seed"))
+    if seed != int(policy.get("seed")):
+        raise ValueError("probe seed does not match frozen policy")
+    holdout_pairs = int(manifest.get("holdout_pairs"))
+    minimum_pairs = max(1, int(policy.get("min_holdout_pairs")))
+    maximum_pairs = int(policy.get("max_holdout_pairs"))
+    if not minimum_pairs <= holdout_pairs <= maximum_pairs:
+        raise ValueError("holdout pair count is outside frozen policy")
+    expected_points = holdout_pairs * epochs
+    for row in rows.values():
+        captioned_score = float(row.get("captioned_score"))
+        blank_score = float(row.get("blank_caption_score"))
+        combined = float(row.get("score"))
+        if any(
+            not math.isfinite(value) or value < 0.0
+            for value in (captioned_score, blank_score, combined)
+        ):
+            raise ValueError("proxy component score is invalid")
+        recomputed = (
+            captioned_weight * captioned_score + blank_weight * blank_score
+        )
+        if not math.isclose(combined, recomputed, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError("combined proxy score does not match its strata")
+        if (
+            int(row.get("captioned_points")) != expected_points
+            or int(row.get("blank_caption_points")) != expected_points
+            or int(row.get("points")) != expected_points * 2
+        ):
+            raise ValueError("proxy point count does not match holdout contract")
+        for key in ("captioned_stddev", "blank_caption_stddev"):
+            spread = float(row.get(key))
+            if not math.isfinite(spread) or spread < 0.0:
+                raise ValueError("proxy dispersion field is invalid")
+
+
+def _proxy_required_advantage(
+    policy: dict[str, Any],
+    manifest: dict[str, Any],
+    best_row: dict[str, Any],
+    default_row: dict[str, Any],
+    default_score: float,
+) -> float:
+    holdout_pairs = int(manifest.get("holdout_pairs"))
+    minimum_pairs = int(policy.get("min_holdout_pairs", 1))
+    if holdout_pairs < max(1, minimum_pairs):
+        raise ValueError("insufficient independent held-out pairs for proxy policy")
+
+    def _variance(row: dict[str, Any]) -> float:
+        captioned_sd = float(row.get("captioned_stddev"))
+        blank_sd = float(row.get("blank_caption_stddev"))
+        captioned_points = int(row.get("captioned_points"))
+        blank_points = int(row.get("blank_caption_points"))
+        values = (captioned_sd, blank_sd)
+        if (
+            any(not math.isfinite(value) or value < 0.0 for value in values)
+            or captioned_points <= 0
+            or blank_points <= 0
+        ):
+            raise ValueError("proxy row has invalid dispersion fields")
+        # Repeated loss points are not independent images; never inflate n_eff
+        # beyond the number of genuinely held-out pairs.
+        captioned_n = min(holdout_pairs, captioned_points)
+        blank_n = min(holdout_pairs, blank_points)
+        captioned_weight = float(policy.get("captioned_weight"))
+        blank_weight = float(policy.get("blank_caption_weight"))
+        return (
+            (captioned_weight ** 2) * (captioned_sd ** 2) / captioned_n
+            + (blank_weight ** 2) * (blank_sd ** 2) / blank_n
+        )
+
+    absolute = float(policy.get("absolute_floor"))
+    relative = float(policy.get("relative_floor"))
+    multiplier = float(policy.get("dispersion_multiplier"))
+    if (
+        any(not math.isfinite(value) or value < 0.0
+            for value in (absolute, relative, multiplier))
+        or relative > 1.0
+    ):
+        raise ValueError("invalid frozen proxy policy")
+    dispersion = multiplier * math.sqrt(
+        _variance(best_row) + _variance(default_row)
+    )
+    return max(absolute, relative * abs(default_score), dispersion)
 
 
 def _select_from_loss_divergence(
@@ -591,6 +891,13 @@ def _selection_record(
         "metric": selection.metric,
         "direction": selection.direction,
         "training_loss_is_proxy_not_validator_metric": selection.is_training_loss_proxy,
+        "metric_is_proxy_not_validator_metric": selection.is_metric_proxy,
+        "reference_file": selection.reference_file,
+        "reference_score": selection.reference_score,
+        "score_advantage": selection.score_advantage,
+        "required_advantage": selection.required_advantage,
+        "margin_policy": selection.margin_policy,
+        "calibration_id": selection.calibration_id,
         "current_candidates_discovered": discovered,
         "current_candidates_valid": valid,
         "created_unix": int(time.time()),
