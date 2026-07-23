@@ -434,6 +434,9 @@ def _probe_config(
     process["training_folder"] = os.path.join(candidate_root, "outputs")
     process["sqlite_db_path"] = os.path.join(candidate_root, "aitk.db")
     process["trigger_word"] = None
+    # The pinned ai-toolkit reads determinism from this process-level key.
+    # SEED/PYTHONHASHSEED in the worker environment do not set its Torch RNG.
+    process["training_seed"] = _SEED
 
     network = process.setdefault("network", {})
     network["pretrained_lora_path"] = candidate
