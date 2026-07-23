@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         started_monotonic=started,
         export_reserve_s=_EXPORT_RESERVE_SECONDS,
     )
-    telemetry.init(
+    telemetry.start_run(
         task_id=args.task_id,
         model_type=args.model_type,
         model_arg=args.model,
@@ -105,12 +105,27 @@ def _run(spec: ImageSpec, deadline: Deadline) -> None:
     the handler lazily so heavy diffusion deps don't load for a model type this
     build doesn't implement, and we catch everything.
     """
+    # Replace any recorder left by an older build before fallible setup.  The
+    # compatibility writer stores full telemetry only in container-local /tmp
+    # and puts a strict public projection in the exact validator upload root.
+    try:
+        import os
+
+        os.makedirs(spec.output_dir, exist_ok=True)
+        telemetry.prepare_public_recorder(spec.output_dir)
+    except Exception:
+        pass
+
     # Scope checkpoint discovery before dispatch so even import failures and
     # unknown future model types cannot promote stale files from a prior retry.
     try:
         from forge.tasks import checkpoints
 
-        checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+        scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+        telemetry.bind_private_bundle(
+            spec.output_dir, str(scope.get("attempt_nonce") or "")
+        )
+        telemetry.write_into(spec.output_dir)
     except Exception as exc:
         telemetry.event(
             "checkpoint_scope_failed", error=f"{type(exc).__name__}: {exc}"
@@ -129,7 +144,7 @@ def _run(spec: ImageSpec, deadline: Deadline) -> None:
         try:
             handler(spec, deadline)
             telemetry.event("run_complete")
-            telemetry.write_into(spec.output_dir)
+            _finalize_public_bundle(spec)
             return
         except BaseException as exc:  # noqa: BLE001
             _log(f"handler raised ({type(exc).__name__}: {exc}); using fallback")
@@ -142,7 +157,20 @@ def _run(spec: ImageSpec, deadline: Deadline) -> None:
     except Exception as exc:
         _log(f"fallback failed: {exc!r}")
         telemetry.event("fallback_failed", error=repr(exc))
-    telemetry.write_into(spec.output_dir)
+    _finalize_public_bundle(spec)
+
+
+def _finalize_public_bundle(spec: ImageSpec) -> None:
+    """Terminal upload construction; diagnostics must never affect exit status."""
+    try:
+        from forge.tasks import publication
+
+        publication.finalize_public_bundle(spec.output_dir)
+    except BaseException as exc:  # noqa: BLE001
+        telemetry.event(
+            "public_bundle_failed", error=f"{type(exc).__name__}: {exc}"
+        )
+        telemetry.write_into(spec.output_dir)
 
 
 def _log(msg: str) -> None:
