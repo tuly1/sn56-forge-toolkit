@@ -8,8 +8,8 @@ and only considers files whose filesystem signature changed afterwards.
 
 Selection is intentionally conservative:
 
-* A current-run ``forge_holdout_scores.json`` is authoritative when it declares
-  ``source: heldout`` and scores valid current-run candidates.
+* A current-run ``forge_holdout_scores.json`` can influence selection only when
+  it is scope-bound, complete, and covered by a frozen consumer-owned policy.
 * Otherwise, the exact final save wins unless the current run's ai-toolkit
   ``loss_log.db`` shows large, sustained late training-loss divergence.  That
   signal is explicitly recorded as a proxy, never as the validator metric.
@@ -48,12 +48,10 @@ _SELECTION_SCHEMA = 1
 _AUTO_RESUME_FIXED_NAMES = frozenset({"optimizer.pt", "learnable_snr.json"})
 _PROCESS_NONCE = uuid.uuid4().hex
 _ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
-# Only names whose values are produced by the validator's exact scoring code may
-# bypass proxy calibration. Unknown/self-declared metric names fail closed.
-_EXACT_HELDOUT_METRICS = frozenset({"validator_exact_combined"})
-# Frozen, consumer-owned promotion gates. A producer manifest cannot declare
-# its own safety threshold. Entries are added only after exact Comfy evaluator
-# calibration, keyed by (metric, model_type); an empty map is telemetry-only.
+# Frozen, consumer-owned promotion gates.  No producer-declared metric, including
+# one named after the validator, can bypass this map. Entries are added only after
+# exact Comfy evaluator calibration, keyed by (metric, model_type); an empty map
+# makes every held-out manifest telemetry-only.
 _HELDOUT_PROXY_POLICIES: dict[tuple[str, str], dict[str, Any]] = {}
 
 
@@ -76,7 +74,12 @@ class Selection:
     calibration_id: str | None = None
 
 
-def begin_run(save_root: str, repo: str) -> dict[str, Any]:
+def begin_run(
+    save_root: str,
+    repo: str,
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
     """Persist a pre-run inventory and return it.
 
     ai-toolkit itself auto-resumes from the newest direct child matching
@@ -102,6 +105,8 @@ def begin_run(save_root: str, repo: str) -> dict[str, Any]:
         "quarantine": quarantine,
         "quarantine_complete": False,
     }
+    if isinstance(task_id, str) and task_id:
+        state["task_id"] = task_id
     # Install the incomplete attempt in memory before *any* filesystem work.
     # If even mkdir or the first journal write fails, the handler cannot revive
     # a complete scope left by a previous process and train on its optimizer.
@@ -176,7 +181,12 @@ def begin_run(save_root: str, repo: str) -> dict[str, Any]:
     return state
 
 
-def ensure_run(save_root: str, repo: str) -> dict[str, Any]:
+def ensure_run(
+    save_root: str,
+    repo: str,
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
     """Reuse only this process's CLI scope, or create a direct-call scope.
 
     A completed journal found only on disk belongs to an earlier process and is
@@ -186,12 +196,14 @@ def ensure_run(save_root: str, repo: str) -> dict[str, Any]:
     if state is not None:
         if state.get("repo") != repo:
             raise RuntimeError("active checkpoint scope belongs to another repo")
+        if task_id is not None and state.get("task_id") != task_id:
+            raise RuntimeError("active checkpoint scope belongs to another task")
         if state.get("process_nonce") != _PROCESS_NONCE:
             raise RuntimeError("active checkpoint scope belongs to another process")
         if state.get("quarantine_complete") is not True:
             raise RuntimeError("checkpoint scope initialization is incomplete")
         return state
-    return begin_run(save_root, repo)
+    return begin_run(save_root, repo, task_id=task_id)
 
 
 def load_run(save_root: str) -> dict[str, Any] | None:
@@ -204,6 +216,27 @@ def load_run(save_root: str) -> dict[str, Any] | None:
         return state if _scope_is_current_process(state) else None
     except Exception:
         return None
+
+
+def active_run_matches(
+    save_root: str,
+    state: dict[str, Any] | None,
+    *,
+    task_id: str,
+    repo: str,
+) -> bool:
+    """Whether ``state`` is the complete live scope for this task and repo."""
+    try:
+        active = load_run(save_root)
+        return bool(
+            _scope_is_complete(active)
+            and isinstance(state, dict)
+            and active == state
+            and active.get("task_id") == task_id
+            and active.get("repo") == repo
+        )
+    except Exception:
+        return False
 
 
 def _scope_is_current_process(state: Any) -> bool:
@@ -221,6 +254,11 @@ def _scope_is_complete(state: Any) -> bool:
     return _scope_is_current_process(state) and state.get("quarantine_complete") is True
 
 
+def _scope_matches_active(save_root: str, state: Any) -> bool:
+    active = load_run(save_root)
+    return bool(_scope_is_complete(active) and active == state)
+
+
 def set_planned_steps(
     save_root: str,
     state: dict[str, Any],
@@ -229,28 +267,78 @@ def set_planned_steps(
     model_type: str | None = None,
 ) -> dict[str, Any]:
     """Add the planned terminal step so an unnumbered exact final is traceable."""
-    updated = dict(state)
     try:
-        updated["planned_steps"] = max(1, int(steps))
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+            raise ValueError("planned steps must be a positive integer")
+        active = load_run(save_root)
+        if not _scope_is_complete(active) or active != state:
+            raise RuntimeError("planned steps cannot bind to a stale run scope")
+        updated = dict(active)
+        updated["planned_steps"] = steps
         if model_type:
             updated["model_type"] = str(model_type).strip().lower()
-        _ACTIVE_RUNS[os.path.abspath(save_root)] = updated
         _atomic_json(os.path.join(save_root, _SCOPE_FILE), updated)
+        _ACTIVE_RUNS[os.path.abspath(save_root)] = updated
     except Exception as exc:
         _event("checkpoint_scope_plan_failed", error=f"{type(exc).__name__}: {exc}")
+        raise
     return updated
 
 
-def current_loras(save_root: str, state: dict[str, Any] | None) -> list[str]:
+def bind_dataset_split(
+    save_root: str,
+    state: dict[str, Any],
+    *,
+    split_sha256: str,
+    training_pairs: int,
+    holdout_pairs: int,
+) -> dict[str, Any]:
+    """Bind the pre-training exact-content split to the active attempt scope."""
+    active = load_run(save_root)
+    if (
+        not _scope_is_complete(active)
+        or active != state
+        or not re.fullmatch(r"[0-9a-f]{64}", str(split_sha256))
+        or isinstance(training_pairs, bool)
+        or isinstance(holdout_pairs, bool)
+        or not isinstance(training_pairs, int)
+        or not isinstance(holdout_pairs, int)
+        or training_pairs <= 0
+        or holdout_pairs <= 0
+    ):
+        raise RuntimeError("dataset split cannot bind to the active scope")
+    updated = dict(active)
+    updated.update(
+        dataset_split_sha256=str(split_sha256),
+        training_pairs=training_pairs,
+        holdout_pairs=holdout_pairs,
+    )
+    _atomic_json(os.path.join(save_root, _SCOPE_FILE), updated)
+    _ACTIVE_RUNS[os.path.abspath(save_root)] = updated
+    return updated
+
+
+def current_loras(
+    save_root: str,
+    state: dict[str, Any] | None,
+    *,
+    enforce_plan: bool = True,
+) -> list[str]:
     """Return only validly named LoRAs created or replaced in this run."""
-    if not _scope_is_complete(state) or not os.path.isdir(save_root):
+    if not _scope_matches_active(save_root, state) or not os.path.isdir(save_root):
         return []
     repo = str(state.get("repo") or "")
     periodic = re.compile(rf"^{re.escape(repo)}_\d+\.safetensors$")
+    planned = _planned_steps(state)
     out: list[str] = []
     for name in os.listdir(save_root):
-        if name != f"{repo}.safetensors" and periodic.fullmatch(name) is None:
+        periodic_match = periodic.fullmatch(name)
+        if name != f"{repo}.safetensors" and periodic_match is None:
             continue
+        if periodic_match is not None and enforce_plan and planned is not None:
+            step = _step_of(name)
+            if not 0 < step <= planned:
+                continue
         path = os.path.join(save_root, name)
         if os.path.isfile(path) and _is_current(path, state):
             out.append(path)
@@ -263,7 +351,7 @@ def current_selection_record(
     """Return only a selection record created or replaced by this active attempt."""
     state = state or load_run(save_root)
     path = os.path.join(save_root, _SELECTION_FILE)
-    if not _scope_is_complete(state) or not _is_current(path, state):
+    if not _scope_matches_active(save_root, state) or not _is_current(path, state):
         return None
     try:
         with open(path, encoding="utf-8") as fh:
@@ -286,16 +374,16 @@ def finalize(
     current run nor a prior attempt left a valid artifact.
     """
     state = state or load_run(save_root)
-    if state is not None and not _scope_is_complete(state):
-        _event("checkpoint_scope_incomplete", context=context)
+    if not _scope_matches_active(save_root, state):
+        _event("checkpoint_scope_stale_or_incomplete", context=context)
         return None
-    if state is not None and state.get("repo") != repo:
+    if state.get("repo") != repo:
         _event(
             "checkpoint_scope_repo_mismatch",
             expected_repo=repo,
             scoped_repo=state.get("repo"),
         )
-        state = None
+        return None
     candidates = current_loras(save_root, state)
     valid = [path for path in candidates if valid_safetensors(path)]
 
@@ -417,20 +505,55 @@ def _select_from_holdout(
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        if data.get("schema") != 1:
-            raise ValueError("schema must be 1")
+        if not isinstance(data, dict) or data.get("schema") != 2:
+            raise ValueError("schema must be 2")
         if data.get("source") != "heldout":
             raise ValueError("source must be 'heldout'")
         if data.get("complete") is not True:
             raise ValueError("complete must be true")
+        _validate_manifest_scope_binding(data, state, save_root)
         direction = str(data.get("direction", "min")).lower()
         if direction not in ("min", "max"):
             raise ValueError("direction must be min or max")
-        metric = str(data.get("metric") or "heldout_score")
-        is_proxy = (
-            data.get("proxy_not_validator_metric") is True
-            or metric not in _EXACT_HELDOUT_METRICS
-        )
+        metric_value = data.get("metric")
+        if not isinstance(metric_value, str) or not metric_value:
+            raise ValueError("metric must be a nonempty string")
+        metric = metric_value
+        if data.get("proxy_not_validator_metric") is not True:
+            _event(
+                "heldout_proxy_telemetry_only",
+                reason="proxy disclosure was missing or false",
+            )
+            return None
+        model_type = str(data.get("model_type") or "").strip().lower()
+        scoped_model_type = str((state or {}).get("model_type") or "").strip().lower()
+        if not scoped_model_type or model_type != scoped_model_type:
+            _event(
+                "heldout_proxy_telemetry_only",
+                reason="manifest model type is not bound to this run scope",
+            )
+            return None
+        policy = _HELDOUT_PROXY_POLICIES.get((metric, model_type))
+        if policy is None:
+            _event(
+                "heldout_proxy_telemetry_only",
+                reason=(
+                    "no frozen calibration policy exists for "
+                    f"{model_type or 'unknown'}"
+                ),
+            )
+            return None
+        allowed_sources = policy.get("reference_sources", ("exact_final",))
+        if (
+            not isinstance(allowed_sources, (list, tuple, set, frozenset))
+            or default.source not in {str(value) for value in allowed_sources}
+        ):
+            _event(
+                "heldout_proxy_telemetry_only",
+                reason=f"policy does not cover reference source {default.source}",
+            )
+            return None
+
         by_name = {os.path.basename(path): path for path in valid}
         rows = data.get("scores")
         if not isinstance(rows, list):
@@ -440,11 +563,20 @@ def _select_from_holdout(
         seen: set[str] = set()
         for row in rows:
             try:
-                name = os.path.basename(
-                    str(row.get("checkpoint") or row.get("file") or "")
-                )
+                if not isinstance(row, dict):
+                    raise ValueError("score row must be an object")
+                name = row.get("checkpoint")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or name in (".", "..")
+                    or name != os.path.basename(name)
+                    or "/" in name
+                    or "\\" in name
+                ):
+                    raise ValueError("checkpoint must be one safe basename")
                 candidate = by_name.get(name)
-                if not name or name in seen:
+                if name in seen:
                     raise ValueError("checkpoint names must be unique")
                 seen.add(name)
                 score = float(row.get("score"))
@@ -456,19 +588,25 @@ def _select_from_holdout(
                     or _sha256(candidate) != declared_sha
                 ):
                     raise ValueError(f"invalid score/hash for {name!r}")
-                step = row.get("step")
                 inferred_step = _step_of(candidate)
                 if inferred_step < 0:
                     inferred_step = _planned_steps(state)
-                try:
-                    step = int(step) if step is not None else inferred_step
-                except (TypeError, ValueError):
-                    step = inferred_step
+                planned_steps = _planned_steps(state)
+                step = row.get("step")
+                if (
+                    inferred_step is None
+                    or planned_steps is None
+                    or not 0 < inferred_step <= planned_steps
+                    or isinstance(step, bool)
+                    or not isinstance(step, int)
+                    or step != inferred_step
+                ):
+                    raise ValueError(f"declared step does not match {name!r}")
                 scored.append(
                     (
                         score,
                         candidate,
-                        step if step is not None and step >= 0 else None,
+                        step,
                     )
                 )
                 row_by_path[candidate] = row
@@ -494,145 +632,230 @@ def _select_from_holdout(
             default_score - score if direction == "min" else score - default_score
         )
 
-        if is_proxy:
-            if data.get("proxy_not_validator_metric") is not True:
-                _event(
-                    "heldout_proxy_telemetry_only",
-                    reason="proxy disclosure was missing or false",
-                )
-                return None
-            model_type = str(data.get("model_type") or "").strip().lower()
-            policy = _HELDOUT_PROXY_POLICIES.get((metric, model_type))
-            if policy is None:
-                _event(
-                    "heldout_proxy_telemetry_only",
-                    reason=(
-                        "no frozen calibration policy exists for "
-                        f"{model_type or 'unknown'}"
-                    ),
-                )
-                return None
-            scoped_model_type = str(
-                (state or {}).get("model_type") or ""
-            ).strip().lower()
-            if not scoped_model_type or model_type != scoped_model_type:
-                _event(
-                    "heldout_proxy_telemetry_only",
-                    reason="manifest model type is not bound to this run scope",
-                )
-                return None
-            allowed_sources = policy.get("reference_sources", ("exact_final",))
-            if (
-                not isinstance(allowed_sources, (list, tuple, set, frozenset))
-                or default.source not in {str(value) for value in allowed_sources}
-            ):
-                _event(
-                    "heldout_proxy_telemetry_only",
-                    reason=f"policy does not cover reference source {default.source}",
-                )
-                return None
-            try:
-                _validate_proxy_contract(policy, data, row_by_path)
-            except (KeyError, TypeError, ValueError) as exc:
-                _event(
-                    "heldout_proxy_telemetry_only",
-                    reason=f"proxy contract invalid: {exc}",
-                )
-                return None
-            if candidate == default.path:
-                return Selection(
-                    path=default.path,
-                    source="heldout_manifest",
-                    reason=(
-                        f"the conservative default is also best on {metric}; "
-                        "no proxy-based checkpoint change was needed"
-                    ),
-                    step=default.step,
-                    score=default_score,
-                    metric=metric,
-                    direction=direction,
-                    is_metric_proxy=True,
-                    reference_file=os.path.basename(default.path),
-                    reference_score=default_score,
-                    score_advantage=0.0,
-                    required_advantage=0.0,
-                    margin_policy=str(policy.get("name") or "calibrated_proxy_margin"),
-                    calibration_id=str(policy.get("calibration_id") or ""),
-                )
-            try:
-                required = _proxy_required_advantage(
-                    policy,
-                    data,
-                    row_by_path[candidate],
-                    row_by_path[default.path],
-                    default_score,
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                _event(
-                    "heldout_proxy_telemetry_only",
-                    reason=f"calibrated-gate evidence was invalid: {exc}",
-                )
-                return None
-            if advantage <= required:
-                return _guarded_proxy_default(
-                    default,
-                    metric,
-                    direction,
-                    default_score,
-                    "proxy advantage did not strictly exceed the calibrated gate",
-                    advantage=advantage,
-                    required=required,
-                    policy=policy,
-                )
-            return Selection(
-                path=candidate,
-                source="heldout_manifest",
-                reason=(
-                    f"selected best {metric}; proxy advantage {advantage:.8g} "
-                    f"strictly exceeded calibrated gate {required:.8g}"
-                ),
-                step=step,
-                score=score,
-                metric=metric,
-                direction=direction,
-                is_metric_proxy=True,
-                reference_file=os.path.basename(default.path),
-                reference_score=default_score,
-                score_advantage=advantage,
-                required_advantage=required,
-                margin_policy=str(policy.get("name") or "calibrated_proxy_margin"),
-                calibration_id=str(policy.get("calibration_id") or ""),
+        try:
+            _validate_proxy_contract(policy, data, row_by_path)
+        except (KeyError, TypeError, ValueError) as exc:
+            _event(
+                "heldout_proxy_telemetry_only",
+                reason=f"proxy contract invalid: {exc}",
             )
-
-        # Non-proxy held-out metrics retain the pre-Gate-B exact-score contract.
-        if candidate != default.path and advantage == 0.0:
+            return None
+        if candidate == default.path:
             return Selection(
                 path=default.path,
-                source="heldout_manifest_near_tie",
+                source="heldout_manifest",
                 reason=(
-                    f"{metric} tied the conservative default exactly; retained "
-                    "the exact-final/default checkpoint"
+                    f"the conservative default is also best on {metric}; "
+                    "no proxy-based checkpoint change was needed"
                 ),
                 step=default.step,
                 score=default_score,
                 metric=metric,
                 direction=direction,
+                is_metric_proxy=True,
+                reference_file=os.path.basename(default.path),
+                reference_score=default_score,
+                score_advantage=0.0,
+                required_advantage=0.0,
+                margin_policy=str(policy.get("name") or "calibrated_proxy_margin"),
+                calibration_id=str(policy.get("calibration_id") or ""),
+            )
+        try:
+            required = _proxy_required_advantage(
+                policy,
+                data,
+                row_by_path[candidate],
+                row_by_path[default.path],
+                default_score,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            _event(
+                "heldout_proxy_telemetry_only",
+                reason=f"calibrated-gate evidence was invalid: {exc}",
+            )
+            return None
+        if advantage <= required:
+            return _guarded_proxy_default(
+                default,
+                metric,
+                direction,
+                default_score,
+                "proxy advantage did not strictly exceed the calibrated gate",
+                advantage=advantage,
+                required=required,
+                policy=policy,
             )
         return Selection(
             path=candidate,
             source="heldout_manifest",
             reason=(
-                f"selected best {metric} from current-run {_HOLDOUT_FILE}; "
-                "held-out scores take precedence over final weights"
+                f"selected best {metric}; proxy advantage {advantage:.8g} "
+                f"strictly exceeded calibrated gate {required:.8g}"
             ),
             step=step,
             score=score,
             metric=metric,
             direction=direction,
+            is_metric_proxy=True,
+            reference_file=os.path.basename(default.path),
+            reference_score=default_score,
+            score_advantage=advantage,
+            required_advantage=required,
+            margin_policy=str(policy.get("name") or "calibrated_proxy_margin"),
+            calibration_id=str(policy.get("calibration_id") or ""),
         )
     except Exception as exc:
         _event("holdout_manifest_ignored", error=f"{type(exc).__name__}: {exc}")
         return None
+
+
+def _validate_manifest_scope_binding(
+    manifest: dict[str, Any],
+    state: dict[str, Any] | None,
+    save_root: str,
+) -> None:
+    active = load_run(save_root)
+    if not _scope_is_complete(state) or active != state:
+        raise ValueError("manifest consumer scope is not the live attempt")
+    assert state is not None
+    string_bindings = {
+        "task_id": state.get("task_id"),
+        "expected_repo_name": state.get("repo"),
+        "attempt_nonce": state.get("attempt_nonce"),
+        "dataset_split_sha256": state.get("dataset_split_sha256"),
+    }
+    for key, expected in string_bindings.items():
+        if not isinstance(expected, str) or not expected or manifest.get(key) != expected:
+            raise ValueError(f"manifest {key} is not bound to the active scope")
+    started = state.get("started_unix")
+    if (
+        isinstance(started, bool)
+        or not isinstance(started, (int, float))
+        or not math.isfinite(float(started))
+        or manifest.get("scope_started_unix") != started
+    ):
+        raise ValueError("manifest scope_started_unix is not bound to the active scope")
+    planned = state.get("planned_steps")
+    if (
+        isinstance(planned, bool)
+        or not isinstance(planned, int)
+        or planned <= 0
+        or manifest.get("planned_steps") != planned
+    ):
+        raise ValueError("manifest planned_steps is not bound to the active scope")
+    created = manifest.get("created_unix")
+    if (
+        isinstance(created, bool)
+        or not isinstance(created, int)
+        or created < int(float(started))
+    ):
+        raise ValueError("manifest timestamp predates the active scope")
+
+
+def _validate_dataset_split_contract(manifest: dict[str, Any]) -> None:
+    split = manifest.get("dataset_split")
+    if not isinstance(split, dict):
+        raise ValueError("dataset split attestation is missing")
+    expected_keys = {
+        "schema",
+        "identity",
+        "training",
+        "holdout",
+        "training_pairs",
+        "holdout_pairs",
+        "total_pairs",
+        "training_set_sha256",
+        "holdout_set_sha256",
+        "post_dedup_set_sha256",
+        "training_sequence_sha256",
+        "holdout_sequence_sha256",
+        "sample_disjoint",
+        "image_disjoint",
+    }
+    if (
+        set(split) != expected_keys
+        or split.get("schema") != 1
+        or split.get("identity") != "forge-image-caption-sha256-v1"
+        or split.get("sample_disjoint") is not True
+        or split.get("image_disjoint") is not True
+    ):
+        raise ValueError("dataset split schema is invalid")
+    canonical = json.dumps(
+        split,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    declared_split = manifest.get("dataset_split_sha256")
+    if (
+        not isinstance(declared_split, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", declared_split)
+        or hashlib.sha256(canonical).hexdigest() != declared_split
+    ):
+        raise ValueError("dataset split digest does not match its payload")
+
+    def _records(key: str) -> list[dict[str, str]]:
+        raw = split.get(key)
+        if not isinstance(raw, list) or not raw:
+            raise ValueError(f"dataset split {key} records are missing")
+        out: list[dict[str, str]] = []
+        for row in raw:
+            if not isinstance(row, dict) or set(row) != {
+                "sample_sha256",
+                "image_sha256",
+                "caption_sha256",
+            }:
+                raise ValueError(f"dataset split {key} record is malformed")
+            values = {name: row.get(name) for name in row}
+            if any(
+                not isinstance(value, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", value)
+                for value in values.values()
+            ):
+                raise ValueError(f"dataset split {key} hash is malformed")
+            sample = hashlib.sha256()
+            sample.update(b"forge-image-caption-v1\0")
+            sample.update(bytes.fromhex(values["image_sha256"]))
+            sample.update(bytes.fromhex(values["caption_sha256"]))
+            if sample.hexdigest() != values["sample_sha256"]:
+                raise ValueError(f"dataset split {key} sample hash is inconsistent")
+            out.append(values)
+        return out
+
+    training = _records("training")
+    holdout = _records("holdout")
+    if (
+        split.get("training_pairs") != len(training)
+        or split.get("holdout_pairs") != len(holdout)
+        or split.get("total_pairs") != len(training) + len(holdout)
+        or manifest.get("holdout_pairs") != len(holdout)
+    ):
+        raise ValueError("dataset split counts are inconsistent")
+    training_ids = [row["sample_sha256"] for row in training]
+    holdout_ids = [row["sample_sha256"] for row in holdout]
+    all_ids = training_ids + holdout_ids
+    all_images = [row["image_sha256"] for row in training + holdout]
+    if len(set(all_ids)) != len(all_ids) or len(set(all_images)) != len(all_images):
+        raise ValueError("dataset split is not content-disjoint")
+    aggregate_fields = {
+        "training_set_sha256": _sample_identity_digest(training_ids, ordered=False),
+        "holdout_set_sha256": _sample_identity_digest(holdout_ids, ordered=False),
+        "post_dedup_set_sha256": _sample_identity_digest(all_ids, ordered=False),
+        "training_sequence_sha256": _sample_identity_digest(training_ids, ordered=True),
+        "holdout_sequence_sha256": _sample_identity_digest(holdout_ids, ordered=True),
+    }
+    if any(split.get(key) != value for key, value in aggregate_fields.items()):
+        raise ValueError("dataset split aggregate digest is inconsistent")
+
+
+def _sample_identity_digest(values: list[str], *, ordered: bool) -> str:
+    digest = hashlib.sha256()
+    digest.update(
+        b"forge-sample-sequence-v1\0" if ordered else b"forge-sample-set-v1\0"
+    )
+    for value in values if ordered else sorted(values):
+        digest.update(bytes.fromhex(value))
+    return digest.hexdigest()
 
 
 def _guarded_proxy_default(
@@ -669,6 +892,7 @@ def _validate_proxy_contract(
     manifest: dict[str, Any],
     rows: dict[str, dict[str, Any]],
 ) -> None:
+    _validate_dataset_split_contract(manifest)
     direction = str(manifest.get("direction") or "").lower()
     if direction != str(policy.get("direction") or "").lower():
         raise ValueError("direction does not match frozen policy")

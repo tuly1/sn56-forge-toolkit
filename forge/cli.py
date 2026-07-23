@@ -121,7 +121,11 @@ def _run(spec: ImageSpec, deadline: Deadline) -> None:
     try:
         from forge.tasks import checkpoints
 
-        scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+        scope = checkpoints.begin_run(
+            spec.save_root,
+            spec.expected_repo_name,
+            task_id=spec.task_id,
+        )
         telemetry.bind_private_bundle(
             spec.output_dir, str(scope.get("attempt_nonce") or "")
         )
