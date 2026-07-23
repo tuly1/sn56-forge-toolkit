@@ -209,6 +209,7 @@ def test_probe_config_is_isolated_zero_lr_and_deterministic(tmp_path):
                 {
                     "type": "diffusion_trainer",
                     "training_folder": "/app/checkpoints/task",
+                    "training_seed": 7,
                     "trigger_word": "TOK",
                     "network": {"type": "lora", "linear": 32},
                     "datasets": [
@@ -243,7 +244,9 @@ def test_probe_config_is_isolated_zero_lr_and_deterministic(tmp_path):
 
     assert cfg["config"]["name"] == "repo"  # source was not mutated
     assert out["config"]["name"] == "probe"
+    assert cfg["config"]["process"][0]["training_seed"] == 7
     assert process["training_folder"].startswith(str(tmp_path / "isolated"))
+    assert process["training_seed"] == holdout._SEED
     assert process["network"]["pretrained_lora_path"] == str(candidate)
     assert process["network"]["dropout"] == 0.0
     assert process["trigger_word"] is None
