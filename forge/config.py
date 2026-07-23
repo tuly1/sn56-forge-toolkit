@@ -152,12 +152,17 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
         mk["text_encoder_path"] = _KREA2_TE
         # Krea2Model appends the "vae" subfolder itself → pass the model DIR.
         mk["vae_path"] = spec.cached_model_dir
-        # LR OVERRIDE REMOVED (Jul-20 postmortem): the 1e-3 override came from
-        # a 128-step / 2-holdout-image probe and failed at tournament scale —
-        # our R2 krea2 (lr 1e-3, 367 steps, final-export) scored 0.1420 vs the
-        # opponent's 0.0525 on template lr 1e-4 with a deep run + EARLY
-        # selected checkpoint. Template LR stands; the real gap is checkpoint
-        # SELECTION for image exports (see postmortem handoff).
+        # GATE-B PROVISIONAL LR (Jul-21/22 H100 ladder; single public fixture,
+        # single training seed — REVERSIBLE, revisit with a second fixture):
+        # 8 arms x 5 candidates, all 40 rescored by the pinned exact evaluator.
+        # Best condition: 367 steps @ 2e-4, guidance on, final export (0.02711);
+        # the restored 1e-4 baseline arm scored 0.02842 (-4.63%), all 4 external
+        # holdout images improved. Note the LRxGUIDANCE INTERACTION: guidance-on
+        # wins at 2e-4 but guidance-off edged it at 1e-4/5e-5 — this pins the
+        # best measured PAIR, not a universal guidance rule. Evidence record:
+        # project docs SN56-GATE-B-H100-RESULTS.md §5 (kept outside this public
+        # repo deliberately — counter-intel).
+        p["train"]["lr"] = 2e-4
     return cfg
 
 
