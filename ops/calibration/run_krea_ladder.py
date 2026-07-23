@@ -639,10 +639,10 @@ def main() -> int:
     # Heavy/project imports intentionally occur only after seeded re-exec.
     import yaml
 
-    from forge import recipe
+    from forge import recipe, telemetry as forge_telemetry
     from forge.cli import main as forge_main
     from forge.data.schema import ImageSpec
-    from forge.tasks import aitoolkit, checkpoints
+    from forge.tasks import aitoolkit, checkpoints, publication
     from forge.tasks.integrity import valid_safetensors
 
     campaign_dir = args.campaign_dir.expanduser().resolve()
@@ -794,18 +794,43 @@ def main() -> int:
     if not captured:
         raise RuntimeError("Forge never resolved the calibration config")
 
-    config_path = Path(spec.config_path)
-    manifest_path = Path(spec.save_root) / "forge_holdout_scores.json"
-    selection_path = Path(spec.save_root) / "forge_checkpoint_selection.json"
-    telemetry_path = Path(spec.save_root) / "forge_run.json"
-    scope_path = Path(spec.save_root) / ".forge_checkpoint_scope.json"
+    # Production publication archives private sidecars outside the exact folder
+    # G.O.D uploads.  Resolve the same-process ephemeral bundle explicitly; never
+    # add a calibration-only switch that could disable the production scrub.
+    private_dir = Path(forge_telemetry.private_bundle_dir(spec.save_root))
+    config_path = Path(
+        publication.private_artifact_path(spec.save_root, "config.yaml")
+    )
+    manifest_path = Path(
+        publication.private_artifact_path(spec.save_root, "forge_holdout_scores.json")
+    )
+    selection_path = Path(
+        publication.private_artifact_path(
+            spec.save_root, "forge_checkpoint_selection.json"
+        )
+    )
+    telemetry_path = Path(forge_telemetry.private_record_path(spec.save_root))
+    public_telemetry_path = Path(spec.save_root) / "forge_run.json"
+    scope_path = Path(
+        publication.private_artifact_path(
+            spec.save_root, ".forge_checkpoint_scope.json"
+        )
+    )
     last_path = Path(spec.save_root) / "last.safetensors"
     selected_paths = [
-        config_path, manifest_path, selection_path, telemetry_path, scope_path, last_path
+        config_path,
+        manifest_path,
+        selection_path,
+        telemetry_path,
+        public_telemetry_path,
+        scope_path,
+        last_path,
     ]
     for path in selected_paths:
         if path.is_symlink() or not path.is_file():
             raise RuntimeError(f"required current-run output is absent/unsafe: {path}")
+    if private_dir.is_symlink() or not private_dir.is_dir():
+        raise RuntimeError(f"private evidence bundle is absent/unsafe: {private_dir}")
 
     loaded_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if loaded_config != captured["resolved"]:
@@ -847,6 +872,24 @@ def main() -> int:
     selection = _read_json(selection_path)
     telemetry = _read_json(telemetry_path)
     _validate_telemetry(telemetry, args=args, candidate_count=len(candidates))
+    public_telemetry = _read_json(public_telemetry_path)
+    if (
+        set(public_telemetry)
+        != {"schema", "kind", "private_record_sha256", "events"}
+        or public_telemetry.get("schema") != 2
+        or public_telemetry.get("kind") != "forge-public-run-recorder"
+        or public_telemetry.get("private_record_sha256")
+        != _sha256_file(telemetry_path)
+        or not isinstance(public_telemetry.get("events"), list)
+    ):
+        raise RuntimeError("public telemetry is not the strict hash-bound projection")
+    if any(
+        not isinstance(event, dict)
+        or not {"t", "name"}.issubset(event)
+        or not set(event).issubset({"t", "name", "failure_class"})
+        for event in public_telemetry["events"]
+    ):
+        raise RuntimeError("public telemetry event schema is not minimal")
     telemetry_meta = telemetry["meta"]
     if (
         telemetry_meta.get("holdout_pairs") != manifest["holdout_pairs"]
@@ -990,6 +1033,7 @@ def main() -> int:
             "manifest_sha256": _sha256_file(manifest_path),
             "selection_sha256": _sha256_file(selection_path),
             "telemetry_sha256": _sha256_file(telemetry_path),
+            "public_telemetry_sha256": _sha256_file(public_telemetry_path),
             "last_sha256": last_sha,
             "candidate_sha256": candidate_hashes,
         },

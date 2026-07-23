@@ -257,6 +257,22 @@ def current_loras(save_root: str, state: dict[str, Any] | None) -> list[str]:
     return sorted(out)
 
 
+def current_selection_record(
+    save_root: str, state: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Return only a selection record created or replaced by this active attempt."""
+    state = state or load_run(save_root)
+    path = os.path.join(save_root, _SELECTION_FILE)
+    if not _scope_is_complete(state) or not _is_current(path, state):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            record = json.load(fh)
+        return record if isinstance(record, dict) else None
+    except Exception:
+        return None
+
+
 def finalize(
     save_root: str,
     repo: str,
@@ -924,6 +940,7 @@ def _tracked_names(save_root: str) -> list[str]:
         or name
         in (
             _HOLDOUT_FILE,
+            _SELECTION_FILE,
             _LOSS_DB_FILE,
             _LOSS_DB_FILE + "-wal",
             _LOSS_DB_FILE + "-shm",
