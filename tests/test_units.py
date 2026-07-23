@@ -621,13 +621,13 @@ def test_failed_retry_explicitly_preserves_previous_last(tmp_path):
     assert "no valid checkpoint" in record["reason"]
 
 
-def test_heldout_manifest_selects_scored_checkpoint(tmp_path):
+def test_legacy_self_declared_exact_manifest_cannot_select_checkpoint(tmp_path):
     import json
 
     state = checkpoints.begin_run(str(tmp_path), "repo")
-    best = _write_st(tmp_path / "repo_000000100.safetensors", tag="best")
+    _write_st(tmp_path / "repo_000000100.safetensors", tag="best")
     _write_st(tmp_path / "repo_000000200.safetensors", tag="worse")
-    _write_st(tmp_path / "repo.safetensors", tag="final")
+    final = _write_st(tmp_path / "repo.safetensors", tag="final")
     (tmp_path / "forge_holdout_scores.json").write_text(
         json.dumps(
             {
@@ -657,10 +657,8 @@ def test_heldout_manifest_selects_scored_checkpoint(tmp_path):
         )
     )
     record = checkpoints.finalize(str(tmp_path), "repo", state)
-    assert (tmp_path / "last.safetensors").read_bytes() == best
-    assert record["source"] == "heldout_manifest"
-    assert record["selected_step"] == 100
-    assert record["score"] == 0.05
+    assert (tmp_path / "last.safetensors").read_bytes() == final
+    assert record["source"] == "exact_final"
 
 
 def test_unknown_self_named_heldout_metric_cannot_bypass_proxy_guard(tmp_path):

@@ -51,7 +51,11 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     # The CLI scopes before dispatch so import/preparation failures are covered;
     # direct handler calls create the same durable scope here.  Reusing it is
     # essential: beginning twice would lose the first quarantine journal.
-    scope = checkpoints.ensure_run(spec.save_root, spec.expected_repo_name)
+    scope = checkpoints.ensure_run(
+        spec.save_root,
+        spec.expected_repo_name,
+        task_id=spec.task_id,
+    )
 
     base_model = resolve_base_model(spec.cached_model_dir)
     images_dir, total_pairs = dataset.prepare_aitoolkit_dataset(
@@ -59,6 +63,8 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         images_dir=spec.dataset_images_dir,
         trigger_word=spec.trigger_word,
     )
+    if dataset.count_flat_pairs(images_dir) != total_pairs:
+        raise RuntimeError("prepared dataset count does not match its exact contents")
     holdout_feature_ready = holdout.budget_allows(
         spec.model_type,
         deadline.remaining(),
@@ -77,7 +83,49 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         if holdout_feature_ready
         else 0
     )
-    pairs = total_pairs - holdout_pairs
+    pairs = total_pairs
+    if holdout_pairs > 0:
+        try:
+            split_identity = holdout.dataset_split_identity(
+                images_dir,
+                spec.dataset_holdout_dir,
+            )
+            dataset.validate_reserved_split(
+                images_dir,
+                holdout_dir=spec.dataset_holdout_dir,
+                split_identity=split_identity,
+            )
+            pairs = _attested_training_pairs(
+                split_identity,
+                total_pairs=total_pairs,
+                reserved_pairs=holdout_pairs,
+            )
+            scope = checkpoints.bind_dataset_split(
+                spec.save_root,
+                scope,
+                split_sha256=holdout.dataset_split_sha256(split_identity),
+                training_pairs=split_identity["training_pairs"],
+                holdout_pairs=split_identity["holdout_pairs"],
+            )
+        except Exception as exc:
+            restored = dataset.restore_reserved_holdout(
+                images_dir,
+                holdout_dir=spec.dataset_holdout_dir,
+            )
+            restored_total = dataset.count_flat_pairs(images_dir)
+            if restored != holdout_pairs or restored_total != total_pairs:
+                raise RuntimeError(
+                    "invalid holdout split could not be restored to the prepared count"
+                ) from exc
+            telemetry.event(
+                "holdout_scoring_skipped",
+                reason="split_attestation_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            holdout_pairs = 0
+            pairs = total_pairs
+    if dataset.count_flat_pairs(images_dir) != pairs:
+        raise RuntimeError("training dataset count changed after holdout reservation")
     telemetry.collect_env()
     telemetry.set_meta(
         model_type=spec.model_type,
@@ -139,6 +187,36 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
             reason="scoring_budget_not_reserved",
         )
     _finalize(spec, scope)
+
+
+def _attested_training_pairs(
+    split_identity: dict,
+    *,
+    total_pairs: int,
+    reserved_pairs: int,
+) -> int:
+    """Bind recipe sizing to the exact split derived from prepared inputs."""
+    values = (
+        total_pairs,
+        reserved_pairs,
+        split_identity.get("total_pairs"),
+        split_identity.get("training_pairs"),
+        split_identity.get("holdout_pairs"),
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        raise RuntimeError("dataset split counts must be integers")
+    split_total = split_identity["total_pairs"]
+    training_pairs = split_identity["training_pairs"]
+    split_holdout = split_identity["holdout_pairs"]
+    if (
+        total_pairs <= 0
+        or reserved_pairs <= 0
+        or split_total != total_pairs
+        or split_holdout != reserved_pairs
+        or training_pairs != total_pairs - reserved_pairs
+    ):
+        raise RuntimeError("dataset split counts do not match prepared inputs")
+    return training_pairs
 
 
 def _recipe_hours(deadline: Deadline, scoring_reserve_s: float) -> float:

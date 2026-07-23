@@ -13,7 +13,7 @@ replica.
 The existing consumer in :mod:`forge.tasks.checkpoints` accepts a manifest only
 when every valid current-run candidate is represented by an exact SHA-256.  The
 producer below preserves that contract: any timeout, missing point, worker
-failure, candidate-set change, or hash drift leaves no authoritative manifest.
+failure, candidate-set change, or hash drift leaves no consumer-eligible manifest.
 Finalization then falls through to the exact-final/divergence policy.
 """
 
@@ -39,12 +39,14 @@ import yaml
 
 from forge import recipe, telemetry
 from forge.clock import Deadline
+from forge.data import dataset as dataset_ops
 from forge.data.schema import ImageSpec
 from forge.tasks import checkpoints
 from forge.tasks.integrity import valid_safetensors
 
 _AI_TOOLKIT_DIR = os.environ.get("AI_TOOLKIT_DIR", "/app/ai-toolkit")
 _MANIFEST_NAME = "forge_holdout_scores.json"
+_MANIFEST_SCHEMA = 2
 _METRIC = "heldout_diffusion_loss_proxy_v2"
 _SEED = 42565431
 _PROBE_EPOCHS = 2
@@ -57,6 +59,7 @@ _IMPLEMENTED_TYPES = frozenset({"krea2", "ideogram4"})
 _SCORING_RESERVE_S = {"krea2": 900.0, "ideogram4": 750.0}
 _MIN_TRAINING_WINDOW_S = {"krea2": 600.0, "ideogram4": 600.0}
 _BOUNDARY_MARGIN_S = 45.0
+_HOLDOUT_RECEIPT_FILE = ".forge_holdout_reservation.json"
 
 
 def enabled_for(model_type: str) -> bool:
@@ -123,15 +126,26 @@ def produce(
     holdout_pairs: int,
     scorer: Callable[..., dict[str, Any]] | None = None,
 ) -> bool:
-    """Score every valid current-run candidate and atomically publish a manifest.
+    """Score every valid current-run candidate and atomically publish evidence.
 
-    Returns ``True`` only when a complete authoritative manifest was written.
+    Returns ``True`` only when a complete scope-bound manifest was written.
+    Promotion remains a separate consumer-owned policy decision.
     It never raises into finalization.
     """
     manifest_path = os.path.join(spec.save_root, _MANIFEST_NAME)
     started = time.monotonic()
     temp_root = None
     try:
+        if not checkpoints.active_run_matches(
+            spec.save_root,
+            scope,
+            task_id=spec.task_id,
+            repo=spec.expected_repo_name,
+        ):
+            telemetry.event(
+                "holdout_scoring_skipped", reason="scope_not_current_for_task"
+            )
+            return False
         _remove_manifest(manifest_path)
         if not enabled_for(spec.model_type):
             telemetry.event(
@@ -143,6 +157,20 @@ def produce(
         if holdout_pairs <= 0 or not os.path.isdir(spec.dataset_holdout_dir):
             telemetry.event("holdout_scoring_skipped", reason="no_true_holdout")
             return False
+
+        split_identity = dataset_split_identity(
+            spec.dataset_images_dir,
+            spec.dataset_holdout_dir,
+        )
+        split_sha256 = dataset_split_sha256(split_identity)
+        if split_identity["holdout_pairs"] != holdout_pairs:
+            raise RuntimeError("holdout identity count differs from reserved pairs")
+        if (
+            scope.get("dataset_split_sha256") != split_sha256
+            or scope.get("training_pairs") != split_identity["training_pairs"]
+            or scope.get("holdout_pairs") != split_identity["holdout_pairs"]
+        ):
+            raise RuntimeError("holdout split is not bound to the active scope")
 
         before = _valid_candidates(spec.save_root, scope)
         if len(before) < 2:
@@ -165,12 +193,29 @@ def produce(
                 f"probe datasets have {probe_pairs} pairs per stratum; expected "
                 f"{holdout_pairs}"
             )
+        _validate_probe_identity(
+            captioned_dir,
+            blank_dir,
+            split_identity["holdout"],
+        )
         expected_stratum_points = probe_pairs * _PROBE_EPOCHS
         expected_points = expected_stratum_points * 2
 
         score_one = scorer or _score_candidate
         rows: list[dict[str, Any]] = []
         for index, path in enumerate(before):
+            if not checkpoints.active_run_matches(
+                spec.save_root,
+                scope,
+                task_id=spec.task_id,
+                repo=spec.expected_repo_name,
+            ):
+                raise RuntimeError("checkpoint scope changed while scoring")
+            _validate_probe_identity(
+                captioned_dir,
+                blank_dir,
+                split_identity["holdout"],
+            )
             candidates_left = len(before) - index
             required_window = (
                 _FINALIZE_MARGIN_S
@@ -233,13 +278,34 @@ def produce(
                 points=points,
             )
 
+        _validate_probe_identity(
+            captioned_dir,
+            blank_dir,
+            split_identity["holdout"],
+        )
+
         after = _valid_candidates(spec.save_root, scope)
         after_hashes = {os.path.basename(path): _sha256(path) for path in after}
         if list(before_hashes) != list(after_hashes) or before_hashes != after_hashes:
             raise RuntimeError("candidate set or bytes changed while scoring")
+        if dataset_split_identity(
+            spec.dataset_images_dir,
+            spec.dataset_holdout_dir,
+        ) != split_identity:
+            raise RuntimeError("training or holdout sample bytes changed while scoring")
+        if not checkpoints.active_run_matches(
+            spec.save_root,
+            scope,
+            task_id=spec.task_id,
+            repo=spec.expected_repo_name,
+        ):
+            raise RuntimeError("checkpoint scope changed while scoring")
+        active_scope = checkpoints.load_run(spec.save_root)
+        if active_scope is None:
+            raise RuntimeError("active checkpoint scope disappeared")
 
         manifest = {
-            "schema": 1,
+            "schema": _MANIFEST_SCHEMA,
             "source": "heldout",
             "complete": True,
             # Bind the evidence to the checkpoint journal that authorized this
@@ -247,10 +313,12 @@ def produce(
             # hash, while calibration tooling can additionally prove that a
             # complete manifest was produced by this attempt rather than left
             # behind by a same-task retry.
-            "task_id": spec.task_id,
-            "expected_repo_name": spec.expected_repo_name,
-            "attempt_nonce": scope.get("attempt_nonce"),
-            "scope_started_unix": scope.get("started_unix"),
+            "task_id": active_scope["task_id"],
+            "expected_repo_name": active_scope["repo"],
+            "attempt_nonce": active_scope["attempt_nonce"],
+            "scope_started_unix": active_scope["started_unix"],
+            "planned_steps": active_scope.get("planned_steps"),
+            "dataset_split_sha256": split_sha256,
             "direction": "min",
             "metric": _METRIC,
             "proxy_not_validator_metric": True,
@@ -261,6 +329,7 @@ def produce(
             "captioned_weight": _CAPTIONED_WEIGHT,
             "blank_caption_weight": _BLANK_WEIGHT,
             "strata_scored_separately": True,
+            "dataset_split": split_identity,
             "scores": rows,
             "elapsed_s": round(time.monotonic() - started, 3),
             "created_unix": int(time.time()),
@@ -275,13 +344,19 @@ def produce(
         )
         return True
     except BaseException as exc:
-        try:
-            _remove_manifest(manifest_path)
-        except BaseException as cleanup_exc:
-            telemetry.event(
-                "holdout_manifest_cleanup_failed",
-                error=f"{type(cleanup_exc).__name__}: {cleanup_exc}",
-            )
+        if checkpoints.active_run_matches(
+            spec.save_root,
+            scope,
+            task_id=spec.task_id,
+            repo=spec.expected_repo_name,
+        ):
+            try:
+                _remove_manifest(manifest_path)
+            except BaseException as cleanup_exc:
+                telemetry.event(
+                    "holdout_manifest_cleanup_failed",
+                    error=f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                )
         telemetry.event(
             "holdout_scoring_failed", error=f"{type(exc).__name__}: {exc}"
         )
@@ -492,23 +567,126 @@ def _build_probe_datasets(
     blank_dir = os.path.join(probe_root, "blank")
     os.makedirs(captioned_dir)
     os.makedirs(blank_dir)
-    images: list[tuple[str, str, str]] = []
-    for name in sorted(os.listdir(holdout_dir)):
-        stem, ext = os.path.splitext(name)
-        if ext.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
-            continue
-        image = os.path.join(holdout_dir, name)
-        caption = os.path.join(holdout_dir, stem + ".txt")
-        if os.path.isfile(image) and os.path.isfile(caption):
-            images.append((image, caption, ext.lower()))
-    for index, (image, caption, ext) in enumerate(images):
+    pairs = dataset_ops.strict_flat_pairs(
+        holdout_dir,
+        allowed_files=frozenset({_HOLDOUT_RECEIPT_FILE}),
+    )
+    for index, (image, caption) in enumerate(pairs):
         stem = f"h{index:03d}"
+        ext = os.path.splitext(image)[1].lower()
         shutil.copy2(image, os.path.join(captioned_dir, stem + ext))
         shutil.copyfile(caption, os.path.join(captioned_dir, stem + ".txt"))
         shutil.copy2(image, os.path.join(blank_dir, stem + ext))
         with open(os.path.join(blank_dir, stem + ".txt"), "wb"):
             pass
-    return captioned_dir, blank_dir, len(images)
+    return captioned_dir, blank_dir, len(pairs)
+
+
+def dataset_split_identity(
+    training_dir: str,
+    holdout_dir: str,
+) -> dict[str, Any]:
+    """Return exact-content identities and prove the two flat roots are disjoint."""
+    training = _dataset_snapshot(training_dir)
+    heldout = _dataset_snapshot(
+        holdout_dir,
+        allowed_files=frozenset({_HOLDOUT_RECEIPT_FILE}),
+    )
+    training_ids = [row["sample_sha256"] for row in training]
+    holdout_ids = [row["sample_sha256"] for row in heldout]
+    training_images = {row["image_sha256"] for row in training}
+    holdout_images = {row["image_sha256"] for row in heldout}
+    if not training_ids or not holdout_ids:
+        raise RuntimeError("training and holdout roots must both contain pairs")
+    if len(set(training_ids + holdout_ids)) != len(training_ids) + len(holdout_ids):
+        raise RuntimeError("training and holdout roots contain identical pairs")
+    if (
+        len(training_images) != len(training)
+        or len(holdout_images) != len(heldout)
+        or training_images & holdout_images
+    ):
+        raise RuntimeError("training and holdout roots contain identical images")
+    return {
+        "schema": 1,
+        "identity": "forge-image-caption-sha256-v1",
+        "training": training,
+        "holdout": heldout,
+        "training_pairs": len(training),
+        "holdout_pairs": len(heldout),
+        "total_pairs": len(training) + len(heldout),
+        "training_set_sha256": _identity_digest(training_ids, ordered=False),
+        "holdout_set_sha256": _identity_digest(holdout_ids, ordered=False),
+        "post_dedup_set_sha256": _identity_digest(
+            training_ids + holdout_ids, ordered=False
+        ),
+        "training_sequence_sha256": _identity_digest(training_ids, ordered=True),
+        "holdout_sequence_sha256": _identity_digest(holdout_ids, ordered=True),
+        "sample_disjoint": True,
+        "image_disjoint": True,
+    }
+
+
+def dataset_split_sha256(identity: dict[str, Any]) -> str:
+    payload = json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _dataset_snapshot(
+    directory: str,
+    *,
+    allowed_files: frozenset[str] = frozenset(),
+) -> list[dict[str, str]]:
+    samples: list[dict[str, str]] = []
+    for image, caption in dataset_ops.strict_flat_pairs(
+        directory,
+        allowed_files=allowed_files,
+    ):
+        image_sha = _sha256(image)
+        caption_sha = _sha256(caption)
+        sample_digest = hashlib.sha256()
+        sample_digest.update(b"forge-image-caption-v1\0")
+        sample_digest.update(bytes.fromhex(image_sha))
+        sample_digest.update(bytes.fromhex(caption_sha))
+        samples.append(
+            {
+                "image_sha256": image_sha,
+                "caption_sha256": caption_sha,
+                "sample_sha256": sample_digest.hexdigest(),
+            }
+        )
+    return samples
+
+
+def _identity_digest(values: list[str], *, ordered: bool) -> str:
+    digest = hashlib.sha256()
+    digest.update(
+        b"forge-sample-sequence-v1\0" if ordered else b"forge-sample-set-v1\0"
+    )
+    for value in values if ordered else sorted(values):
+        digest.update(bytes.fromhex(value))
+    return digest.hexdigest()
+
+
+def _validate_probe_identity(
+    captioned_dir: str,
+    blank_dir: str,
+    expected_holdout: list[dict[str, str]],
+) -> None:
+    captioned = _dataset_snapshot(captioned_dir)
+    blank = _dataset_snapshot(blank_dir)
+    if captioned != expected_holdout:
+        raise RuntimeError("captioned probe bytes differ from held-out samples")
+    expected_images = [row["image_sha256"] for row in expected_holdout]
+    if [row["image_sha256"] for row in blank] != expected_images:
+        raise RuntimeError("blank probe image bytes differ from held-out samples")
+    empty_sha = hashlib.sha256(b"").hexdigest()
+    if any(row["caption_sha256"] != empty_sha for row in blank):
+        raise RuntimeError("blank probe captions are not empty")
 
 
 def _loss_values(path: str) -> list[float]:
@@ -523,11 +701,28 @@ def _loss_values(path: str) -> list[float]:
 
 
 def _valid_candidates(save_root: str, scope: dict[str, Any]) -> list[str]:
-    return [
+    candidates = [
         path
-        for path in checkpoints.current_loras(save_root, scope)
+        for path in checkpoints.current_loras(
+            save_root,
+            scope,
+            enforce_plan=False,
+        )
         if valid_safetensors(path)
     ]
+    try:
+        planned = int(scope.get("planned_steps"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("candidate scope has no planned step bound") from exc
+    if planned <= 0:
+        raise RuntimeError("candidate scope has no positive planned step bound")
+    for path in candidates:
+        step = _step_of(path, scope)
+        if step is None or not 0 < step <= planned:
+            raise RuntimeError(
+                f"candidate step is outside the active plan: {os.path.basename(path)}"
+            )
+    return candidates
 
 
 def _step_of(path: str, scope: dict[str, Any]) -> int | None:

@@ -482,15 +482,18 @@ def _validate_manifest(
     args: argparse.Namespace,
     scope: dict[str, Any],
     candidates: list[Path],
+    expected_split: dict[str, Any],
 ) -> dict[str, str]:
     expected_header = {
-        "schema": 1,
+        "schema": 2,
         "source": "heldout",
         "complete": True,
         "task_id": args.task_id,
         "expected_repo_name": args.expected_repo_name,
         "attempt_nonce": scope["attempt_nonce"],
         "scope_started_unix": scope["started_unix"],
+        "planned_steps": args.steps,
+        "dataset_split_sha256": scope["dataset_split_sha256"],
         "direction": "min",
         "metric": "heldout_diffusion_loss_proxy_v2",
         "proxy_not_validator_metric": True,
@@ -500,6 +503,8 @@ def _validate_manifest(
     for key, expected in expected_header.items():
         if manifest.get(key) != expected:
             raise RuntimeError(f"manifest {key!r} is not bound to this attempt")
+    if manifest.get("dataset_split") != expected_split:
+        raise RuntimeError("manifest dataset split differs from current sample bytes")
     holdout_pairs = manifest.get("holdout_pairs")
     epochs = manifest.get("probe_epochs")
     seed = manifest.get("seed")
@@ -642,7 +647,12 @@ def main() -> int:
     from forge import recipe, telemetry as forge_telemetry
     from forge.cli import main as forge_main
     from forge.data.schema import ImageSpec
-    from forge.tasks import aitoolkit, checkpoints, publication
+    from forge.tasks import (
+        aitoolkit,
+        checkpoints,
+        holdout as forge_holdout,
+        publication,
+    )
     from forge.tasks.integrity import valid_safetensors
 
     campaign_dir = args.campaign_dir.expanduser().resolve()
@@ -846,12 +856,21 @@ def main() -> int:
     if active_scope is None or active_scope != disk_scope:
         raise RuntimeError("checkpoint scope is not active in this process")
     scope = active_scope
+    split_identity = forge_holdout.dataset_split_identity(
+        spec.dataset_images_dir,
+        spec.dataset_holdout_dir,
+    )
+    split_sha256 = forge_holdout.dataset_split_sha256(split_identity)
     if (
         scope.get("schema") != 2
+        or scope.get("task_id") != args.task_id
         or scope.get("repo") != args.expected_repo_name
         or scope.get("quarantine_complete") is not True
         or scope.get("planned_steps") != args.steps
         or scope.get("model_type") != "krea2"
+        or scope.get("dataset_split_sha256") != split_sha256
+        or scope.get("training_pairs") != split_identity["training_pairs"]
+        or scope.get("holdout_pairs") != split_identity["holdout_pairs"]
         or scope.get("before") != {}
         or not isinstance(scope.get("attempt_nonce"), str)
         or not scope["attempt_nonce"]
@@ -867,7 +886,11 @@ def main() -> int:
         raise RuntimeError("fewer than two valid current-attempt candidates")
     manifest = _read_json(manifest_path)
     candidate_hashes = _validate_manifest(
-        manifest, args=args, scope=scope, candidates=candidates
+        manifest,
+        args=args,
+        scope=scope,
+        candidates=candidates,
+        expected_split=split_identity,
     )
     selection = _read_json(selection_path)
     telemetry = _read_json(telemetry_path)

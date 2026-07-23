@@ -20,12 +20,16 @@ Pure stdlib — no torch — so it is cheap to unit-test.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
+import re
 import shutil
 import zipfile
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+_HOLDOUT_RECEIPT_FILE = ".forge_holdout_reservation.json"
+_HOLDOUT_RECEIPT_SCHEMA = 1
 
 
 def prepare_aitoolkit_dataset(
@@ -115,12 +119,14 @@ def reserve_holdout(
     This helper is deliberately fail-open for *training* and fail-closed for
     *selection*.  It copies every chosen pair before deleting any source.  On
     any error it restores the original training directory, clears the holdout,
-    and returns zero, so the ordinary exact-final selection path remains usable.
+    and returns zero only after proving byte-exact rollback. An ambiguous
+    rollback raises so the handler falls back without training on changed data.
     """
     copied: list[tuple[str, str]] = []
     removed: list[tuple[str, str]] = []
     chosen: list[tuple[str, str]] = []
     original_digests: dict[tuple[str, str], str] = {}
+    original_records: list[dict[str, str]] = []
     try:
         pairs = _flat_pairs(images_dir)
         min_training_pairs = max(1, int(min_training_pairs))
@@ -140,6 +146,7 @@ def reserve_holdout(
             key=lambda pair: (_pair_digest(*pair), os.path.basename(pair[0])),
         )
         chosen = ranked[:count]
+        original_records = _pair_records(pairs)
         original_digests = {
             pair: _pair_digest(*pair)
             for pair in chosen
@@ -162,6 +169,33 @@ def reserve_holdout(
             copied.extend(
                 ((image_path, holdout_image), (caption_path, holdout_caption))
             )
+
+        # Prove every reserved copy still equals its pre-split source, then
+        # durably anchor both the reserved subset and the complete pre-split
+        # dataset before deleting a single training input.  A later attestation
+        # failure can only resume training if this exact dataset is restored.
+        for image_path, caption_path in chosen:
+            holdout_pair = (
+                os.path.join(holdout_dir, os.path.basename(image_path)),
+                os.path.join(holdout_dir, os.path.basename(caption_path)),
+            )
+            if _pair_digest(*holdout_pair) != original_digests[
+                (image_path, caption_path)
+            ]:
+                raise RuntimeError("reserved holdout copy changed pair bytes")
+        _write_holdout_receipt(
+            holdout_dir,
+            original_records=original_records,
+            reserved_records=_pair_records(
+                [
+                    (
+                        os.path.join(holdout_dir, os.path.basename(image_path)),
+                        os.path.join(holdout_dir, os.path.basename(caption_path)),
+                    )
+                    for image_path, caption_path in chosen
+                ]
+            ),
+        )
 
         for source, holdout_copy in copied:
             os.remove(source)
@@ -197,6 +231,12 @@ def reserve_holdout(
                     rollback_errors.append(os.path.basename(pair[0]))
             except Exception:
                 rollback_errors.append(os.path.basename(pair[0]))
+        if original_records:
+            try:
+                if _pair_records(_flat_pairs(images_dir)) != original_records:
+                    rollback_errors.append("dataset-inventory")
+            except Exception:
+                rollback_errors.append("dataset-inventory")
         _holdout_event(
             "holdout_reservation_failed", error=f"{type(exc).__name__}: {exc}"
         )
@@ -212,6 +252,193 @@ def reserve_holdout(
         return 0
 
 
+def restore_reserved_holdout(images_dir: str, *, holdout_dir: str) -> int:
+    """Restore only the exact pre-split dataset bound by the durable receipt."""
+    restored: list[tuple[str, str]] = []
+    try:
+        receipt = _read_holdout_receipt(holdout_dir)
+        pairs = _flat_pairs(
+            holdout_dir,
+            allowed_files=frozenset({_HOLDOUT_RECEIPT_FILE}),
+        )
+        if _pair_records(pairs) != receipt["reserved_records"]:
+            raise RuntimeError("reserved holdout bytes differ from the receipt")
+        for image, caption in pairs:
+            destinations = (
+                os.path.join(images_dir, os.path.basename(image)),
+                os.path.join(images_dir, os.path.basename(caption)),
+            )
+            if any(os.path.lexists(path) for path in destinations):
+                raise RuntimeError("reserved holdout restore would overwrite training")
+        for image, caption in pairs:
+            destination_image = os.path.join(images_dir, os.path.basename(image))
+            destination_caption = os.path.join(images_dir, os.path.basename(caption))
+            expected = _pair_digest(image, caption)
+            shutil.copy2(image, destination_image)
+            shutil.copyfile(caption, destination_caption)
+            if _pair_digest(destination_image, destination_caption) != expected:
+                raise RuntimeError("reserved holdout restore changed pair bytes")
+            restored.append((destination_image, destination_caption))
+        if _pair_records(_flat_pairs(images_dir)) != receipt["original_records"]:
+            raise RuntimeError(
+                "restored training dataset differs from the pre-split receipt"
+            )
+        shutil.rmtree(holdout_dir)
+        os.makedirs(holdout_dir)
+        return len(restored)
+    except BaseException:
+        # The caller must abort the handler rather than train against an
+        # ambiguous reconstruction. Any copied files remain available for
+        # forensic recovery, but are never certified by a successful return.
+        raise
+
+
+def validate_reserved_split(
+    images_dir: str,
+    *,
+    holdout_dir: str,
+    split_identity: dict[str, object] | None = None,
+) -> None:
+    """Prove the live split is the exact partition captured before reservation."""
+    receipt = _read_holdout_receipt(holdout_dir)
+    training_records = _pair_records(_flat_pairs(images_dir))
+    reserved_records = _pair_records(
+        _flat_pairs(
+            holdout_dir,
+            allowed_files=frozenset({_HOLDOUT_RECEIPT_FILE}),
+        )
+    )
+    if reserved_records != receipt["reserved_records"]:
+        raise RuntimeError("reserved holdout bytes differ from the receipt")
+    current_union = sorted(
+        training_records + reserved_records,
+        key=lambda record: record["image"].casefold(),
+    )
+    if current_union != receipt["original_records"]:
+        raise RuntimeError("live dataset split differs from the pre-split receipt")
+    if split_identity is not None:
+        expected_training = _split_identity_records(training_records)
+        expected_holdout = _split_identity_records(reserved_records)
+        if (
+            split_identity.get("training") != expected_training
+            or split_identity.get("holdout") != expected_holdout
+            or split_identity.get("training_pairs") != len(expected_training)
+            or split_identity.get("holdout_pairs") != len(expected_holdout)
+            or split_identity.get("total_pairs")
+            != len(expected_training) + len(expected_holdout)
+        ):
+            raise RuntimeError(
+                "dataset split identity differs from the reservation receipt"
+            )
+
+
+def count_flat_pairs(images_dir: str) -> int:
+    """Return the strict complete-pair count used by holdout reservation."""
+    return len(_flat_pairs(images_dir))
+
+
+def strict_flat_pairs(
+    directory: str,
+    *,
+    allowed_files: frozenset[str] = frozenset(),
+) -> list[tuple[str, str]]:
+    """Inventory one flat dataset root, rejecting every unbound direct child."""
+    return _flat_pairs(directory, allowed_files=allowed_files)
+
+
+def _write_holdout_receipt(
+    holdout_dir: str,
+    *,
+    original_records: list[dict[str, str]],
+    reserved_records: list[dict[str, str]],
+) -> None:
+    receipt = {
+        "schema": _HOLDOUT_RECEIPT_SCHEMA,
+        "identity": "forge-pre-split-flat-dataset-v1",
+        "original_records": original_records,
+        "reserved_records": reserved_records,
+    }
+    path = os.path.join(holdout_dir, _HOLDOUT_RECEIPT_FILE)
+    temp = path + ".tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(receipt, handle, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        _fsync_directory(holdout_dir)
+    except BaseException:
+        try:
+            if os.path.exists(temp):
+                os.remove(temp)
+        except Exception:
+            pass
+        raise
+
+
+def _read_holdout_receipt(holdout_dir: str) -> dict[str, object]:
+    path = os.path.join(holdout_dir, _HOLDOUT_RECEIPT_FILE)
+    if os.path.islink(holdout_dir) or os.path.islink(path):
+        raise RuntimeError("holdout reservation receipt path is unsafe")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            receipt = json.load(handle)
+    except Exception as exc:
+        raise RuntimeError("holdout reservation receipt is unavailable") from exc
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema") != _HOLDOUT_RECEIPT_SCHEMA
+        or receipt.get("identity") != "forge-pre-split-flat-dataset-v1"
+    ):
+        raise RuntimeError("holdout reservation receipt is invalid")
+    original = _validate_receipt_records(receipt.get("original_records"))
+    reserved = _validate_receipt_records(receipt.get("reserved_records"))
+    if not reserved or any(record not in original for record in reserved):
+        raise RuntimeError("holdout reservation receipt has an invalid subset")
+    return {"original_records": original, "reserved_records": reserved}
+
+
+def _validate_receipt_records(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeError("holdout reservation receipt has no records")
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+    expected_keys = {
+        "image",
+        "caption",
+        "image_sha256",
+        "caption_sha256",
+        "pair_sha256",
+    }
+    for value_record in value:
+        if not isinstance(value_record, dict) or set(value_record) != expected_keys:
+            raise RuntimeError("holdout reservation receipt record is invalid")
+        if not all(isinstance(value_record[key], str) for key in expected_keys):
+            raise RuntimeError("holdout reservation receipt record is invalid")
+        record = {key: str(value_record[key]) for key in expected_keys}
+        image, caption = record["image"], record["caption"]
+        stem, extension = os.path.splitext(image)
+        if (
+            not stem
+            or extension.lower() not in _IMAGE_EXTS
+            or os.path.basename(image) != image
+            or os.path.basename(caption) != caption
+            or "/" in image + caption
+            or "\\" in image + caption
+            or caption != stem + ".txt"
+            or image.casefold() in seen
+            or any(
+                not isinstance(record[key], str)
+                or re.fullmatch(r"[0-9a-f]{64}", record[key]) is None
+                for key in ("image_sha256", "caption_sha256", "pair_sha256")
+            )
+        ):
+            raise RuntimeError("holdout reservation receipt record is unsafe")
+        seen.add(image.casefold())
+        records.append(record)
+    return records
+
+
 def _strict_reset_dir(path: str) -> None:
     if os.path.isdir(path):
         shutil.rmtree(path)
@@ -220,36 +447,133 @@ def _strict_reset_dir(path: str) -> None:
     os.makedirs(path)
 
 
-def _flat_pairs(directory: str) -> list[tuple[str, str]]:
+def _flat_pairs(
+    directory: str,
+    *,
+    allowed_files: frozenset[str] = frozenset(),
+) -> list[tuple[str, str]]:
+    if os.path.islink(directory):
+        raise RuntimeError(f"flat dataset root is unsafe: {directory!r}")
     if not os.path.isdir(directory):
         return []
-    out: list[tuple[str, str]] = []
+    images: list[tuple[str, str]] = []
+    captions: set[str] = set()
     seen_stems: set[str] = set()
     for name in sorted(os.listdir(directory)):
-        stem, ext = os.path.splitext(name)
-        if ext.lower() not in _IMAGE_EXTS:
+        path = os.path.join(directory, name)
+        if os.path.islink(path):
+            raise RuntimeError(f"flat dataset contains a symlink: {name!r}")
+        if name in allowed_files:
+            if not os.path.isfile(path):
+                raise RuntimeError(
+                    f"allowed dataset sidecar is not a regular file: {name!r}"
+                )
             continue
+        stem, ext = os.path.splitext(name)
+        if ext.lower() == ".txt":
+            if not os.path.isfile(path):
+                raise RuntimeError(
+                    f"dataset caption is not a regular file: {name!r}"
+                )
+            captions.add(name)
+            continue
+        if ext.lower() not in _IMAGE_EXTS or not os.path.isfile(path):
+            raise RuntimeError(f"flat dataset contains an unbound entry: {name!r}")
         stem_key = stem.casefold()
         if stem_key in seen_stems:
             raise RuntimeError(
                 f"ambiguous image stem in flat dataset: {stem!r}"
             )
-        image_path = os.path.join(directory, name)
-        caption_path = os.path.join(directory, stem + ".txt")
-        if os.path.isfile(image_path) and os.path.isfile(caption_path):
-            seen_stems.add(stem_key)
-            out.append((image_path, caption_path))
-    return out
+        seen_stems.add(stem_key)
+        images.append((name, stem + ".txt"))
+    expected_captions = {caption for _image, caption in images}
+    if captions != expected_captions:
+        unexpected = sorted(captions - expected_captions)
+        missing = sorted(expected_captions - captions)
+        raise RuntimeError(
+            "flat dataset caption inventory is not one-to-one: "
+            f"unexpected={unexpected}, missing={missing}"
+        )
+    return [
+        (os.path.join(directory, image), os.path.join(directory, caption))
+        for image, caption in images
+    ]
 
 
 def _pair_digest(image_path: str, caption_path: str) -> str:
+    return _component_pair_digest(
+        _file_sha256(image_path),
+        _file_sha256(caption_path),
+    )
+
+
+def _component_pair_digest(image_sha256: str, caption_sha256: str) -> str:
     digest = hashlib.sha256()
-    for path in (image_path, caption_path):
-        with open(path, "rb") as fh:
-            for block in iter(lambda: fh.read(1024 * 1024), b""):
-                digest.update(block)
-        digest.update(b"\0")
+    digest.update(b"forge-image-caption-pair-v2\0")
+    digest.update(bytes.fromhex(image_sha256))
+    digest.update(bytes.fromhex(caption_sha256))
     return digest.hexdigest()
+
+
+def _pair_records(pairs: list[tuple[str, str]]) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for image_path, caption_path in pairs:
+        if os.path.islink(image_path) or os.path.islink(caption_path):
+            raise RuntimeError("dataset pair path is unsafe")
+        image_sha256 = _file_sha256(image_path)
+        caption_sha256 = _file_sha256(caption_path)
+        records.append(
+            {
+                "image": os.path.basename(image_path),
+                "caption": os.path.basename(caption_path),
+                "image_sha256": image_sha256,
+                "caption_sha256": caption_sha256,
+                "pair_sha256": _component_pair_digest(
+                    image_sha256,
+                    caption_sha256,
+                ),
+            }
+        )
+    return sorted(records, key=lambda record: record["image"].casefold())
+
+
+def _split_identity_records(
+    records: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for record in sorted(records, key=lambda value: value["image"]):
+        sample = hashlib.sha256()
+        sample.update(b"forge-image-caption-v1\0")
+        sample.update(bytes.fromhex(record["image_sha256"]))
+        sample.update(bytes.fromhex(record["caption_sha256"]))
+        out.append(
+            {
+                "image_sha256": record["image_sha256"],
+                "caption_sha256": record["caption_sha256"],
+                "sample_sha256": sample.hexdigest(),
+            }
+        )
+    return out
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _fsync_directory(path: str) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
 
 
 def _holdout_event(name: str, **values) -> None:
