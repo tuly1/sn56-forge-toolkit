@@ -134,6 +134,7 @@ RUN set -eu; \
     cc /tmp/sn56-cc-probe.c -o /tmp/sn56-cc-probe; \
     /tmp/sn56-cc-probe; \
     rm -f /tmp/sn56-cc-probe.c /tmp/sn56-cc-probe; \
+    install -d -m 0755 /opt/sn56; \
     dpkg-query -W -f='${Package}=${Version}\n' \
       gcc gcc-12 gcc-12-base libc-bin libc6 libc6-dev libgcc-s1 libstdc++6 \
       >/opt/sn56/legacy-aitoolkit-toolchain-lock.txt; \

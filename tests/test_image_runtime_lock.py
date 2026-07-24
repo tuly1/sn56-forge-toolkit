@@ -172,6 +172,7 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
     assert "rm -f /etc/apt/sources.list.d/cuda-debian11-x86_64.list" in contents
     assert "command -v cc; command -v gcc" in contents
     assert "test -f /usr/include/stdlib.h" in contents
+    assert "install -d -m 0755 /opt/sn56" in contents
     assert "legacy-aitoolkit-toolchain-lock.txt" in contents
     assert "legacy-os-package-inventory.txt" in contents
     assert "legacy-os-package-inventory.sha256" in contents
