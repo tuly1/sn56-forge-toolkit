@@ -104,15 +104,44 @@ def test_toolkit_image_applies_the_certified_two_phase_lock():
     assert "--files-only" in contents
 
 
-def test_legacy_flux_image_is_a_pinned_offline_kohya_runtime():
+def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
     contents = LEGACY_FLUX_DOCKERFILE.read_text(encoding="utf-8")
 
     assert contents != TOOLKIT_DOCKERFILE.read_text(encoding="utf-8")
+    assert (
+        "FROM diagonalge/ai-toolkit:latest@sha256:"
+        "c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8 "
+        "AS aitoolkit-runtime"
+    ) in contents
     assert (
         "FROM diagonalge/kohya_latest:latest@sha256:"
         "d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e"
     ) in contents
     assert "FORGE_FLUX_BACKEND=kohya" in contents
+    assert "AI_TOOLKIT_DIR=/app/ai-toolkit" in contents
+    assert "PYTHONPATH=/opt/sn56/ai-toolkit-python" in contents
+    assert (
+        "FORGE_KOHYA_PYTHONPATH=/home/.local/lib/python3.10/site-packages"
+        in contents
+    )
+    assert "FORGE_KOHYA_LD_PRELOAD=libtcmalloc.so" in contents
+    assert "FORGE_KOHYA_PROTOBUF_IMPLEMENTATION=python" in contents
+    assert "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb" in contents
+    assert (
+        "COPY --from=aitoolkit-runtime /app/ai-toolkit/ /app/ai-toolkit/"
+        in contents
+    )
+    assert (
+        "COPY --from=aitoolkit-runtime "
+        "/usr/local/lib/python3.10/dist-packages/ "
+        "/opt/sn56/ai-toolkit-python/"
+    ) in contents
+    assert contents.count("99be3d96a2468d3a5228a4eb05ba67e63c586b4e") == 3
+    assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents
+    assert "python3 /opt/sn56/verify-image-runtime.py" in contents
+    assert "assert torch.__version__ == '2.6.0+cu124'" in contents
+    assert "assert torch.version.cuda == '12.4'" in contents
+    assert "startswith('/opt/sn56/ai-toolkit-python/')" in contents
     assert "SD_SCRIPTS_DIR=/app/sd-scripts" in contents
     assert "flux_train_network.py" in contents
     assert "python3 -m forge.verify_flux_kohya_runtime" in contents
@@ -124,12 +153,16 @@ def test_legacy_flux_image_is_a_pinned_offline_kohya_runtime():
     assert "3db67ab1af984cf10548a73467f0e5bca2aaaeb2" in (
         ROOT / "forge/flux_kohya_tokenizers.py"
     ).read_text(encoding="utf-8")
-    assert 'ENTRYPOINT ["dumb-init", "--", "python3", "-m", "forge.cli"]' in contents
+    assert (
+        'ENTRYPOINT ["dumb-init", "--", "python3", "-m", "forge.cli"]'
+        in contents
+    )
     assert "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38" in contents
     assert "660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd" in contents
     assert "6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635" in contents
-    for mutable_install in ("git fetch", "git clone", "pip install", "apt-get", "curl "):
-        assert mutable_install not in contents
+    assert "assert torch.__version__ == '2.1.2+cu121'" in contents
+    assert "assert torch.version.cuda == '12.1'" in contents
+    assert "startswith('/home/.local/lib/python3.10/site-packages/')" in contents
 
 
 def test_image_sources_are_pinned_to_certified_identities():

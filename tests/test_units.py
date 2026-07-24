@@ -1273,7 +1273,8 @@ def test_toolkit_dockerfile_repins_torchcodec_for_torch26():
 
     assert "torch==2.6.0" in toolkit_text
     assert "torchcodec==0.2.1" in toolkit_text
-    # FLUX is validator-routed through the legacy filename and needs Kohya's
-    # single-checkpoint loader, so intentional backend divergence is required.
+    # FLUX is validator-routed through the legacy filename. That image carries
+    # both runtimes and enables its cache-shape-aware wrapper; the toolkit image
+    # does not need the standalone-checkpoint Kohya path.
     assert "FORGE_FLUX_BACKEND=kohya" in legacy_text
     assert toolkit_text != legacy_text

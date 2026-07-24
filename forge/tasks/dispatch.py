@@ -17,10 +17,10 @@ Handler = Callable[[ImageSpec, Deadline], None]
 
 def for_model_type(model_type: str) -> Handler | None:
     if model_type == "flux" and os.environ.get("FORGE_FLUX_BACKEND") == "kohya":
-        # G.O.D routes FLUX to the legacy-named Dockerfile. Standalone FLUX
-        # checkpoints need Kohya's single-file loader and bundled support assets;
-        # ai-toolkit's directory loader fails before its first save on that cache
-        # shape. The toolkit Dockerfile deliberately does not set this switch.
+        # G.O.D routes FLUX to the legacy-named, dual-runtime Dockerfile. Its
+        # shape-aware handler selects Kohya only for the downloader's normalized
+        # exact-one-file cache and ai-toolkit for full snapshot directories. The
+        # toolkit-named Dockerfile deliberately does not set this switch.
         from forge.tasks.flux_kohya import run
 
         return run

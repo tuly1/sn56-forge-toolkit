@@ -1,8 +1,10 @@
-"""Deadline-safe Kohya backend for standalone FLUX checkpoints.
+"""Shape-aware legacy FLUX backend with deadline-safe Kohya support.
 
-The validator routes FLUX through the legacy-named Dockerfile and may stage the
-base as one monolithic ``.safetensors`` file.  Kohya understands that shape;
-ai-toolkit expects a Diffusers directory.  Forge still owns the surrounding
+The validator routes FLUX through the legacy-named Dockerfile.  Its downloader
+normalizes a standalone FLUX repository to exactly one root ``.safetensors``
+file, but preserves every other repository as a full snapshot directory. Kohya
+understands the former shape; ai-toolkit understands the latter. Forge chooses
+between them from the trusted, read-only cache shape while retaining the same
 run scope, telemetry, kill-safe checkpoint promotion, publication scrub, and
 never-forfeit fallback.
 """
@@ -27,14 +29,63 @@ from forge.tasks import checkpoints, holdout
 _SD_SCRIPTS_DIR = os.environ.get("SD_SCRIPTS_DIR", "/app/sd-scripts")
 _POLL_SECONDS = 5.0
 _STOP_MARGIN_S = holdout.boundary_margin_s()
+_KOHYA_PYTHONPATH_ENV = "FORGE_KOHYA_PYTHONPATH"
+_KOHYA_LD_LIBRARY_PATH_ENV = "FORGE_KOHYA_LD_LIBRARY_PATH"
+_KOHYA_LD_PRELOAD_ENV = "FORGE_KOHYA_LD_PRELOAD"
+_KOHYA_PROTOBUF_ENV = "FORGE_KOHYA_PROTOBUF_IMPLEMENTATION"
+_KOHYA_PATH_ENV = "FORGE_KOHYA_PATH"
+_STANDALONE_LAYOUT = "standalone_checkpoint"
+_SNAPSHOT_LAYOUT = "snapshot_directory"
+_MODEL_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".ckpt", ".pt")
+_DIFFUSERS_COMPONENT_DIRS = {
+    "scheduler",
+    "text_encoder",
+    "text_encoder_2",
+    "tokenizer",
+    "tokenizer_2",
+    "transformer",
+    "unet",
+    "vae",
+}
+_WEIGHT_INDEX_SUFFIXES = (".bin.index.json", ".safetensors.index.json")
+_SHARDED_CHECKPOINT_PATTERN = re.compile(r"-\d{5}-of-\d{5}\.safetensors$")
 
 
 def run(spec: ImageSpec, deadline: Deadline) -> None:
+    layout, standalone_model = resolve_flux_cache_layout(spec.cached_model_dir)
+    if layout == _SNAPSHOT_LAYOUT:
+        telemetry.set_meta(backend="aitoolkit", base_model_layout=layout)
+        telemetry.event(
+            "flux_backend_selected",
+            backend="aitoolkit",
+            cache_layout=layout,
+        )
+        # Import lazily: the Kohya image contains both runtimes, while this
+        # module must remain importable in unit tests without ai-toolkit deps.
+        from forge.tasks import aitoolkit
+
+        aitoolkit.run(spec, deadline)
+        return
+
+    telemetry.event(
+        "flux_backend_selected",
+        backend="kohya",
+        cache_layout=layout,
+    )
+    _run_standalone_kohya(spec, deadline, standalone_model)
+
+
+def _run_standalone_kohya(
+    spec: ImageSpec,
+    deadline: Deadline,
+    base_model: str | None,
+) -> None:
+    if base_model is None:  # defensive: the resolver binds this invariant
+        raise RuntimeError("standalone FLUX layout resolved without a checkpoint")
     os.makedirs(spec.save_root, exist_ok=True)
     os.makedirs(spec.training_folder, exist_ok=True)
     scope = checkpoints.ensure_run(spec.save_root, spec.expected_repo_name)
 
-    base_model = resolve_standalone_model_file(spec.cached_model_dir)
     train_data_dir, pairs = dataset.prepare_kohya_flux_dataset(
         spec.cached_zip_path,
         images_root=spec.dataset_images_dir,
@@ -58,10 +109,15 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     )
     flux_kohya_config.write_config(config, config_path)
 
-    telemetry.collect_env()
+    # The parent process uses the image's ai-toolkit dependency graph; Kohya
+    # runs in a child-only graph selected by _kohya_subprocess_env(). Calling
+    # collect_env here would therefore attest Torch/CUDA/library versions that
+    # did not train this checkpoint. Accurate absence is better than false
+    # provenance; the child process and image build gates own runtime identity.
     telemetry.set_meta(
         model_type=spec.model_type,
         backend="kohya",
+        base_model_layout=_STANDALONE_LAYOUT,
         pairs=pairs,
         base_model=os.path.basename(base_model),
         steps=steps,
@@ -85,28 +141,136 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         source=record["source"],
         selected_step=record["selected_step"],
     )
-    telemetry.note_peak_memory()
+
+
+def resolve_flux_cache_layout(cached_model_dir: str) -> tuple[str, str | None]:
+    """Resolve the validator's two FLUX cache shapes, failing closed.
+
+    G.O.D's downloader (introduced in #1309) normalizes a standalone FLUX repo
+    to exactly one direct, regular ``.safetensors`` file. Its legacy path
+    resolver makes the same exact-one-root-file distinction. Any other complete
+    model repository remains a directory for ai-toolkit. We mirror that contract
+    and add local integrity checks because guessing a backend for an empty,
+    root-symlinked, or weight-free cache would consume the task budget first.
+    """
+    if os.path.islink(cached_model_dir):
+        raise RuntimeError(
+            f"FLUX cache root must not be a symlink: {cached_model_dir!r}"
+        )
+    if not os.path.isdir(cached_model_dir):
+        raise FileNotFoundError(f"FLUX cache directory not found: {cached_model_dir!r}")
+
+    direct_files: list[str] = []
+    direct_directories: set[str] = set()
+    model_weights: list[str] = []
+    try:
+        for entry in os.scandir(cached_model_dir):
+            if entry.is_symlink():
+                raise RuntimeError(
+                    f"FLUX cache contains a symlink: {entry.path!r}"
+                )
+            if entry.is_file(follow_symlinks=False):
+                direct_files.append(entry.path)
+            elif entry.is_dir(follow_symlinks=False):
+                direct_directories.add(entry.name)
+    except OSError as exc:
+        raise RuntimeError(
+            f"unable to inspect FLUX cache directory {cached_model_dir!r}"
+        ) from exc
+
+    # Mirror G.O.D #1309's repository classifier while tolerating directories its
+    # normalizer deliberately leaves in reused caches. Arbitrary assets/examples
+    # (and Hugging Face's .cache metadata) do not change a standalone checkpoint;
+    # known Diffusers components, a weight index anywhere, or a shard-form name
+    # are semantic proof that the directory belongs to ai-toolkit instead.
+    has_weight_index = False
+    try:
+        for _root, _dirs, files in os.walk(
+            cached_model_dir,
+            followlinks=False,
+            onerror=_raise_walk_error,
+        ):
+            if any(name.endswith(_WEIGHT_INDEX_SUFFIXES) for name in files):
+                has_weight_index = True
+                break
+    except OSError as exc:
+        raise RuntimeError(
+            f"unable to inspect FLUX cache metadata {cached_model_dir!r}"
+        ) from exc
+
+    direct_names = {os.path.basename(path) for path in direct_files}
+    standalone_candidate = (
+        len(direct_files) == 1
+        and direct_files[0].endswith(".safetensors")
+        and "model_index.json" not in direct_names
+        and not (direct_directories & _DIFFUSERS_COMPONENT_DIRS)
+        and not has_weight_index
+        and not _SHARDED_CHECKPOINT_PATTERN.search(
+            os.path.basename(direct_files[0])
+        )
+    )
+    if standalone_candidate:
+        try:
+            if os.path.getsize(direct_files[0]) <= 0:
+                raise RuntimeError(
+                    f"standalone FLUX checkpoint is empty: {direct_files[0]!r}"
+                )
+        except OSError as exc:
+            raise RuntimeError(
+                f"unable to inspect standalone FLUX checkpoint {direct_files[0]!r}"
+            ) from exc
+        return _STANDALONE_LAYOUT, direct_files[0]
+
+    # Every other cache shape is a directory candidate for ai-toolkit. Require
+    # at least one non-empty model weight and reject symlinks rather than guessing
+    # at a malformed/incomplete cache. Full snapshots may be sharded or keep all
+    # weights under component directories.
+    try:
+        for root, dirs, files in os.walk(
+            cached_model_dir,
+            followlinks=False,
+            onerror=_raise_walk_error,
+        ):
+            for name in dirs:
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    raise RuntimeError(f"FLUX cache contains a symlink: {path!r}")
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    raise RuntimeError(f"FLUX cache contains a symlink: {path!r}")
+                if name.lower().endswith(_MODEL_WEIGHT_SUFFIXES):
+                    if os.path.getsize(path) <= 0:
+                        raise RuntimeError(
+                            f"FLUX snapshot contains an empty model weight: {path!r}"
+                        )
+                    model_weights.append(path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"unable to inspect FLUX snapshot {cached_model_dir!r}"
+        ) from exc
+
+    if not model_weights:
+        raise RuntimeError(
+            "FLUX cache is neither an exact-one-file standalone checkpoint "
+            "nor a snapshot containing model weights"
+        )
+    return _SNAPSHOT_LAYOUT, None
 
 
 def resolve_standalone_model_file(cached_model_dir: str) -> str:
-    """Resolve exactly one direct-child FLUX checkpoint, failing closed."""
-    if not os.path.isdir(cached_model_dir):
-        raise FileNotFoundError(
-            f"standalone FLUX cache directory not found: {cached_model_dir!r}"
-        )
-    candidates = sorted(
-        os.path.join(cached_model_dir, name)
-        for name in os.listdir(cached_model_dir)
-        if name.lower().endswith(".safetensors")
-        and os.path.isfile(os.path.join(cached_model_dir, name))
-        and not os.path.islink(os.path.join(cached_model_dir, name))
-    )
-    if len(candidates) != 1:
+    """Resolve only the downloader's normalized one-file FLUX shape."""
+    layout, checkpoint = resolve_flux_cache_layout(cached_model_dir)
+    if layout != _STANDALONE_LAYOUT or checkpoint is None:
         raise RuntimeError(
-            "standalone FLUX cache must contain exactly one direct "
-            f".safetensors file; found {len(candidates)}"
+            "standalone FLUX cache must match G.O.D's exact-one direct "
+            ".safetensors contract without Diffusers/index/shard markers"
         )
-    return candidates[0]
+    return checkpoint
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
 
 
 def _config_path(spec: ImageSpec) -> str:
@@ -147,6 +311,7 @@ def _run_kohya(
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=_kohya_subprocess_env(),
             )
             while proc.poll() is None:
                 # Deadline.remaining() already excludes the CLI's 180-second
@@ -171,12 +336,14 @@ def _run_kohya(
         stopped_by_deadline=stopped_by_deadline,
         elapsed_s=round(time.monotonic() - started, 1),
     )
-    loss, step = _parse_log(log_path)
-    if loss is not None or step is not None:
-        telemetry.event("kohya_metrics", loss=loss, last_step=step)
+    loss = _parse_loss(log_path)
     if loss is not None:
+        # Checkpoint selection is the only authoritative source of training
+        # progress. Kohya logs contain many unrelated ``current/total`` counters
+        # (cache passes, data loaders, saves), so publishing a guessed last_step
+        # can contradict the checkpoint record. Retain the observed loss only.
+        telemetry.event("kohya_metrics", loss=loss)
         telemetry.sample("final_loss", loss)
-        telemetry.train_point(step or 0, loss, None)
 
     if (
         rc not in (0, None)
@@ -258,9 +425,8 @@ def _log_path(spec: ImageSpec) -> str:
     )
 
 
-def _parse_log(path: str) -> tuple[float | None, int | None]:
+def _parse_loss(path: str) -> float | None:
     loss = None
-    step = None
     try:
         with open(path, encoding="utf-8", errors="ignore") as fh:
             text = fh.read()
@@ -268,12 +434,36 @@ def _parse_log(path: str) -> tuple[float | None, int | None]:
         losses = re.findall(rf"(?:loss|avr_loss)[=:]\s*({number})", text, re.I)
         if losses:
             loss = float(losses[-1])
-        progress = re.findall(r"(\d+)\s*/\s*(\d+)", text)
-        if progress:
-            step = int(progress[-1][0])
     except Exception:
         pass
-    return loss, step
+    return loss
+
+
+def _kohya_subprocess_env() -> dict[str, str]:
+    """Return a child-only environment for the pinned Kohya dependency graph.
+
+    The legacy image carries ai-toolkit as its default Python graph so directory
+    snapshots work. Its Kohya graph remains at the pinned base-image location
+    and is exposed only to the standalone subprocess; mixing both graphs in one
+    interpreter would make dispatch shape-aware but runtime behavior ambiguous.
+    """
+    env = os.environ.copy()
+    kohya_pythonpath = env.get(_KOHYA_PYTHONPATH_ENV)
+    if kohya_pythonpath:
+        env["PYTHONPATH"] = kohya_pythonpath
+    kohya_library_path = env.get(_KOHYA_LD_LIBRARY_PATH_ENV)
+    if kohya_library_path:
+        env["LD_LIBRARY_PATH"] = kohya_library_path
+    kohya_ld_preload = env.get(_KOHYA_LD_PRELOAD_ENV)
+    if kohya_ld_preload:
+        env["LD_PRELOAD"] = kohya_ld_preload
+    kohya_protobuf = env.get(_KOHYA_PROTOBUF_ENV)
+    if kohya_protobuf:
+        env["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = kohya_protobuf
+    kohya_path = env.get(_KOHYA_PATH_ENV)
+    if kohya_path:
+        env["PATH"] = kohya_path
+    return env
 
 
 def _terminate(proc: subprocess.Popen) -> None:

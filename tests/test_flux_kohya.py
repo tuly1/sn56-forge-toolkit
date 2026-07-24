@@ -52,7 +52,7 @@ def _write_safetensors(path, tag: str = "test") -> bytes:
     return value
 
 
-def test_dispatch_uses_kohya_only_in_legacy_flux_image(monkeypatch):
+def test_dispatch_uses_shape_aware_flux_handler_only_in_legacy_image(monkeypatch):
     monkeypatch.delenv("FORGE_FLUX_BACKEND", raising=False)
     assert dispatch.for_model_type("flux").__module__ == "forge.tasks.aitoolkit"
 
@@ -61,21 +61,269 @@ def test_dispatch_uses_kohya_only_in_legacy_flux_image(monkeypatch):
     assert dispatch.for_model_type("krea2").__module__ == "forge.tasks.aitoolkit"
 
 
-def test_standalone_model_resolution_requires_exactly_one_direct_file(tmp_path):
+def test_standalone_model_resolution_matches_normalized_downloader_shape(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     only = model_dir / "base.safetensors"
     only.write_bytes(b"model")
-    (model_dir / "README.md").write_text("metadata", encoding="utf-8")
-    nested = model_dir / "nested"
-    nested.mkdir()
-    (nested / "ignored.safetensors").write_bytes(b"nested")
+    # huggingface_hub can retain nested local-dir metadata; G.O.D's normalizer
+    # removes other root files, and its legacy resolver counts root files only.
+    nested = model_dir / ".cache" / "huggingface"
+    nested.mkdir(parents=True)
+    (nested / "download.json").write_text("{}", encoding="utf-8")
 
     assert flux_kohya.resolve_standalone_model_file(str(model_dir)) == str(only)
 
-    (model_dir / "second.safetensors").write_bytes(b"second")
-    with pytest.raises(RuntimeError, match="exactly one"):
+    (model_dir / "README.md").write_text("metadata", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="exact-one direct"):
         flux_kohya.resolve_standalone_model_file(str(model_dir))
+
+
+def test_flux_cache_layout_routes_diffusers_snapshot_to_aitoolkit(tmp_path):
+    model_dir = tmp_path / "model"
+    (model_dir / "transformer").mkdir(parents=True)
+    (model_dir / "model_index.json").write_text("{}", encoding="utf-8")
+    weight = model_dir / "transformer" / "diffusion_pytorch_model.safetensors"
+    weight.write_bytes(b"model")
+
+    assert flux_kohya.resolve_flux_cache_layout(str(model_dir)) == (
+        "snapshot_directory",
+        None,
+    )
+
+
+def test_one_root_checkpoint_ignores_arbitrary_leftover_asset_directory(tmp_path):
+    model_dir = tmp_path / "model"
+    (model_dir / "examples").mkdir(parents=True)
+    root_checkpoint = model_dir / "root.safetensors"
+    root_checkpoint.write_bytes(b"root model")
+    (model_dir / "examples" / "README.md").write_text(
+        "{}", encoding="utf-8"
+    )
+    (model_dir / "examples" / "nested.safetensors").write_bytes(
+        b"unused nested model"
+    )
+
+    assert flux_kohya.resolve_flux_cache_layout(str(model_dir)) == (
+        "standalone_checkpoint",
+        str(root_checkpoint),
+    )
+
+
+def test_one_root_checkpoint_with_diffusers_component_routes_snapshot(tmp_path):
+    model_dir = tmp_path / "model"
+    transformer = model_dir / "transformer"
+    transformer.mkdir(parents=True)
+    (model_dir / "root.safetensors").write_bytes(b"root model")
+    (transformer / "config.json").write_text("{}", encoding="utf-8")
+    (transformer / "nested.safetensors").write_bytes(b"component model")
+
+    assert flux_kohya.resolve_flux_cache_layout(str(model_dir)) == (
+        "snapshot_directory",
+        None,
+    )
+
+
+def test_flux_cache_layout_routes_sharded_snapshot_to_aitoolkit(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"transformer.weight":"model-00001-of-00001.safetensors"}}',
+        encoding="utf-8",
+    )
+    (model_dir / "model-00001-of-00001.safetensors").write_bytes(b"model")
+
+    assert flux_kohya.resolve_flux_cache_layout(str(model_dir)) == (
+        "snapshot_directory",
+        None,
+    )
+
+
+def test_single_shard_named_weight_routes_snapshot_per_downloader_contract(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model-00001-of-00001.safetensors").write_bytes(b"model")
+
+    assert flux_kohya.resolve_flux_cache_layout(str(model_dir)) == (
+        "snapshot_directory",
+        None,
+    )
+
+
+def test_nested_weight_index_routes_snapshot(tmp_path):
+    model_dir = tmp_path / "model"
+    assets = model_dir / "assets"
+    assets.mkdir(parents=True)
+    (model_dir / "root.safetensors").write_bytes(b"root model")
+    (assets / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"weight":"root.safetensors"}}', encoding="utf-8"
+    )
+
+    assert flux_kohya.resolve_flux_cache_layout(str(model_dir)) == (
+        "snapshot_directory",
+        None,
+    )
+
+
+@pytest.mark.parametrize("cache_kind", ["empty", "weight_free", "empty_weight"])
+def test_flux_cache_layout_rejects_incomplete_cache(tmp_path, cache_kind):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    if cache_kind == "weight_free":
+        (model_dir / "README.md").write_text("metadata", encoding="utf-8")
+    elif cache_kind == "empty_weight":
+        (model_dir / "model.safetensors").touch()
+
+    with pytest.raises(RuntimeError):
+        flux_kohya.resolve_flux_cache_layout(str(model_dir))
+
+
+def test_standalone_layout_ignores_unreferenced_nested_symlink(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    only = model_dir / "base.safetensors"
+    only.write_bytes(b"model")
+    nested = model_dir / ".cache"
+    nested.mkdir()
+    (nested / "outside").symlink_to(tmp_path / "outside")
+
+    assert flux_kohya.resolve_flux_cache_layout(str(model_dir)) == (
+        "standalone_checkpoint",
+        str(only),
+    )
+
+
+def test_snapshot_layout_rejects_nested_symlink(tmp_path):
+    model_dir = tmp_path / "model"
+    transformer = model_dir / "transformer"
+    transformer.mkdir(parents=True)
+    (model_dir / "model_index.json").write_text("{}", encoding="utf-8")
+    (transformer / "weights.safetensors").write_bytes(b"model")
+    (transformer / "outside").symlink_to(tmp_path / "outside")
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        flux_kohya.resolve_flux_cache_layout(str(model_dir))
+
+
+def test_legacy_flux_handler_routes_cache_shape_without_guessing(monkeypatch, tmp_path):
+    from forge.tasks import aitoolkit
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    spec = _spec()
+    monkeypatch.setattr(
+        type(spec), "cached_model_dir", property(lambda self: str(model_dir))
+    )
+    calls = []
+    monkeypatch.setattr(
+        flux_kohya,
+        "_run_standalone_kohya",
+        lambda selected_spec, deadline, model: calls.append(("kohya", model)),
+    )
+    monkeypatch.setattr(
+        aitoolkit,
+        "run",
+        lambda selected_spec, deadline: calls.append(("aitoolkit", None)),
+    )
+    monkeypatch.setattr(flux_kohya.telemetry, "set_meta", lambda **values: None)
+    monkeypatch.setattr(flux_kohya.telemetry, "event", lambda *args, **values: None)
+
+    standalone = model_dir / "base.safetensors"
+    standalone.write_bytes(b"model")
+    flux_kohya.run(spec, object())
+    assert calls == [("kohya", str(standalone))]
+
+    calls.clear()
+    (model_dir / "model_index.json").write_text("{}", encoding="utf-8")
+    flux_kohya.run(spec, object())
+    assert calls == [("aitoolkit", None)]
+
+
+def test_kohya_subprocess_uses_only_its_pinned_dependency_paths(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/opt/sn56/ai-toolkit-python")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "")
+    monkeypatch.setenv(
+        "FORGE_KOHYA_PYTHONPATH",
+        "/home/.local/lib/python3.10/site-packages",
+    )
+    monkeypatch.setenv(
+        "FORGE_KOHYA_LD_LIBRARY_PATH",
+        "/usr/local/cuda/lib:/usr/local/cuda/lib64",
+    )
+    monkeypatch.setenv("FORGE_KOHYA_LD_PRELOAD", "libtcmalloc.so")
+    monkeypatch.setenv("FORGE_KOHYA_PROTOBUF_IMPLEMENTATION", "python")
+    monkeypatch.setenv("FORGE_KOHYA_PATH", "/kohya/bin:/usr/bin")
+
+    env = flux_kohya._kohya_subprocess_env()
+
+    assert env["PYTHONPATH"] == "/home/.local/lib/python3.10/site-packages"
+    assert env["LD_LIBRARY_PATH"] == "/usr/local/cuda/lib:/usr/local/cuda/lib64"
+    assert env["LD_PRELOAD"] == "libtcmalloc.so"
+    assert env["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] == "python"
+    assert env["PATH"] == "/kohya/bin:/usr/bin"
+
+
+def test_standalone_path_does_not_attest_the_parent_dependency_graph(
+    monkeypatch, tmp_path
+):
+    spec = _spec()
+    monkeypatch.setattr(
+        type(spec), "save_root", property(lambda self: str(tmp_path / "output"))
+    )
+    monkeypatch.setattr(
+        type(spec),
+        "training_folder",
+        property(lambda self: str(tmp_path / "training")),
+    )
+    monkeypatch.setattr(
+        flux_kohya.checkpoints, "ensure_run", lambda *args: {"scope": "test"}
+    )
+    monkeypatch.setattr(
+        flux_kohya.dataset,
+        "prepare_kohya_flux_dataset",
+        lambda *args, **kwargs: (str(tmp_path / "training"), 1),
+    )
+    monkeypatch.setattr(
+        flux_kohya.checkpoints,
+        "set_planned_steps",
+        lambda *args, **kwargs: {"scope": "test"},
+    )
+    monkeypatch.setattr(
+        flux_kohya.flux_kohya_config,
+        "build_config",
+        lambda **kwargs: {"save_every_n_steps": 25},
+    )
+    monkeypatch.setattr(
+        flux_kohya.flux_kohya_config, "write_config", lambda *args: None
+    )
+    monkeypatch.setattr(flux_kohya, "_run_kohya", lambda *args: None)
+    monkeypatch.setattr(
+        flux_kohya.checkpoints,
+        "finalize",
+        lambda *args, **kwargs: {
+            "status": "selected_current_run",
+            "source": "exact_final",
+            "selected_step": 250,
+        },
+    )
+    monkeypatch.setattr(flux_kohya.telemetry, "set_meta", lambda **kwargs: None)
+    monkeypatch.setattr(flux_kohya.telemetry, "event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        flux_kohya.telemetry,
+        "collect_env",
+        lambda: pytest.fail("parent ai-toolkit graph must not describe Kohya"),
+    )
+    monkeypatch.setattr(
+        flux_kohya.telemetry,
+        "note_peak_memory",
+        lambda: pytest.fail("parent Torch allocator did not train Kohya"),
+    )
+
+    flux_kohya._run_standalone_kohya(
+        spec,
+        object(),
+        str(tmp_path / "base.safetensors"),
+    )
 
 
 def test_standalone_model_resolution_rejects_symlink_only(tmp_path):
@@ -85,7 +333,7 @@ def test_standalone_model_resolution_rejects_symlink_only(tmp_path):
     outside.write_bytes(b"model")
     (model_dir / "linked.safetensors").symlink_to(outside)
 
-    with pytest.raises(RuntimeError, match="found 0"):
+    with pytest.raises(RuntimeError, match="symlink"):
         flux_kohya.resolve_standalone_model_file(str(model_dir))
 
 
@@ -266,10 +514,60 @@ def test_terminate_signals_the_process_group(monkeypatch):
     ]
 
 
-def test_kohya_log_parser_handles_scientific_loss(tmp_path):
+def test_kohya_log_parser_keeps_loss_but_does_not_infer_progress(tmp_path):
     log = tmp_path / "kohya.log"
     log.write_text(
-        "steps: 70%|#######| 175/250 [avr_loss=2.531e-02]\n",
+        "steps: 70%|#######| 175/250 [avr_loss=2.531e-02]\n"
+        "unrelated cache pass: 51/64\n",
         encoding="utf-8",
     )
-    assert flux_kohya._parse_log(str(log)) == (pytest.approx(0.02531), 175)
+    assert flux_kohya._parse_loss(str(log)) == pytest.approx(0.02531)
+    assert not hasattr(flux_kohya, "_parse_log")
+
+
+def test_kohya_metrics_never_publish_a_guessed_step(monkeypatch, tmp_path):
+    script_root = tmp_path / "sd-scripts"
+    script_root.mkdir()
+    (script_root / "flux_train_network.py").write_text("# test", encoding="utf-8")
+    log_path = tmp_path / "kohya.log"
+    events = []
+
+    class Process:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    class Deadline:
+        def remaining(self):
+            return 3600
+
+    def popen(command, **kwargs):
+        kwargs["stdout"].write(
+            "steps: 70%|#######| 175/250 [avr_loss=2.531e-02]\n"
+            "unrelated cache pass: 51/64\n"
+        )
+        kwargs["stdout"].flush()
+        return Process()
+
+    monkeypatch.setattr(flux_kohya, "_SD_SCRIPTS_DIR", str(script_root))
+    monkeypatch.setattr(flux_kohya, "_log_path", lambda spec: str(log_path))
+    monkeypatch.setattr(flux_kohya, "_start_gpu_sampler", lambda *args: None)
+    monkeypatch.setattr(flux_kohya.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        flux_kohya.telemetry,
+        "event",
+        lambda name, **values: events.append((name, values)),
+    )
+    monkeypatch.setattr(flux_kohya.telemetry, "sample", lambda *args: None)
+    monkeypatch.setattr(
+        flux_kohya.telemetry,
+        "train_point",
+        lambda *args: pytest.fail("an unbound loss must not become a train point"),
+    )
+
+    flux_kohya._run_kohya("/tmp/config.toml", Deadline(), _spec(), {})
+
+    assert [event for event in events if event[0] == "kohya_metrics"] == [
+        ("kohya_metrics", {"loss": pytest.approx(0.02531)})
+    ]
