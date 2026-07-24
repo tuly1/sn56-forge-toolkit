@@ -120,6 +120,7 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
     assert "FORGE_FLUX_BACKEND=kohya" in contents
     assert "AI_TOOLKIT_DIR=/app/ai-toolkit" in contents
     assert "PYTHONPATH=/opt/sn56/ai-toolkit-python" in contents
+    assert "PYTHONNOUSERSITE=1" in contents
     assert (
         "FORGE_KOHYA_PYTHONPATH=/home/.local/lib/python3.10/site-packages"
         in contents

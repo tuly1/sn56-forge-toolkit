@@ -40,6 +40,7 @@ RUN python3 -m pip install --no-cache-dir --no-deps \
 FROM diagonalge/kohya_latest:latest@sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e
 
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONNOUSERSITE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
