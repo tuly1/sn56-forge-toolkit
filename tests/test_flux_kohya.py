@@ -153,6 +153,7 @@ def test_operational_config_is_fixed_offline_and_kill_safe(tmp_path):
     assert config["network_alpha"] == 64
     assert config["seed"] == 2
     assert config["max_data_loader_n_workers"] == 4
+    assert config["tokenizer_cache_dir"] == "/app/flux/tokenizers"
     assert config["config_file"] == "/dataset/configs/task.toml"
     assert config["mem_eff_save"] is True
     assert "noise_offset_type" not in config
@@ -163,6 +164,7 @@ def test_operational_config_is_fixed_offline_and_kill_safe(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert 'pretrained_model_name_or_path = "/cache/models/base/model.safetensors"' in text
     assert 'network_args = ["train_double_block_indices=all"' in text
+    assert 'tokenizer_cache_dir = "/app/flux/tokenizers"' in text
     assert not (path.parent / "task.toml.tmp").exists()
 
 

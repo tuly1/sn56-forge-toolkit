@@ -25,6 +25,7 @@ WINNER_REFERENCE = (
 AE_PATH = "/app/flux/ae.safetensors"
 CLIP_L_PATH = "/app/flux/clip_l.safetensors"
 T5XXL_PATH = "/app/flux/t5xxl_fp16.safetensors"
+TOKENIZER_CACHE_DIR = "/app/flux/tokenizers"
 
 
 def build_config(
@@ -51,6 +52,7 @@ def build_config(
         "clip_l": CLIP_L_PATH,
         "t5xxl": T5XXL_PATH,
         "t5xxl_max_token_length": 512,
+        "tokenizer_cache_dir": TOKENIZER_CACHE_DIR,
         "apply_t5_attn_mask": True,
         # Output. No Hub or tracker keys are emitted: tournament runtime is
         # offline and the validator uploads this directory itself.

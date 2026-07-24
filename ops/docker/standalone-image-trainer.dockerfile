@@ -27,6 +27,11 @@ RUN test -f /app/sd-scripts/flux_train_network.py && \
 
 WORKDIR /app
 COPY forge/ /app/forge/
-RUN python3 -m forge.verify_flux_kohya_runtime
+RUN HF_HOME=/tmp/forge-flux-tokenizer-download \
+    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 \
+    python3 -m forge.flux_kohya_tokenizers stage && \
+    python3 -c "import shutil; shutil.rmtree('/tmp/forge-flux-tokenizer-download')" && \
+    python3 -m forge.flux_kohya_tokenizers verify && \
+    python3 -m forge.verify_flux_kohya_runtime
 
 ENTRYPOINT ["dumb-init", "--", "python3", "-m", "forge.cli"]

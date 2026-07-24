@@ -116,6 +116,14 @@ def test_legacy_flux_image_is_a_pinned_offline_kohya_runtime():
     assert "SD_SCRIPTS_DIR=/app/sd-scripts" in contents
     assert "flux_train_network.py" in contents
     assert "python3 -m forge.verify_flux_kohya_runtime" in contents
+    assert "python3 -m forge.flux_kohya_tokenizers stage" in contents
+    assert "python3 -m forge.flux_kohya_tokenizers verify" in contents
+    assert "32bd64288804d66eefd0ccbe215aa642df71cc41" in (
+        ROOT / "forge/flux_kohya_tokenizers.py"
+    ).read_text(encoding="utf-8")
+    assert "3db67ab1af984cf10548a73467f0e5bca2aaaeb2" in (
+        ROOT / "forge/flux_kohya_tokenizers.py"
+    ).read_text(encoding="utf-8")
     assert 'ENTRYPOINT ["dumb-init", "--", "python3", "-m", "forge.cli"]' in contents
     assert "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38" in contents
     assert "660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd" in contents
