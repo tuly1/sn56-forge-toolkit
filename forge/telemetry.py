@@ -1,28 +1,41 @@
-"""Flight recorder: a small JSON written into the output directory.
+"""Private flight recorder plus a minimal, hash-bound public projection.
 
-The training container runs on the validator's hardware and its console is never
-shown to us; the only artifact we reliably get back is the uploaded output
-folder. So we keep a compact run log *inside* that folder (`forge_run.json`,
-which the uploader does not filter out) and update it throughout the run. After
-a tournament we can download our own uploaded repos and reconstruct exactly what
-happened on each task — the post-mortem that makes week-over-week improvement
-possible.
+The validator uploads the exact checkpoint output directory.  Detailed recipe,
+environment, curve, and selection telemetry is useful for local calibration but
+also discloses the trainer's strategy when written there.  Full telemetry is
+therefore checkpointed only in a nonce-scoped, container-local ``/tmp``
+directory which is neither uploaded nor backed by G.O.D's shared checkpoint
+volume.  The upload root receives a strict allowlist projection containing
+event classes, relative timings, failure classes, and the SHA-256 of the exact
+private record bytes.
 
-Design rules: never raise (a diagnostic must not cost a run), never grow beyond
-a few hundred KB (curves are thinned), and never record anything sensitive
-(nothing sensitive exists in the container anyway).
+Design rules: never raise (a diagnostic must not cost a run), never put the full
+record below the upload root, construct the public schema by allowlist rather
+than subtraction, and keep both writes atomic and durable on a best-effort basis.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
+import shutil
 import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+import uuid
 
 _FILENAME = "forge_run.json"
+_PRIVATE_FILENAME = "forge_run.full.json"
+_PRIVATE_RECORD_NAME_RE = re.compile(
+    r"forge_run\.full(?:\.[0-9a-f]{64})?\.json"
+)
+_PRIVATE_ROOT = "/tmp/forge-private"
+_RUN_NONCE = uuid.uuid4().hex
+_BOUND_RUN_KEYS: dict[str, str] = {}
+_LATEST_PRIVATE_RECORDS: dict[str, str] = {}
 _MAX_EVENTS = 200
 _MAX_CURVE_POINTS = 300
 _MAX_SAMPLES = 120
@@ -81,6 +94,28 @@ _data: dict[str, Any] = {
     "eval_curve": [],  # (rel_s, step, eval_loss)
     "samples": {},  # name -> [(rel_s, value)]
 }
+
+
+def start_run(**meta: Any) -> None:
+    """Reset process-global telemetry for one CLI invocation, then initialize it."""
+    global _data, _t0, _RUN_NONCE, _BOUND_RUN_KEYS, _LATEST_PRIVATE_RECORDS
+    try:
+        _t0 = time.monotonic()
+        _RUN_NONCE = uuid.uuid4().hex
+        _BOUND_RUN_KEYS = {}
+        _LATEST_PRIVATE_RECORDS = {}
+        _data = {
+            "schema": 1,
+            "meta": {},
+            "env": {},
+            "events": [],
+            "train_curve": [],
+            "eval_curve": [],
+            "samples": {},
+        }
+        init(**meta)
+    except Exception:
+        pass
 
 
 def _rel() -> float:
@@ -182,20 +217,284 @@ def note_peak_memory() -> None:
 
 
 def write_into(output_dir: str) -> None:
-    """Atomically (tmp+replace) drop the log into the folder that gets uploaded."""
+    """Checkpoint the private record and refresh its safe public projection.
+
+    This compatibility entry point is used by callbacks during training.  It is
+    intentionally safe to call before the terminal post-selection scrub: the
+    only file it writes below ``output_dir`` is the strict public projection.
+    """
     try:
         if not os.path.isdir(output_dir):
             return
-        _data["meta"]["last_write_rel_s"] = _rel()
-        tmp = os.path.join(output_dir, _FILENAME + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(_data, fh, separators=(",", ":"), default=str)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, os.path.join(output_dir, _FILENAME))
-        _fsync_directory(output_dir)
+        digest = write_private(output_dir) or private_record_sha256()
+        if digest:
+            write_public(output_dir, digest)
     except Exception:
         pass
+
+
+def write_private(output_dir: str) -> str | None:
+    """Atomically persist canonical full telemetry outside the upload root.
+
+    Returns the SHA-256 of the exact bytes written, or ``None`` on any failure.
+    The returned digest is suitable for the public recorder's binding field.
+    """
+    try:
+        if not os.path.isdir(output_dir):
+            return None
+        _data["meta"]["last_write_rel_s"] = _rel()
+        payload = _canonical_private_bytes()
+        private_dir = _secure_private_bundle_dir(output_dir)
+        if private_dir is None:
+            return None
+        digest = hashlib.sha256(payload).hexdigest()
+        path = os.path.join(private_dir, f"forge_run.full.{digest}.json")
+        if not os.path.isfile(path):
+            _atomic_bytes(path, payload)
+        elif _sha256_file(path) != digest:
+            return None
+        _LATEST_PRIVATE_RECORDS[os.path.abspath(output_dir)] = path
+        return digest
+    except Exception:
+        return None
+
+
+def write_public(output_dir: str, private_sha256: str) -> bool:
+    """Atomically write the strict public recorder into the upload root."""
+    try:
+        if not os.path.isdir(output_dir) or not re.fullmatch(
+            r"[0-9a-f]{64}", str(private_sha256)
+        ):
+            return False
+        payload = json.dumps(
+            public_record(private_sha256),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        _atomic_bytes(os.path.join(output_dir, _FILENAME), payload)
+        return True
+    except Exception:
+        return False
+
+
+def bind_private_bundle(output_dir: str, attempt_nonce: str) -> None:
+    """Bind future private writes for one upload root to its checkpoint attempt."""
+    try:
+        if not isinstance(attempt_nonce, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]{8,128}", attempt_nonce
+        ):
+            return
+        _BOUND_RUN_KEYS[os.path.abspath(output_dir)] = attempt_nonce
+    except Exception:
+        pass
+
+
+def write_public_snapshot(output_dir: str) -> bool:
+    """Replace stale public telemetry without touching any prior private record."""
+    try:
+        digest = private_record_sha256()
+        return bool(digest and write_public(output_dir, digest))
+    except Exception:
+        return False
+
+
+def prepare_public_recorder(output_dir: str) -> bool:
+    """Remove stale/full recorder slots, then install a safe initial projection."""
+    try:
+        if not os.path.isdir(output_dir):
+            return False
+        names = {_FILENAME, _FILENAME + ".tmp", _PRIVATE_FILENAME}
+        names.update(
+            name
+            for name in os.listdir(output_dir)
+            if _PRIVATE_RECORD_NAME_RE.fullmatch(name)
+        )
+        for name in names:
+            path = os.path.join(output_dir, name)
+            if not os.path.lexists(path):
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+        _fsync_directory(output_dir)
+        return write_public_snapshot(output_dir)
+    except Exception:
+        return False
+
+
+def private_record_sha256() -> str | None:
+    """Hash the current in-memory private record without persisting it."""
+    try:
+        return hashlib.sha256(_canonical_private_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def public_record(private_sha256: str) -> dict[str, Any]:
+    """Build the public recorder exclusively from explicitly allowed fields."""
+    events: list[dict[str, Any]] = []
+    for raw in _data.get("events", []):
+        if not isinstance(raw, dict):
+            continue
+        name = _public_event_name(raw.get("name"))
+        timing = raw.get("t")
+        if name is None or isinstance(timing, bool) or not isinstance(
+            timing, (int, float)
+        ) or not math.isfinite(float(timing)):
+            continue
+        item: dict[str, Any] = {"t": round(float(timing), 1), "name": name}
+        failure_class = _public_failure_class(raw)
+        if failure_class is not None:
+            item["failure_class"] = failure_class
+        events.append(item)
+    return {
+        "schema": 2,
+        "kind": "forge-public-run-recorder",
+        "private_record_sha256": str(private_sha256),
+        "events": events,
+    }
+
+
+def private_bundle_dir(output_dir: str) -> str:
+    """Return this process-run's container-local ephemeral private bundle."""
+    absolute = os.path.abspath(output_dir)
+    run_key = _BOUND_RUN_KEYS.get(absolute, _RUN_NONCE)
+    suffix = hashlib.sha256(
+        f"{absolute}\0{run_key}".encode("utf-8")
+    ).hexdigest()[:24]
+    return os.path.join(_PRIVATE_ROOT, suffix)
+
+
+def private_record_path(output_dir: str) -> str:
+    """Return the latest immutable private record path for this run."""
+    path = _LATEST_PRIVATE_RECORDS.get(os.path.abspath(output_dir))
+    if path:
+        return path
+    return os.path.join(private_bundle_dir(output_dir), _PRIVATE_FILENAME)
+
+
+def private_record_path_for_digest(output_dir: str, digest: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", str(digest)):
+        raise ValueError("private record digest must be lowercase SHA-256")
+    return os.path.join(
+        private_bundle_dir(output_dir), f"forge_run.full.{digest}.json"
+    )
+
+
+def ensure_private_bundle_dir(output_dir: str) -> str | None:
+    """Return a securely validated ephemeral private directory, if available."""
+    return _secure_private_bundle_dir(output_dir)
+
+
+def _canonical_private_bytes() -> bytes:
+    return json.dumps(
+        _data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+
+
+def _public_event_name(value: Any) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", value):
+        return None
+    return value
+
+
+def _public_failure_class(event_value: dict[str, Any]) -> str | None:
+    """Extract only an exception *type*, never a message or reason string."""
+    raw = event_value.get("error")
+    if not isinstance(raw, str):
+        return None
+    match = re.match(r"^([A-Za-z_][A-Za-z0-9_.]{0,95})(?::|\()", raw)
+    return match.group(1) if match else None
+
+
+def _atomic_bytes(path: str, payload: bytes) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(
+        parent, f".{os.path.basename(path)}.{uuid.uuid4().hex}.tmp"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(tmp, flags, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_directory(parent)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _is_descendant(path: str, directory: str) -> bool:
+    try:
+        return os.path.commonpath(
+            (os.path.abspath(path), os.path.abspath(directory))
+        ) == os.path.abspath(directory)
+    except (OSError, ValueError):
+        return True
+
+
+def _secure_private_bundle_dir(output_dir: str) -> str | None:
+    """Create/validate the private directory without following symlink leaves."""
+    try:
+        root = os.path.abspath(_PRIVATE_ROOT)
+        if os.path.lexists(root) and os.path.islink(root):
+            return None
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        bundle = os.path.abspath(private_bundle_dir(output_dir))
+        if os.path.commonpath((bundle, root)) != root:
+            return None
+        if os.path.lexists(bundle):
+            if os.path.islink(bundle) or not os.path.isdir(bundle):
+                return None
+        else:
+            os.mkdir(bundle, mode=0o700)
+        os.chmod(bundle, 0o700)
+        real_bundle = os.path.realpath(bundle)
+        real_root = os.path.realpath(root)
+        real_output = os.path.realpath(output_dir)
+        if (
+            os.path.commonpath((real_bundle, real_root)) != real_root
+            or _is_descendant(real_bundle, real_output)
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(bundle, flags)
+        try:
+            stat_fd = os.fstat(fd)
+            stat_path = os.lstat(bundle)
+            if (stat_fd.st_dev, stat_fd.st_ino) != (
+                stat_path.st_dev,
+                stat_path.st_ino,
+            ):
+                return None
+        finally:
+            os.close(fd)
+        return bundle
+    except Exception:
+        return None
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _fsync_directory(path: str) -> None:

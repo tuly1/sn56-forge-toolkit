@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+import subprocess
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+LOCK = ROOT / "ops/docker/image-runtime-lock.txt"
+CONSTRAINTS = ROOT / "ops/docker/image-runtime-phase1-constraints.txt"
+VERIFIER = ROOT / "ops/docker/verify_image_runtime.py"
+DOCKERFILES = (
+    ROOT / "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+    ROOT / "ops/docker/standalone-image-trainer.dockerfile",
+)
+
+SPEC = importlib.util.spec_from_file_location("verify_image_runtime", VERIFIER)
+assert SPEC is not None and SPEC.loader is not None
+verify_image_runtime = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(verify_image_runtime)
+
+
+def _result(returncode: int, stdout: str, stderr: str = ""):
+    return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+
+
+def _runner(*results):
+    calls = []
+    queue = list(results)
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return queue.pop(0)
+
+    run.calls = calls
+    return run
+
+
+def test_certified_lock_is_exact_evidence_inventory():
+    lines = LOCK.read_text(encoding="utf-8").splitlines()
+
+    assert len(lines) == 185
+    assert (
+        verify_image_runtime.GOLDEN_INVENTORY_SHA256
+        == "9c4c15130508c547c67d891f559ca1a513cd62bd5a4b695eb25ceafccd0b850b"
+    )
+    assert (
+        "easy_dwpose @ git+https://github.com/jaretburkett/easy_dwpose.git@"
+        "028aa1449f9e07bdeef7f84ed0ce7a2660e72239"
+    ) in lines
+    assert "huggingface_hub==1.10.1" in lines
+
+
+def test_phase1_constraints_are_the_exact_mechanical_derivation():
+    inventory = LOCK.read_text(encoding="utf-8")
+    constraints = CONSTRAINTS.read_text(encoding="utf-8")
+
+    assert constraints == verify_image_runtime.derive_phase1_constraints(inventory)
+    assert len(constraints.splitlines()) == 162
+    assert (
+        verify_image_runtime.PHASE1_CONSTRAINTS_SHA256
+        == "864ed2d3c45f86464b189e3f1685e0578eae2af9ecf49e6bb63cadf3a85986ac"
+    )
+
+    excluded = [
+        line
+        for line in inventory.splitlines()
+        if verify_image_runtime.phase1_excludes(line)
+    ]
+    excluded_names = {
+        verify_image_runtime.distribution_name(line) for line in excluded
+    }
+    prefixed_names = {
+        name
+        for name in excluded_names
+        if name.startswith("nvidia-") or name.startswith("cuda-")
+    }
+    assert len(excluded) == 23
+    assert excluded_names - prefixed_names == set(
+        verify_image_runtime.PHASE1_EXCLUDED_NAMES
+    )
+    assert not any(
+        verify_image_runtime.phase1_excludes(line)
+        for line in constraints.splitlines()
+    )
+
+
+def test_both_image_dockerfiles_apply_the_same_two_phase_lock():
+    contents = [path.read_text(encoding="utf-8") for path in DOCKERFILES]
+
+    assert contents[0] == contents[1]
+    assert contents[0].count("Phase 1") == 1
+    assert contents[0].count("Phase 2") == 1
+    assert "--no-deps" in contents[0]
+    assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents[0]
+    assert "python3 /opt/sn56/verify-image-runtime.py" in contents[0]
+    assert (
+        contents[0].count(
+            "--constraint /opt/sn56/image-runtime-phase1-constraints.txt"
+        )
+        == 2
+    )
+    assert "--files-only" in contents[0]
+
+
+def test_image_sources_are_pinned_to_certified_identities():
+    dockerfile = DOCKERFILES[0].read_text(encoding="utf-8")
+    inventory = LOCK.read_text(encoding="utf-8")
+
+    assert (
+        "FROM diagonalge/ai-toolkit:latest@sha256:"
+        "c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8"
+    ) in dockerfile
+    assert dockerfile.count("99be3d96a2468d3a5228a4eb05ba67e63c586b4e") == 2
+    assert (
+        "diffusers @ git+https://github.com/huggingface/diffusers.git@"
+        "dc8d9032171c83741fd37ed2b12bc9d8274464f3"
+    ) in inventory
+    assert (
+        "easy_dwpose @ git+https://github.com/jaretburkett/easy_dwpose.git@"
+        "028aa1449f9e07bdeef7f84ed0ce7a2660e72239"
+    ) in inventory
+
+
+def test_runtime_lock_wording_is_limited_to_metadata_inventory():
+    implementation = "\n".join(
+        [
+            DOCKERFILES[0].read_text(encoding="utf-8"),
+            VERIFIER.read_text(encoding="utf-8"),
+        ]
+    ).lower()
+
+    assert "version/vcs metadata inventory" in implementation
+    assert "does not attest downloaded wheel bytes" in implementation
+    assert "hermetic" not in implementation
+    assert "byte-identical" not in implementation
+    assert "overlays every" not in implementation
+
+
+def test_verifier_accepts_only_the_certified_runtime_and_conflict():
+    expected_freeze = LOCK.read_text(encoding="utf-8")
+    allowed_conflict = verify_image_runtime.ALLOWED_PIP_CHECK_LINES[0]
+    run = _runner(_result(0, expected_freeze), _result(1, allowed_conflict + "\n"))
+
+    result = verify_image_runtime.verify_runtime(
+        LOCK, CONSTRAINTS, runner=run, python_executable="/runtime/python"
+    )
+
+    assert result == {
+        "result": "PASS",
+        "verification_scope": "pip-freeze-version-vcs-metadata",
+        "inventory_sha256": verify_image_runtime.GOLDEN_INVENTORY_SHA256,
+        "inventory_entry_count": 185,
+        "phase1_constraints_sha256": verify_image_runtime.PHASE1_CONSTRAINTS_SHA256,
+        "phase1_constraint_count": 162,
+        "allowed_pip_check_conflicts": [allowed_conflict],
+    }
+    assert [call[0] for call in run.calls] == [
+        ["/runtime/python", "-m", "pip", "freeze", "--all"],
+        ["/runtime/python", "-m", "pip", "check"],
+    ]
+
+
+def test_verifier_rejects_a_runtime_freeze_mismatch():
+    run = _runner(_result(0, LOCK.read_text(encoding="utf-8") + "drift==1\n"))
+
+    with pytest.raises(
+        verify_image_runtime.VerificationError, match="metadata inventory mismatch"
+    ):
+        verify_image_runtime.verify_runtime(LOCK, CONSTRAINTS, runner=run)
+
+
+def test_verifier_rejects_pip_diagnostics_on_stderr():
+    run = _runner(_result(0, LOCK.read_text(encoding="utf-8"), "invalid metadata\n"))
+
+    with pytest.raises(verify_image_runtime.VerificationError, match="freeze emitted stderr"):
+        verify_image_runtime.verify_runtime(LOCK, CONSTRAINTS, runner=run)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "output"),
+    [
+        (0, ""),
+        (
+            1,
+            verify_image_runtime.ALLOWED_PIP_CHECK_LINES[0]
+            + "\nanother 1 has requirement missing>=2, but you have missing 1.\n",
+        ),
+        (1, ""),
+    ],
+)
+def test_verifier_rejects_any_other_pip_check_state(returncode, output):
+    run = _runner(
+        _result(0, LOCK.read_text(encoding="utf-8")),
+        _result(returncode, output),
+    )
+
+    with pytest.raises(verify_image_runtime.VerificationError, match="pip check"):
+        verify_image_runtime.verify_runtime(LOCK, CONSTRAINTS, runner=run)
+
+
+def test_verifier_rejects_an_edited_golden_lock(tmp_path):
+    edited_lock = tmp_path / "image-runtime-lock.txt"
+    edited_lock.write_text(LOCK.read_text(encoding="utf-8") + "drift==1\n")
+
+    with pytest.raises(verify_image_runtime.VerificationError, match="digest mismatch"):
+        verify_image_runtime.verify_runtime(edited_lock, CONSTRAINTS, runner=_runner())
+
+
+def test_verifier_rejects_an_edited_phase1_constraints(tmp_path):
+    edited_constraints = tmp_path / "image-runtime-phase1-constraints.txt"
+    edited_constraints.write_text(
+        CONSTRAINTS.read_text(encoding="utf-8") + "drift==1\n"
+    )
+
+    with pytest.raises(verify_image_runtime.VerificationError, match="digest mismatch"):
+        verify_image_runtime.verify_metadata_files(LOCK, edited_constraints)
+
+
+def test_allowed_pip_check_conflict_is_exact_and_singular():
+    assert verify_image_runtime.ALLOWED_PIP_CHECK_LINES == (
+        "easy-dwpose 1.0.3 has requirement huggingface_hub<1.0,>=0.26, "
+        "but you have huggingface-hub 1.10.1.",
+    )

@@ -376,7 +376,6 @@ def _finalize(spec: ImageSpec, scope: dict | None = None) -> None:
         selected_step=record["selected_step"],
     )
     telemetry.note_peak_memory()
-    telemetry.write_into(spec.output_dir)
 
 
 def _has_current_lora(spec: ImageSpec, scope: dict) -> bool:
