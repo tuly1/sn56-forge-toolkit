@@ -467,6 +467,8 @@ def test_kohya_exact_final_beats_periodics(tmp_path):
     assert (tmp_path / "last.safetensors").read_bytes() == final
     assert record["source"] == "exact_final"
     assert record["selected_step"] == 250
+    assert "current run's exact final" in record["reason"]
+    assert "ai-toolkit" not in record["reason"]
 
 
 def test_kohya_truncated_newest_falls_back_to_valid_periodic(tmp_path):

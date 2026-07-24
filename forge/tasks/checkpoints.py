@@ -396,7 +396,7 @@ def _default_selection(
             source="exact_final",
             reason=(
                 "no authoritative held-out selection and no clear sustained "
-                "late training-loss divergence; selected ai-toolkit's exact final"
+                "late training-loss divergence; selected the current run's exact final"
             ),
             step=_planned_steps(state),
         )
