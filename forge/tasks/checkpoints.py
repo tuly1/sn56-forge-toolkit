@@ -242,11 +242,18 @@ def set_planned_steps(
 
 
 def current_loras(save_root: str, state: dict[str, Any] | None) -> list[str]:
-    """Return only validly named LoRAs created or replaced in this run."""
+    """Return only validly named LoRAs created or replaced in this run.
+
+    ai-toolkit writes ``repo_000000123.safetensors`` while Kohya writes
+    ``repo-step00000123.safetensors``. The exact final is ``repo.safetensors``
+    on both backends.
+    """
     if not _scope_is_complete(state) or not os.path.isdir(save_root):
         return []
     repo = str(state.get("repo") or "")
-    periodic = re.compile(rf"^{re.escape(repo)}_\d+\.safetensors$")
+    periodic = re.compile(
+        rf"^{re.escape(repo)}(?:_\d+|-step\d+)\.safetensors$"
+    )
     out: list[str] = []
     for name in os.listdir(save_root):
         if name != f"{repo}.safetensors" and periodic.fullmatch(name) is None:
@@ -389,7 +396,7 @@ def _default_selection(
             source="exact_final",
             reason=(
                 "no authoritative held-out selection and no clear sustained "
-                "late training-loss divergence; selected ai-toolkit's exact final"
+                "late training-loss divergence; selected the current run's exact final"
             ),
             step=_planned_steps(state),
         )
@@ -1075,7 +1082,10 @@ def _is_current(path: str, state: dict[str, Any] | None) -> bool:
 
 
 def _step_of(path: str) -> int:
-    match = re.search(r"_(\d+)\.safetensors$", os.path.basename(path))
+    match = re.search(
+        r"(?:_|-step)(\d+)\.safetensors$",
+        os.path.basename(path),
+    )
     return int(match.group(1)) if match else -1
 
 

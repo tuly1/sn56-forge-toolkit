@@ -11,10 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "ops/docker/image-runtime-lock.txt"
 CONSTRAINTS = ROOT / "ops/docker/image-runtime-phase1-constraints.txt"
 VERIFIER = ROOT / "ops/docker/verify_image_runtime.py"
-DOCKERFILES = (
-    ROOT / "ops/docker/standalone-image-toolkit-trainer.dockerfile",
-    ROOT / "ops/docker/standalone-image-trainer.dockerfile",
+TOOLKIT_DOCKERFILE = (
+    ROOT / "ops/docker/standalone-image-toolkit-trainer.dockerfile"
 )
+LEGACY_FLUX_DOCKERFILE = ROOT / "ops/docker/standalone-image-trainer.dockerfile"
 
 SPEC = importlib.util.spec_from_file_location("verify_image_runtime", VERIFIER)
 assert SPEC is not None and SPEC.loader is not None
@@ -87,26 +87,155 @@ def test_phase1_constraints_are_the_exact_mechanical_derivation():
     )
 
 
-def test_both_image_dockerfiles_apply_the_same_two_phase_lock():
-    contents = [path.read_text(encoding="utf-8") for path in DOCKERFILES]
+def test_toolkit_image_applies_the_certified_two_phase_lock():
+    contents = TOOLKIT_DOCKERFILE.read_text(encoding="utf-8")
 
-    assert contents[0] == contents[1]
-    assert contents[0].count("Phase 1") == 1
-    assert contents[0].count("Phase 2") == 1
-    assert "--no-deps" in contents[0]
-    assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents[0]
-    assert "python3 /opt/sn56/verify-image-runtime.py" in contents[0]
+    assert contents.count("Phase 1") == 1
+    assert contents.count("Phase 2") == 1
+    assert "--no-deps" in contents
+    assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents
+    assert "python3 /opt/sn56/verify-image-runtime.py" in contents
     assert (
-        contents[0].count(
+        contents.count(
             "--constraint /opt/sn56/image-runtime-phase1-constraints.txt"
         )
         == 2
     )
-    assert "--files-only" in contents[0]
+    assert "--files-only" in contents
+
+
+def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
+    contents = LEGACY_FLUX_DOCKERFILE.read_text(encoding="utf-8")
+
+    assert contents != TOOLKIT_DOCKERFILE.read_text(encoding="utf-8")
+    assert (
+        "FROM diagonalge/ai-toolkit:latest@sha256:"
+        "c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8 "
+        "AS aitoolkit-runtime"
+    ) in contents
+    assert (
+        "FROM diagonalge/kohya_latest:latest@sha256:"
+        "d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e"
+    ) in contents
+    assert "FORGE_FLUX_BACKEND=kohya" in contents
+    assert "AI_TOOLKIT_DIR=/app/ai-toolkit" in contents
+    assert "PYTHONPATH=/opt/sn56/ai-toolkit-python" in contents
+    assert "PYTHONNOUSERSITE=1" in contents
+    assert (
+        "FORGE_KOHYA_PYTHONPATH=/home/.local/lib/python3.10/site-packages"
+        in contents
+    )
+    assert "FORGE_KOHYA_LD_PRELOAD=libtcmalloc.so" in contents
+    assert "FORGE_KOHYA_PROTOBUF_IMPLEMENTATION=python" in contents
+    assert "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb" in contents
+    assert (
+        "COPY --from=aitoolkit-runtime /app/ai-toolkit/ /app/ai-toolkit/"
+        in contents
+    )
+    assert (
+        "COPY --from=aitoolkit-runtime "
+        "/usr/local/lib/python3.10/dist-packages/ "
+        "/opt/sn56/ai-toolkit-python/"
+    ) in contents
+    for system_distribution, target_name in (
+        ("pip", "pip"),
+        ("pip-22.0.2.dist-info", "pip-22.0.2.dist-info"),
+        ("wheel", "wheel"),
+        ("wheel-0.37.1.egg-info", "wheel-0.37.1.egg-info"),
+    ):
+        assert (
+            "COPY --from=aitoolkit-runtime "
+            f"/usr/lib/python3/dist-packages/{system_distribution}/ "
+            f"/opt/sn56/ai-toolkit-python/{target_name}/"
+        ) in contents
+    assert contents.count("99be3d96a2468d3a5228a4eb05ba67e63c586b4e") == 3
+    assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents
+    assert "python3 /opt/sn56/verify-image-runtime.py" in contents
+    assert "assert torch.__version__ == '2.6.0+cu124'" in contents
+    assert "assert torch.version.cuda == '12.4'" in contents
+    assert "startswith('/opt/sn56/ai-toolkit-python/')" in contents
+    assert "SD_SCRIPTS_DIR=/app/sd-scripts" in contents
+    assert "flux_train_network.py" in contents
+    assert "python3 -m forge.verify_flux_kohya_runtime" in contents
+    assert "python3 -m forge.flux_kohya_tokenizers stage" in contents
+    assert "python3 -m forge.flux_kohya_tokenizers verify" in contents
+    # ai-toolkit's bitsandbytes/Triton import JITs a CUDA helper on first use.
+    # The Debian Kohya base has no compiler or libc headers unless we add them.
+    assert "gcc=4:12.2.0-3" in contents
+    assert "gcc-12=12.2.0-14+deb12u1" in contents
+    assert "gcc-12-base=12.2.0-14+deb12u1" in contents
+    assert "libc-bin=2.36-9+deb12u14" in contents
+    assert "libc6=2.36-9+deb12u14" in contents
+    assert "libc6-dev=2.36-9+deb12u14" in contents
+    assert "libgcc-s1=12.2.0-14+deb12u1" in contents
+    assert "libstdc++6=12.2.0-14+deb12u1" in contents
+    assert "rm -f /etc/apt/sources.list.d/cuda-debian11-x86_64.list" in contents
+    assert "command -v cc; command -v gcc" in contents
+    assert "test -f /usr/include/stdlib.h" in contents
+    assert "install -d -m 0755 /opt/sn56" in contents
+    assert "legacy-aitoolkit-toolchain-lock.txt" in contents
+    assert "legacy-os-package-inventory.txt" in contents
+    assert "legacy-os-package-inventory.sha256" in contents
+    assert "32bd64288804d66eefd0ccbe215aa642df71cc41" in (
+        ROOT / "forge/flux_kohya_tokenizers.py"
+    ).read_text(encoding="utf-8")
+    assert "3db67ab1af984cf10548a73467f0e5bca2aaaeb2" in (
+        ROOT / "forge/flux_kohya_tokenizers.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        'ENTRYPOINT ["dumb-init", "--", "python3", "-m", "forge.cli"]'
+        in contents
+    )
+    assert "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38" in contents
+    assert "660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd" in contents
+    assert "6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635" in contents
+    assert "assert torch.__version__ == '2.1.2+cu121'" in contents
+    assert "assert torch.version.cuda == '12.1'" in contents
+    assert "startswith('/home/.local/lib/python3.10/site-packages/')" in contents
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "helper_count", "retry_loop_count"),
+    [
+        (TOOLKIT_DOCKERFILE, 3, 3),
+        # The legacy image has the four ordinary helpers plus the independent
+        # apt cache-reset loop used for its Debian C toolchain.
+        (LEGACY_FLUX_DOCKERFILE, 4, 5),
+    ],
+)
+def test_image_build_network_access_has_bounded_retries(
+    dockerfile: Path, helper_count: int, retry_loop_count: int
+):
+    contents = dockerfile.read_text(encoding="utf-8")
+
+    assert contents.count("retry_network()") == helper_count
+    assert contents.count('if [ "$attempt" -ge 5 ]') == retry_loop_count
+    assert contents.count("SN56_NETWORK_RETRY exhausted") == retry_loop_count
+    assert contents.count("SN56_NETWORK_RETRY retry=") == retry_loop_count
+    assert "retry_network git fetch origin 99be3d96" in contents
+    assert contents.count("retry_network pip install --no-cache-dir") == 3
+    assert "retry_network python3 -m pip install --no-cache-dir --no-deps" in contents
+    assert "--network=host" not in contents
+
+    locked_install = contents.index(
+        "retry_network python3 -m pip install --no-cache-dir --no-deps"
+    )
+    assert contents.index("python3 /opt/sn56/verify-image-runtime.py", locked_install) > (
+        locked_install
+    )
+
+
+def test_legacy_flux_tokenizer_stage_is_retried_but_verification_is_not():
+    contents = LEGACY_FLUX_DOCKERFILE.read_text(encoding="utf-8")
+    stage = contents.index("python3 -m forge.flux_kohya_tokenizers stage")
+    verify = contents.index("python3 -m forge.flux_kohya_tokenizers verify")
+
+    assert contents.rfind("retry_network env", 0, stage) != -1
+    assert stage < verify
 
 
 def test_image_sources_are_pinned_to_certified_identities():
-    dockerfile = DOCKERFILES[0].read_text(encoding="utf-8")
+    dockerfile = TOOLKIT_DOCKERFILE.read_text(encoding="utf-8")
     inventory = LOCK.read_text(encoding="utf-8")
 
     assert (
@@ -127,7 +256,7 @@ def test_image_sources_are_pinned_to_certified_identities():
 def test_runtime_lock_wording_is_limited_to_metadata_inventory():
     implementation = "\n".join(
         [
-            DOCKERFILES[0].read_text(encoding="utf-8"),
+            TOOLKIT_DOCKERFILE.read_text(encoding="utf-8"),
             VERIFIER.read_text(encoding="utf-8"),
         ]
     ).lower()
