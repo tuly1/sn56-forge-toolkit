@@ -84,6 +84,65 @@ RUN retry_network() { \
 
 FROM diagonalge/kohya_latest:latest@sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e
 
+# The default ai-toolkit graph imports bitsandbytes, whose Triton backend JITs
+# a tiny CUDA driver helper on first use.  The pinned Kohya base deliberately
+# omits every C toolchain component, so merely transplanting the Python graph
+# is insufficient for snapshot-directory FLUX caches.  Install the minimal
+# pinned Debian compiler/header surface here; the standalone Kohya child still
+# uses its isolated Python/Torch graph below.  HTTPS is required because the
+# provider's HTTP path has returned hash-mismatched package bodies in practice.
+RUN set -eu; \
+    rm -f /etc/apt/sources.list.d/cuda-debian11-x86_64.list; \
+    sed -i \
+      -e 's#http://deb.debian.org#https://deb.debian.org#g' \
+      -e 's#http://security.debian.org#https://security.debian.org#g' \
+      /etc/apt/sources.list.d/debian.sources; \
+    attempt=1; installed=0; \
+    while [ "$attempt" -le 5 ]; do \
+      if rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial/* && \
+        apt-get clean && \
+        apt-get -o Acquire::Retries=3 update && \
+        DEBIAN_FRONTEND=noninteractive \
+          apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+            gcc=4:12.2.0-3 \
+            gcc-12=12.2.0-14+deb12u1 \
+            gcc-12-base=12.2.0-14+deb12u1 \
+            libc-bin=2.36-9+deb12u14 \
+            libc6=2.36-9+deb12u14 \
+            libc6-dev=2.36-9+deb12u14 \
+            libgcc-s1=12.2.0-14+deb12u1 \
+            libstdc++6=12.2.0-14+deb12u1; then \
+        installed=1; \
+        break; \
+      else \
+        status=$?; \
+      fi; \
+      if [ "$attempt" -ge 5 ]; then \
+        echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=apt-toolchain status=$status" >&2; \
+        exit "$status"; \
+      fi; \
+      delay=$((attempt * 5)); \
+      echo "SN56_NETWORK_RETRY retry=$((attempt + 1))/5 delay_seconds=$delay command=apt-toolchain status=$status" >&2; \
+      sleep "$delay"; \
+      attempt=$((attempt + 1)); \
+    done; \
+    test "$installed" = 1; \
+    command -v cc; command -v gcc; \
+    test -f /usr/include/stdlib.h; \
+    test -f /usr/local/include/python3.10/Python.h; \
+    printf '#include <stdlib.h>\nint main(void) { return 0; }\n' >/tmp/sn56-cc-probe.c; \
+    cc /tmp/sn56-cc-probe.c -o /tmp/sn56-cc-probe; \
+    /tmp/sn56-cc-probe; \
+    rm -f /tmp/sn56-cc-probe.c /tmp/sn56-cc-probe; \
+    dpkg-query -W -f='${Package}=${Version}\n' \
+      gcc gcc-12 gcc-12-base libc-bin libc6 libc6-dev libgcc-s1 libstdc++6 \
+      >/opt/sn56/legacy-aitoolkit-toolchain-lock.txt; \
+    dpkg-query -W -f='${binary:Package}=${Version}\n' | \
+      LC_ALL=C sort >/opt/sn56/legacy-os-package-inventory.txt; \
+    sha256sum /opt/sn56/legacy-os-package-inventory.txt \
+      >/opt/sn56/legacy-os-package-inventory.sha256; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONNOUSERSITE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \

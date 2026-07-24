@@ -159,6 +159,22 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
     assert "python3 -m forge.verify_flux_kohya_runtime" in contents
     assert "python3 -m forge.flux_kohya_tokenizers stage" in contents
     assert "python3 -m forge.flux_kohya_tokenizers verify" in contents
+    # ai-toolkit's bitsandbytes/Triton import JITs a CUDA helper on first use.
+    # The Debian Kohya base has no compiler or libc headers unless we add them.
+    assert "gcc=4:12.2.0-3" in contents
+    assert "gcc-12=12.2.0-14+deb12u1" in contents
+    assert "gcc-12-base=12.2.0-14+deb12u1" in contents
+    assert "libc-bin=2.36-9+deb12u14" in contents
+    assert "libc6=2.36-9+deb12u14" in contents
+    assert "libc6-dev=2.36-9+deb12u14" in contents
+    assert "libgcc-s1=12.2.0-14+deb12u1" in contents
+    assert "libstdc++6=12.2.0-14+deb12u1" in contents
+    assert "rm -f /etc/apt/sources.list.d/cuda-debian11-x86_64.list" in contents
+    assert "command -v cc; command -v gcc" in contents
+    assert "test -f /usr/include/stdlib.h" in contents
+    assert "legacy-aitoolkit-toolchain-lock.txt" in contents
+    assert "legacy-os-package-inventory.txt" in contents
+    assert "legacy-os-package-inventory.sha256" in contents
     assert "32bd64288804d66eefd0ccbe215aa642df71cc41" in (
         ROOT / "forge/flux_kohya_tokenizers.py"
     ).read_text(encoding="utf-8")
@@ -178,21 +194,23 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
 
 
 @pytest.mark.parametrize(
-    ("dockerfile", "helper_count"),
+    ("dockerfile", "helper_count", "retry_loop_count"),
     [
-        (TOOLKIT_DOCKERFILE, 3),
-        (LEGACY_FLUX_DOCKERFILE, 4),
+        (TOOLKIT_DOCKERFILE, 3, 3),
+        # The legacy image has the four ordinary helpers plus the independent
+        # apt cache-reset loop used for its Debian C toolchain.
+        (LEGACY_FLUX_DOCKERFILE, 4, 5),
     ],
 )
 def test_image_build_network_access_has_bounded_retries(
-    dockerfile: Path, helper_count: int
+    dockerfile: Path, helper_count: int, retry_loop_count: int
 ):
     contents = dockerfile.read_text(encoding="utf-8")
 
     assert contents.count("retry_network()") == helper_count
-    assert contents.count('if [ "$attempt" -ge 5 ]') == helper_count
-    assert contents.count("SN56_NETWORK_RETRY exhausted") == helper_count
-    assert contents.count("SN56_NETWORK_RETRY retry=") == helper_count
+    assert contents.count('if [ "$attempt" -ge 5 ]') == retry_loop_count
+    assert contents.count("SN56_NETWORK_RETRY exhausted") == retry_loop_count
+    assert contents.count("SN56_NETWORK_RETRY retry=") == retry_loop_count
     assert "retry_network git fetch origin 99be3d96" in contents
     assert contents.count("retry_network pip install --no-cache-dir") == 3
     assert "retry_network python3 -m pip install --no-cache-dir --no-deps" in contents
