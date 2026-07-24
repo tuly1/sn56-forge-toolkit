@@ -10,13 +10,25 @@ needed by that legacy-named path.
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any
+
+from forge import recipe
 
 
 MAX_TRAIN_STEPS = 250
 SAVE_EVERY_STEPS = 25
 SAVE_LAST_N_STEPS = 100
+# R11's frozen standalone child ran for 1,576.6 seconds before its deadline
+# termination.  During that window step 75 was the last durable checkpoint;
+# step 100 was interrupted while saving and was not a valid candidate.  Use the
+# conservative effective rate (durable steps / full child runtime) and retain
+# 20% additional headroom.  This is an operational completion calibration, not
+# a claim that the resulting step count is quality-optimal.
+R11_LAST_DURABLE_STEPS = 75
+R11_OBSERVED_CHILD_RUNTIME_S = 1_576.6
+DEADLINE_THROUGHPUT_HEADROOM = 0.80
 WINNER_REFERENCE = (
     "https://github.com/gradients-opensource/"
     "god-image-tourn-4aff76a867d2af49-20260720-position-1"
@@ -44,7 +56,15 @@ def build_config(
     while checkpoint cadence is made step-based for Forge's deadline fallback.
     """
     steps = max(1, int(steps))
-    save_every = min(SAVE_EVERY_STEPS, max(1, steps // 5))
+    # Reuse the common fixed-candidate cadence.  Re-scaling to ``steps // 5``
+    # would make short deadline-capped runs spend a disproportionate share of
+    # their budget writing multi-gigabyte checkpoints.
+    save_every = recipe.kill_safe_save_every(steps, SAVE_EVERY_STEPS)
+    if steps > 1 and save_every >= steps:
+        # The common cadence deliberately changes regimes at 25 steps.  At the
+        # boundary it can otherwise place the first periodic save at the exact
+        # terminal step, leaving no recovery candidate if throughput degrades.
+        save_every = max(1, steps // 2)
     return {
         # Model and immutable support assets baked into the pinned base image.
         "pretrained_model_name_or_path": base_model,
@@ -126,6 +146,39 @@ def build_config(
         "max_data_loader_n_workers": 4,
         "seed": 2,
     }
+
+
+def budgeted_train_steps(
+    remaining_soft_s: float,
+    *,
+    boundary_margin_s: float,
+    max_steps: int = MAX_TRAIN_STEPS,
+) -> int:
+    """Cap the winner-derived recipe to a naturally completable task budget.
+
+    ``remaining_soft_s`` already excludes Forge's export reserve.  The caller
+    supplies the additional process-termination boundary margin.  The measured
+    rate is intentionally based only on R11's last fully durable checkpoint;
+    the interrupted step-100 write is not counted as usable throughput.
+    Invalid or exhausted budgets fail safe to one planned step, which still
+    leaves the normal fallback/finalization path alive.
+    """
+    try:
+        remaining = float(remaining_soft_s)
+        raw_boundary = float(boundary_margin_s)
+        ceiling = max(1, int(max_steps))
+        if not math.isfinite(remaining) or not math.isfinite(raw_boundary):
+            return 1
+        boundary = max(0.0, raw_boundary)
+        usable = max(0.0, remaining - boundary)
+        calibrated = math.floor(
+            usable
+            * (R11_LAST_DURABLE_STEPS / R11_OBSERVED_CHILD_RUNTIME_S)
+            * DEADLINE_THROUGHPUT_HEADROOM
+        )
+        return max(1, min(ceiling, calibrated))
+    except (TypeError, ValueError, OverflowError):
+        return 1
 
 
 def write_config(config: dict[str, Any], path: str) -> None:

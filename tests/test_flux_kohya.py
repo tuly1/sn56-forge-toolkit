@@ -283,15 +283,25 @@ def test_standalone_path_does_not_attest_the_parent_dependency_graph(
         "prepare_kohya_flux_dataset",
         lambda *args, **kwargs: (str(tmp_path / "training"), 1),
     )
+    planned = []
+
+    def set_planned_steps(_root, _scope, steps, **kwargs):
+        planned.append((steps, kwargs))
+        return {"scope": "test"}
+
     monkeypatch.setattr(
-        flux_kohya.checkpoints,
-        "set_planned_steps",
-        lambda *args, **kwargs: {"scope": "test"},
+        flux_kohya.checkpoints, "set_planned_steps", set_planned_steps
     )
+    configs = []
+
+    def build_config(**kwargs):
+        configs.append(kwargs)
+        return {"save_every_n_steps": 25}
+
     monkeypatch.setattr(
         flux_kohya.flux_kohya_config,
         "build_config",
-        lambda **kwargs: {"save_every_n_steps": 25},
+        build_config,
     )
     monkeypatch.setattr(
         flux_kohya.flux_kohya_config, "write_config", lambda *args: None
@@ -303,11 +313,16 @@ def test_standalone_path_does_not_attest_the_parent_dependency_graph(
         lambda *args, **kwargs: {
             "status": "selected_current_run",
             "source": "exact_final",
-            "selected_step": 250,
+            "selected_step": 59,
         },
     )
+    events = []
     monkeypatch.setattr(flux_kohya.telemetry, "set_meta", lambda **kwargs: None)
-    monkeypatch.setattr(flux_kohya.telemetry, "event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        flux_kohya.telemetry,
+        "event",
+        lambda name, **kwargs: events.append((name, kwargs)),
+    )
     monkeypatch.setattr(
         flux_kohya.telemetry,
         "collect_env",
@@ -319,11 +334,22 @@ def test_standalone_path_does_not_attest_the_parent_dependency_graph(
         lambda: pytest.fail("parent Torch allocator did not train Kohya"),
     )
 
+    class Deadline:
+        def remaining(self):
+            # 0.5h hard budget minus Forge's 180s export reserve.
+            return 1620.0
+
     flux_kohya._run_standalone_kohya(
         spec,
-        object(),
+        Deadline(),
         str(tmp_path / "base.safetensors"),
     )
+
+    assert planned == [(59, {"model_type": "flux"})]
+    assert configs[0]["steps"] == 59
+    budget = next(values for name, values in events if name == "kohya_step_budgeted")
+    assert budget["planned_steps"] == 59
+    assert budget["remaining_soft_s"] == 1620.0
 
 
 def test_standalone_model_resolution_rejects_symlink_only(tmp_path):
@@ -409,7 +435,7 @@ def test_operational_config_is_fixed_offline_and_kill_safe(tmp_path):
     )
 
     assert config["max_train_steps"] == 250
-    assert config["save_every_n_steps"] == 25
+    assert config["save_every_n_steps"] == 51
     assert config["save_last_n_steps"] == 100
     assert config["guidance_scale"] == 85.0
     assert config["optimizer_type"] == "Lion"
@@ -432,6 +458,59 @@ def test_operational_config_is_fixed_offline_and_kill_safe(tmp_path):
     assert 'network_args = ["train_double_block_indices=all"' in text
     assert 'tokenizer_cache_dir = "/app/flux/tokenizers"' in text
     assert not (path.parent / "task.toml.tmp").exists()
+
+
+@pytest.mark.parametrize(
+    ("remaining_soft_s", "expected"),
+    [
+        (1620.0, 59),
+        (3420.0, 128),
+        (7200.0, 250),
+        (45.0, 1),
+        (44.0, 1),
+        (float("nan"), 1),
+        (float("inf"), 1),
+        (None, 1),
+        ("invalid", 1),
+    ],
+)
+def test_kohya_step_budget_uses_only_durable_r11_throughput(
+    remaining_soft_s, expected
+):
+    assert flux_kohya_config.budgeted_train_steps(
+        remaining_soft_s,
+        boundary_margin_s=45.0,
+    ) == expected
+
+
+@pytest.mark.parametrize("boundary", [float("nan"), float("inf"), "invalid"])
+def test_kohya_step_budget_rejects_invalid_boundary(boundary):
+    assert flux_kohya_config.budgeted_train_steps(
+        1620.0,
+        boundary_margin_s=boundary,
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    ("steps", "save_every"),
+    [(25, 12), (59, 25), (128, 26), (250, 51)],
+)
+def test_deadline_capped_config_uses_fixed_candidate_save_cadence(
+    steps, save_every
+):
+    config = flux_kohya_config.build_config(
+        base_model="/cache/models/base/model.safetensors",
+        train_data_dir="/dataset/images",
+        output_dir="/app/checkpoints/task/repo",
+        output_name="repo",
+        config_file="/dataset/configs/task.toml",
+        steps=steps,
+    )
+
+    assert config["max_train_steps"] == steps
+    assert config["save_every_n_steps"] == save_every
+    assert save_every < steps
+    assert steps % save_every != 0
 
 
 def test_kohya_executes_toml_from_private_publication_scope(monkeypatch):

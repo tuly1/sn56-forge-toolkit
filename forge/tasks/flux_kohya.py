@@ -91,7 +91,23 @@ def _run_standalone_kohya(
         images_root=spec.dataset_images_dir,
         trigger_word=spec.trigger_word,
     )
-    steps = flux_kohya_config.MAX_TRAIN_STEPS
+    remaining_soft_s = deadline.remaining()
+    steps = flux_kohya_config.budgeted_train_steps(
+        remaining_soft_s,
+        boundary_margin_s=_STOP_MARGIN_S,
+    )
+    telemetry.event(
+        "kohya_step_budgeted",
+        max_steps=flux_kohya_config.MAX_TRAIN_STEPS,
+        planned_steps=steps,
+        remaining_soft_s=round(remaining_soft_s, 1),
+        boundary_margin_s=_STOP_MARGIN_S,
+        last_durable_steps=flux_kohya_config.R11_LAST_DURABLE_STEPS,
+        observed_child_runtime_s=(
+            flux_kohya_config.R11_OBSERVED_CHILD_RUNTIME_S
+        ),
+        throughput_headroom=flux_kohya_config.DEADLINE_THROUGHPUT_HEADROOM,
+    )
     scope = checkpoints.set_planned_steps(
         spec.save_root,
         scope,
