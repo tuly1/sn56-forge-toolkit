@@ -66,6 +66,14 @@ ENV PYTHONUNBUFFERED=1 \
 # share one interpreter.
 COPY --from=aitoolkit-runtime /app/ai-toolkit/ /app/ai-toolkit/
 COPY --from=aitoolkit-runtime /usr/local/lib/python3.10/dist-packages/ /opt/sn56/ai-toolkit-python/
+# pip and wheel come from Ubuntu's dist-packages in the ai-toolkit stage, not
+# /usr/local.  Carry their code and metadata into the isolated graph as well;
+# otherwise the Kohya base's pip/wheel metadata leaks into `pip freeze` even
+# though every application distribution is loaded from the transplanted tree.
+COPY --from=aitoolkit-runtime /usr/lib/python3/dist-packages/pip/ /opt/sn56/ai-toolkit-python/pip/
+COPY --from=aitoolkit-runtime /usr/lib/python3/dist-packages/pip-22.0.2.dist-info/ /opt/sn56/ai-toolkit-python/pip-22.0.2.dist-info/
+COPY --from=aitoolkit-runtime /usr/lib/python3/dist-packages/wheel/ /opt/sn56/ai-toolkit-python/wheel/
+COPY --from=aitoolkit-runtime /usr/lib/python3/dist-packages/wheel-0.37.1.egg-info/ /opt/sn56/ai-toolkit-python/wheel-0.37.1.egg-info/
 COPY --from=aitoolkit-runtime /opt/sn56/image-runtime-lock.txt /opt/sn56/image-runtime-lock.txt
 COPY --from=aitoolkit-runtime /opt/sn56/image-runtime-phase1-constraints.txt /opt/sn56/image-runtime-phase1-constraints.txt
 COPY --from=aitoolkit-runtime /opt/sn56/verify-image-runtime.py /opt/sn56/verify-image-runtime.py

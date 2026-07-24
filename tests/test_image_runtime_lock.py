@@ -137,6 +137,17 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
         "/usr/local/lib/python3.10/dist-packages/ "
         "/opt/sn56/ai-toolkit-python/"
     ) in contents
+    for system_distribution, target_name in (
+        ("pip", "pip"),
+        ("pip-22.0.2.dist-info", "pip-22.0.2.dist-info"),
+        ("wheel", "wheel"),
+        ("wheel-0.37.1.egg-info", "wheel-0.37.1.egg-info"),
+    ):
+        assert (
+            "COPY --from=aitoolkit-runtime "
+            f"/usr/lib/python3/dist-packages/{system_distribution}/ "
+            f"/opt/sn56/ai-toolkit-python/{target_name}/"
+        ) in contents
     assert contents.count("99be3d96a2468d3a5228a4eb05ba67e63c586b4e") == 3
     assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents
     assert "python3 /opt/sn56/verify-image-runtime.py" in contents
