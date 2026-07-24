@@ -145,6 +145,11 @@ def prepare_kohya_flux_dataset(
             caption, trigger_bytes
         ):
             caption = trigger_bytes + (b", " + caption if caption else b"")
+        elif not caption:
+            # Kohya rejects an existing zero-byte caption before training.  A
+            # single newline survives that pre-check but still strips to the
+            # same semantically empty caption when no trigger was requested.
+            caption = b"\n"
         with open(destination, "wb") as fh:
             fh.write(caption)
 

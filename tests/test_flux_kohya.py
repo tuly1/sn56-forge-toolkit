@@ -374,6 +374,24 @@ def test_kohya_dataset_layout_and_trigger_injection(tmp_path):
     assert not (tmp_path / "images__forge_flux_flat").exists()
 
 
+def test_kohya_missing_caption_without_trigger_is_nonempty_but_blank(tmp_path):
+    archive = tmp_path / "task.zip"
+    root = tmp_path / "images"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("nested/a.png", _png_bytes())
+
+    train_dir, pairs = dataset.prepare_kohya_flux_dataset(
+        str(archive), images_root=str(root), trigger_word=None
+    )
+
+    caption = root / "1_style" / "a.txt"
+    assert train_dir == str(root)
+    assert pairs == 1
+    assert caption.read_bytes() == b"\n"
+    assert caption.read_text(encoding="utf-8").strip() == ""
+    assert not (tmp_path / "images__forge_flux_flat").exists()
+
+
 def test_caption_trigger_requires_an_exact_leading_token():
     assert dataset._caption_starts_with_trigger(b"art, ink drawing", b"art")
     assert dataset._caption_starts_with_trigger(b"  ART poster", b"art")
