@@ -11,10 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "ops/docker/image-runtime-lock.txt"
 CONSTRAINTS = ROOT / "ops/docker/image-runtime-phase1-constraints.txt"
 VERIFIER = ROOT / "ops/docker/verify_image_runtime.py"
-DOCKERFILES = (
-    ROOT / "ops/docker/standalone-image-toolkit-trainer.dockerfile",
-    ROOT / "ops/docker/standalone-image-trainer.dockerfile",
+TOOLKIT_DOCKERFILE = (
+    ROOT / "ops/docker/standalone-image-toolkit-trainer.dockerfile"
 )
+LEGACY_FLUX_DOCKERFILE = ROOT / "ops/docker/standalone-image-trainer.dockerfile"
 
 SPEC = importlib.util.spec_from_file_location("verify_image_runtime", VERIFIER)
 assert SPEC is not None and SPEC.loader is not None
@@ -87,26 +87,45 @@ def test_phase1_constraints_are_the_exact_mechanical_derivation():
     )
 
 
-def test_both_image_dockerfiles_apply_the_same_two_phase_lock():
-    contents = [path.read_text(encoding="utf-8") for path in DOCKERFILES]
+def test_toolkit_image_applies_the_certified_two_phase_lock():
+    contents = TOOLKIT_DOCKERFILE.read_text(encoding="utf-8")
 
-    assert contents[0] == contents[1]
-    assert contents[0].count("Phase 1") == 1
-    assert contents[0].count("Phase 2") == 1
-    assert "--no-deps" in contents[0]
-    assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents[0]
-    assert "python3 /opt/sn56/verify-image-runtime.py" in contents[0]
+    assert contents.count("Phase 1") == 1
+    assert contents.count("Phase 2") == 1
+    assert "--no-deps" in contents
+    assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents
+    assert "python3 /opt/sn56/verify-image-runtime.py" in contents
     assert (
-        contents[0].count(
+        contents.count(
             "--constraint /opt/sn56/image-runtime-phase1-constraints.txt"
         )
         == 2
     )
-    assert "--files-only" in contents[0]
+    assert "--files-only" in contents
+
+
+def test_legacy_flux_image_is_a_pinned_offline_kohya_runtime():
+    contents = LEGACY_FLUX_DOCKERFILE.read_text(encoding="utf-8")
+
+    assert contents != TOOLKIT_DOCKERFILE.read_text(encoding="utf-8")
+    assert (
+        "FROM diagonalge/kohya_latest:latest@sha256:"
+        "d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e"
+    ) in contents
+    assert "FORGE_FLUX_BACKEND=kohya" in contents
+    assert "SD_SCRIPTS_DIR=/app/sd-scripts" in contents
+    assert "flux_train_network.py" in contents
+    assert "python3 -m forge.verify_flux_kohya_runtime" in contents
+    assert 'ENTRYPOINT ["dumb-init", "--", "python3", "-m", "forge.cli"]' in contents
+    assert "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38" in contents
+    assert "660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd" in contents
+    assert "6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635" in contents
+    for mutable_install in ("git fetch", "git clone", "pip install", "apt-get", "curl "):
+        assert mutable_install not in contents
 
 
 def test_image_sources_are_pinned_to_certified_identities():
-    dockerfile = DOCKERFILES[0].read_text(encoding="utf-8")
+    dockerfile = TOOLKIT_DOCKERFILE.read_text(encoding="utf-8")
     inventory = LOCK.read_text(encoding="utf-8")
 
     assert (
@@ -127,7 +146,7 @@ def test_image_sources_are_pinned_to_certified_identities():
 def test_runtime_lock_wording_is_limited_to_metadata_inventory():
     implementation = "\n".join(
         [
-            DOCKERFILES[0].read_text(encoding="utf-8"),
+            TOOLKIT_DOCKERFILE.read_text(encoding="utf-8"),
             VERIFIER.read_text(encoding="utf-8"),
         ]
     ).lower()

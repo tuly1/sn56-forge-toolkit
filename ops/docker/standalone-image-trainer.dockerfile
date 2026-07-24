@@ -1,53 +1,32 @@
-FROM diagonalge/ai-toolkit:latest@sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8
+# Validator-routed FLUX trainer. G.O.D deliberately selects this legacy-named
+# Dockerfile for model_type=flux; the other four image architectures use the
+# toolkit-named Dockerfile. A standalone FLUX cache contains one transformer
+# checkpoint, which ai-toolkit's directory loader cannot consume offline. The
+# Kohya base supplies the matching FLUX loader plus immutable AE/CLIP/T5 assets.
 
-ENV AI_TOOLKIT_DIR=/app/ai-toolkit
-ENV FORGE_TEMPLATES_DIR=/app/forge/templates
+FROM diagonalge/kohya_latest:latest@sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e
 
-# This is the exact 185-entry version/VCS metadata inventory observed in both
-# independently built H100 subjects. It does not attest downloaded wheel bytes.
-COPY ops/docker/image-runtime-lock.txt /opt/sn56/image-runtime-lock.txt
-COPY ops/docker/image-runtime-phase1-constraints.txt /opt/sn56/image-runtime-phase1-constraints.txt
-COPY ops/docker/verify_image_runtime.py /opt/sn56/verify-image-runtime.py
-RUN python3 /opt/sn56/verify-image-runtime.py \
-        --lock /opt/sn56/image-runtime-lock.txt \
-        --constraints /opt/sn56/image-runtime-phase1-constraints.txt \
-        --files-only
+ENV PYTHONUNBUFFERED=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    FORGE_FLUX_BACKEND=kohya \
+    SD_SCRIPTS_DIR=/app/sd-scripts
 
-WORKDIR /app/ai-toolkit
-# Phase 1 constrains the ordinary Python graph while leaving the explicitly
-# installed CUDA/Torch island and easy_dwpose's known metadata conflict open.
-RUN git fetch origin 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
-    git checkout 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
-    pip install --no-cache-dir \
-        --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
-        --requirement requirements.txt && \
-    pip install --no-cache-dir \
-        torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-        --index-url https://download.pytorch.org/whl/cu124
-
-# ai-toolkit currently pins torchcodec 0.9.1, whose compiled extension targets
-# Torch 2.9.  G.O.D deliberately pins this image to Torch 2.6/cu124; the official
-# TorchCodec compatibility matrix maps that ABI to the 0.2 series.  Repin after
-# requirements.txt and Torch so even optional media imports remain loadable.
-RUN pip install --no-cache-dir \
-        --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
-        torchcodec==0.2.1 pyyaml Pillow numpy safetensors
-
-# Phase 2 requests every certified version/source commit without dependency
-# resolution. --no-deps preserves the intentional easy_dwpose/hub metadata
-# mismatch. The verifier checks the serialized metadata inventory and requires
-# that mismatch to be the only output from `pip check`.
-RUN python3 -m pip install --no-cache-dir --no-deps \
-        --extra-index-url https://download.pytorch.org/whl/cu124 \
-        --requirement /opt/sn56/image-runtime-lock.txt && \
-    python3 /opt/sn56/verify-image-runtime.py \
-        --lock /opt/sn56/image-runtime-lock.txt \
-        --constraints /opt/sn56/image-runtime-phase1-constraints.txt
+# Fail the build if the pinned base ever stops matching the exact runtime and
+# support assets certified for this path. These are public model weights baked
+# into the base image; no credential or runtime download is involved.
+RUN test -f /app/sd-scripts/flux_train_network.py && \
+    printf '%s  %s\n' \
+      afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38 /app/flux/ae.safetensors \
+      660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd /app/flux/clip_l.safetensors \
+      6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635 /app/flux/t5xxl_fp16.safetensors \
+      | sha256sum --check --strict && \
+    python3 -c "import accelerate, lion_pytorch, PIL, safetensors, toml, torch, yaml"
 
 WORKDIR /app
-# Templates ship inside the package (forge/templates/*.yaml), so this one COPY
-# brings the trainer AND its config templates. FORGE_TEMPLATES_DIR still points
-# at /app/forge/templates as a belt-and-braces override.
 COPY forge/ /app/forge/
+RUN python3 -m forge.verify_flux_kohya_runtime
 
-ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh", "python3", "-m", "forge.cli"]
+ENTRYPOINT ["dumb-init", "--", "python3", "-m", "forge.cli"]

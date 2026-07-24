@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import shutil
 import zipfile
 
@@ -96,6 +97,80 @@ def prepare_aitoolkit_dataset(
     except Exception:
         pass
     return images_dir, pairs
+
+
+def prepare_kohya_flux_dataset(
+    zip_path: str,
+    *,
+    images_root: str,
+    trigger_word: str | None = None,
+) -> tuple[str, int]:
+    """Create Kohya's ``{repeats}_{concept}`` dataset from the staged zip.
+
+    The common unpacker remains the single implementation of archive walking,
+    collision-safe flattening, perceptual deduplication, and caption pairing.
+    Kohya needs one additional directory level and does not have ai-toolkit's
+    separate ``trigger_word`` field, so a request trigger is prepended only when
+    it is not already present in the supplied caption.
+
+    Returns ``(train_data_dir, pairs)`` where ``train_data_dir`` contains the
+    numbered concept directory expected by ``flux_train_network.py``.
+    """
+    flat = images_root.rstrip("/") + "__forge_flux_flat"
+    _flat_dir, pairs = prepare_aitoolkit_dataset(
+        zip_path,
+        images_dir=flat,
+        trigger_word=trigger_word,
+    )
+
+    concept = _kohya_concept_name(trigger_word)
+    _reset_dir(images_root)
+    concept_dir = os.path.join(images_root, f"1_{concept}")
+    os.makedirs(concept_dir, exist_ok=True)
+    trigger_bytes = (trigger_word or "").strip().encode("utf-8")
+
+    for name in sorted(os.listdir(flat)):
+        source = os.path.join(flat, name)
+        if not os.path.isfile(source):
+            continue
+        stem, ext = os.path.splitext(name)
+        destination = os.path.join(concept_dir, name)
+        if ext.lower() != ".txt":
+            shutil.copy2(source, destination)
+            continue
+
+        with open(source, "rb") as fh:
+            caption = fh.read()
+        if trigger_bytes and not _caption_starts_with_trigger(
+            caption, trigger_bytes
+        ):
+            caption = trigger_bytes + (b", " + caption if caption else b"")
+        with open(destination, "wb") as fh:
+            fh.write(caption)
+
+    shutil.rmtree(flat, ignore_errors=True)
+    return images_root, pairs
+
+
+def _kohya_concept_name(trigger_word: str | None) -> str:
+    value = (trigger_word or "style").strip()
+    value = re.sub(r"[^A-Za-z0-9.-]+", "-", value).strip(".-")
+    return (value or "style")[:64]
+
+
+def _caption_starts_with_trigger(caption: bytes, trigger: bytes) -> bool:
+    """Whether the first caption token is exactly ``trigger``.
+
+    A substring match is unsafe (``art`` appears inside ``cartoon``), and a
+    later mention does not reproduce ai-toolkit's leading trigger injection.
+    """
+    caption = caption.lstrip().lower()
+    trigger = trigger.strip().lower()
+    if not trigger or not caption.startswith(trigger):
+        return False
+    if len(caption) == len(trigger):
+        return True
+    return caption[len(trigger) : len(trigger) + 1] in b", \t\r\n.;:-"
 
 
 def reserve_holdout(

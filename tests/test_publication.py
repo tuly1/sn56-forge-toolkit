@@ -242,6 +242,7 @@ def test_publication_runs_after_loss_selection_and_preserves_model_bytes(tmp_pat
     (root / "loss_log.db-wal").write_bytes(b"")
     (root / "loss_log.db-shm").write_bytes(b"")
     (root / "config.yaml").write_text("private_recipe: true\n", encoding="utf-8")
+    (root / "config.toml").write_text("private_recipe = true\n", encoding="utf-8")
     (root / "learnable_snr.json").write_text("{}", encoding="utf-8")
     record = checkpoints.finalize(str(root), "repo", scope)
     assert record["source"] == "training_loss_divergence"
@@ -267,6 +268,7 @@ def test_publication_runs_after_loss_selection_and_preserves_model_bytes(tmp_pat
         "loss_log.db-wal",
         "loss_log.db-shm",
         "config.yaml",
+        "config.toml",
         "learnable_snr.json",
     ):
         assert os.path.isfile(os.path.join(private_dir, name))

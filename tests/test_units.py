@@ -1252,18 +1252,28 @@ def test_new_types_dispatchable():
         assert s.model_type == mt
 
 
-def test_image_dockerfiles_repin_torchcodec_for_torch26():
-    """Keep ai-toolkit's media extension on the ABI G.O.D actually ships."""
-    names = (
-        "standalone-image-trainer.dockerfile",
+def test_toolkit_dockerfile_repins_torchcodec_for_torch26():
+    """Keep the ai-toolkit media extension on the ABI G.O.D actually ships."""
+    toolkit = os.path.join(
+        REPO_ROOT,
+        "ops",
+        "docker",
         "standalone-image-toolkit-trainer.dockerfile",
     )
-    contents = []
-    for name in names:
-        path = os.path.join(REPO_ROOT, "ops", "docker", name)
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-        assert "torch==2.6.0" in text
-        assert "torchcodec==0.2.1" in text
-        contents.append(text)
-    assert contents[0] == contents[1]
+    legacy = os.path.join(
+        REPO_ROOT,
+        "ops",
+        "docker",
+        "standalone-image-trainer.dockerfile",
+    )
+    with open(toolkit, encoding="utf-8") as fh:
+        toolkit_text = fh.read()
+    with open(legacy, encoding="utf-8") as fh:
+        legacy_text = fh.read()
+
+    assert "torch==2.6.0" in toolkit_text
+    assert "torchcodec==0.2.1" in toolkit_text
+    # FLUX is validator-routed through the legacy filename and needs Kohya's
+    # single-checkpoint loader, so intentional backend divergence is required.
+    assert "FORGE_FLUX_BACKEND=kohya" in legacy_text
+    assert toolkit_text != legacy_text

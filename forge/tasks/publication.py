@@ -31,6 +31,7 @@ from forge.tasks.integrity import valid_safetensors
 _PUBLIC_RECORDER = "forge_run.json"
 _PRIVATE_SIDECARS = (
     "config.yaml",
+    "config.toml",
     "loss_log.db",
     "loss_log.db-wal",
     "loss_log.db-shm",

@@ -531,7 +531,10 @@ def _valid_candidates(save_root: str, scope: dict[str, Any]) -> list[str]:
 
 
 def _step_of(path: str, scope: dict[str, Any]) -> int | None:
-    match = re.search(r"_(\d+)\.safetensors$", os.path.basename(path))
+    match = re.search(
+        r"(?:_|-step)(\d+)\.safetensors$",
+        os.path.basename(path),
+    )
     if match:
         return int(match.group(1))
     try:
