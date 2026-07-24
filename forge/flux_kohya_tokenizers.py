@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import shutil
 from typing import Any
 
 
@@ -38,25 +39,45 @@ TOKENIZERS: tuple[dict[str, Any], ...] = (
 
 
 def stage(root: str = TOKENIZER_ROOT) -> dict[str, object]:
-    """Download pinned public tokenizer sources during the Docker build."""
+    """Download pinned public tokenizer sources and publish them atomically."""
     from transformers import CLIPTokenizer, T5TokenizerFast
 
     classes = {
         "CLIPTokenizer": CLIPTokenizer,
         "T5TokenizerFast": T5TokenizerFast,
     }
-    os.makedirs(root, exist_ok=True)
-    for spec in TOKENIZERS:
-        destination = os.path.join(root, spec["directory"])
-        if os.path.lexists(destination):
-            raise FileExistsError(destination)
-        tokenizer = classes[spec["class"]].from_pretrained(
-            spec["repo"],
-            revision=spec["revision"],
-            local_files_only=False,
-        )
-        tokenizer.save_pretrained(destination)
-    return verify(root)
+    if os.path.lexists(root):
+        raise FileExistsError(root)
+
+    staging_root = f"{root}.staging"
+    _remove_staging_root(staging_root)
+    os.makedirs(staging_root)
+    try:
+        for spec in TOKENIZERS:
+            destination = os.path.join(staging_root, spec["directory"])
+            tokenizer = classes[spec["class"]].from_pretrained(
+                spec["repo"],
+                revision=spec["revision"],
+                local_files_only=False,
+            )
+            tokenizer.save_pretrained(destination)
+        result = verify(staging_root)
+        os.rename(staging_root, root)
+    except BaseException:
+        _remove_staging_root(staging_root)
+        raise
+
+    result["root"] = root
+    return result
+
+
+def _remove_staging_root(path: str) -> None:
+    """Remove only a prior regular staging directory; reject unsafe entries."""
+    if not os.path.lexists(path):
+        return
+    if os.path.islink(path) or not os.path.isdir(path):
+        raise RuntimeError(f"unsafe tokenizer staging path: {path}")
+    shutil.rmtree(path)
 
 
 def verify(root: str = TOKENIZER_ROOT) -> dict[str, object]:

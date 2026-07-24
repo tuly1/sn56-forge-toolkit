@@ -177,6 +177,44 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
     assert "startswith('/home/.local/lib/python3.10/site-packages/')" in contents
 
 
+@pytest.mark.parametrize(
+    ("dockerfile", "helper_count"),
+    [
+        (TOOLKIT_DOCKERFILE, 3),
+        (LEGACY_FLUX_DOCKERFILE, 4),
+    ],
+)
+def test_image_build_network_access_has_bounded_retries(
+    dockerfile: Path, helper_count: int
+):
+    contents = dockerfile.read_text(encoding="utf-8")
+
+    assert contents.count("retry_network()") == helper_count
+    assert contents.count('if [ "$attempt" -ge 5 ]') == helper_count
+    assert contents.count("SN56_NETWORK_RETRY exhausted") == helper_count
+    assert contents.count("SN56_NETWORK_RETRY retry=") == helper_count
+    assert "retry_network git fetch origin 99be3d96" in contents
+    assert contents.count("retry_network pip install --no-cache-dir") == 3
+    assert "retry_network python3 -m pip install --no-cache-dir --no-deps" in contents
+    assert "--network=host" not in contents
+
+    locked_install = contents.index(
+        "retry_network python3 -m pip install --no-cache-dir --no-deps"
+    )
+    assert contents.index("python3 /opt/sn56/verify-image-runtime.py", locked_install) > (
+        locked_install
+    )
+
+
+def test_legacy_flux_tokenizer_stage_is_retried_but_verification_is_not():
+    contents = LEGACY_FLUX_DOCKERFILE.read_text(encoding="utf-8")
+    stage = contents.index("python3 -m forge.flux_kohya_tokenizers stage")
+    verify = contents.index("python3 -m forge.flux_kohya_tokenizers verify")
+
+    assert contents.rfind("retry_network env", 0, stage) != -1
+    assert stage < verify
+
+
 def test_image_sources_are_pinned_to_certified_identities():
     dockerfile = TOOLKIT_DOCKERFILE.read_text(encoding="utf-8")
     inventory = LOCK.read_text(encoding="utf-8")

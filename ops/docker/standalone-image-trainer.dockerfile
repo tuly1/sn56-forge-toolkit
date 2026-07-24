@@ -15,20 +15,65 @@ RUN python3 /opt/sn56/verify-image-runtime.py \
 
 WORKDIR /app/ai-toolkit
 # Reproduce the same pinned two-phase runtime used by the toolkit-named image.
-RUN git fetch origin 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+RUN retry_network() { \
+        attempt=1; \
+        while :; do \
+            "$@" && return 0; \
+            status=$?; \
+            if [ "$attempt" -ge 5 ]; then \
+                echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=$1 status=$status" >&2; \
+                return "$status"; \
+            fi; \
+            delay=$((attempt * 5)); \
+            echo "SN56_NETWORK_RETRY retry=$((attempt + 1))/5 delay_seconds=$delay command=$1 status=$status" >&2; \
+            sleep "$delay"; \
+            attempt=$((attempt + 1)); \
+        done; \
+    }; \
+    retry_network git fetch origin 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
     git checkout 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
-    pip install --no-cache-dir \
+    retry_network pip install --no-cache-dir \
         --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
         --requirement requirements.txt && \
-    pip install --no-cache-dir \
+    retry_network pip install --no-cache-dir \
         torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
         --index-url https://download.pytorch.org/whl/cu124
 
-RUN pip install --no-cache-dir \
+RUN retry_network() { \
+        attempt=1; \
+        while :; do \
+            "$@" && return 0; \
+            status=$?; \
+            if [ "$attempt" -ge 5 ]; then \
+                echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=$1 status=$status" >&2; \
+                return "$status"; \
+            fi; \
+            delay=$((attempt * 5)); \
+            echo "SN56_NETWORK_RETRY retry=$((attempt + 1))/5 delay_seconds=$delay command=$1 status=$status" >&2; \
+            sleep "$delay"; \
+            attempt=$((attempt + 1)); \
+        done; \
+    }; \
+    retry_network pip install --no-cache-dir \
         --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
         torchcodec==0.2.1 pyyaml Pillow numpy safetensors
 
-RUN python3 -m pip install --no-cache-dir --no-deps \
+RUN retry_network() { \
+        attempt=1; \
+        while :; do \
+            "$@" && return 0; \
+            status=$?; \
+            if [ "$attempt" -ge 5 ]; then \
+                echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=$1 status=$status" >&2; \
+                return "$status"; \
+            fi; \
+            delay=$((attempt * 5)); \
+            echo "SN56_NETWORK_RETRY retry=$((attempt + 1))/5 delay_seconds=$delay command=$1 status=$status" >&2; \
+            sleep "$delay"; \
+            attempt=$((attempt + 1)); \
+        done; \
+    }; \
+    retry_network python3 -m pip install --no-cache-dir --no-deps \
         --extra-index-url https://download.pytorch.org/whl/cu124 \
         --requirement /opt/sn56/image-runtime-lock.txt && \
     python3 /opt/sn56/verify-image-runtime.py \
@@ -111,13 +156,29 @@ RUN test -f /app/sd-scripts/flux_train_network.py && \
     PYTHONPATH=/home/.local/lib/python3.10/site-packages \
     python3 -c "import os, accelerate, lion_pytorch, PIL, safetensors, toml, torch, yaml; assert torch.__version__ == '2.1.2+cu121'; assert torch.version.cuda == '12.1'; assert os.path.realpath(torch.__file__).startswith('/home/.local/lib/python3.10/site-packages/')"
 
-RUN HF_HOME=/tmp/forge-flux-tokenizer-download \
-    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 \
-    LD_PRELOAD=libtcmalloc.so \
-    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64 \
-    PYTHONPATH=/home/.local/lib/python3.10/site-packages \
-    python3 -m forge.flux_kohya_tokenizers stage && \
+RUN retry_network() { \
+        attempt=1; \
+        while :; do \
+            "$@" && return 0; \
+            status=$?; \
+            if [ "$attempt" -ge 5 ]; then \
+                echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=$1 status=$status" >&2; \
+                return "$status"; \
+            fi; \
+            delay=$((attempt * 5)); \
+            echo "SN56_NETWORK_RETRY retry=$((attempt + 1))/5 delay_seconds=$delay command=$1 status=$status" >&2; \
+            sleep "$delay"; \
+            attempt=$((attempt + 1)); \
+        done; \
+    }; \
+    retry_network env \
+        HF_HOME=/tmp/forge-flux-tokenizer-download \
+        HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 \
+        LD_PRELOAD=libtcmalloc.so \
+        PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
+        LD_LIBRARY_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64 \
+        PYTHONPATH=/home/.local/lib/python3.10/site-packages \
+        python3 -m forge.flux_kohya_tokenizers stage && \
     python3 -c "import shutil; shutil.rmtree('/tmp/forge-flux-tokenizer-download')" && \
     LD_PRELOAD=libtcmalloc.so \
     PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
