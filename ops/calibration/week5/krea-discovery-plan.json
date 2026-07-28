@@ -1,0 +1,335 @@
+{
+  "schema": 2,
+  "kind": "sn56-week5-krea-discovery-freeze",
+  "status": "draft_blocked_pre_gpu",
+  "release_base_commit": "c654c4b24376f7aa9e12dcb82f5e73dcddee3bdb",
+  "field_ledger_sha256": "e64d52a5ac7745fad1c1b4598f89bdf23fdbd0ea83531fba315f5fd202a28920",
+  "model": "krea/Krea-2-Raw",
+  "model_type": "krea2",
+  "tournament_envelope_hours": 0.75,
+  "training_seed_a": 42565431,
+  "training_seed_b_contingency": 309817421,
+  "gpu_execution_authorized": false,
+  "gpu_blockers": [
+    "D1 and D2 identities, train/evaluation split manifests, and content hashes are unset",
+    "measured conservative throughput bounds and held-out end-to-end timing validation are unset",
+    "K2-K4 public-arm provenance manifests and the K5 internal evidence record exist but named-human review approvals are unset",
+    "the published C1-C4 pre-finalist commitment exists but named-human reviewer acceptance and continued no-unblinding custody are unset",
+    "all accountable human DRI names, including the independent reviewer, remain unset"
+  ],
+  "discovery_tasks": {
+    "D1": {
+      "identity": null,
+      "fixture_split_manifest_sha256": null,
+      "required_training_pair_range": [18, 24],
+      "requirements": [
+        "matched but disjoint held-out evaluation rows",
+        "concept differs from D2",
+        "immutable train/evaluation content hashes before arm execution"
+      ]
+    },
+    "D2": {
+      "identity": null,
+      "fixture_split_manifest_sha256": null,
+      "required_training_pair_range": [36, 48],
+      "requirements": [
+        "matched but disjoint held-out evaluation rows",
+        "concept differs from D1",
+        "immutable train/evaluation content hashes before arm execution"
+      ]
+    }
+  },
+  "cross_fixture_human_review": {
+    "path": null,
+    "sha256": null
+  },
+  "confirmation_fixture_commitment": {
+    "state": "published_external_unaccepted_by_named_human",
+    "public_record": "/Users/atulyashetty/Test/SN56-project/SN56-WEEK5-C1C4-SEALED-COMMITMENT-2026-07-27.md",
+    "public_record_sha256": "fe956bbd0aaa02708c17b5b88cf21ded2a8fa2ba958acaa24cb7e37d7bc52e57",
+    "commitment_sha256": "0a12c416bcef48805132e80f9de65d0d248ef4415d617715d5736c189a379dbc",
+    "implementation_read_sealed_contents": false
+  },
+  "day0_source_evidence": {
+    "thin_evidence_manifest_file_sha256": "ca0f40d8aaac36f88e844704b090b022bea5585c27cdc10cae80d04d3ff9b715",
+    "public_source_review_state": "unreviewed",
+    "K2_manifest_file_sha256": "c443ce1c35c3fb56555b3e78d976ce46eca9a2474e60a5c863cade1d27fad766",
+    "K3_manifest_file_sha256": "8e997bff734b959796206b8a6fd05e05d5f0480b69f508fa7c7e76e2784ab22b",
+    "K4_manifest_file_sha256": "eb0d9558228e80af68c494e96c3d2f7745fa13f97489bdadfb902c1e9dd101a3",
+    "K5_internal_evidence_file_sha256": "52e23e79b46e623a73d5f70fce9c6fda752c12d6477bbe9c8387b4c622fe0883"
+  },
+  "arms": [
+    {
+      "id": "K0",
+      "purpose": "deployed-recipe shallow control",
+      "throughput_equivalence_class": "A-rank32-adamw8bit-mse-guidance2",
+      "depth_policy": "release-c654c4b-static-policy",
+      "candidate_cadence_policy": "release-c654c4b-kill-safe cadence; preserve production behavior rather than impose the discovery 1/8 cadence",
+      "lr": 0.0001,
+      "rank": 32,
+      "alpha": 32,
+      "optimizer": "adamw8bit",
+      "loss": "mse",
+      "guidance": 2,
+      "dropout": 0.05,
+      "ema": false,
+      "provenance_required": false
+    },
+    {
+      "id": "K1",
+      "purpose": "K0-matched budget-policy control (depth plus candidate cadence)",
+      "throughput_equivalence_class": "A-rank32-adamw8bit-mse-guidance2",
+      "matched_to": "K0",
+      "only_intended_recipe_change": ["depth_policy", "candidate_cadence_policy"],
+      "depth_policy": "measured-budget-fill",
+      "candidate_cadence_policy": "discovery-uniform-1/8-with-real-write-accounting",
+      "lr": 0.0001,
+      "rank": 32,
+      "alpha": 32,
+      "optimizer": "adamw8bit",
+      "loss": "mse",
+      "guidance": 2,
+      "dropout": 0.05,
+      "ema": false,
+      "provenance_required": false
+    },
+    {
+      "id": "K2",
+      "purpose": "official rank-2 public family",
+      "throughput_equivalence_class": "A-rank32-adamw8bit-mse-guidance2",
+      "source_rank": 2,
+      "source_revision": "f4766189afc0f0ce46b52ac2991efc5f005ebbfd",
+      "source_planned_steps": 1140,
+      "source_submitted_step": 960,
+      "source_save_cadence_steps": 120,
+      "depth_policy": "measured-budget-fill-with-step-960-landmark-if-budget-safe",
+      "candidate_cadence_policy": "discovery-uniform-1/8-with-real-write-accounting",
+      "lr": 0.000086,
+      "rank": 32,
+      "alpha": 32,
+      "optimizer": "adamw8bit",
+      "loss": "mse",
+      "guidance": 2,
+      "dropout": 0.1,
+      "ema": false,
+      "provenance_required": true,
+      "adapted_fields": [
+        "depth policy",
+        "save cadence and candidate grid",
+        "offline exact-scoring selection policy"
+      ],
+      "selector_reproduction_claimed": false,
+      "selection_policy": "preserve and exact-score full curve; public holdout algorithm is not assumed recoverable"
+    },
+    {
+      "id": "K3",
+      "purpose": "official rank-3 public family",
+      "throughput_equivalence_class": "B-rank32-adamw8bit-mae-guidance3",
+      "source_rank": 3,
+      "source_revision": "919e07cd4505cf64c13a9baef4402f2b42a6fb59",
+      "source_planned_steps": 1432,
+      "source_submitted_step": 1200,
+      "source_save_cadence_steps": 200,
+      "source_selection": "validator highest-number fallback; no last.safetensors and no selection record",
+      "depth_policy": "measured-budget-fill-with-step-1200-landmark-if-budget-safe",
+      "candidate_cadence_policy": "discovery-uniform-1/8-with-real-write-accounting",
+      "lr": 0.0001,
+      "rank": 32,
+      "alpha": 32,
+      "optimizer": "adamw8bit",
+      "loss": "mae",
+      "guidance": 3,
+      "dropout": null,
+      "ema": null,
+      "unknown_source_fields": ["dropout", "ema"],
+      "predeclared_local_values": {
+        "dropout": 0.05,
+        "ema": false
+      },
+      "provenance_required": true,
+      "adapted_fields": [
+        "depth policy",
+        "save cadence and candidate grid",
+        "offline exact-scoring selection policy",
+        "source-unknown dropout and EMA fixed locally to the K0/K1 controls"
+      ],
+      "execution_blocked_until_unknown_adaptations_are_predeclared": false
+    },
+    {
+      "id": "K4",
+      "purpose": "official rank-5 rank-64 adaptive public family",
+      "throughput_equivalence_class": "C-rank64-automagic-mse-guidance2",
+      "source_rank": 5,
+      "source_revision": "71bf349eb44640289b00fc620640a1302cc3c485",
+      "source_planned_steps": 1140,
+      "source_submitted_step": 840,
+      "source_save_cadence_steps": 120,
+      "depth_policy": "measured-budget-fill-with-step-840-landmark-if-budget-safe",
+      "candidate_cadence_policy": "discovery-uniform-1/8-with-real-write-accounting",
+      "lr": 0.00000086,
+      "lr_semantics": "configured Automagic base/input; realized per-update LR trajectory is unknown",
+      "min_lr": 0.0000001,
+      "max_lr": 0.001,
+      "lr_bump": 0.000001,
+      "rank": 64,
+      "alpha": 64,
+      "optimizer": "automagic",
+      "loss": "mse",
+      "guidance": 2,
+      "dropout": 0.3,
+      "ema": false,
+      "provenance_required": true,
+      "adapted_fields": [
+        "depth policy",
+        "save cadence and candidate grid",
+        "offline exact-scoring selection policy"
+      ],
+      "selector_reproduction_claimed": false,
+      "selection_policy": "preserve and exact-score full curve; public holdout algorithm is not assumed recoverable"
+    },
+    {
+      "id": "K5",
+      "purpose": "prior internal LR challenger",
+      "throughput_equivalence_class": "A-rank32-adamw8bit-mse-guidance2",
+      "matched_to": "K1",
+      "only_intended_recipe_change": ["lr"],
+      "depth_policy": "measured-budget-fill",
+      "candidate_cadence_policy": "discovery-uniform-1/8-with-real-write-accounting",
+      "lr": 0.0002,
+      "rank": 32,
+      "alpha": 32,
+      "optimizer": "adamw8bit",
+      "loss": "mse",
+      "guidance": 2,
+      "dropout": 0.05,
+      "ema": false,
+      "provenance_required": true,
+      "prior_evidence_scope": "one fixture family, 367-step final exports, guidance on, rank 32, same seed; not a deep-arm, second-seed, or universal result",
+      "internal_evidence_anchors": [
+        "SN56-GATE-B-H100-RESULTS.md",
+        "SN56-WEEK4-GPU-CAMPAIGN-RESULTS-2026-07-23.md",
+        "SN56-WEEK4-GPU-VALIDATION-ERRATUM-2026-07-22.md"
+      ]
+    }
+  ],
+  "budget_contract": {
+    "throughput_profiles_by_equivalence_class": {
+      "A-rank32-adamw8bit-mse-guidance2": null,
+      "B-rank32-adamw8bit-mae-guidance3": null,
+      "C-rank64-automagic-mse-guidance2": null
+    },
+    "profile_required": true,
+    "profile_sharing_rule": "arms may share a profile only when rank, optimizer, loss, guidance compute path, effective geometry, resolution, precision, caching, compilation, workers, and runtime identities match; otherwise a separate measured profile and held-out end-to-end validation are mandatory",
+    "guessed_fallback_forbidden": true,
+    "bound_method": "observed-max-plus-predeclared-margin",
+    "minimum_samples": {
+      "startup": 3,
+      "optimizer_updates": 100,
+      "checkpoint_saves": 8,
+      "held_out_end_to_end_runs": 1
+    },
+    "costs_required": [
+      "startup_upper_bound_s",
+      "update_upper_bound_s",
+      "save_upper_bound_s",
+      "finalization_reserve_s",
+      "upload_reserve_s"
+    ],
+    "selection_mode": "offline_post_training",
+    "selection_scoring_reserve_s": 0,
+    "live_selection_rule": "only a measured live_in_budget scorer with bound identity may consume a positive reserve",
+    "geometry_required": [
+      "micro_batch_size",
+      "gradient_accumulation_steps",
+      "data_parallel_replicas",
+      "images_per_update",
+      "resolution_policy_sha256",
+      "precision_policy_sha256"
+    ],
+    "minimum_post_reserve_training_utilization": 0.9,
+    "maximum_candidate_save_overhead_fraction": 0.1,
+    "utilization_definition": "optimizer update time plus checkpoint I/O divided by the post-fixed-reserve window; save I/O is separately capped at 10%"
+  },
+  "candidate_contract": {
+    "backend_constraint": "ai-toolkit exposes one uniform save_every value",
+    "uniform_interval_target_fraction": 0.125,
+    "report_targets": [0.1, 0.25, 0.5, 0.75, 0.9, 1.0],
+    "mapping_rule": "nearest actual candidate; ties choose earlier step; actual step, fraction, and image exposures always reported",
+    "terminal_periodic_write_rule": "charge a periodic write when save_every divides the terminal step even though candidate identity deduplicates it from final",
+    "field_landmarks": "add only when uniformly representable and inside the save-overhead cap",
+    "exact_score_during_discovery": "zero-LoRA and every valid current-attempt candidate, offline after training"
+  },
+  "decision_contract": {
+    "relative_loss_formula": "(L_control-L_candidate)/L_control",
+    "paired_rows_required": true,
+    "discovery_tie_band": 0.01,
+    "cluster_unit": "task/concept",
+    "bootstrap": "cluster-bootstrap by task/concept",
+    "bootstrap_confidence": 0.95,
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 42565431,
+    "material_rank_reversal_definition": "any non-control pair switches order across D1/D2 with >0.01 relative-improvement separation in both directions",
+    "checkpoint_tie_breaker": "earliest actual step among candidates within 0.01 of best",
+    "default_evaluation_rows_per_task": [24, 40],
+    "advance_if_D1_D2_agree": [
+      "shared winner",
+      "next-lowest minimax-regret non-control",
+      "K0"
+    ],
+    "advance_if_D1_D2_disagree": [
+      "D1 winner",
+      "D2 winner",
+      "lowest-minimax-regret remaining non-control",
+      "K0"
+    ],
+    "seed_b_trigger": "three or more non-controls inside tie band or material rank reversal",
+    "maximum_finalists": 4,
+    "fallback_policy_predeclared": true,
+    "learning_entry_fallback": {
+      "arm": "K1",
+      "checkpoint_target_fraction": 0.875,
+      "mapping_rule": "nearest valid current-run candidate; ties choose earlier; record actual step, fraction, and image exposures",
+      "activation": "only if the sealed discovery/confirmation decision cannot complete by the owner cutoff and the named owner signs a written learning-risk waiver",
+      "required_gates": [
+        "equivalence-class-A throughput profile measured and held-out end-to-end validated",
+        "K1 natural completion under the measured budget plan",
+        "valid current-run 7/8 candidate with no failure or fallback telemetry",
+        "mechanics evidence PASS and exact artifact binding",
+        "waiver states plainly that Krea may still lose Round 1 because field parity is unproven"
+      ],
+      "claim_limit": "learning entry only; never field_parity_ready or win_ready",
+      "anti_adaptation_rule": "do not tune 0.875 after seeing a partial D1 curve; either use the sealed main decision rule or invoke this fixed fallback",
+      "forbidden_fallback": "K0"
+    },
+    "day5_incomplete_outcome": "no-go or owner-approved invocation of the fixed K1 learning-entry fallback"
+  },
+  "confirmation_contract": {
+    "fixtures": ["C1", "C2", "C3", "C4"],
+    "identities": null,
+    "fixture_shape_contract": {
+      "C1": {"dataset_shape": "small", "training_pair_range": [18, 24], "evaluation_rows": 24},
+      "C2": {"dataset_shape": "small", "training_pair_range": [18, 24], "evaluation_rows": 24},
+      "C3": {"dataset_shape": "large", "training_pair_range": [36, 48], "evaluation_rows": 40},
+      "C4": {"dataset_shape": "large", "training_pair_range": [36, 48], "evaluation_rows": 40}
+    },
+    "sealed_by_independent_reviewer_before_discovery_unblinding": true,
+    "paired_predeclared_seed_per_concept": true,
+    "second_seed_repeats": 2,
+    "field_parity_noninferiority_cap": 0.01,
+    "concept_regression_cap": 0.03,
+    "minimum_point_estimate_wins_or_ties": 3,
+    "point_win_or_tie_cap": 0.01,
+    "strongest_public_reference_rule": "minimum loss among exhaustive K2-K4 faithful replicas for the same concept and seed",
+    "boundary_hours": [0.5, 0.75, 1.0],
+    "dataset_boundaries": ["small", "large"],
+    "boundary_gate": "mechanics_only_natural_completion_upload_ready_clean"
+  },
+  "prohibited": [
+    "use unrelated concepts to score harvested concept-specific LoRAs",
+    "treat pooled row count as independent concepts",
+    "enable production proxy selection from offline exact scores",
+    "claim exact target fractions when the backend emitted different fractions",
+    "claim a private public-arm selector was reproduced when only its selected artifact is observable",
+    "port an experiment policy into forge before sealed confirmation and review"
+  ]
+}

@@ -38,6 +38,11 @@ from typing import Any, Iterator
 import urllib.error
 import urllib.request
 
+try:
+    from . import krea_dataset_identity
+except ImportError:  # pragma: no cover - direct script execution.
+    import krea_dataset_identity  # type: ignore[no-redef]
+
 
 _LOOPBACK = "127.0.0.1"
 _DEFAULT_PORT = 8188
@@ -143,9 +148,7 @@ def _git_snapshot(path: Path, *, expected_commit: str | None) -> dict[str, str]:
             raise RuntimeError(f"not a Git checkout: {path}") from exc
     commit = _run_text(["git", "-C", str(path), "rev-parse", "HEAD"])
     tree = _run_text(["git", "-C", str(path), "rev-parse", "HEAD^{tree}"])
-    object_type = _run_text(
-        ["git", "-C", str(path), "cat-file", "-t", commit]
-    )
+    object_type = _run_text(["git", "-C", str(path), "cat-file", "-t", commit])
     if object_type != "commit":
         raise RuntimeError(f"Git HEAD is not a commit in {path}")
     status = _run_text(
@@ -203,7 +206,9 @@ def _module_source(module: ModuleType) -> Path:
     return path
 
 
-def _import_god(god_root: Path) -> tuple[dict[str, ModuleType], dict[str, dict[str, str]]]:
+def _import_god(
+    god_root: Path,
+) -> tuple[dict[str, ModuleType], dict[str, dict[str, str]]]:
     root_text = str(god_root)
     if root_text in sys.path:
         sys.path.remove(root_text)
@@ -238,7 +243,9 @@ def _import_god(god_root: Path) -> tuple[dict[str, ModuleType], dict[str, dict[s
     }
     for name, module in sorted(namespace_modules.items()):
         if getattr(module, "__file__", None) is None:
-            locations = [Path(item).resolve() for item in getattr(module, "__path__", ())]
+            locations = [
+                Path(item).resolve() for item in getattr(module, "__path__", ())
+            ]
             if not locations or any(
                 not _path_is_within(location, god_root) for location in locations
             ):
@@ -266,7 +273,9 @@ def _assert_bound_sources_unchanged(
     for details in bindings.values():
         path = god_root / details["path"]
         if _sha256(path) != details["sha256"]:
-            raise RuntimeError(f"imported G.O.D source changed during evaluation: {path}")
+            raise RuntimeError(
+                f"imported G.O.D source changed during evaluation: {path}"
+            )
 
 
 def _python_environment(python_path: Path) -> dict[str, Any]:
@@ -337,94 +346,14 @@ def _capture_dataset(
     list_supported_images: Any,
     extensions: tuple[str, ...],
 ) -> dict[str, Any]:
-    if not dataset.is_dir():
-        raise ValueError(f"dataset path is not a directory: {dataset}")
-    entries = list(dataset.iterdir())
-    non_files = [entry.name for entry in entries if not entry.is_file()]
-    symlinks = [entry.name for entry in entries if entry.is_symlink()]
-    if non_files or symlinks:
-        raise RuntimeError(
-            {"dataset_non_files": sorted(non_files), "dataset_symlinks": sorted(symlinks)}
-        )
-
-    evaluator_order = list_supported_images(str(dataset), extensions)
-    if (
-        not isinstance(evaluator_order, list)
-        or not evaluator_order
-        or any(not isinstance(name, str) for name in evaluator_order)
-        or len(evaluator_order) != len(set(evaluator_order))
-    ):
-        raise RuntimeError("G.O.D returned an invalid or empty image list")
-
-    image_names = set(evaluator_order)
-    stems: set[str] = set()
-    prompt_names: set[str] = set()
-    rows: list[dict[str, Any]] = []
-    for index, image_name in enumerate(evaluator_order):
-        image_path = dataset / image_name
-        stem = os.path.splitext(image_name)[0]
-        if stem in stems:
-            raise RuntimeError(f"ambiguous duplicate image stem in dataset: {stem}")
-        stems.add(stem)
-        prompt_name = f"{stem}.txt"
-        prompt_path = dataset / prompt_name
-        if not prompt_path.is_file() or prompt_path.is_symlink():
-            raise RuntimeError(f"missing or unsafe paired prompt: {prompt_path}")
-        try:
-            prompt = prompt_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise RuntimeError(f"prompt is not valid UTF-8: {prompt_path}") from exc
-        if not prompt.strip():
-            raise RuntimeError(f"paired prompt is empty: {prompt_path}")
-        prompt_names.add(prompt_name)
-
-        # PIL is already a dependency of the imported evaluator.  Verifying the
-        # bytes here prevents a corrupt row from becoming an unnamed eval error.
-        pil_image = importlib.import_module("PIL.Image")
-        try:
-            with pil_image.open(image_path) as image:
-                image.verify()
-            with pil_image.open(image_path) as image:
-                width, height = image.size
-                image_format = image.format
-                mode = image.mode
-        except Exception as exc:
-            raise RuntimeError(f"invalid image row: {image_path}") from exc
-        if width <= 0 or height <= 0:
-            raise RuntimeError(f"image has invalid dimensions: {image_path}")
-        rows.append(
-            {
-                "index": index,
-                "image": image_name,
-                "image_sha256": _sha256(image_path),
-                "image_bytes": image_path.stat().st_size,
-                "image_width": width,
-                "image_height": height,
-                "image_format": image_format,
-                "image_mode": mode,
-                "prompt": prompt_name,
-                "prompt_sha256": _sha256(prompt_path),
-                "prompt_bytes": prompt_path.stat().st_size,
-            }
-        )
-
-    regular_names = {entry.name for entry in entries}
-    expected_names = image_names | prompt_names
-    unexpected = regular_names - expected_names
-    missing_expected = expected_names - regular_names
-    if unexpected or missing_expected:
-        raise RuntimeError(
-            {
-                "unexpected_dataset_files": sorted(unexpected),
-                "missing_dataset_files": sorted(missing_expected),
-            }
-        )
-    identity = {
-        "evaluator_order": evaluator_order,
-        "rows": rows,
-    }
-    identity["sha256"] = _json_sha256(identity)
-    return identity
+    # One implementation is shared by pre-GPU fixture sealing, the evaluator,
+    # and result validation.  Separate "directory fingerprints" are not an
+    # evaluator identity and must never be substituted here.
+    return krea_dataset_identity.capture_dataset(
+        dataset,
+        list_supported_images=list_supported_images,
+        extensions=extensions,
+    )
 
 
 def _file_snapshot(paths: dict[str, Path]) -> dict[str, dict[str, Any]]:
@@ -489,9 +418,7 @@ def _wait_for_fresh_comfy(
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
             last_error = exc
             time.sleep(0.5)
-    raise TimeoutError(
-        f"fresh ComfyUI was not ready within {timeout_s}s: {last_error}"
-    )
+    raise TimeoutError(f"fresh ComfyUI was not ready within {timeout_s}s: {last_error}")
 
 
 class _EvaluationTimedOut(TimeoutError):
@@ -651,8 +578,10 @@ def main() -> int:
     candidate = _absolute_lexical(args.candidate_path)
     output = _absolute_lexical(args.output)
     temp_output = Path(f"{output}.tmp")
-    comfy_log = _absolute_lexical(args.comfy_log) if args.comfy_log else Path(
-        f"{output}.comfy.log"
+    comfy_log = (
+        _absolute_lexical(args.comfy_log)
+        if args.comfy_log
+        else Path(f"{output}.comfy.log")
     )
     comfy_root = Path(args.comfy_root).expanduser().resolve(strict=True)
     god_root = Path(args.god_root).expanduser().resolve(strict=True)
@@ -759,9 +688,7 @@ def main() -> int:
         immutable_paths = {
             "candidate": candidate,
             "staged_candidate": staged_candidate,
-            "diffusion_model": (
-                comfy_root / "models" / "diffusion_models" / base_name
-            ),
+            "diffusion_model": (comfy_root / "models" / "diffusion_models" / base_name),
             "text_encoder": (
                 comfy_root
                 / "models"
@@ -772,9 +699,7 @@ def main() -> int:
             "workflow": workflow_path,
             "calibration_shim": Path(__file__).resolve(),
             "comfy_main": comfy_main,
-            "comfy_environment_marker": Path(
-                python_environment["identity_marker"]
-            ),
+            "comfy_environment_marker": Path(python_environment["identity_marker"]),
         }
         immutable_before = _file_snapshot(immutable_paths)
 
@@ -864,7 +789,9 @@ def main() -> int:
                     with _time_limit(args.evaluation_timeout_s):
                         gateway.connect()
                         if getattr(gateway, "ws", None) is None:
-                            raise RuntimeError("G.O.D Comfy gateway did not create a websocket")
+                            raise RuntimeError(
+                                "G.O.D Comfy gateway did not create a websocket"
+                            )
                         gateway.ws.settimeout(args.evaluation_timeout_s)
                         raw, actual_order = _run_exact_eval(
                             diffusion,
@@ -876,9 +803,7 @@ def main() -> int:
                         raise RuntimeError(
                             "G.O.D image order changed between identity capture and scoring"
                         )
-                    expected_prompts = (
-                        len(dataset_before["rows"]) * generations * 2
-                    )
+                    expected_prompts = len(dataset_before["rows"]) * generations * 2
                     history = _http_json(args.port, "/history", timeout=10.0)
                     history_evidence = _validate_history(
                         history,
@@ -888,7 +813,9 @@ def main() -> int:
                     if not isinstance(queue, dict):
                         raise RuntimeError("ComfyUI returned an invalid queue")
                     if queue.get("queue_running") or queue.get("queue_pending"):
-                        raise RuntimeError("ComfyUI queue was not empty after evaluation")
+                        raise RuntimeError(
+                            "ComfyUI queue was not empty after evaluation"
+                        )
                     if process.poll() is not None:
                         raise RuntimeError(
                             "fresh ComfyUI exited before controlled shutdown "
@@ -950,7 +877,9 @@ def main() -> int:
             expected_commit=args.expected_tooling_commit,
         )
         if _python_environment(comfy_python) != python_environment:
-            raise RuntimeError("Comfy virtual-environment identity changed during evaluation")
+            raise RuntimeError(
+                "Comfy virtual-environment identity changed during evaluation"
+            )
         if _driver_environment() != driver_environment:
             raise RuntimeError("evaluator driver environment changed during evaluation")
 
@@ -960,17 +889,21 @@ def main() -> int:
         if not math.isfinite(text_weight) or not 0.0 <= text_weight <= 1.0:
             raise RuntimeError(f"invalid G.O.D text-guided weight: {text_weight}")
         weighted = text_weight * text_mean + (1.0 - text_weight) * blank_mean
-        if not all(math.isfinite(value) and value >= 0.0 for value in (
-            text_mean,
-            blank_mean,
-            weighted,
-        )):
+        if not all(
+            math.isfinite(value) and value >= 0.0
+            for value in (
+                text_mean,
+                blank_mean,
+                weighted,
+            )
+        ):
             raise RuntimeError("aggregate evaluator loss is invalid")
         if any(value > 1.0 for value in (text_mean, blank_mean, weighted)):
             raise RuntimeError("aggregate evaluator loss escaped RGB-MSE bounds")
 
+        master_seed = 42
         seeds = diffusion.generate_reproducible_seeds(
-            master_seed=42,
+            master_seed=master_seed,
             n=generations,
         )
         if (
@@ -1026,6 +959,7 @@ def main() -> int:
             "cfg": cfg,
             "denoise": denoise,
             "generations": generations,
+            "master_seed": master_seed,
             "seeds": seeds,
             "text_guided_losses": normalized["text_guided_losses"],
             "blank_prompt_losses": normalized["no_text_losses"],
@@ -1055,7 +989,9 @@ def main() -> int:
                 "god_import_bindings": import_bindings,
                 "workflow_path": str(workflow_path.relative_to(god_root)),
                 "workflow_sha256": immutable_before["workflow"]["sha256"],
-                "calibration_shim_sha256": immutable_before["calibration_shim"]["sha256"],
+                "calibration_shim_sha256": immutable_before["calibration_shim"][
+                    "sha256"
+                ],
                 "comfy_main_sha256": immutable_before["comfy_main"]["sha256"],
             },
             "runtime": {
