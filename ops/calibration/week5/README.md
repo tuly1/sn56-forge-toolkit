@@ -19,7 +19,11 @@ The order is fail-closed:
 4. Curate and seal D1/D2 matched-but-disjoint train/evaluation splits under
    `KREA-FIXTURE-CURATION-CONTRACT.md`. A C1-C4 pre-finalist commitment was
    published externally; it remains sealed and requires named-human acceptance
-   before it can satisfy the independent-review gate.
+   before it can satisfy the independent-review gate. The later public-shape
+   correction is bound by `krea-c1c4-shape-contract-amendment.json`: C1-C4 use
+   their exact published concept classes and 20/6, 45/6, 30/8, and 12/5
+   train/evaluation counts. It is an amendment to the plan contract, never a
+   reseal of the unchanged fixture commitment.
 5. Measure conservative actual GPU/runtime upper bounds, validate the resulting
    plan in one held-out end-to-end timing run, and bind the profile by SHA-256.
 6. Resolve a budget-fill plan, actual candidate fractions, and image exposures.

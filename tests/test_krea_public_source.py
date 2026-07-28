@@ -19,6 +19,7 @@ import krea_public_source as public_source  # noqa: E402
 
 
 _LEDGER = _CALIBRATION / "week5" / "krea-r1-field-ledger.json"
+_DISCOVERY_PLAN = _CALIBRATION / "week5" / "krea-discovery-plan.json"
 _CONFIGS = {
     "K2": Path("K2-rank2-f4766189-config.yaml"),
     "K3": Path("K3-rank3-919e07cd-config.yaml"),
@@ -144,8 +145,21 @@ def test_actual_public_configs_rederive_frozen_source_recipe(
         field_ledger_path=_LEDGER,
     )
     fields = metadata["normalized_recipe"]["fields"]
+    disclosure = metadata["local_reproduction_disclosure"]
+    plan = json.loads(_DISCOVERY_PLAN.read_text(encoding="utf-8"))
+    plan_arm = next(row for row in plan["arms"] if row["id"] == arm)
     assert metadata["review_assertion"]["status"] == "unreviewed"
     assert metadata["evaluator_sha"] is None
+    assert disclosure["execution_authorized"] is False
+    assert [row["name"] for row in disclosure["adapted_fields"]] == sorted(
+        plan_arm["adapted_fields"]
+    )
+    assert (
+        next(
+            row for row in disclosure["adapted_fields"] if row["name"] == "depth policy"
+        )["local_policy"]
+        == plan_arm["depth_policy"]
+    )
     assert fields["submitted_step"]["source_value"] == step
     assert fields["learning_rate"]["source_value"] == lr
     assert fields["selector"]["source_value"] == selector
@@ -153,9 +167,66 @@ def test_actual_public_configs_rederive_frozen_source_recipe(
     if arm == "K3":
         assert fields["dropout"]["classification"] == "unknown"
         assert fields["ema"]["classification"] == "unknown"
+        assert [
+            row["field"] for row in disclosure["source_unknown_fields"]
+        ] == plan_arm["unknown_source_fields"]
+        assert {
+            row["field"]: row["value"] for row in disclosure["predeclared_local_values"]
+        } == plan_arm["predeclared_local_values"]
+        assert all(
+            "not evidence of K3's source" in row["basis"]
+            for row in disclosure["predeclared_local_values"]
+        )
     else:
         assert fields["dropout"]["classification"] == "known"
         assert fields["ema"]["classification"] == "known"
+        assert disclosure["source_unknown_fields"] == []
+        assert disclosure["predeclared_local_values"] == []
+        assert (
+            next(
+                row
+                for row in disclosure["adapted_fields"]
+                if row["name"] == "offline exact-scoring selection policy"
+            )["local_policy"]
+            == plan_arm["selection_policy"]
+        )
+
+
+def test_automagic_lr_caveat_is_scoped_only_to_automagic(tmp_path: Path) -> None:
+    evidence = {}
+    for arm, step in (("K2", 960), ("K3", 1200), ("K4", 840)):
+        metadata = public_source.build_metadata(
+            arm,
+            source_config_path=_config(tmp_path / f"{arm}.yaml", arm),
+            source_artifact_path=_artifact(tmp_path / f"{arm}.safetensors", step),
+            field_ledger_path=_LEDGER,
+        )
+        evidence[arm] = metadata["normalized_recipe"]["fields"]["learning_rate"][
+            "evidence"
+        ]
+    assert evidence["K2"] == "Immutable source config."
+    assert evidence["K3"] == "Immutable source config."
+    assert "Automagic" in evidence["K4"]
+
+
+def test_k3_unknowns_and_local_values_cannot_be_conflated(tmp_path: Path) -> None:
+    metadata = public_source.build_metadata(
+        "K3",
+        source_config_path=_config(tmp_path / "K3.yaml", "K3"),
+        source_artifact_path=_artifact(tmp_path / "K3.safetensors", 1200),
+        field_ledger_path=_LEDGER,
+    )
+    disclosure = metadata["local_reproduction_disclosure"]
+    source = metadata["normalized_recipe"]["fields"]
+    assert source["dropout"]["source_value"] is None
+    assert source["ema"]["source_value"] is None
+    assert all(
+        row["source_value"] is None for row in disclosure["source_unknown_fields"]
+    )
+    assert {row["field"] for row in disclosure["predeclared_local_values"]} == {
+        "dropout",
+        "ema",
+    }
 
 
 def test_artifact_step_must_match_official_ledger(tmp_path: Path) -> None:

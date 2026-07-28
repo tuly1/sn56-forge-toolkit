@@ -32,16 +32,17 @@ except ImportError:  # pragma: no cover - direct script execution.
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-_ROLE_COUNTS = {
+_DISCOVERY_ROLE_COUNTS = {
     "D1": ((18, 24), (24, 24)),
     "D2": ((36, 48), (40, 40)),
-    "C1": ((18, 24), (24, 24)),
-    "C2": ((18, 24), (24, 24)),
-    "C3": ((36, 48), (40, 40)),
-    "C4": ((36, 48), (40, 40)),
 }
-_SMALL_ROLES = frozenset({"D1", "C1", "C2"})
-_LARGE_ROLES = frozenset({"D2", "C3", "C4"})
+_CONFIRMATION_ROLE_COUNTS = {
+    "C1": ((20, 20), (6, 6)),
+    "C2": ((45, 45), (6, 6)),
+    "C3": ((30, 30), (8, 8)),
+    "C4": ((12, 12), (5, 5)),
+}
+_ROLE_COUNTS = {**_DISCOVERY_ROLE_COUNTS, **_CONFIRMATION_ROLE_COUNTS}
 _CROSS_FIXTURE_ROLES = ("D1", "D2", "C1", "C2", "C3", "C4")
 _HUMAN_IDENTITY_ASSURANCE = (
     "named-human-string-self-assertion-not-cryptographic-authentication"
@@ -116,7 +117,7 @@ def _parse_canonical_utc(value: Any, label: str) -> datetime:
 def _validate_role_counts(
     role: str, training_count: int, evaluation_count: int
 ) -> None:
-    """Enforce the frozen small/large fixture classes without inventing counts."""
+    """Enforce discovery ranges and each published confirmation shape exactly."""
 
     if role not in _ROLE_COUNTS:
         raise ValueError("experimental_role must be D1, D2, or C1-C4")
@@ -130,16 +131,6 @@ def _validate_role_counts(
         raise ValueError(f"{role} training count is outside {train_range}")
     if not eval_range[0] <= evaluation_count <= eval_range[1]:
         raise ValueError(f"{role} evaluation count is outside {eval_range}")
-    if role in (_SMALL_ROLES - {"D1"}) and (train_range, eval_range) != (
-        (18, 24),
-        (24, 24),
-    ):
-        raise AssertionError("C1/C2 must remain frozen to the small fixture class")
-    if role in (_LARGE_ROLES - {"D2"}) and (train_range, eval_range) != (
-        (36, 48),
-        (40, 40),
-    ):
-        raise AssertionError("C3/C4 must remain frozen to the large fixture class")
 
 
 def canonical_utc(value: Any, label: str) -> str:

@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "kind": "forge-krea-confirmation-fixture-shape-contract-amendment",
+  "operation": "amend_contract_metadata_without_resealing_fixtures",
+  "amends_discovery_plan_file_sha256": "6365f150352de1497fbf32edc8ea07bc2859c3096c95796cff708c89382aee6a",
+  "amends_discovery_plan_commit": "1bd7477717ab8d96d208d9fe265f071f08e47e73",
+  "authorship_order": "authored after the public commitment and the independent reviewer finding; this amendment was not part of the original fixture seal",
+  "source_public_record": "SN56-project/SN56-WEEK5-C1C4-SEALED-COMMITMENT-2026-07-27.md",
+  "source_public_record_sha256": "f907c40e362378c1b82e7455d96ffd8bd876696f25cef21705e14bbba2d4ffc0",
+  "commitment_sha256_before": "0a12c416bcef48805132e80f9de65d0d248ef4415d617715d5736c189a379dbc",
+  "commitment_sha256_after": "0a12c416bcef48805132e80f9de65d0d248ef4415d617715d5736c189a379dbc",
+  "fixture_commitment_resealed": false,
+  "implementation_read_sealed_contents": false,
+  "prior_fixture_shape_contract": {
+    "C1": {"dataset_shape": "small", "training_pair_range": [18, 24], "evaluation_rows": 24},
+    "C2": {"dataset_shape": "small", "training_pair_range": [18, 24], "evaluation_rows": 24},
+    "C3": {"dataset_shape": "large", "training_pair_range": [36, 48], "evaluation_rows": 40},
+    "C4": {"dataset_shape": "large", "training_pair_range": [36, 48], "evaluation_rows": 40}
+  },
+  "amended_fixture_shape_contract": {
+    "C1": {"concept_class": "architectural object", "training_pairs": 20, "evaluation_rows": 6},
+    "C2": {"concept_class": "art/print-style series", "training_pairs": 45, "evaluation_rows": 6},
+    "C3": {"concept_class": "natural subject", "training_pairs": 30, "evaluation_rows": 8},
+    "C4": {"concept_class": "product/design object set", "training_pairs": 12, "evaluation_rows": 5}
+  },
+  "published_manifest_file_sha256s": {
+    "C1": "ed287150fd4d189b3a0964d87c5fc50de11851ab372dabe30da9d9f87fdc450e",
+    "C2": "902a4a6716a9210694f3f441d54b4def19e9bc64d0a49be4cb832ccff8605083",
+    "C3": "74ebbfaf91b156741d34b10ba2d37600076844c010ea6ea83d4af36a386eda09",
+    "C4": "7a3fb670bed78d851cf8c066696b61ccc79d78dffd1ecb633520493772210872"
+  },
+  "claim_limit": "Corrects only the public per-fixture concept classes and train/evaluation counts; fixture bytes, manifest digests, aggregate commitment, identities, and custody are unchanged.",
+  "amendment_sha256": "367fbcd46827e49efa4d14bf50d1533d85f56d5354a3233d4ea41a81779ef61c"
+}

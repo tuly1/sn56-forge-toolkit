@@ -38,6 +38,9 @@
     ],
     "consequence": "checkpoint-soup.safetensors in 5GpcTKW7 was not scored because last.safetensors existed."
   },
+  "discovery_arm_selection": {
+    "excluded_final_rank_4": "Final rank 4 adds no fully disclosed distinct faithful arm: its scored last.safetensors is in the rank-32 AdamW8bit MSE LR-1e-4 family already covered by K0/K2, its only potentially orthogonal checkpoint soup was not submitted or scored, and its differential-guidance setting is unknown."
+  },
   "field_summary": {
     "all_top_10_submitted_step_range": [840, 1200],
     "shallow_cluster": [

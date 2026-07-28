@@ -21,16 +21,20 @@ from typing import Any
 
 try:
     from . import krea_budget
+    from . import krea_c1c4_amendment
     from . import krea_dataset_identity
     from . import krea_fixture
     from . import krea_host_identity
+    from . import krea_internal_evidence
     from . import krea_provenance
     from . import krea_public_source
 except ImportError:  # pragma: no cover - direct script execution.
     import krea_budget  # type: ignore[no-redef]
+    import krea_c1c4_amendment  # type: ignore[no-redef]
     import krea_dataset_identity  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
     import krea_host_identity  # type: ignore[no-redef]
+    import krea_internal_evidence  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_public_source  # type: ignore[no-redef]
 
@@ -350,6 +354,7 @@ def _arm_basis(
             "evaluator_sha",
             "matched_concept",
             "adaptation_target",
+            "local_reproduction_disclosure",
             "normalized_recipe",
         }
         mismatches = sorted(
@@ -381,19 +386,37 @@ def _arm_basis(
             "normalized_execution_recipe": normalized,
         }
     if mode == "internal":
-        _exact(basis, {"mode", "basis_record"}, "internal arm basis binding")
+        expected_keys = {"mode", "basis_record"}
+        if arm_id == "K5":
+            expected_keys.add("project_root")
+        _exact(basis, expected_keys, "internal arm basis binding")
         _, record, record_file_sha = _load_binding(
             basis["basis_record"], "internal arm basis record"
         )
         validate_internal_basis(record, arm_id=arm_id)
         normalized = krea_provenance.normalize_recipe(execution_recipe)
-        return {
+        result = {
             "mode": mode,
             "basis_record_file_sha256": record_file_sha,
             "basis_sha256": record["basis_sha256"],
             "basis_mode": record["mode"],
             "normalized_execution_recipe": normalized,
         }
+        if arm_id == "K5":
+            project_root = _safe_directory(
+                basis["project_root"], "K5 evidence project root"
+            )
+            evidence_path, evidence, evidence_file_sha = _load_binding(
+                record["evidence_record"], "K5 internal evidence record"
+            )
+            krea_internal_evidence.validate_record(evidence, project_root=project_root)
+            anchor = krea_internal_evidence.build_anchor(
+                record_path=evidence_path, project_root=project_root
+            )
+            if anchor["record_file_sha256"] != evidence_file_sha:
+                raise ValueError("K5 evidence record binding differs from its anchor")
+            result["K5_internal_evidence_anchor"] = anchor
+        return result
     raise ValueError("arm basis mode must be public_submission or internal")
 
 
@@ -446,6 +469,10 @@ def validate_discovery_semantics(
         or discovery.get("gpu_execution_authorized") is not False
     ):
         raise ValueError("unsupported or execution-enabled discovery plan")
+    # A plan-level digest binding is insufficient if its repo-local amendment
+    # has disappeared or changed since the plan was written.  Validate the
+    # artifact itself on both timing-probe and execution-plan load paths.
+    krea_c1c4_amendment.validate_bound_plan_amendment(discovery)
     tasks = _object(discovery.get("discovery_tasks"), "discovery tasks")
     if fixture_id not in {"D1", "D2"} or fixture_id not in tasks:
         raise ValueError("discovery fixture id must be D1 or D2")
@@ -542,6 +569,8 @@ def validate_discovery_semantics(
             for key, expected in expected_parameters.items()
         ):
             raise ValueError("Automagic parameters contradict the frozen K4 arm")
+    if arm_id == "K5":
+        krea_internal_evidence.validate_anchor(arm.get("internal_evidence_anchor"))
     return {
         "path": path,
         "file_sha256": file_sha,
@@ -738,11 +767,12 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         or evaluation_sha != expected_identity["sha256"]
     ):
         raise ValueError("evaluation dataset differs from the approved fixture")
-    recipe = _arm_basis(
+    normalized_basis = _arm_basis(
         plan["arm_basis"],
         arm_id=plan["arm_id"],
         execution_recipe=plan["execution_recipe"],
-    )["normalized_execution_recipe"]
+    )
+    recipe = normalized_basis["normalized_execution_recipe"]
     profile_path, profile_sha = _file_binding(
         plan["throughput_profile"], "throughput profile"
     )
@@ -987,6 +1017,12 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         basis_mode=basis_mode,
     )
     if (
+        plan["arm_id"] == "K5"
+        and normalized_basis["K5_internal_evidence_anchor"]
+        != discovery["arm"]["internal_evidence_anchor"]
+    ):
+        raise ValueError("K5 execution basis differs from the frozen evidence anchor")
+    if (
         probe_contract["probe_contract_sha256"] != raw_samples["probe_contract_sha256"]
         or probe_contract["probe_contract_sha256"]
         != end_to_end["probe_contract_sha256"]
@@ -1210,6 +1246,12 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
         predeclared_recipe_axes=axes,
         basis_mode=_object(plan["arm_basis"], "probe arm basis").get("mode"),
     )
+    if (
+        plan["arm_id"] == "K5"
+        and normalized_basis["K5_internal_evidence_anchor"]
+        != discovery["arm"]["internal_evidence_anchor"]
+    ):
+        raise ValueError("K5 probe basis differs from the frozen evidence anchor")
     command = plan["command_argv"]
     if (
         not isinstance(command, list)

@@ -16,11 +16,23 @@ human review only; referencing them here does not approve a source or split.
   training pairs and 40 held-out exact-evaluation rows.
 - **C1–C4:** four additional concepts selected and privately sealed by the
   independent reviewer before D1/D2 results are unblinded. They are confirmation
-  evidence, not additional discovery opportunities.
+  evidence, not additional discovery opportunities. Their public, exact shapes
+  are:
 
-The exact concepts remain unset. Filling them is an evidence-changing decision
-that requires a named source owner and reviewer; a convenient directory of
-images is not authorization to use it.
+  | Role | Concept class | Training pairs | Evaluation rows |
+  |---|---|---:|---:|
+  | C1 | architectural object | 20 | 6 |
+  | C2 | art/print-style series | 45 | 6 |
+  | C3 | natural subject | 30 | 8 |
+  | C4 | product/design object set | 12 | 5 |
+
+  These are four distinct concept/shape contracts. C1/C2 are not aliases for
+  the discovery `small` boundary, and C3/C4 are not aliases for `large`.
+
+The exact fixture identities remain unset; only the four public concept classes
+above are known. Filling the identities is an evidence-changing decision that
+requires a named source owner and reviewer; a convenient directory of images
+is not authorization to use it.
 
 ## Admission rules
 
@@ -76,6 +88,12 @@ rehash-verified copy bound to the approved manifest, not mutable source paths.
 6. D1/D2 results freeze finalists and the deterministic checkpoint rule.
 7. C1–C4 identities are revealed once; failed confirmation sends the policy
    back to discovery and cannot be relabeled as a win.
+
+The C1–C4 counts above were added after the public commitment exposed the
+earlier plan's incorrect small/large generalization. This is a metadata
+amendment, recorded in `krea-c1c4-shape-contract-amendment.json`; it does not
+reseal or change fixture bytes, manifest digests, identities, custody, or the
+published aggregate commitment.
 
 ## Claim limit
 

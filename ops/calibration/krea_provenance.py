@@ -63,7 +63,8 @@ _SELECTORS = frozenset(
     }
 )
 _KIND = "forge-krea-public-arm-provenance"
-_SCHEMA = 1
+_SCHEMA = 2
+_LOCAL_DISCLOSURE_KIND = "forge-krea-local-reproduction-disclosure"
 
 
 def _parse() -> argparse.Namespace:
@@ -734,6 +735,178 @@ def _adaptation_target(
     }
 
 
+def _local_reproduction_disclosure(
+    value: Any,
+    *,
+    adaptation_target: dict[str, str],
+    source_recipe: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate the local choices without relabelling them as source facts.
+
+    Public provenance remains a source-only record.  This sibling disclosure
+    makes the intended local reproduction legible from the manifest alone:
+    policy adaptations are named explicitly, while source-unknown fields and
+    their predeclared local values remain separate evidence classes.
+    """
+
+    if adaptation_target["mode"] == "direct_public_artifact":
+        if value is not None:
+            raise ValueError(
+                "direct_public_artifact cannot carry a local reproduction disclosure"
+            )
+        return None
+    disclosure = _require_object(value, "local_reproduction_disclosure")
+    _exact_keys(
+        disclosure,
+        {
+            "schema",
+            "kind",
+            "execution_authorized",
+            "adapted_fields",
+            "source_unknown_fields",
+            "predeclared_local_values",
+            "claim_limit",
+        },
+        "local_reproduction_disclosure",
+    )
+    if (
+        disclosure["schema"] != 1
+        or disclosure["kind"] != _LOCAL_DISCLOSURE_KIND
+        or disclosure["execution_authorized"] is not False
+    ):
+        raise ValueError("local reproduction disclosure identity is invalid")
+
+    source_fields = source_recipe["fields"]
+    raw_adapted = disclosure["adapted_fields"]
+    if not isinstance(raw_adapted, list) or not raw_adapted:
+        raise ValueError("local reproduction must disclose every adapted field")
+    adapted: list[dict[str, Any]] = []
+    adapted_names: set[str] = set()
+    for index, raw in enumerate(raw_adapted):
+        label = f"local_reproduction_disclosure.adapted_fields[{index}]"
+        row = _require_object(raw, label)
+        _exact_keys(
+            row,
+            {"name", "source_recipe_fields", "local_policy", "evidence"},
+            label,
+        )
+        name = _text(row["name"], f"{label}.name")
+        if name in adapted_names:
+            raise ValueError("local reproduction repeats an adapted field")
+        adapted_names.add(name)
+        recipe_fields = row["source_recipe_fields"]
+        if (
+            not isinstance(recipe_fields, list)
+            or not recipe_fields
+            or recipe_fields != sorted(set(recipe_fields))
+            or any(field not in _RECIPE_FIELDS for field in recipe_fields)
+        ):
+            raise ValueError(f"{label}.source_recipe_fields is invalid")
+        adapted.append(
+            {
+                "name": name,
+                "source_recipe_fields": recipe_fields,
+                "local_policy": _text(row["local_policy"], f"{label}.local_policy"),
+                "evidence": _text(row["evidence"], f"{label}.evidence"),
+            }
+        )
+
+    raw_unknowns = disclosure["source_unknown_fields"]
+    if not isinstance(raw_unknowns, list):
+        raise ValueError("source_unknown_fields must be an array")
+    unknowns: list[dict[str, Any]] = []
+    unknown_names: set[str] = set()
+    for index, raw in enumerate(raw_unknowns):
+        label = f"local_reproduction_disclosure.source_unknown_fields[{index}]"
+        row = _require_object(raw, label)
+        _exact_keys(
+            row,
+            {
+                "field",
+                "source_classification",
+                "source_pointers",
+                "source_value",
+                "evidence",
+            },
+            label,
+        )
+        field = _text(row["field"], f"{label}.field")
+        if field not in _RECIPE_FIELDS or field in unknown_names:
+            raise ValueError(f"{label}.field is invalid or duplicated")
+        unknown_names.add(field)
+        source = source_fields[field]
+        expected = {
+            "field": field,
+            "source_classification": "unknown",
+            "source_pointers": [],
+            "source_value": None,
+            "evidence": source["evidence"],
+        }
+        if source["classification"] != "unknown" or row != expected:
+            raise ValueError(
+                f"source-unknown disclosure for {field} contradicts source provenance"
+            )
+        unknowns.append(expected)
+
+    raw_values = disclosure["predeclared_local_values"]
+    if not isinstance(raw_values, list):
+        raise ValueError("predeclared_local_values must be an array")
+    local_values: list[dict[str, Any]] = []
+    local_names: set[str] = set()
+    for index, raw in enumerate(raw_values):
+        label = f"local_reproduction_disclosure.predeclared_local_values[{index}]"
+        row = _require_object(raw, label)
+        _exact_keys(row, {"field", "value", "basis"}, label)
+        field = _text(row["field"], f"{label}.field")
+        if field not in _RECIPE_FIELDS or field in local_names:
+            raise ValueError(f"{label}.field is invalid or duplicated")
+        local_names.add(field)
+        if field == "ema" and isinstance(row["value"], bool):
+            # Discovery plans express the local EMA choice as an enable flag;
+            # the source recipe's full {enabled, decay} shape remains separate.
+            pass
+        else:
+            _validate_recipe_value(field, row["value"], f"{label}.value")
+        local_values.append(
+            {
+                "field": field,
+                "value": row["value"],
+                "basis": _text(row["basis"], f"{label}.basis"),
+            }
+        )
+    if local_names != unknown_names:
+        raise ValueError(
+            "predeclared local values must exactly cover disclosed source unknowns"
+        )
+    adapted_recipe_fields = {
+        field for row in adapted for field in row["source_recipe_fields"]
+    }
+    required_unknown_names = {
+        field
+        for field in adapted_recipe_fields
+        if source_fields[field]["classification"] == "unknown"
+    }
+    if unknown_names != required_unknown_names:
+        raise ValueError("adapted source-unknown fields must be disclosed exactly once")
+    if adapted != sorted(adapted, key=lambda row: row["name"]):
+        raise ValueError("adapted_fields must be sorted by name")
+    if unknowns != sorted(unknowns, key=lambda row: row["field"]):
+        raise ValueError("source_unknown_fields must be sorted by field")
+    if local_values != sorted(local_values, key=lambda row: row["field"]):
+        raise ValueError("predeclared_local_values must be sorted by field")
+    return {
+        "schema": 1,
+        "kind": _LOCAL_DISCLOSURE_KIND,
+        "execution_authorized": False,
+        "adapted_fields": adapted,
+        "source_unknown_fields": unknowns,
+        "predeclared_local_values": local_values,
+        "claim_limit": _text(
+            disclosure["claim_limit"], "local_reproduction_disclosure.claim_limit"
+        ),
+    }
+
+
 def _safe_file(path: Path, label: str) -> Path:
     path = Path(os.path.abspath(os.path.expanduser(path)))
     current = path
@@ -1187,6 +1360,7 @@ def build_manifest(
             "evaluator_sha",
             "matched_concept",
             "adaptation_target",
+            "local_reproduction_disclosure",
             "normalized_recipe",
             "review_assertion",
         },
@@ -1213,6 +1387,14 @@ def build_manifest(
     source_config_identity = _file_identity(source_config_path, "source_config")
     source_artifact_identity = _file_identity(source_artifact_path, "source_artifact")
     matched_concept = _matched_concept(metadata["matched_concept"])
+    adaptation_target = _adaptation_target(
+        metadata["adaptation_target"], matched_concept=matched_concept
+    )
+    local_disclosure = _local_reproduction_disclosure(
+        metadata["local_reproduction_disclosure"],
+        adaptation_target=adaptation_target,
+        source_recipe=normalized_recipe,
+    )
     body: dict[str, Any] = {
         "schema": _SCHEMA,
         "kind": _KIND,
@@ -1235,9 +1417,8 @@ def build_manifest(
         "fields": classified_fields,
         "evaluator_sha": evaluator_sha,
         "matched_concept": matched_concept,
-        "adaptation_target": _adaptation_target(
-            metadata["adaptation_target"], matched_concept=matched_concept
-        ),
+        "adaptation_target": adaptation_target,
+        "local_reproduction_disclosure": local_disclosure,
         "normalized_recipe": normalized_recipe,
         "review_assertion": _review_assertion(metadata["review_assertion"]),
     }
@@ -1270,6 +1451,7 @@ def validate_manifest(
             "evaluator_sha",
             "matched_concept",
             "adaptation_target",
+            "local_reproduction_disclosure",
             "normalized_recipe",
             "review_assertion",
             "manifest_sha256",
@@ -1311,6 +1493,7 @@ def validate_manifest(
         "evaluator_sha": manifest["evaluator_sha"],
         "matched_concept": manifest["matched_concept"],
         "adaptation_target": manifest["adaptation_target"],
+        "local_reproduction_disclosure": manifest["local_reproduction_disclosure"],
         "normalized_recipe": manifest["normalized_recipe"],
         "review_assertion": manifest["review_assertion"],
     }
@@ -1353,6 +1536,13 @@ def validate_manifest(
     )
     if recipe != manifest["normalized_recipe"]:
         raise ValueError("manifest.normalized_recipe is not canonical")
+    local_disclosure = _local_reproduction_disclosure(
+        rebuilt_metadata["local_reproduction_disclosure"],
+        adaptation_target=adaptation_target,
+        source_recipe=recipe,
+    )
+    if local_disclosure != manifest["local_reproduction_disclosure"]:
+        raise ValueError("manifest.local_reproduction_disclosure is not canonical")
     if (
         _review_assertion(rebuilt_metadata["review_assertion"])
         != manifest["review_assertion"]

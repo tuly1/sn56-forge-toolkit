@@ -22,9 +22,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 try:
     from . import batch_evaluate_krea as krea_batch
+    from . import krea_c1c4_amendment
     from . import krea_provenance
 except ImportError:  # pragma: no cover - direct script execution.
     import batch_evaluate_krea as krea_batch  # type: ignore[no-redef]
+    import krea_c1c4_amendment  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
 
 
@@ -62,6 +64,93 @@ _CONCEPT_CAP = Decimal("0.03")
 _CONFIDENCE = Decimal("0.95")
 _BOOTSTRAP_RESAMPLES = 10_000
 _BOOTSTRAP_SEED = 42_565_431
+_C1C4_PUBLIC_RECORD = "SN56-project/SN56-WEEK5-C1C4-SEALED-COMMITMENT-2026-07-27.md"
+_C1C4_PUBLIC_RECORD_SHA256 = (
+    "f907c40e362378c1b82e7455d96ffd8bd876696f25cef21705e14bbba2d4ffc0"
+)
+_C1C4_COMMITMENT_SHA256 = (
+    "0a12c416bcef48805132e80f9de65d0d248ef4415d617715d5736c189a379dbc"
+)
+_C1C4_PRE_AMENDMENT_PLAN_FILE_SHA256 = (
+    "6365f150352de1497fbf32edc8ea07bc2859c3096c95796cff708c89382aee6a"
+)
+_C1C4_PRE_AMENDMENT_PLAN_COMMIT = "1bd7477717ab8d96d208d9fe265f071f08e47e73"
+_C1C4_SHAPE_AMENDMENT_PATH = (
+    "ops/calibration/week5/krea-c1c4-shape-contract-amendment.json"
+)
+_C1C4_SHAPE_AMENDMENT_FILE_SHA256 = (
+    "5f1b02ab78d6f82da6587c533af19e61ead5aa2e821ce268fa94c9bd0ad9587e"
+)
+_C1C4_SHAPE_AMENDMENT_SHA256 = (
+    "367fbcd46827e49efa4d14bf50d1533d85f56d5354a3233d4ea41a81779ef61c"
+)
+_CONFIRMATION_SHAPE_CONTRACT = {
+    "C1": {
+        "concept_class": "architectural object",
+        "training_pairs": 20,
+        "evaluation_rows": 6,
+    },
+    "C2": {
+        "concept_class": "art/print-style series",
+        "training_pairs": 45,
+        "evaluation_rows": 6,
+    },
+    "C3": {
+        "concept_class": "natural subject",
+        "training_pairs": 30,
+        "evaluation_rows": 8,
+    },
+    "C4": {
+        "concept_class": "product/design object set",
+        "training_pairs": 12,
+        "evaluation_rows": 5,
+    },
+}
+_PRE_AMENDMENT_CONFIRMATION_SHAPE_CONTRACT = {
+    "C1": {
+        "dataset_shape": "small",
+        "training_pair_range": [18, 24],
+        "evaluation_rows": 24,
+    },
+    "C2": {
+        "dataset_shape": "small",
+        "training_pair_range": [18, 24],
+        "evaluation_rows": 24,
+    },
+    "C3": {
+        "dataset_shape": "large",
+        "training_pair_range": [36, 48],
+        "evaluation_rows": 40,
+    },
+    "C4": {
+        "dataset_shape": "large",
+        "training_pair_range": [36, 48],
+        "evaluation_rows": 40,
+    },
+}
+_C1C4_MANIFEST_FILE_SHA256S = {
+    "C1": "ed287150fd4d189b3a0964d87c5fc50de11851ab372dabe30da9d9f87fdc450e",
+    "C2": "902a4a6716a9210694f3f441d54b4def19e9bc64d0a49be4cb832ccff8605083",
+    "C3": "74ebbfaf91b156741d34b10ba2d37600076844c010ea6ea83d4af36a386eda09",
+    "C4": "7a3fb670bed78d851cf8c066696b61ccc79d78dffd1ecb633520493772210872",
+}
+_C1C4_AMENDMENT_AUTHORSHIP_ORDER = (
+    "authored after the public commitment and the independent reviewer finding; "
+    "this amendment was not part of the original fixture seal"
+)
+_C1C4_AMENDMENT_CLAIM_LIMIT = (
+    "Corrects only the public per-fixture concept classes and train/evaluation "
+    "counts; fixture bytes, manifest digests, aggregate commitment, identities, "
+    "and custody are unchanged."
+)
+_DISCOVERY_FIXTURE_COUNTS = {
+    "D1": (18, 24, 24),
+    "D2": (36, 48, 40),
+}
+_BOUNDARY_FIXTURE_COUNTS = {
+    "small": (18, 24, 24),
+    "large": (36, 48, 40),
+}
 _LOSS_KEYS = frozenset({"text_guided_loss", "blank_prompt_loss"})
 _OUTPUT_NAME = re.compile(
     r"krea-(?:discovery|confirmation)-decision(?:-[A-Za-z0-9_.-]+)?\.json"
@@ -384,6 +473,12 @@ def _validate_bootstrap(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
+def validate_confirmation_shape_amendment(value: Any) -> dict[str, Any]:
+    """Validate the post-publication shape correction without resealing C1-C4."""
+
+    return krea_c1c4_amendment.validate_amendment(value)
+
+
 def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
     required = {
         "schema",
@@ -400,6 +495,7 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
         "budget_contract",
         "candidate_contract",
         "decision_contract",
+        "confirmation_fixture_commitment",
         "confirmation_contract",
         "prohibited",
     }
@@ -525,6 +621,41 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
             f"decision contract differs from frozen protocol: {mismatches}"
         )
 
+    commitment = _object(
+        value["confirmation_fixture_commitment"],
+        "confirmation_fixture_commitment",
+    )
+    _exact(
+        commitment,
+        {
+            "state",
+            "public_record",
+            "public_record_sha256",
+            "commitment_sha256",
+            "shape_contract_amendment",
+            "implementation_read_sealed_contents",
+        },
+        "confirmation_fixture_commitment",
+    )
+    amendment = _object(
+        commitment["shape_contract_amendment"], "shape_contract_amendment"
+    )
+    expected_commitment = {
+        "state": "published_external_unaccepted_by_named_human",
+        "public_record": _C1C4_PUBLIC_RECORD,
+        "public_record_sha256": _C1C4_PUBLIC_RECORD_SHA256,
+        "commitment_sha256": _C1C4_COMMITMENT_SHA256,
+        "shape_contract_amendment": {
+            "path": _C1C4_SHAPE_AMENDMENT_PATH,
+            "file_sha256": _C1C4_SHAPE_AMENDMENT_FILE_SHA256,
+            "amendment_sha256": _C1C4_SHAPE_AMENDMENT_SHA256,
+        },
+        "implementation_read_sealed_contents": False,
+    }
+    if amendment != expected_commitment["shape_contract_amendment"]:
+        raise ValueError("confirmation shape amendment binding is not frozen")
+    if commitment != expected_commitment:
+        raise ValueError("confirmation fixture commitment differs from publication")
     confirmation = _object(value["confirmation_contract"], "confirmation_contract")
     required_confirmation = {
         "fixtures",
@@ -548,28 +679,7 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
         "sealed_by_independent_reviewer_before_discovery_unblinding": True,
         "paired_predeclared_seed_per_concept": True,
         "second_seed_repeats": 2,
-        "fixture_shape_contract": {
-            "C1": {
-                "dataset_shape": "small",
-                "training_pair_range": [18, 24],
-                "evaluation_rows": 24,
-            },
-            "C2": {
-                "dataset_shape": "small",
-                "training_pair_range": [18, 24],
-                "evaluation_rows": 24,
-            },
-            "C3": {
-                "dataset_shape": "large",
-                "training_pair_range": [36, 48],
-                "evaluation_rows": 40,
-            },
-            "C4": {
-                "dataset_shape": "large",
-                "training_pair_range": [36, 48],
-                "evaluation_rows": 40,
-            },
-        },
+        "fixture_shape_contract": _CONFIRMATION_SHAPE_CONTRACT,
         "field_parity_noninferiority_cap": 0.01,
         "concept_regression_cap": 0.03,
         "minimum_point_estimate_wins_or_ties": 3,
@@ -596,6 +706,11 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("confirmation identities must commit exactly C1-C4")
     for fixture_id, digest in identities.items():
         _digest(digest, f"confirmation identity {fixture_id}")
+    # The three literal binding strings above are not evidence that the public
+    # artifact still exists.  Every policy load reopens the repository-local
+    # amendment, verifies its exact bytes and self-digest, and fails closed on
+    # absence, corruption, symlink substitution, or drift.
+    krea_c1c4_amendment.validate_bound_plan_amendment(value)
     return {
         "document": value,
         "arm_ids": arm_ids,
@@ -603,6 +718,7 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
         "seed_b": seed_b,
         "report_targets": [Decimal(str(item)) for item in report_targets],
         "confirmation_identities": identities,
+        "confirmation_shape_contract": _CONFIRMATION_SHAPE_CONTRACT,
         "protocol_sha256": _discovery_protocol_sha(value),
     }
 
@@ -621,6 +737,7 @@ def _discovery_protocol_sha(value: Mapping[str, Any]) -> str:
         "training_seed_b_contingency": value["training_seed_b_contingency"],
         "candidate_contract": value["candidate_contract"],
         "decision_contract": value["decision_contract"],
+        "confirmation_fixture_commitment": value["confirmation_fixture_commitment"],
         "confirmation_contract": confirmation,
         "prohibited": value["prohibited"],
     }
@@ -2658,6 +2775,26 @@ def _load_policy_approval(
     )
 
 
+def _expected_fixture_counts(
+    *, plan_state: Mapping[str, Any], fixture_id: str, boundary: Any
+) -> tuple[int, int, int]:
+    """Resolve counts without treating distinct C1-C4 fixtures as size aliases."""
+
+    if fixture_id in _DISCOVERY_FIXTURES:
+        if boundary is not None:
+            raise ValueError("discovery fixture cannot declare a boundary alias")
+        return _DISCOVERY_FIXTURE_COUNTS[fixture_id]
+    if fixture_id in _CONFIRMATION_FIXTURES:
+        if boundary is not None:
+            raise ValueError("confirmation fixture cannot declare a boundary alias")
+        shape = plan_state["confirmation_shape_contract"][fixture_id]
+        training_pairs = shape["training_pairs"]
+        return training_pairs, training_pairs, shape["evaluation_rows"]
+    if boundary not in _BOUNDARY_FIXTURE_COUNTS:
+        raise ValueError("score batch does not map to a frozen fixture contract")
+    return _BOUNDARY_FIXTURE_COUNTS[boundary]
+
+
 def _match_aggregates(
     *, policy: dict[str, Any], aggregate_paths: Iterable[Path]
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
@@ -2771,13 +2908,11 @@ def _match_aggregates(
             raise ValueError("aggregate training and evaluation datasets are not split")
         fixture_id = expected["fixture_id"]
         boundary = expected["dataset_boundary"]
-        small = fixture_id in {"D1", "C1", "C2"} or boundary == "small"
-        large = fixture_id in {"D2", "C3", "C4"} or boundary == "large"
-        if small == large:
-            raise ValueError(
-                "score batch does not map to one frozen fixture size class"
-            )
-        lower, upper, eval_count = (18, 24, 24) if small else (36, 48, 40)
+        lower, upper, eval_count = _expected_fixture_counts(
+            plan_state=plan_state,
+            fixture_id=fixture_id,
+            boundary=boundary,
+        )
         if (
             not lower <= contract["training_pair_count"] <= upper
             or contract["evaluation_row_count"] != eval_count

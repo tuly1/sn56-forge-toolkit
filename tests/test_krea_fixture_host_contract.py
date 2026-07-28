@@ -45,15 +45,13 @@ def _sha(label: str) -> str:
 @pytest.mark.parametrize(
     ("role", "training", "evaluation"),
     [
-        ("C1", 18, 24),
-        ("C1", 24, 24),
-        ("C2", 20, 24),
-        ("C3", 36, 40),
-        ("C3", 48, 40),
-        ("C4", 40, 40),
+        ("C1", 20, 6),
+        ("C2", 45, 6),
+        ("C3", 30, 8),
+        ("C4", 12, 5),
     ],
 )
-def test_confirmation_fixture_roles_enforce_frozen_size_classes(
+def test_confirmation_fixture_roles_enforce_published_exact_shapes(
     role, training, evaluation
 ):
     fixture._validate_role_counts(role, training, evaluation)
@@ -62,18 +60,37 @@ def test_confirmation_fixture_roles_enforce_frozen_size_classes(
 @pytest.mark.parametrize(
     ("role", "training", "evaluation"),
     [
-        ("C1", 25, 24),
-        ("C2", 20, 40),
-        ("C3", 24, 40),
-        ("C4", 40, 24),
-        ("C4", True, 40),
+        ("C1", 19, 6),
+        ("C1", 20, 24),
+        ("C2", 20, 6),
+        ("C2", 45, 24),
+        ("C3", 40, 8),
+        ("C3", 30, 40),
+        ("C4", 40, 5),
+        ("C4", 12, 40),
+        ("C4", True, 5),
     ],
 )
-def test_confirmation_fixture_roles_reject_wrong_class_or_count(
+def test_confirmation_fixture_roles_reject_generalized_or_wrong_counts(
     role, training, evaluation
 ):
     with pytest.raises(ValueError):
         fixture._validate_role_counts(role, training, evaluation)
+
+
+@pytest.mark.parametrize(
+    ("role", "training", "evaluation"),
+    [
+        ("D1", 18, 24),
+        ("D1", 24, 24),
+        ("D2", 36, 40),
+        ("D2", 48, 40),
+    ],
+)
+def test_discovery_fixture_ranges_remain_distinct_and_unchanged(
+    role, training, evaluation
+):
+    fixture._validate_role_counts(role, training, evaluation)
 
 
 def _row(role: str, index: int) -> dict:

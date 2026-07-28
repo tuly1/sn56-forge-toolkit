@@ -48,6 +48,68 @@ _ARMS = {
     },
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_RANK4_EXCLUSION_RATIONALE = (
+    "Final rank 4 adds no fully disclosed distinct faithful arm: its scored "
+    "last.safetensors is in the rank-32 AdamW8bit MSE LR-1e-4 family already "
+    "covered by K0/K2, its only potentially orthogonal checkpoint soup was not "
+    "submitted or scored, and its differential-guidance setting is unknown."
+)
+_LOCAL_REPRODUCTION = {
+    "K2": {
+        "depth_policy": "measured-budget-fill-with-step-960-landmark-if-budget-safe",
+        "candidate_cadence_policy": (
+            "discovery-uniform-1/8-with-real-write-accounting"
+        ),
+        "selection_policy": (
+            "preserve and exact-score full curve; public holdout algorithm is not "
+            "assumed recoverable"
+        ),
+        "source_unknown_fields": [],
+        "predeclared_local_values": [],
+    },
+    "K3": {
+        "depth_policy": "measured-budget-fill-with-step-1200-landmark-if-budget-safe",
+        "candidate_cadence_policy": (
+            "discovery-uniform-1/8-with-real-write-accounting"
+        ),
+        "selection_policy": (
+            "preserve and exact-score every valid current-attempt candidate offline "
+            "after training; the public highest-numbered fallback remains a source "
+            "submission fact, not the local selector"
+        ),
+        "source_unknown_fields": ["dropout", "ema"],
+        "predeclared_local_values": [
+            {
+                "field": "dropout",
+                "value": 0.05,
+                "basis": (
+                    "Predeclared local K0/K1 control value from the draft discovery "
+                    "plan; this is not evidence of K3's source dropout."
+                ),
+            },
+            {
+                "field": "ema",
+                "value": False,
+                "basis": (
+                    "Predeclared local K0/K1 control value from the draft discovery "
+                    "plan; this is not evidence of K3's source EMA setting."
+                ),
+            },
+        ],
+    },
+    "K4": {
+        "depth_policy": "measured-budget-fill-with-step-840-landmark-if-budget-safe",
+        "candidate_cadence_policy": (
+            "discovery-uniform-1/8-with-real-write-accounting"
+        ),
+        "selection_policy": (
+            "preserve and exact-score full curve; public holdout algorithm is not "
+            "assumed recoverable"
+        ),
+        "source_unknown_fields": [],
+        "predeclared_local_values": [],
+    },
+}
 
 
 def _parse() -> argparse.Namespace:
@@ -222,6 +284,87 @@ def _unknown(evidence: str) -> dict[str, Any]:
     }
 
 
+def _local_reproduction_disclosure(
+    arm: str, *, normalized_recipe: dict[str, Any]
+) -> dict[str, Any]:
+    """Expose intended local adaptations without changing source observations."""
+
+    policy = _LOCAL_REPRODUCTION[arm]
+    source_fields = normalized_recipe["fields"]
+    adapted = [
+        {
+            "name": "depth policy",
+            "source_recipe_fields": ["planned_steps", "submitted_step"],
+            "local_policy": policy["depth_policy"],
+            "evidence": (
+                "Source planned/submitted depth remains in normalized_recipe; the "
+                "local run uses this separately predeclared budget-fill policy."
+            ),
+        },
+        {
+            "name": "offline exact-scoring selection policy",
+            "source_recipe_fields": ["selector"],
+            "local_policy": policy["selection_policy"],
+            "evidence": (
+                "The public selector remains a source observation; local checkpoint "
+                "choice is deferred to the separately predeclared exact-score rule."
+            ),
+        },
+        {
+            "name": "save cadence and candidate grid",
+            "source_recipe_fields": ["save_cadence"],
+            "local_policy": policy["candidate_cadence_policy"],
+            "evidence": (
+                "Source save cadence remains in normalized_recipe; the local grid "
+                "uses this separately predeclared cadence policy."
+            ),
+        },
+    ]
+    unknown_names = policy["source_unknown_fields"]
+    if unknown_names:
+        adapted.append(
+            {
+                "name": (
+                    "source-unknown dropout and EMA fixed locally to the K0/K1 "
+                    "controls"
+                ),
+                "source_recipe_fields": ["dropout", "ema"],
+                "local_policy": (
+                    "Use only the separately listed predeclared_local_values; these "
+                    "are local controls, not recovered K3 source facts."
+                ),
+                "evidence": (
+                    "The immutable K3 config omits both fields; source absence and "
+                    "local choices are deliberately represented in separate arrays."
+                ),
+            }
+        )
+    adapted.sort(key=lambda row: row["name"])
+    source_unknowns = [
+        {
+            "field": name,
+            "source_classification": "unknown",
+            "source_pointers": [],
+            "source_value": None,
+            "evidence": source_fields[name]["evidence"],
+        }
+        for name in sorted(unknown_names)
+    ]
+    return {
+        "schema": 1,
+        "kind": "forge-krea-local-reproduction-disclosure",
+        "execution_authorized": False,
+        "adapted_fields": adapted,
+        "source_unknown_fields": source_unknowns,
+        "predeclared_local_values": policy["predeclared_local_values"],
+        "claim_limit": (
+            "Machine-derived disclosure of intended local adaptations only; it is "
+            "not human review, execution approval, or evidence that an adapted run "
+            "reproduces the public score."
+        ),
+    }
+
+
 def build_metadata(
     arm: str,
     *,
@@ -240,6 +383,11 @@ def build_metadata(
         or ledger.get("kind") != "sn56-week5-krea-r1-public-field-ledger"
     ):
         raise ValueError("unsupported field ledger")
+    if (
+        ledger.get("discovery_arm_selection", {}).get("excluded_final_rank_4")
+        != _RANK4_EXCLUSION_RATIONALE
+    ):
+        raise ValueError("field ledger lacks the frozen final-rank-4 exclusion basis")
     submissions = ledger.get("submissions")
     if not isinstance(submissions, list):
         raise ValueError("field ledger submissions are not an array")
@@ -316,6 +464,12 @@ def build_metadata(
     if not isinstance(optimizer_params, dict) or not optimizer_params:
         raise ValueError("source optimizer parameters are absent")
 
+    learning_rate_evidence = "Immutable source config."
+    if str(train.get("optimizer", "")).casefold() == "automagic":
+        learning_rate_evidence = (
+            "Immutable source config; for Automagic this scalar is a configured "
+            "input/base LR, not a realized per-update trajectory."
+        )
     known: dict[str, tuple[Any, str, str]] = {
         "planned_steps": (
             planned,
@@ -330,7 +484,7 @@ def build_metadata(
         "learning_rate": (
             train.get("lr"),
             "/config/process/0/train/lr",
-            "Immutable source config; Automagic values are configured inputs, not a realized trajectory.",
+            learning_rate_evidence,
         ),
         "rank": (
             _positive_int(network.get("linear"), "network rank"),
@@ -418,12 +572,26 @@ def build_metadata(
         "save_cadence",
         "selector",
     }
+    unknown_evidence = {
+        "dropout": (
+            "caption_dropout_rate is absent from the immutable source config; "
+            "framework default not imputed."
+        ),
+        "ema": (
+            "ema_config is absent from the immutable source config; framework "
+            "default not imputed."
+        ),
+    }
     fields = {
         name: (
             _row(*known[name])
             if name in known
             else _unknown(
-                "Field absent from the immutable source config; framework default not imputed."
+                unknown_evidence.get(
+                    name,
+                    "Field absent from the immutable source config; framework "
+                    "default not imputed.",
+                )
             )
         )
         for name in sorted(all_recipe_fields)
@@ -505,6 +673,9 @@ def build_metadata(
             "candidate_role": "local_training_output",
             "description": "Retrain the source family from the immutable Krea base on independently sealed fixtures; do not score the public artifact as a matched-concept candidate.",
         },
+        "local_reproduction_disclosure": _local_reproduction_disclosure(
+            arm, normalized_recipe=normalized_recipe
+        ),
         "normalized_recipe": normalized_recipe,
         "review_assertion": {
             "status": "unreviewed",

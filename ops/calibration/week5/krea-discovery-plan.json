@@ -3,7 +3,7 @@
   "kind": "sn56-week5-krea-discovery-freeze",
   "status": "draft_blocked_pre_gpu",
   "release_base_commit": "c654c4b24376f7aa9e12dcb82f5e73dcddee3bdb",
-  "field_ledger_sha256": "e64d52a5ac7745fad1c1b4598f89bdf23fdbd0ea83531fba315f5fd202a28920",
+  "field_ledger_sha256": "febf1db56c550f4f9858a49b198b67d6ab4919a0fb829dc35dbb0fc5d01f22f9",
   "model": "krea/Krea-2-Raw",
   "model_type": "krea2",
   "tournament_envelope_hours": 0.75,
@@ -45,18 +45,34 @@
   },
   "confirmation_fixture_commitment": {
     "state": "published_external_unaccepted_by_named_human",
-    "public_record": "/Users/atulyashetty/Test/SN56-project/SN56-WEEK5-C1C4-SEALED-COMMITMENT-2026-07-27.md",
-    "public_record_sha256": "fe956bbd0aaa02708c17b5b88cf21ded2a8fa2ba958acaa24cb7e37d7bc52e57",
+    "public_record": "SN56-project/SN56-WEEK5-C1C4-SEALED-COMMITMENT-2026-07-27.md",
+    "public_record_sha256": "f907c40e362378c1b82e7455d96ffd8bd876696f25cef21705e14bbba2d4ffc0",
     "commitment_sha256": "0a12c416bcef48805132e80f9de65d0d248ef4415d617715d5736c189a379dbc",
+    "shape_contract_amendment": {
+      "path": "ops/calibration/week5/krea-c1c4-shape-contract-amendment.json",
+      "file_sha256": "5f1b02ab78d6f82da6587c533af19e61ead5aa2e821ce268fa94c9bd0ad9587e",
+      "amendment_sha256": "367fbcd46827e49efa4d14bf50d1533d85f56d5354a3233d4ea41a81779ef61c"
+    },
     "implementation_read_sealed_contents": false
   },
   "day0_source_evidence": {
-    "thin_evidence_manifest_file_sha256": "ca0f40d8aaac36f88e844704b090b022bea5585c27cdc10cae80d04d3ff9b715",
+    "thin_evidence_manifest_file_sha256": "35fc00e534e779da04844a829f2dbfb3cef1451971a2e5a15f8b97f708912868",
     "public_source_review_state": "unreviewed",
-    "K2_manifest_file_sha256": "c443ce1c35c3fb56555b3e78d976ce46eca9a2474e60a5c863cade1d27fad766",
-    "K3_manifest_file_sha256": "8e997bff734b959796206b8a6fd05e05d5f0480b69f508fa7c7e76e2784ab22b",
-    "K4_manifest_file_sha256": "eb0d9558228e80af68c494e96c3d2f7745fa13f97489bdadfb902c1e9dd101a3",
-    "K5_internal_evidence_file_sha256": "52e23e79b46e623a73d5f70fce9c6fda752c12d6477bbe9c8387b4c622fe0883"
+    "K2_manifest_file_sha256": "6bbeae58d5e4bcf02ba5fda576875c95c4016ebd2353cc74c20bc95ced311e50",
+    "K3_manifest_file_sha256": "1a29c0f948360c6fdf5e77cf9ad4a32b9b9b02827daad38ceeb6e85c9f469e5b",
+    "K4_manifest_file_sha256": "1553fc7c13a9a3dbcf8e3bdf599e49ade4740d0f80af9056a42ff1bf982bf4da",
+    "K5_internal_evidence_anchor": {
+      "project_root_contract": "explicit_bound_input_not_process_cwd",
+      "record_path": "K5-INTERNAL-EVIDENCE-RECORD.json",
+      "record_bytes": 1301,
+      "record_file_sha256": "959e1980ad7302b6198e68700010cec37508204395290a1edf2080387bd9b090",
+      "record_sha256": "8903030b07d0dc0cfac01c624a88e252dfd6b1f20c721c13604178ec753a936f",
+      "evidence_paths": [
+        "SN56-GATE-B-H100-RESULTS.md",
+        "SN56-WEEK4-GPU-CAMPAIGN-RESULTS-2026-07-23.md",
+        "week4-gpu-evidence-2026-07-22/EVIDENCE-ERRATA.md"
+      ]
+    }
   },
   "arms": [
     {
@@ -205,11 +221,18 @@
       "ema": false,
       "provenance_required": true,
       "prior_evidence_scope": "one fixture family, 367-step final exports, guidance on, rank 32, same seed; not a deep-arm, second-seed, or universal result",
-      "internal_evidence_anchors": [
-        "SN56-GATE-B-H100-RESULTS.md",
-        "SN56-WEEK4-GPU-CAMPAIGN-RESULTS-2026-07-23.md",
-        "SN56-WEEK4-GPU-VALIDATION-ERRATUM-2026-07-22.md"
-      ]
+      "internal_evidence_anchor": {
+        "project_root_contract": "explicit_bound_input_not_process_cwd",
+        "record_path": "K5-INTERNAL-EVIDENCE-RECORD.json",
+        "record_bytes": 1301,
+        "record_file_sha256": "959e1980ad7302b6198e68700010cec37508204395290a1edf2080387bd9b090",
+        "record_sha256": "8903030b07d0dc0cfac01c624a88e252dfd6b1f20c721c13604178ec753a936f",
+        "evidence_paths": [
+          "SN56-GATE-B-H100-RESULTS.md",
+          "SN56-WEEK4-GPU-CAMPAIGN-RESULTS-2026-07-23.md",
+          "week4-gpu-evidence-2026-07-22/EVIDENCE-ERRATA.md"
+        ]
+      }
     }
   ],
   "budget_contract": {
@@ -270,7 +293,7 @@
     "bootstrap_seed": 42565431,
     "material_rank_reversal_definition": "any non-control pair switches order across D1/D2 with >0.01 relative-improvement separation in both directions",
     "checkpoint_tie_breaker": "earliest actual step among candidates within 0.01 of best",
-    "default_evaluation_rows_per_task": [24, 40],
+    "discovery_evaluation_rows_by_fixture": {"D1": 24, "D2": 40},
     "advance_if_D1_D2_agree": [
       "shared winner",
       "next-lowest minimax-regret non-control",
@@ -307,10 +330,10 @@
     "fixtures": ["C1", "C2", "C3", "C4"],
     "identities": null,
     "fixture_shape_contract": {
-      "C1": {"dataset_shape": "small", "training_pair_range": [18, 24], "evaluation_rows": 24},
-      "C2": {"dataset_shape": "small", "training_pair_range": [18, 24], "evaluation_rows": 24},
-      "C3": {"dataset_shape": "large", "training_pair_range": [36, 48], "evaluation_rows": 40},
-      "C4": {"dataset_shape": "large", "training_pair_range": [36, 48], "evaluation_rows": 40}
+      "C1": {"concept_class": "architectural object", "training_pairs": 20, "evaluation_rows": 6},
+      "C2": {"concept_class": "art/print-style series", "training_pairs": 45, "evaluation_rows": 6},
+      "C3": {"concept_class": "natural subject", "training_pairs": 30, "evaluation_rows": 8},
+      "C4": {"concept_class": "product/design object set", "training_pairs": 12, "evaluation_rows": 5}
     },
     "sealed_by_independent_reviewer_before_discovery_unblinding": true,
     "paired_predeclared_seed_per_concept": true,
@@ -330,6 +353,7 @@
     "enable production proxy selection from offline exact scores",
     "claim exact target fractions when the backend emitted different fractions",
     "claim a private public-arm selector was reproduced when only its selected artifact is observable",
+    "treat a C1-C4 confirmation fixture as a generic small or large boundary alias",
     "port an experiment policy into forge before sealed confirmation and review"
   ]
 }

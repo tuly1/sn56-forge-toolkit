@@ -72,6 +72,11 @@ Consequently:
 The public families should be represented as separate controlled arms rather
 than collapsed into a generic "deep" recipe:
 
+Final rank 4 is excluded as a separate faithful arm because its scored
+`last.safetensors` stays in the rank-32 AdamW8bit MSE LR-1e-4 family already
+covered by K0/K2, while its only potentially orthogonal soup was not
+submitted/scored and its differential-guidance setting is unknown.
+
 1. A modal rank-32, LR-1e-4, MSE, guidance-2 budget-fill curve.
 2. The current rank-2 family: LR 8.6e-5, rank 32, MSE, guidance 2, dropout 0.1,
    with candidate selection centered on the observed step-960 region.

@@ -161,6 +161,29 @@ def _metadata(
     reviewer: str = "Atulya Shetty",
 ):
     direct = mode == "direct_public_artifact"
+    local_disclosure = None
+    if not direct:
+        local_disclosure = {
+            "schema": 1,
+            "kind": "forge-krea-local-reproduction-disclosure",
+            "execution_authorized": False,
+            "adapted_fields": [
+                {
+                    "name": "depth policy",
+                    "source_recipe_fields": ["planned_steps", "submitted_step"],
+                    "local_policy": "measured-budget-fill",
+                    "evidence": (
+                        "Source depth remains immutable; local depth is resolved by "
+                        "the predeclared timing policy."
+                    ),
+                }
+            ],
+            "source_unknown_fields": [],
+            "predeclared_local_values": [],
+            "claim_limit": (
+                "Machine disclosure only; not human review or execution approval."
+            ),
+        }
     return {
         "source_arm_id": source_arm_id,
         "source": {
@@ -215,6 +238,7 @@ def _metadata(
                 else "retrain recipe from the immutable base"
             ),
         },
+        "local_reproduction_disclosure": local_disclosure,
         "normalized_recipe": _source_recipe(),
         # This is deliberately an assertion, not a signature/authentication.
         "review_assertion": {
@@ -896,6 +920,101 @@ def test_provenance_is_pretraining_canonical_and_requires_external_approval(tmp_
     plan = _plan(role_root, arms=("arm",), reviewer="human owner")
     with pytest.raises(ValueError, match="role label"):
         batch._validate_plan(plan)
+
+
+def test_local_reproduction_disclosure_is_required_and_fail_closed(tmp_path):
+    path, manifest, _config, _artifact = _source_provenance(tmp_path, "arm")
+    disclosure = manifest["local_reproduction_disclosure"]
+    assert disclosure["execution_authorized"] is False
+    assert disclosure["adapted_fields"][0]["name"] == "depth policy"
+
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["local_reproduction_disclosure"]["execution_authorized"] = True
+    body = {key: value for key, value in tampered.items() if key != "manifest_sha256"}
+    tampered["manifest_sha256"] = provenance.canonical_sha256(body)
+    with pytest.raises(ValueError, match="disclosure identity"):
+        provenance.validate_manifest(tampered)
+
+    missing = _metadata("another-arm")
+    del missing["local_reproduction_disclosure"]
+    with pytest.raises(ValueError, match="metadata keys mismatch"):
+        provenance.build_manifest(
+            missing,
+            source_config_path=tmp_path / "arm.source.yaml",
+            source_artifact_path=tmp_path / "arm.source.safetensors",
+            field_ledger_path=tmp_path / "arm.field-ledger.json",
+            task_raw_path=tmp_path / "arm.task.raw.json",
+            tournament_raw_path=tmp_path / "arm.tournament.raw.json",
+            revision_manifest_path=tmp_path / "arm.revision.raw.json",
+        )
+
+
+def test_source_unknowns_and_predeclared_values_are_separate_contracts():
+    source = _source_recipe()
+    disclosure = {
+        "schema": 1,
+        "kind": "forge-krea-local-reproduction-disclosure",
+        "execution_authorized": False,
+        "adapted_fields": [
+            {
+                "name": "source-unknown dropout fixed locally",
+                "source_recipe_fields": ["dropout"],
+                "local_policy": "use the separately declared local control",
+                "evidence": "source absence is not a local-value observation",
+            }
+        ],
+        "source_unknown_fields": [
+            {
+                "field": "dropout",
+                "source_classification": "unknown",
+                "source_pointers": [],
+                "source_value": None,
+                "evidence": source["fields"]["dropout"]["evidence"],
+            }
+        ],
+        "predeclared_local_values": [
+            {
+                "field": "dropout",
+                "value": 0.05,
+                "basis": "predeclared local control, not source evidence",
+            }
+        ],
+        "claim_limit": "not execution approval",
+    }
+    target = {
+        "mode": "local_reproduction",
+        "model_type": "krea2",
+        "source_artifact_role": "reference_only",
+        "candidate_role": "local_training_output",
+        "description": "local test",
+    }
+    assert (
+        provenance._local_reproduction_disclosure(
+            disclosure,
+            adaptation_target=target,
+            source_recipe=source,
+        )
+        == disclosure
+    )
+
+    conflated = json.loads(json.dumps(disclosure))
+    conflated["source_unknown_fields"][0]["source_value"] = 0.05
+    with pytest.raises(ValueError, match="contradicts source provenance"):
+        provenance._local_reproduction_disclosure(
+            conflated,
+            adaptation_target=target,
+            source_recipe=source,
+        )
+
+    omitted = json.loads(json.dumps(disclosure))
+    omitted["source_unknown_fields"] = []
+    omitted["predeclared_local_values"] = []
+    with pytest.raises(ValueError, match="must be disclosed exactly once"):
+        provenance._local_reproduction_disclosure(
+            omitted,
+            adaptation_target=target,
+            source_recipe=source,
+        )
 
 
 def test_local_reproduction_uses_distinct_disjoint_train_and_eval_sets(tmp_path):

@@ -565,6 +565,128 @@ def test_public_basis_rejects_self_rehashed_recipe_not_derived_from_fixed_yaml(
         )
 
 
+def test_public_basis_rejects_self_rehashed_disclosure_not_derived_from_primary_bytes(
+    monkeypatch, tmp_path
+):
+    """A rehashed disclosure cannot diverge from the primary-byte derivation."""
+
+    paths = {
+        name: tmp_path / name
+        for name in (
+            "source_config",
+            "source_artifact",
+            "field_ledger",
+            "task_raw",
+            "tournament_raw",
+            "revision_manifest",
+        )
+    }
+    for path in paths.values():
+        path.write_bytes(b"fixed-primary-bytes")
+    disclosure = {
+        "schema": 1,
+        "kind": "forge-krea-local-reproduction-disclosure",
+        "execution_authorized": False,
+        "adapted_fields": [
+            {
+                "name": "depth policy",
+                "source_recipe_fields": ["planned_steps", "submitted_step"],
+                "local_policy": "fill the measured budget",
+                "evidence": "derived from the bound public source",
+            }
+        ],
+        "source_unknown_fields": [],
+        "predeclared_local_values": [],
+        "claim_limit": "disclosure only; not execution approval",
+    }
+    expected = {
+        "schema": 2,
+        "kind": "forge-krea-public-arm-provenance",
+        "source_arm_id": "K2",
+        "source": {"url": "https://example.invalid/K2", "revision": "1" * 40},
+        "official_context": {"task_id": "task"},
+        "files": {"source_config": {}, "source_artifact": {}},
+        "fields": {"observed": {}, "unsupported": [], "adapted": []},
+        "evaluator_sha": None,
+        "matched_concept": {"available": False},
+        "adaptation_target": {"mode": "local_reproduction"},
+        "local_reproduction_disclosure": disclosure,
+        "normalized_recipe": {},
+        "review_assertion": {"status": "unreviewed"},
+    }
+    expected["manifest_sha256"] = krea_provenance.canonical_sha256(expected)
+    tampered = json.loads(json.dumps(expected))
+    tampered["local_reproduction_disclosure"]["adapted_fields"][0][
+        "local_policy"
+    ] = "silently use a different local depth policy"
+    tampered["manifest_sha256"] = krea_provenance.canonical_sha256(
+        {key: value for key, value in tampered.items() if key != "manifest_sha256"}
+    )
+    approval = {
+        "schema": 1,
+        "kind": "forge-krea-source-normalization-approval",
+        "source_arm_id": "K2",
+        "provenance_manifest_sha256": tampered["manifest_sha256"],
+        "reviewer_identity": "Jordan Example",
+        "decision": "approved",
+        "assertions": {
+            "source_fields_reviewed": True,
+            "unsupported_fields_reviewed": True,
+            "adaptations_reviewed": True,
+            "source_artifact_identity_reviewed": True,
+            "claim_limits_reviewed": True,
+        },
+    }
+    bindings = {
+        name: {"path": str(path), "sha256": SHA["2"]} for name, path in paths.items()
+    }
+    monkeypatch.setattr(
+        krea_execution_plan,
+        "_load_binding",
+        lambda value, label: (
+            (tmp_path / "source.json", tampered, SHA["3"])
+            if "source provenance" in label
+            else (tmp_path / "approval.json", approval, SHA["4"])
+        ),
+    )
+    monkeypatch.setattr(
+        krea_execution_plan,
+        "_file_binding",
+        lambda value, label: (Path(value["path"]), value["sha256"]),
+    )
+    # Model a manifest whose own digest and human approval have both been
+    # updated.  Only re-derivation from the immutable source bytes exposes it.
+    monkeypatch.setattr(
+        krea_execution_plan.krea_provenance,
+        "validate_manifest",
+        lambda manifest, **kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        krea_execution_plan.krea_public_source,
+        "build_metadata",
+        lambda *args, **kwargs: {"parsed_from_fixed_primary_bytes": True},
+    )
+    monkeypatch.setattr(
+        krea_execution_plan.krea_provenance,
+        "build_manifest",
+        lambda *args, **kwargs: expected,
+    )
+    with pytest.raises(ValueError, match="primary-byte re-derivation"):
+        krea_execution_plan._arm_basis(
+            {
+                "mode": "public_submission",
+                "source_provenance": {"path": "/source", "sha256": SHA["3"]},
+                "source_normalization_approval": {
+                    "path": "/approval",
+                    "sha256": SHA["4"],
+                },
+                "source_files": bindings,
+            },
+            arm_id="K2",
+            execution_recipe={"fields": {}},
+        )
+
+
 def test_pre_run_approval_contains_no_future_natural_completion(monkeypatch):
     resolved = {
         "host_execution_manifest": {"host_execution_identity_sha256": SHA["1"]},

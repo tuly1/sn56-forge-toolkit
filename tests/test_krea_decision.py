@@ -202,8 +202,22 @@ class Harness:
         steps: tuple[int, ...] = (100, 500, 1000),
         denominator: int = 1000,
     ) -> tuple[Path, dict]:
-        small = fixture_id in {"D1", "C1", "C2"} or boundary == "small"
-        training_pairs, evaluation_rows = (20, 24) if small else (40, 40)
+        if fixture_id == "D1":
+            training_pairs, evaluation_rows = 20, 24
+        elif fixture_id == "D2":
+            training_pairs, evaluation_rows = 40, 40
+        elif fixture_id in {"C1", "C2", "C3", "C4"}:
+            shape = self.plan["confirmation_contract"]["fixture_shape_contract"][
+                fixture_id
+            ]
+            training_pairs = shape["training_pairs"]
+            evaluation_rows = shape["evaluation_rows"]
+        elif boundary == "small":
+            training_pairs, evaluation_rows = 20, 24
+        elif boundary == "large":
+            training_pairs, evaluation_rows = 40, 40
+        else:
+            raise ValueError("synthetic aggregate has no fixture-count contract")
         candidates = [
             self._score_row(
                 batch_id=batch_id,
@@ -840,6 +854,18 @@ def test_frozen_constants_bootstrap_and_plan_shape_are_not_tunable(harness: Harn
     with pytest.raises(ValueError, match="differs from frozen protocol"):
         krea_decision._validate_discovery_plan(bad)
 
+    bad = deepcopy(harness.plan)
+    bad["confirmation_contract"]["fixture_shape_contract"]["C2"][
+        "concept_class"
+    ] = "generic small fixture"
+    with pytest.raises(ValueError, match="differs from frozen protocol"):
+        krea_decision._validate_discovery_plan(bad)
+
+    bad = deepcopy(harness.plan)
+    bad["confirmation_fixture_commitment"]["commitment_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="differs from publication"):
+        krea_decision._validate_discovery_plan(bad)
+
     bad_bootstrap = {**BOOTSTRAP, "seed": 7}
     with pytest.raises(ValueError, match="frozen policy"):
         krea_decision._validate_bootstrap(bad_bootstrap)
@@ -848,6 +874,36 @@ def test_frozen_constants_bootstrap_and_plan_shape_are_not_tunable(harness: Harn
     assert krea_decision._bootstrap_ci(clusters, label="fixed") == (
         krea_decision._bootstrap_ci(clusters, label="fixed")
     )
+
+
+def test_confirmation_counts_are_per_fixture_not_small_large_aliases(
+    harness: Harness,
+):
+    plan_state = krea_decision._validate_discovery_plan(harness.plan)
+    assert {
+        fixture: krea_decision._expected_fixture_counts(
+            plan_state=plan_state,
+            fixture_id=fixture,
+            boundary=None,
+        )
+        for fixture in ("C1", "C2", "C3", "C4")
+    } == {
+        "C1": (20, 20, 6),
+        "C2": (45, 45, 6),
+        "C3": (30, 30, 8),
+        "C4": (12, 12, 5),
+    }
+    assert krea_decision._expected_fixture_counts(
+        plan_state=plan_state,
+        fixture_id="B-0p5-small",
+        boundary="small",
+    ) == (18, 24, 24)
+    with pytest.raises(ValueError, match="cannot declare a boundary alias"):
+        krea_decision._expected_fixture_counts(
+            plan_state=plan_state,
+            fixture_id="C1",
+            boundary="small",
+        )
 
 
 def test_checkpoint_tie_breaker_chooses_earliest_actual_step_inside_one_percent():
