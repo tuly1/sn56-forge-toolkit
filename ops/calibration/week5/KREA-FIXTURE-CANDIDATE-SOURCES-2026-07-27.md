@@ -10,7 +10,37 @@ and legally reviewable. It does not fill the fixture manifests, authorize GPU
 execution, or replace the independent review required by
 `KREA-FIXTURE-CURATION-CONTRACT.md`.
 
-## Recommended D1: Fontana delle Tartarughe
+## Authoritative 2026-07-29 correction
+
+The original memo below preserved the first-pass candidate research. It is not
+the current source decision. The current pre-admission profiles are frozen in
+`krea-curation-source-policy.json` and remain **curation-only**:
+
+- **D1 is Fontana del Moro**, not Fontana delle Tartarughe. The exact Commons
+  category contains 245 rows; 84 pass the positive PD/CC0/CC-BY-only license
+  and >=768-pixel machine screen, across 41 normalized creator identities.
+  Those 84 are an upper bound, not an admitted count. Six known off-domain rows
+  are hard-reject hints and four subject-conflict rows are quarantined for
+  visual review. Severe creator/burst concentration means the intended final
+  shape is exactly **18 train + 24 evaluation**, with at least eight accepted
+  unused reserves, creator-disjoint splits, a three-row-per-creator ceiling,
+  whole-cluster assignment, and exhaustive human review.
+- **D2 remains AIC's _Pictures of No Performances (Nogaku Zue)_**, but the old
+  112-row figure was only the first two pages of a fuzzy search. An exact,
+  artist-ID-bound, series-suffix-bound, public-domain query returns 229 rows.
+  After four index pages, one frontispiece, one 1024x707 source, and one
+  predeclared domain-outlier plate are excluded, 222 machine candidates form
+  219 play/impression components. The intended final shape is exactly
+  **36 train + 40 evaluation**, selecting at most one representative per
+  component. Public-domain IIIF retrieval uses the documented 1686-pixel
+  derivative so decoded landscape images remain >=768 pixels on both axes.
+
+The metadata freezes, policy, and machine hints do not approve rights, visual
+quality, captions, similarity, a split, or GPU execution. Those gates remain
+named-human and independent-review responsibilities under the curation
+contract.
+
+## Historical first-pass D1 candidate: Fontana delle Tartarughe
 
 - Source: [Wikimedia Commons category](https://commons.wikimedia.org/wiki/Category:Fontana_delle_Tartarughe_(Rome))
 - Intended role: one subject/identity-shaped concept.
@@ -75,7 +105,7 @@ Do not copy Commons prose into captions. Preserve it only in provenance.
 - Intended role: a materially different style/domain fixture.
 - Intended final shape: 36 training pairs and 40 privately sealed evaluation
   rows.
-- Live metadata observation: the first two 100-result search pages yielded 91
+- Historical partial observation: the first two 100-result fuzzy-search pages yielded 91
   and 98 qualifying unique artwork IDs after filtering for an exact normalized
   artist match containing `Tsukioka Kogyo`, `is_public_domain=true`, and a
   non-null `image_id`.  Of those 189 rows, 77 belong to `One Hundred No Dramas
