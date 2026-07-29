@@ -44,6 +44,20 @@ _CONFIRMATION_ROLE_COUNTS = {
 }
 _ROLE_COUNTS = {**_DISCOVERY_ROLE_COUNTS, **_CONFIRMATION_ROLE_COUNTS}
 _CROSS_FIXTURE_ROLES = ("D1", "D2", "C1", "C2", "C3", "C4")
+_BASE_GROUP_FIELDS = frozenset(
+    {
+        "source_id",
+        "creator_id",
+        "burst_id",
+        "scene_id",
+        "play_root_id",
+        "human_similarity_cluster_id",
+    }
+)
+_D2_GROUP_FIELDS = frozenset({"play_component_id", "accession_family_id"})
+_BASE_GROUP_DISJOINT_FIELDS = frozenset(
+    {"burst_id", "scene_id", "play_root_id", "human_similarity_cluster_id"}
+)
 _HUMAN_IDENTITY_ASSURANCE = (
     "named-human-string-self-assertion-not-cryptographic-authentication"
 )
@@ -131,6 +145,35 @@ def _validate_role_counts(
         raise ValueError(f"{role} training count is outside {train_range}")
     if not eval_range[0] <= evaluation_count <= eval_range[1]:
         raise ValueError(f"{role} evaluation count is outside {eval_range}")
+
+
+def _group_fields(role: str) -> frozenset[str]:
+    if role not in _ROLE_COUNTS:
+        raise ValueError("experimental_role must be D1, D2, or C1-C4")
+    return _BASE_GROUP_FIELDS | (_D2_GROUP_FIELDS if role == "D2" else frozenset())
+
+
+def _normalize_group_identity(value: Any, *, role: str, label: str) -> dict[str, str]:
+    group = _object(value, label)
+    fields = _group_fields(role)
+    _exact(group, set(fields), label)
+    return {key: _text(group[key], f"{label}.{key}") for key in sorted(fields)}
+
+
+def _normalize_group_disjoint_fields(value: Any, *, role: str) -> list[str]:
+    fields = _group_fields(role)
+    required = _BASE_GROUP_DISJOINT_FIELDS | (
+        _D2_GROUP_FIELDS if role == "D2" else frozenset()
+    )
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(field, str) for field in value)
+        or value != sorted(set(value))
+        or not required.issubset(value)
+        or any(field not in fields for field in value)
+    ):
+        raise ValueError("group_disjoint_fields does not satisfy the leakage policy")
+    return list(value)
 
 
 def canonical_utc(value: Any, label: str) -> str:
@@ -368,7 +411,7 @@ def _decode_row(
     root: Path, evaluator_row: dict[str, Any], group_identity: dict[str, Any]
 ) -> dict[str, Any]:
     try:
-        from PIL import Image, __version__ as pillow_version
+        from PIL import Image, ImageOps, __version__ as pillow_version
     except ImportError as exc:  # pragma: no cover - image runtime has Pillow.
         raise RuntimeError("Pillow is required to curate Krea fixtures") from exc
 
@@ -385,7 +428,7 @@ def _decode_row(
     if not normalized_caption:
         raise ValueError(f"caption normalizes to empty: {caption}")
     with Image.open(image) as opened:
-        rgb = opened.convert("RGB")
+        rgb = ImageOps.exif_transpose(opened).convert("RGB")
         width, height = rgb.size
         pixels = rgb.tobytes()
         # Pin the resampling algorithm so Pillow upgrades cannot silently
@@ -421,6 +464,7 @@ def _decode_row(
 def _rows(
     root: Path,
     *,
+    role: str,
     list_supported_images: Callable[[str, tuple[str, ...]], list[str]],
     extensions: tuple[str, ...],
     row_groups: dict[str, dict[str, str]],
@@ -433,22 +477,11 @@ def _rows(
     image_names = set(evaluator_identity["evaluator_order"])
     if set(row_groups) != image_names:
         raise ValueError("row_groups must cover every image exactly")
-    group_keys = {
-        "source_id",
-        "creator_id",
-        "burst_id",
-        "scene_id",
-        "play_root_id",
-        "human_similarity_cluster_id",
-    }
     normalized_groups = {}
     for image_name, raw_group in row_groups.items():
-        group = _object(raw_group, f"row group {image_name}")
-        _exact(group, group_keys, f"row group {image_name}")
-        normalized_groups[image_name] = {
-            key: _text(group[key], f"row group {image_name}.{key}")
-            for key in sorted(group_keys)
-        }
+        normalized_groups[image_name] = _normalize_group_identity(
+            raw_group, role=role, label=f"row group {image_name}"
+        )
     rows = [
         _decode_row(root, row, normalized_groups[row["image"]])
         for row in evaluator_identity["rows"]
@@ -653,35 +686,19 @@ def build_manifest(
     similarity_review_record = _safe_file(
         similarity_review_record, "human similarity review"
     )
-    group_field_vocabulary = {
-        "source_id",
-        "creator_id",
-        "burst_id",
-        "scene_id",
-        "play_root_id",
-        "human_similarity_cluster_id",
-    }
-    group_disjoint_fields = metadata["group_disjoint_fields"]
-    if (
-        not isinstance(group_disjoint_fields, list)
-        or group_disjoint_fields != sorted(set(group_disjoint_fields))
-        or not {
-            "burst_id",
-            "scene_id",
-            "play_root_id",
-            "human_similarity_cluster_id",
-        }.issubset(group_disjoint_fields)
-        or any(field not in group_field_vocabulary for field in group_disjoint_fields)
-    ):
-        raise ValueError("group_disjoint_fields does not satisfy the leakage policy")
+    group_disjoint_fields = _normalize_group_disjoint_fields(
+        metadata["group_disjoint_fields"], role=role
+    )
     training_identity, training_rows = _rows(
         training_dir,
+        role=role,
         list_supported_images=list_supported_images,
         extensions=extensions,
         row_groups=_object(metadata["training_row_groups"], "training_row_groups"),
     )
     evaluation_identity, evaluation_rows = _rows(
         evaluation_dir,
+        role=role,
         list_supported_images=list_supported_images,
         extensions=extensions,
         row_groups=_object(metadata["evaluation_row_groups"], "evaluation_row_groups"),
@@ -735,7 +752,7 @@ def build_manifest(
             inspect.getsource(list_supported_images).encode("utf-8")
         ).hexdigest(),
         "extensions": list(extensions),
-        "perceptual_hash": "rgb-luma-average-hash-8x8-bilinear",
+        "perceptual_hash": ("rgb-luma-average-hash-8x8-bilinear-after-exif-transpose"),
     }
     body = {
         "schema": 1,
@@ -897,8 +914,17 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
                 or row["content_sha256"] != krea_provenance.canonical_sha256(content)
                 or row["image_sha256"] != evaluator_row["image_sha256"]
                 or row["caption_sha256"] != evaluator_row["prompt_sha256"]
-                or row["width"] != evaluator_row["image_width"]
-                or row["height"] != evaluator_row["image_height"]
+                or isinstance(row["width"], bool)
+                or not isinstance(row["width"], int)
+                or row["width"] <= 0
+                or isinstance(row["height"], bool)
+                or not isinstance(row["height"], int)
+                or row["height"] <= 0
+                or (row["width"], row["height"])
+                not in {
+                    (evaluator_row["image_width"], evaluator_row["image_height"]),
+                    (evaluator_row["image_height"], evaluator_row["image_width"]),
+                }
                 or row["media_type"] != evaluator_row["image_format"]
                 or row["mode"] != "RGB"
                 or not isinstance(row["perceptual_hash64"], str)
@@ -921,21 +947,11 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
                 or not decoder["version"]
             ):
                 raise ValueError(f"{split} fixture decoder identity is invalid")
-            group = _object(row["group_identity"], f"{split} fixture group")
-            _exact(
-                group,
-                {
-                    "source_id",
-                    "creator_id",
-                    "burst_id",
-                    "scene_id",
-                    "play_root_id",
-                    "human_similarity_cluster_id",
-                },
-                f"{split} fixture group",
+            _normalize_group_identity(
+                row["group_identity"],
+                role=role,
+                label=f"{split} fixture group",
             )
-            for key, value in group.items():
-                _text(value, f"{split} fixture group.{key}")
         shape = [
             {
                 "width": row["width"],
@@ -969,18 +985,12 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         or not 0 <= threshold <= 64
     ):
         raise ValueError("fixture duplicate threshold is invalid")
-    group_fields = near["group_disjoint_fields"]
-    if (
-        not isinstance(group_fields, list)
-        or group_fields != sorted(set(group_fields))
-        or not {
-            "burst_id",
-            "scene_id",
-            "play_root_id",
-            "human_similarity_cluster_id",
-        }.issubset(group_fields)
-    ):
-        raise ValueError("fixture group-disjointness policy is invalid")
+    try:
+        group_fields = _normalize_group_disjoint_fields(
+            near["group_disjoint_fields"], role=role
+        )
+    except ValueError as exc:
+        raise ValueError("fixture group-disjointness policy is invalid") from exc
     recomputed_report = _duplicates(
         train_rows,
         eval_rows,
@@ -1180,7 +1190,8 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         not isinstance(tool["extensions"], list)
         or not tool["extensions"]
         or any(not isinstance(item, str) or not item for item in tool["extensions"])
-        or tool["perceptual_hash"] != "rgb-luma-average-hash-8x8-bilinear"
+        or tool["perceptual_hash"]
+        != "rgb-luma-average-hash-8x8-bilinear-after-exif-transpose"
     ):
         raise ValueError("tool identity enumerator/perceptual-hash contract is invalid")
     archive_identity = _object(
@@ -1565,6 +1576,7 @@ def cross_fixture_disjoint(
                     left_fixture["near_duplicate_policy"]["group_disjoint_fields"]
                 )
                 | set(right_fixture["near_duplicate_policy"]["group_disjoint_fields"])
+                if key in left["group_identity"] and key in right["group_identity"]
                 if left["group_identity"][key] == right["group_identity"][key]
             )
             if shared_groups:

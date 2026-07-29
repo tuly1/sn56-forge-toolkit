@@ -11,7 +11,6 @@ import sys
 
 import pytest
 
-
 _CALIBRATION = Path(__file__).parents[1] / "ops" / "calibration"
 sys.path.insert(0, str(_CALIBRATION))
 
@@ -106,6 +105,13 @@ def _row(role: str, index: int) -> dict:
             "human_similarity_cluster_id",
         )
     }
+    if role == "D2":
+        group.update(
+            {
+                "play_component_id": f"play-component-{token}",
+                "accession_family_id": f"accession-family-{token}",
+            }
+        )
     return {
         "row_id": f"row-{token}",
         "content_sha256": _sha(f"content-{token}"),
@@ -140,12 +146,19 @@ def _fixtures() -> list[dict]:
                 },
                 "near_duplicate_policy": {
                     "maximum_hamming_distance": 0,
-                    "group_disjoint_fields": [
-                        "burst_id",
-                        "human_similarity_cluster_id",
-                        "play_root_id",
-                        "scene_id",
-                    ],
+                    "group_disjoint_fields": sorted(
+                        {
+                            "burst_id",
+                            "human_similarity_cluster_id",
+                            "play_root_id",
+                            "scene_id",
+                        }
+                        | (
+                            {"play_component_id", "accession_family_id"}
+                            if role == "D2"
+                            else set()
+                        )
+                    ),
                     "human_similarity_review": {
                         "reviewed_at_utc": reviewed_at,
                         "reviewer_identity": f"Similarity {role}",
@@ -156,6 +169,87 @@ def _fixtures() -> list[dict]:
             }
         )
     return values
+
+
+def test_d2_group_identity_requires_component_and_accession_family() -> None:
+    group = _row("D2", 0)["group_identity"]
+    assert fixture._normalize_group_identity(
+        group, role="D2", label="D2 group"
+    ) == dict(sorted(group.items()))
+
+    for missing in ("play_component_id", "accession_family_id"):
+        incomplete = {key: value for key, value in group.items() if key != missing}
+        with pytest.raises(ValueError, match="keys mismatch"):
+            fixture._normalize_group_identity(incomplete, role="D2", label="D2 group")
+
+    with pytest.raises(ValueError, match="keys mismatch"):
+        fixture._normalize_group_identity(group, role="D1", label="D1 group")
+
+
+@pytest.mark.parametrize("shared_field", ("play_component_id", "accession_family_id"))
+def test_d2_component_and_accession_groups_are_leakage_boundaries(shared_field) -> None:
+    training = _row("D2", 0)
+    evaluation = _row("D2", 1)
+    evaluation["group_identity"][shared_field] = training["group_identity"][
+        shared_field
+    ]
+    group_fields = sorted(
+        fixture._BASE_GROUP_DISJOINT_FIELDS | fixture._D2_GROUP_FIELDS
+    )
+
+    report = fixture._duplicates(
+        [training],
+        [evaluation],
+        threshold=0,
+        group_disjoint_fields=tuple(group_fields),
+    )
+
+    assert [match["field"] for match in report["cross_split_group_matches"]] == [
+        shared_field
+    ]
+
+
+@pytest.mark.parametrize("missing", ("play_component_id", "accession_family_id"))
+def test_d2_disjointness_policy_cannot_omit_new_group_boundaries(missing) -> None:
+    fields = sorted(
+        (fixture._BASE_GROUP_DISJOINT_FIELDS | fixture._D2_GROUP_FIELDS) - {missing}
+    )
+    with pytest.raises(ValueError, match="leakage policy"):
+        fixture._normalize_group_disjoint_fields(fields, role="D2")
+
+
+def test_fixture_decode_applies_exif_orientation_before_rgb_identity(tmp_path) -> None:
+    pil_image = pytest.importorskip("PIL.Image")
+    pil_image_ops = pytest.importorskip("PIL.ImageOps")
+    image_path = tmp_path / "oriented.jpg"
+    caption_path = tmp_path / "oriented.txt"
+    image = pil_image.new("RGB", (2, 3), color=(25, 75, 125))
+    exif = pil_image.Exif()
+    exif[274] = 6
+    image.save(image_path, format="JPEG", exif=exif)
+    caption_bytes = b"a reviewed fixture caption\n"
+    caption_path.write_bytes(caption_bytes)
+    image_bytes = image_path.read_bytes()
+    evaluator_row = {
+        "image": image_path.name,
+        "prompt": caption_path.name,
+        "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+        "prompt_sha256": hashlib.sha256(caption_bytes).hexdigest(),
+        "image_format": "JPEG",
+    }
+    group = _row("D1", 0)["group_identity"]
+
+    decoded = fixture._decode_row(tmp_path, evaluator_row, group)
+
+    with pil_image.open(image_path) as opened:
+        assert opened.size == (2, 3)
+        expected = pil_image_ops.exif_transpose(opened).convert("RGB")
+        assert expected.size == (3, 2)
+        expected_pixels = expected.tobytes()
+    assert (decoded["width"], decoded["height"]) == (3, 2)
+    assert (
+        decoded["decoded_pixels_sha256"] == hashlib.sha256(expected_pixels).hexdigest()
+    )
 
 
 def _cross_review(fixtures: list[dict]) -> dict:

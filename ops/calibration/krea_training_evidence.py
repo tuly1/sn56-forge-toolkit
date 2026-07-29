@@ -357,10 +357,15 @@ def _training_identity(
     expected = fixture["training_dataset_identity"]
     observed, rows = krea_fixture._rows(  # Same code as the pre-GPU curator.
         batch._safe_directory(training_dir, "training directory"),
+        role=fixture["experimental_role"],
         list_supported_images=lambda _root, _extensions: list(
             expected["evaluator_order"]
         ),
         extensions=tuple(fixture["tool_identity"]["extensions"]),
+        row_groups={
+            row["relative_image_path"]: row["group_identity"]
+            for row in fixture["training_rows"]
+        },
     )
     if observed != expected or rows != fixture["training_rows"]:
         raise ValueError("training bytes differ from the approved fixture")
