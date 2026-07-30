@@ -351,7 +351,7 @@ def _historical_campaign_binding(
     identity = {
         "schema": 1,
         "kind": "forge-krea-historical-training-evidence-validator",
-        "root": "/admitted/forge-f6ce1ad",
+        "root": "/admitted/forge-c9f30b1",
     }
     monkeypatch.setattr(
         batch.krea_historical_training_evidence,
@@ -412,7 +412,7 @@ def test_schema3_score_approval_uses_historical_authority_graph(
         validate_actor=lambda role, value: (
             calls.append(("actor", role)) or value
         ),
-        binding=lambda: {"historical_contract": "f6ce1ad"},
+        binding=lambda: {"historical_contract": "c9f30b1"},
     )
     modules = {
         "discovery_authorization": historical_authorization,
@@ -427,7 +427,7 @@ def test_schema3_score_approval_uses_historical_authority_graph(
         discovery_execution_authorization=binding,
     )
     assert approval["delegated_review_contract"] == {
-        "historical_contract": "f6ce1ad"
+        "historical_contract": "c9f30b1"
     }
     candidate = {
         "id": "K1-step-50",
@@ -1280,16 +1280,16 @@ class BuilderHarness:
         return campaign, draft, campaign_path, draft_path
 
 
-def test_f6ce1ad_training_bundle_routes_through_historical_validator_and_rejects_drift(
+def test_c9f30b1_training_bundle_routes_through_historical_validator_and_rejects_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     harness = BuilderHarness(tmp_path, monkeypatch)
     identity = {
         "schema": 1,
         "kind": "forge-krea-historical-training-evidence-validator",
-        "root": "/admitted/forge-f6ce1ad",
-        "commit_sha1": "f6ce1ad044ff2aa920f2c63074dedd9c32035922",
-        "tree_sha1": "ec0aade08124b65c1e74f45a8a3a9e3e19a6b92d",
+        "root": "/admitted/forge-c9f30b1",
+        "commit_sha1": "c9f30b14de5358a5fd8e3c2e23a8e6427c2fdb1d",
+        "tree_sha1": "c2d106ebc9165768ac0dcd3b3d6686056fe5a8c2",
         "execution_surface_policy_sha256": (
             "98b59fd90dbf4ea213c860f873bc472cadc66714c7b9118672de2474f020f5f3"
         ),

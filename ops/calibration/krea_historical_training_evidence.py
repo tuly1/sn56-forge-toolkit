@@ -2,7 +2,7 @@
 
 Scorer-only fixes must not require re-emitting otherwise valid training
 evidence.  This module loads the complete validator graph from the exact clean
-f6ce1ad accelerated-discovery successor worktree under an isolated package
+c9f30b1 accelerated-discovery successor worktree under an isolated package
 name. It
 never treats current scorer code as an equivalent training validator and it
 has no generic commit allowlist.
@@ -20,8 +20,8 @@ from types import ModuleType
 from typing import Any
 
 
-_COMMIT = "f6ce1ad044ff2aa920f2c63074dedd9c32035922"
-_TREE = "ec0aade08124b65c1e74f45a8a3a9e3e19a6b92d"
+_COMMIT = "c9f30b14de5358a5fd8e3c2e23a8e6427c2fdb1d"
+_TREE = "c2d106ebc9165768ac0dcd3b3d6686056fe5a8c2"
 _POLICY_SHA256 = "98b59fd90dbf4ea213c860f873bc472cadc66714c7b9118672de2474f020f5f3"
 _MODULE_SHA256 = {
     "krea_training_evidence.py": (
@@ -34,13 +34,16 @@ _MODULE_SHA256 = {
         "29b92928aed6adc5d9d7f59207610f673845e3ab4a196debcca9aba654c786ac"
     ),
     "krea_fixture_admission.py": (
-        "cc86293172d43ba3eb16ef59d1f7d54fd50688f11e7075f5debbb8501422e056"
+        "2c11b08e03e89c22d0b66530379414916e01c9468a6973c4acda641848a57f11"
     ),
     "krea_runtime_binding.py": (
         "af7a95154eb00c4653bc9ecd1cef465fea69cfc5fd7912126a07573360f2f250"
     ),
+    "run_krea_ladder.py": (
+        "29402cfda15dee33d69d5a258384fdbfe764386d31aea10e80c8f488b5448593"
+    ),
 }
-_ALIAS = "_forge_krea_training_validator_f6ce1ad"
+_ALIAS = "_forge_krea_training_validator_c9f30b1"
 _LOADED_ROOT: Path | None = None
 
 
@@ -122,14 +125,14 @@ def capture_identity(root: Path | str) -> dict[str, Any]:
     )
     if top != root_path or commit != _COMMIT or tree != _TREE or status:
         raise ValueError(
-            "historical validator must be the exact clean f6ce1ad worktree"
+            "historical validator must be the exact clean c9f30b1 worktree"
         )
     calibration = root_path / "ops" / "calibration"
     observed = {
         name: _file_sha256(calibration / name) for name in sorted(_MODULE_SHA256)
     }
     if observed != _MODULE_SHA256:
-        raise ValueError("historical training-validator modules differ from f6ce1ad")
+        raise ValueError("historical training-validator modules differ from c9f30b1")
     return {
         "schema": 1,
         "kind": "forge-krea-historical-training-evidence-validator",
