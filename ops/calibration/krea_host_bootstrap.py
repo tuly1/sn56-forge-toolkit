@@ -614,10 +614,20 @@ def _trusted_executable(name: str) -> tuple[str, dict[str, Any]]:
     if not os.path.lexists(requested):
         raise RuntimeError(f"trusted system executable is absent: {requested}")
     requested_stat = requested.lstat()
-    if requested_stat.st_uid != 0 or requested_stat.st_mode & 0o022:
+    if requested_stat.st_uid != 0 or (
+        not stat.S_ISLNK(requested_stat.st_mode)
+        and requested_stat.st_mode & 0o022
+    ):
         raise RuntimeError(
             f"trusted system executable path is operator-writable: {requested}"
         )
+    for ancestor in requested.parents:
+        ancestor_stat = ancestor.stat()
+        if ancestor_stat.st_uid != 0 or ancestor_stat.st_mode & 0o022:
+            raise RuntimeError(
+                "trusted system executable has an operator-writable ancestor: "
+                f"{ancestor}"
+            )
     try:
         resolved = requested.resolve(strict=True)
     except (FileNotFoundError, RuntimeError) as exc:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 
 import pytest
@@ -356,6 +357,41 @@ def test_trusted_system_binary_does_not_consult_operator_path(tmp_path, monkeypa
     assert requested == "/usr/bin/git"
     assert identity["requested_path"] == "/usr/bin/git"
     assert identity["resolved_path"] != str(fake)
+
+
+def test_trusted_root_owned_system_symlink_ignores_symlink_mode_bits(monkeypatch):
+    requested = Path("/usr/bin/python3")
+    resolved = Path("/usr/bin/python3.10")
+    symlink_stat = type(
+        "SymlinkStat", (), {"st_uid": 0, "st_mode": stat.S_IFLNK | 0o777}
+    )()
+    file_stat = type(
+        "FileStat", (), {"st_uid": 0, "st_mode": stat.S_IFREG | 0o755}
+    )()
+    directory_stat = type(
+        "DirectoryStat", (), {"st_uid": 0, "st_mode": stat.S_IFDIR | 0o755}
+    )()
+    monkeypatch.setattr(bootstrap.os.path, "lexists", lambda path: path == requested)
+    monkeypatch.setattr(bootstrap.Path, "lstat", lambda path: symlink_stat)
+    monkeypatch.setattr(
+        bootstrap.Path,
+        "resolve",
+        lambda path, strict=True: resolved if path == requested else path,
+    )
+    monkeypatch.setattr(
+        bootstrap.Path,
+        "stat",
+        lambda path: file_stat if path == resolved else directory_stat,
+    )
+    monkeypatch.setattr(bootstrap.os, "access", lambda *_args: True)
+    monkeypatch.setattr(
+        bootstrap.krea_provenance, "file_sha256", lambda _path: "a" * 64
+    )
+
+    path, identity = bootstrap._trusted_executable("system_python")
+
+    assert path == str(requested)
+    assert identity["resolved_path"] == str(resolved)
 
 
 def test_preimport_venv_drift_rejects_before_any_child_exec(tmp_path, monkeypatch):
