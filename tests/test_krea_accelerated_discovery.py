@@ -132,7 +132,6 @@ def test_k4_correction_is_one_way_and_capped() -> None:
 def test_accelerated_index_contains_one_real_profile_and_six_proxy_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    campaign = accelerated.build_campaign(_payload())
     classes = (
         "A-rank32-adamw8bit-mse-guidance2",
         "B-rank32-adamw8bit-mae-guidance3",
@@ -153,6 +152,11 @@ def test_accelerated_index_contains_one_real_profile_and_six_proxy_slots(
             for class_name in classes
         ]
     }
+    campaign_payload = _payload()
+    campaign_payload["discovery_plan"]["discovery_sha256"] = (
+        krea_provenance.canonical_sha256(discovery)
+    )
+    campaign = accelerated.build_campaign(campaign_payload)
     authorization = {
         "authorization_sha256": _sha("authorization-semantic"),
         "fixture_admission_envelope": campaign["fixture_admission_envelope"],
@@ -283,12 +287,15 @@ def test_source_transition_allows_only_the_control_patch(
         "ops/calibration/week5/krea-accelerated-discovery-policy.json",
         "tests/test_krea_accelerated_discovery.py",
     ]
+    unsafe = {"deletion": False}
 
     def fake_run_text(command: list[str], *, cwd=None) -> str:
         if "status" in command:
             return ""
         if "diff" in command:
-            return "\n".join(changed)
+            if unsafe["deletion"]:
+                return "D\tops/calibration/krea_execution_plan.py"
+            return "\n".join(f"M\t{path}" for path in changed)
         raise AssertionError(command)
 
     monkeypatch.setattr(runner, "_run_text", fake_run_text)
@@ -297,4 +304,8 @@ def test_source_transition_allows_only_the_control_patch(
 
     changed.append("forge/tasks/aitoolkit.py")
     with pytest.raises(RuntimeError, match="non-control files"):
+        runner._validate_control_only_source_transition(compatibility)
+
+    unsafe["deletion"] = True
+    with pytest.raises(RuntimeError, match="unsafe Git change"):
         runner._validate_control_only_source_transition(compatibility)

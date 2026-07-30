@@ -87,6 +87,11 @@ def _canonical_file(path: Path, label: str) -> tuple[dict[str, Any], str]:
     path = Path(os.path.abspath(os.path.expanduser(path)))
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"{label} must be a regular non-symlink file")
+    current = path.parent
+    while current != current.parent:
+        if current.is_symlink():
+            raise ValueError(f"{label} has a symlink ancestor: {current}")
+        current = current.parent
     raw = path.read_bytes()
     try:
         value = _object(json.loads(raw), label)

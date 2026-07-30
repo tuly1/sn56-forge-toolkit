@@ -585,6 +585,8 @@ def _build_accelerated_profile_index(payload: dict[str, Any]) -> dict[str, Any]:
     if (
         campaign["discovery_plan"]["path"] != str(discovery_path)
         or campaign["discovery_plan"]["file_sha256"] != discovery_file_sha
+        or campaign["discovery_plan"]["discovery_sha256"]
+        != krea_provenance.canonical_sha256(discovery)
         or campaign["discovery_execution_authorization"]["path"]
         != str(authorization_path)
         or campaign["discovery_execution_authorization"]["file_sha256"]
@@ -875,6 +877,8 @@ def _validate_accelerated_profile_index(value: dict[str, Any]) -> dict[str, Any]
         value["throughput_equivalence_classes"] != list(classes)
         or campaign["discovery_plan"]["path"] != str(discovery_path)
         or campaign["discovery_plan"]["file_sha256"] != discovery_file_sha
+        or campaign["discovery_plan"]["discovery_sha256"]
+        != krea_provenance.canonical_sha256(discovery)
         or campaign["discovery_execution_authorization"]["path"]
         != str(authorization_path)
         or campaign["discovery_execution_authorization"]["file_sha256"]

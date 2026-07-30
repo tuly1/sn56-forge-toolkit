@@ -999,19 +999,22 @@ def _validate_control_only_source_transition(compatibility: dict[str, Any]) -> N
         capture_output=True,
         timeout=60,
     )
-    changed = set(
-        _run_text(
-            [
-                "git",
-                "-C",
-                str(root),
-                "diff",
-                "--name-only",
-                "--diff-filter=ACMRT",
-                f"{old_commit}..HEAD",
-            ]
-        ).splitlines()
-    )
+    change_rows = _run_text(
+        [
+            "git",
+            "-C",
+            str(root),
+            "diff",
+            "--name-status",
+            f"{old_commit}..HEAD",
+        ]
+    ).splitlines()
+    changed: set[str] = set()
+    for row in change_rows:
+        fields = row.split("\t")
+        if len(fields) != 2 or fields[0] not in {"A", "M"}:
+            raise RuntimeError(f"accelerated transition has unsafe Git change: {row}")
+        changed.add(fields[1])
     allowed = {
         "ops/calibration/krea_accelerated_discovery.py",
         "ops/calibration/krea_execution_plan.py",
