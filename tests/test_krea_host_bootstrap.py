@@ -598,6 +598,11 @@ def test_docker_identity_binds_actual_image_id(monkeypatch):
         "/usr/bin/nvidia-smi" in command and "--entrypoint" in command
         for command, _timeout in observed_timeouts
     )
+    assert any(
+        "/tmp:rw,exec,nosuid,nodev,size=8g,mode=1777" in command
+        and "/usr/bin/python3" in command
+        for command, _timeout in observed_timeouts
+    )
 
     with pytest.raises(RuntimeError, match="actual Docker image ID differs"):
         bootstrap._docker_identity(

@@ -861,7 +861,7 @@ def _docker_identity(
         "none",
         "--read-only",
         "--tmpfs",
-        "/tmp:rw,nosuid,nodev,size=8g,mode=1777",
+        "/tmp:rw,exec,nosuid,nodev,size=8g,mode=1777",
         "--runtime",
         required_runtime,
         "--gpus",
