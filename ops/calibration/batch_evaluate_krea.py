@@ -1920,6 +1920,9 @@ def _validate_run_completion(
     execution_approval_file_sha: str,
     fixture: dict[str, Any],
     execution_plan_validator: Any = krea_execution_plan,
+    expected_execution_surface_policy_sha256: str = (
+        krea_execution_surface_policy.POLICY["policy_sha256"]
+    ),
 ) -> None:
     _exact_keys(
         completion,
@@ -1983,7 +1986,7 @@ def _validate_run_completion(
         or completion["natural_completion"] is not True
         or completion["in_task_proxy_selection"] != {"enabled": False, "reserve_s": 0}
         or completion["execution_surface_policy_sha256"]
-        != krea_execution_surface_policy.POLICY["policy_sha256"]
+        != expected_execution_surface_policy_sha256
         or completion["execution_surface"] != "staged_host_venv"
         or completion["execution_scope"] != "discovery_only"
     ):
@@ -2702,6 +2705,18 @@ def _validate_plan_v2(
     fixture_validator = authority["fixture"]
     fixture_admission_validator = authority["fixture_admission"]
     execution_plan_validator = authority["execution_plan"]
+    training_evidence_validator = authority.get("training_evidence")
+    if training_evidence_validator is None:
+        try:
+            from . import krea_training_evidence as training_evidence_validator
+        except ImportError:  # pragma: no cover
+            import krea_training_evidence as training_evidence_validator  # type: ignore[no-redef]
+    historical_identity = campaign.get("historical_training_evidence_validator")
+    expected_training_policy_sha256 = (
+        krea_execution_surface_policy.POLICY["policy_sha256"]
+        if historical_identity is None
+        else historical_identity["execution_surface_policy_sha256"]
+    )
     fixture_path, fixture_file_sha, fixture, fixture_raw = _bound_file(
         plan["fixture_manifest"], "fixture manifest"
     )
@@ -2885,6 +2900,9 @@ def _validate_plan_v2(
                 execution_approval_file_sha=approval_file_sha,
                 fixture=fixture,
                 execution_plan_validator=execution_plan_validator,
+                expected_execution_surface_policy_sha256=(
+                    expected_training_policy_sha256
+                ),
             )
             matching = [
                 item
@@ -3058,13 +3076,7 @@ def _validate_plan_v2(
                 }
             )
         elif mode == "zero_lora_control":
-            # Lazy import avoids a module cycle: the producer imports this
-            # validator for its filesystem primitives.
-            try:
-                from . import krea_training_evidence
-            except ImportError:  # pragma: no cover
-                import krea_training_evidence  # type: ignore[no-redef]
-            krea_training_evidence.validate_zero_control(
+            training_evidence_validator.validate_zero_control(
                 binding, artifact_path=candidate_path
             )
             if binding["evaluation_dataset_sha256"] != dataset_sha or binding[
@@ -4742,7 +4754,7 @@ def run_batch(
         )
         if fixture_file_sha != evaluator["_fixture_manifest_file_sha256"]:
             raise RuntimeError("fixture manifest changed before publication")
-        krea_fixture.validate_manifest(fixture)
+        evaluator.get("_fixture_validator", krea_fixture).validate_manifest(fixture)
     body: dict[str, Any] = {
         "schema": 2 if is_v2 else _SCHEMA,
         "kind": _KIND,

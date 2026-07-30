@@ -127,6 +127,11 @@ def _bundle_candidates(
         },
         "stage-three run-evidence bundle",
     )
+    expected_execution_surface_policy_sha256 = (
+        krea_execution_surface_policy.POLICY["policy_sha256"]
+        if historical_validator_identity is None
+        else historical_validator_identity["execution_surface_policy_sha256"]
+    )
     body = {key: value for key, value in bundle.items() if key != "bundle_sha256"}
     if (
         bundle["schema"] != 2
@@ -135,7 +140,7 @@ def _bundle_candidates(
         or not isinstance(bundle["arm_id"], str)
         or not batch._SAFE_ID.fullmatch(bundle["arm_id"])
         or bundle["execution_surface_policy_sha256"]
-        != krea_execution_surface_policy.POLICY["policy_sha256"]
+        != expected_execution_surface_policy_sha256
         or bundle["execution_surface"] != "staged_host_venv"
         or bundle["execution_scope"] != "discovery_only"
         or any(
@@ -377,12 +382,17 @@ def _bundle_candidates(
 
 
 def _zero_candidate(
-    manifest_path: Path, *, evaluation_dataset_sha256: str
+    manifest_path: Path,
+    *,
+    evaluation_dataset_sha256: str,
+    training_evidence_validator: Any = krea_training_evidence,
 ) -> tuple[dict[str, Any], str]:
     path, manifest, file_sha = _load(manifest_path, "zero-control manifest")
     artifact = batch._object(manifest.get("artifact"), "zero-control artifact")
     artifact_path = batch._safe_file(artifact.get("path"), "zero-control artifact")
-    krea_training_evidence.validate_zero_control(manifest, artifact_path=artifact_path)
+    training_evidence_validator.validate_zero_control(
+        manifest, artifact_path=artifact_path
+    )
     if manifest.get("evaluation_dataset_sha256") != evaluation_dataset_sha256:
         raise ValueError("zero control belongs to another evaluation fixture")
     return (
@@ -540,7 +550,13 @@ def build_documents(
     candidates.sort(key=lambda row: row["id"])
 
     zero, zero_manifest_sha = _zero_candidate(
-        zero_manifest_path, evaluation_dataset_sha256=expected_dataset_sha
+        zero_manifest_path,
+        evaluation_dataset_sha256=expected_dataset_sha,
+        training_evidence_validator=(
+            krea_training_evidence
+            if historical_modules is None
+            else historical_modules["training_evidence"]
+        ),
     )
     if zero["id"] in candidate_ids or zero["sha256"] in candidate_hashes:
         raise ValueError("zero-control id/bytes collide with a local candidate")

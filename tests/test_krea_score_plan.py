@@ -1306,6 +1306,15 @@ def test_fc70_training_bundle_routes_through_historical_validator_and_rejects_dr
         "validate_run_evidence",
         validate,
     )
+    admitted = json.loads(harness.bundle_path.read_text(encoding="utf-8"))
+    admitted["execution_surface_policy_sha256"] = identity[
+        "execution_surface_policy_sha256"
+    ]
+    admitted_body = {
+        key: value for key, value in admitted.items() if key != "bundle_sha256"
+    }
+    admitted["bundle_sha256"] = krea_provenance.canonical_sha256(admitted_body)
+    _canonical_file(harness.bundle_path, admitted)
     run, rows, *_ = score_plan._bundle_candidates(
         harness.bundle_path,
         historical_validator_identity=identity,
