@@ -13,8 +13,8 @@ sys.path.insert(0, str(_ROOT / "ops" / "calibration"))
 import krea_historical_training_evidence as historical  # noqa: E402
 
 
-def test_exact_daf9_validator_graph_loads_in_isolated_namespace(tmp_path: Path) -> None:
-    checkout = tmp_path / "forge-daf9a252"
+def test_exact_5469851_validator_graph_loads_in_isolated_namespace(tmp_path: Path) -> None:
+    checkout = tmp_path / "forge-5469851"
     subprocess.run(
         ["/usr/bin/git", "clone", "--quiet", "--no-local", str(_ROOT), str(checkout)],
         check=True,
@@ -27,14 +27,14 @@ def test_exact_daf9_validator_graph_loads_in_isolated_namespace(tmp_path: Path) 
             str(checkout),
             "checkout",
             "--quiet",
-            "daf9a2528f4079ed06180c7e6d712a684a4170f0",
+            "546985195687696cf10dff3e2c58f7f0d1dd12d5",
         ],
         check=True,
         timeout=30,
     )
     identity = historical.capture_identity(checkout)
     modules = historical.load_modules(identity)
-    assert identity["tree_sha1"] == "953b58bdca842294ef7dfa1e54a16db52e5b74a2"
+    assert identity["tree_sha1"] == "27e43dc171f01c50cdd68331890394e32298687d"
     assert (
         modules["execution_surface_policy"].POLICY["policy_sha256"]
         == "98b59fd90dbf4ea213c860f873bc472cadc66714c7b9118672de2474f020f5f3"
@@ -51,5 +51,5 @@ def test_exact_daf9_validator_graph_loads_in_isolated_namespace(tmp_path: Path) 
         assert Path(modules[name].__file__).is_relative_to(checkout)
 
     (checkout / "untracked-downgrade.py").write_text("pass\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="exact clean daf9a252 worktree"):
+    with pytest.raises(ValueError, match="exact clean 5469851 worktree"):
         historical.capture_identity(checkout)

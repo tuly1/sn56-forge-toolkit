@@ -2,7 +2,7 @@
 
 Scorer-only fixes must not require re-emitting otherwise valid training
 evidence.  This module loads the complete validator graph from the exact clean
-daf9a252 accelerated-discovery successor worktree under an isolated package
+5469851 accelerated-discovery successor worktree under an isolated package
 name. It
 never treats current scorer code as an equivalent training validator and it
 has no generic commit allowlist.
@@ -20,8 +20,8 @@ from types import ModuleType
 from typing import Any
 
 
-_COMMIT = "daf9a2528f4079ed06180c7e6d712a684a4170f0"
-_TREE = "953b58bdca842294ef7dfa1e54a16db52e5b74a2"
+_COMMIT = "546985195687696cf10dff3e2c58f7f0d1dd12d5"
+_TREE = "27e43dc171f01c50cdd68331890394e32298687d"
 _POLICY_SHA256 = "98b59fd90dbf4ea213c860f873bc472cadc66714c7b9118672de2474f020f5f3"
 _MODULE_SHA256 = {
     "krea_training_evidence.py": (
@@ -34,10 +34,10 @@ _MODULE_SHA256 = {
         "29b92928aed6adc5d9d7f59207610f673845e3ab4a196debcca9aba654c786ac"
     ),
     "krea_fixture_admission.py": (
-        "cab4f28e9c56839f3548ed43526ab8b2e144dca393d88f4043263d6e6117f724"
+        "327214e624b6af89829b2ca7a79b85b2d6b909f9e685430e01a7432196bea437"
     ),
 }
-_ALIAS = "_forge_krea_training_validator_daf9a252"
+_ALIAS = "_forge_krea_training_validator_5469851"
 _LOADED_ROOT: Path | None = None
 
 
@@ -119,14 +119,14 @@ def capture_identity(root: Path | str) -> dict[str, Any]:
     )
     if top != root_path or commit != _COMMIT or tree != _TREE or status:
         raise ValueError(
-            "historical validator must be the exact clean daf9a252 worktree"
+            "historical validator must be the exact clean 5469851 worktree"
         )
     calibration = root_path / "ops" / "calibration"
     observed = {
         name: _file_sha256(calibration / name) for name in sorted(_MODULE_SHA256)
     }
     if observed != _MODULE_SHA256:
-        raise ValueError("historical training-validator modules differ from daf9a252")
+        raise ValueError("historical training-validator modules differ from 5469851")
     return {
         "schema": 1,
         "kind": "forge-krea-historical-training-evidence-validator",
