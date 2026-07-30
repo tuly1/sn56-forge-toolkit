@@ -982,6 +982,52 @@ def _training_seed_support(ai_toolkit_dir: Path) -> dict[str, Any]:
     }
 
 
+def _validate_control_only_source_transition(compatibility: dict[str, Any]) -> None:
+    """Prove the historical profile crossed only this control-plane patch."""
+
+    old_commit = compatibility["document"]["historical_compatibility"][
+        "source_commit"
+    ]
+    if old_commit != "58822b496019177a02fa6196247ac30e788331bb":
+        raise RuntimeError("accelerated source transition has an unknown base")
+    root = Path(__file__).resolve().parents[2]
+    if _run_text(["git", "-C", str(root), "status", "--porcelain"]):
+        raise RuntimeError("accelerated source transition requires a clean tree")
+    subprocess.run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", old_commit, "HEAD"],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    changed = set(
+        _run_text(
+            [
+                "git",
+                "-C",
+                str(root),
+                "diff",
+                "--name-only",
+                "--diff-filter=ACMRT",
+                f"{old_commit}..HEAD",
+            ]
+        ).splitlines()
+    )
+    allowed = {
+        "ops/calibration/krea_accelerated_discovery.py",
+        "ops/calibration/krea_execution_plan.py",
+        "ops/calibration/krea_profile_index.py",
+        "ops/calibration/krea_runtime_binding.py",
+        "ops/calibration/krea_training_evidence.py",
+        "ops/calibration/run_krea_ladder.py",
+        "ops/calibration/week5/krea-accelerated-discovery-policy.json",
+        "tests/test_krea_accelerated_discovery.py",
+    }
+    if not changed or not changed <= allowed:
+        raise RuntimeError(
+            f"accelerated transition changed non-control files: {sorted(changed - allowed)}"
+        )
+
+
 def _validate_measured_execution_envelope(
     *,
     profile: Any,
@@ -992,6 +1038,7 @@ def _validate_measured_execution_envelope(
     pre: dict[str, Any],
     host_execution_identity_sha256: str,
     venv_tree_manifest_sha256: str,
+    accelerated_compatibility: dict[str, Any] | None = None,
 ) -> None:
     """Recompute every locally observable timing-equivalence field."""
 
@@ -1061,7 +1108,25 @@ def _validate_measured_execution_envelope(
         for key, value in actual.items()
         if getattr(envelope, key) != value
     }
-    if mismatches:
+    if accelerated_compatibility is not None:
+        _validate_control_only_source_transition(accelerated_compatibility)
+        cell = accelerated_compatibility["cell"]
+        historical = accelerated_compatibility["historical_host"]
+        if (
+            cell["fixture_id"] != "D1"
+            or cell["runtime_factor"] != "1.00"
+            or cell["cadence_multiplier"] != 1
+            or envelope.host_execution_identity_sha256
+            != historical["host_execution_identity_sha256"]
+            or actual["host_execution_identity_sha256"]
+            == historical["host_execution_identity_sha256"]
+            or set(mismatches)
+            != {"host_execution_identity_sha256", "trainer_identity_sha256"}
+        ):
+            raise RuntimeError(
+                f"accelerated D1/A transition escaped its compatibility envelope: {mismatches}"
+            )
+    elif mismatches:
         raise RuntimeError(f"run escaped measured throughput envelope: {mismatches}")
 
 
@@ -1888,6 +1953,26 @@ def main() -> int:
         "allowed_condition_config_differences": allowed_differences,
         "in_task_proxy_selection": {"enabled": False, "reserve_s": 0},
     }
+    accelerated = execution_controls.get("accelerated_discovery_campaign")
+    if accelerated is not None:
+        cell = accelerated["cell"]
+        historical_host = execution_controls["historical_host_execution_manifest"]
+        campaign_fixed_prefix["accelerated_discovery"] = {
+            "campaign_sha256": accelerated["campaign_sha256"],
+            "cell_sha256": cell["cell_sha256"],
+            "cell_id": cell["cell_id"],
+            "timing_evidence_mode": cell["timing_evidence_mode"],
+            "source_profile_sha256": profile.profile_sha256,
+            "historical_host_execution_identity_sha256": historical_host[
+                "host_execution_identity_sha256"
+            ],
+            "fresh_host_execution_identity_sha256": execution_controls[
+                "host_execution_manifest"
+            ]["host_execution_identity_sha256"],
+            "runtime_factor": cell["runtime_factor"],
+            "effective_hard_budget_s": cell["effective_hard_budget_s"],
+            "claim_limit": accelerated["document"]["claim_limit"],
+        }
     _validate_existing_campaign_prefix(campaign_dir, campaign_fixed_prefix)
 
     original_build_config = aitoolkit.build_config
@@ -1979,6 +2064,17 @@ def main() -> int:
                 "host_execution_manifest"
             ]["host_execution_identity_sha256"],
             venv_tree_manifest_sha256=sealed_surface["venv_tree"]["manifest_sha256"],
+            accelerated_compatibility=(
+                {
+                    **execution_controls["accelerated_discovery_campaign"],
+                    "historical_host": execution_controls[
+                        "historical_host_execution_manifest"
+                    ],
+                }
+                if execution_controls.get("accelerated_discovery_campaign")
+                is not None
+                else None
+            ),
         )
         captured.update(
             baseline=copy.deepcopy(baseline),

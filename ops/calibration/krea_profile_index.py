@@ -18,9 +18,11 @@ import re
 from typing import Any, Mapping
 
 try:
+    from . import krea_accelerated_discovery
     from . import krea_provenance
     from . import krea_runtime_binding
 except ImportError:  # pragma: no cover - direct script execution.
+    import krea_accelerated_discovery  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_runtime_binding  # type: ignore[no-redef]
 
@@ -134,22 +136,67 @@ def validate_plan_cell(
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("fixture approval is not JSON") from exc
+    source_profile = (
+        profile_slot["source_profile"]
+        if index.get("schema") == 3
+        else profile_slot
+    )
     if (
         fixture["manifest_sha256"] != fixture_slot["manifest"]["manifest_sha256"]
         or approval_binding["sha256"] != fixture_slot["approval"]["file_sha256"]
         or approval_document.get("approval_sha256")
         != fixture_slot["approval"]["approval_sha256"]
-        or profile_binding["sha256"] != profile_slot["file_sha256"]
-        or throughput_profile["profile_sha256"] != profile_slot["profile_sha256"]
+        or profile_binding["sha256"] != source_profile["file_sha256"]
+        or throughput_profile["profile_sha256"] != source_profile["profile_sha256"]
     ):
         raise ValueError("execution plan escaped its fixture/class profile-index cell")
+    accelerated_cell = None
+    if index.get("schema") == 3:
+        campaign_binding = index["accelerated_discovery_campaign"]
+        _, campaign, campaign_file_sha = (
+            krea_accelerated_discovery.load_campaign_binding(campaign_binding)
+        )
+        index_campaign = index["accelerated_discovery_campaign"]
+        if (
+            campaign_file_sha != index_campaign["file_sha256"]
+            or campaign["campaign_sha256"] != index_campaign["campaign_sha256"]
+        ):
+            raise ValueError("plan and profile index bind different acceleration")
+        accelerated_cell = krea_accelerated_discovery.campaign_cell(
+            campaign, fixture_id, plan["arm_id"]
+        )
+        if (
+            accelerated_cell["throughput_equivalence_class"] != class_name
+            or accelerated_cell["runtime_factor"] != profile_slot["runtime_factor"]
+            or accelerated_cell["effective_hard_budget_s"]
+            != profile_slot["effective_hard_budget_s"]
+            or accelerated_cell["cell_sha256"]
+            not in profile_slot["eligible_cell_sha256"]
+        ):
+            raise ValueError("plan escaped its accelerated campaign cell")
     return {
         "document": index,
         "file_sha256": file_sha,
         "index_sha256": index["index_sha256"],
         "fixture_id": fixture_id,
         "throughput_equivalence_class": class_name,
-        "profile_sha256": profile_slot["profile_sha256"],
+        "profile_sha256": source_profile["profile_sha256"],
+        "accelerated_cell": accelerated_cell,
+        "accelerated_campaign_sha256": (
+            index["accelerated_discovery_campaign"]["campaign_sha256"]
+            if index.get("schema") == 3
+            else None
+        ),
+        "accelerated_campaign": (
+            {
+                "document": campaign,
+                "file_sha256": campaign_file_sha,
+                "campaign_sha256": campaign["campaign_sha256"],
+                "cell": accelerated_cell,
+            }
+            if accelerated_cell is not None
+            else None
+        ),
         "discovery_execution_authorization": dict(
             index["discovery_execution_authorization"]
         ),

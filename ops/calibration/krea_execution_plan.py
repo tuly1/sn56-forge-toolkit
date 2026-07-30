@@ -1484,6 +1484,32 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if profile.get("profile_sha256") is None:
         raise ValueError("throughput profile lacks its self digest")
     validated_profile = krea_budget.load_throughput_profile(profile)
+    profile_index = None
+    accelerated_campaign = None
+    accelerated_cell = None
+    historical_host_manifest = None
+    if plan_schema == 3:
+        profile_index = krea_profile_index.validate_plan_cell(
+            plan,
+            fixture=fixture,
+            throughput_profile=profile,
+        )
+        accelerated_campaign = profile_index.get("accelerated_campaign")
+        if accelerated_campaign is not None:
+            accelerated_cell = accelerated_campaign["cell"]
+            if (
+                accelerated_cell["cell_id"] != "D1-K1"
+                or accelerated_cell["fixture_id"] != "D1"
+                or accelerated_cell["throughput_equivalence_class"]
+                != accelerated_campaign["document"]["measured_profile"][
+                    "throughput_equivalence_class"
+                ]
+                or accelerated_cell["runtime_factor"] != "1.00"
+                or accelerated_cell["cadence_multiplier"] != 1
+            ):
+                raise ValueError(
+                    "initial accelerated launch is restricted to the exact D1/A cell"
+                )
     timing_evidence = _object(plan["timing_evidence"], "timing evidence")
     _exact(
         timing_evidence,
@@ -1610,6 +1636,11 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("budget plan cannot be recomputed") from exc
     if recomputed_budget != budget_plan:
         raise ValueError("budget plan differs from the measured planner output")
+    if accelerated_cell is not None and (
+        float(budget_plan["hard_budget_s"])
+        != float(accelerated_cell["effective_hard_budget_s"])
+    ):
+        raise ValueError("accelerated cell budget differs from its sealed envelope")
     if (
         profile.get("selection_mode") != "offline_post_training"
         or profile.get("selection_scoring_reserve_s") != 0
@@ -1645,7 +1676,30 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("profile throughput-equivalence class mismatch")
     if validated_profile.execution_envelope.to_record() != profile_envelope:
         raise ValueError("throughput execution envelope did not normalize exactly")
-    if (
+    if accelerated_campaign is not None:
+        historical_binding = accelerated_campaign["document"][
+            "historical_host_execution_manifest"
+        ]
+        _, historical_host_manifest, historical_file_sha = _json_file_binding(
+            {
+                "path": historical_binding["path"],
+                "sha256": historical_binding["file_sha256"],
+            },
+            "historical host execution manifest",
+            canonical=True,
+        )
+        krea_host_identity.validate_manifest(historical_host_manifest)
+        if (
+            historical_file_sha != historical_binding["file_sha256"]
+            or historical_host_manifest["host_execution_identity_sha256"]
+            != historical_binding["host_execution_identity_sha256"]
+            or profile_envelope.get("host_execution_identity_sha256")
+            != historical_host_manifest["host_execution_identity_sha256"]
+            or host_manifest["host_execution_identity_sha256"]
+            == historical_host_manifest["host_execution_identity_sha256"]
+        ):
+            raise ValueError("historical host compatibility binding is invalid")
+    elif (
         profile_envelope.get("host_execution_identity_sha256")
         != host_manifest["host_execution_identity_sha256"]
     ):
@@ -1810,13 +1864,6 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         )
     ):
         raise ValueError("final execution plan escaped its bootstrap timing probe")
-    profile_index = None
-    if plan_schema == 3:
-        profile_index = krea_profile_index.validate_plan_cell(
-            plan,
-            fixture=fixture,
-            throughput_profile=profile,
-        )
     return {
         "fixture": fixture,
         "fixture_manifest_file_sha256": fixture_file_sha,
@@ -1832,6 +1879,12 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "bootstrap_runtime": bootstrap_runtime,
         "bootstrap_execution_surface": bootstrap_execution_surface,
         "discovery_profile_index": profile_index,
+        "accelerated_discovery_campaign": (
+            accelerated_campaign
+            if accelerated_campaign is not None
+            else None
+        ),
+        "historical_host_execution_manifest": historical_host_manifest,
         "discovery_execution_authorization": (
             {
                 "document": discovery_authorization,

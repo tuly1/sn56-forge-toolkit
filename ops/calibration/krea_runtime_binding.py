@@ -20,6 +20,7 @@ import re
 from typing import Any, Mapping, Sequence
 
 try:
+    from . import krea_accelerated_discovery
     from . import krea_budget
     from . import krea_discovery_authorization
     from . import krea_execution_surface_policy
@@ -27,6 +28,7 @@ try:
     from . import krea_host_identity
     from . import krea_provenance
 except ImportError:  # pragma: no cover - direct script execution.
+    import krea_accelerated_discovery  # type: ignore[no-redef]
     import krea_budget  # type: ignore[no-redef]
     import krea_discovery_authorization  # type: ignore[no-redef]
     import krea_execution_surface_policy  # type: ignore[no-redef]
@@ -395,6 +397,8 @@ def build_profile_index(payload: dict[str, Any]) -> dict[str, Any]:
     """Build the six-cell post-timing index without modifying the freeze."""
 
     payload = _object(payload, "profile-index payload")
+    if "accelerated_discovery_campaign" in payload:
+        return _build_accelerated_profile_index(payload)
     _exact(
         payload,
         {
@@ -486,8 +490,185 @@ def build_profile_index(payload: dict[str, Any]) -> dict[str, Any]:
     return index
 
 
+def _accelerated_target_slots(
+    campaign: dict[str, Any],
+    *,
+    classes: tuple[str, ...],
+    measured_profile: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Project twelve arm cells into six fixture/class timing slots."""
+
+    result: dict[str, dict[str, Any]] = {}
+    for fixture_id in _FIXTURES:
+        result[fixture_id] = {}
+        for class_name in classes:
+            cells = [
+                row
+                for row in campaign["cells"]
+                if row["fixture_id"] == fixture_id
+                and row["throughput_equivalence_class"] == class_name
+            ]
+            if not cells:
+                raise ValueError(
+                    f"accelerated campaign lacks target slot {fixture_id}/{class_name}"
+                )
+            projection_keys = (
+                "measured_source_cell",
+                "timing_evidence_mode",
+                "runtime_factor",
+                "base_hard_budget_s",
+                "effective_hard_budget_s",
+                "cadence_multiplier",
+                "depth_increase_from_cadence_relief",
+            )
+            projections = {
+                krea_provenance.canonical_sha256(
+                    {key: row[key] for key in projection_keys}
+                )
+                for row in cells
+            }
+            if len(projections) != 1:
+                raise ValueError(
+                    f"accelerated campaign disagrees within {fixture_id}/{class_name}"
+                )
+            first = cells[0]
+            result[fixture_id][class_name] = {
+                "timing_evidence_mode": first["timing_evidence_mode"],
+                "measured_source_cell": dict(first["measured_source_cell"]),
+                "source_profile": dict(measured_profile),
+                "runtime_factor": first["runtime_factor"],
+                "base_hard_budget_s": first["base_hard_budget_s"],
+                "effective_hard_budget_s": first["effective_hard_budget_s"],
+                "cadence_multiplier": first["cadence_multiplier"],
+                "depth_increase_from_cadence_relief": first[
+                    "depth_increase_from_cadence_relief"
+                ],
+                "eligible_cell_sha256": sorted(row["cell_sha256"] for row in cells),
+            }
+    return result
+
+
+def _build_accelerated_profile_index(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bind one immutable D1/A measurement as an explicit conservative proxy."""
+
+    _exact(
+        payload,
+        {
+            "discovery_plan",
+            "discovery_execution_authorization",
+            "fixtures",
+            "accelerated_discovery_campaign",
+            "measured_profile",
+        },
+        "accelerated profile-index payload",
+    )
+    discovery_path, discovery, discovery_file_sha, classes = _load_discovery(
+        payload["discovery_plan"]
+    )
+    authorization_path, authorization, authorization_file_sha = (
+        krea_discovery_authorization.load_binding(
+            payload["discovery_execution_authorization"]
+        )
+    )
+    krea_discovery_authorization.assert_matches_discovery(
+        authorization,
+        discovery_path=discovery_path,
+        discovery=discovery,
+        discovery_file_sha256=discovery_file_sha,
+        action="profile_indexed_discovery_execution",
+    )
+    campaign_path, campaign, campaign_file_sha = (
+        krea_accelerated_discovery.load_campaign_binding(
+            payload["accelerated_discovery_campaign"]
+        )
+    )
+    if (
+        campaign["discovery_plan"]["path"] != str(discovery_path)
+        or campaign["discovery_plan"]["file_sha256"] != discovery_file_sha
+        or campaign["discovery_execution_authorization"]["path"]
+        != str(authorization_path)
+        or campaign["discovery_execution_authorization"]["file_sha256"]
+        != authorization_file_sha
+        or campaign["discovery_execution_authorization"]["authorization_sha256"]
+        != authorization["authorization_sha256"]
+        or campaign["fixture_admission_envelope"]
+        != authorization["fixture_admission_envelope"]
+    ):
+        raise ValueError("accelerated campaign escaped discovery authority")
+    fixture_inputs = _object(payload["fixtures"], "accelerated profile fixtures")
+    if set(fixture_inputs) != set(_FIXTURES):
+        raise ValueError("accelerated profile index requires D1 and D2 fixtures")
+    fixtures: dict[str, Any] = {}
+    fixture_documents: dict[str, dict[str, Any]] = {}
+    for fixture_id in _FIXTURES:
+        fixture, record = _load_fixture(fixture_id, fixture_inputs[fixture_id])
+        fixtures[fixture_id] = record
+        fixture_documents[fixture_id] = fixture
+
+    measured_class = campaign["measured_profile"][
+        "throughput_equivalence_class"
+    ]
+    measured_fixture = campaign["measured_profile"]["fixture_id"]
+    if measured_fixture != "D1" or measured_class not in classes:
+        raise ValueError("accelerated source profile is not the admitted D1/A slot")
+    class_contracts = _class_contracts(discovery, classes)
+    measured_record = _load_profile(
+        measured_fixture,
+        measured_class,
+        payload["measured_profile"],
+        fixture=fixture_documents[measured_fixture],
+        class_contract=class_contracts[measured_class],
+    )
+    if (
+        campaign["measured_profile"]["path"] != measured_record["path"]
+        or campaign["measured_profile"]["file_sha256"]
+        != measured_record["file_sha256"]
+        or campaign["measured_profile"]["profile_sha256"]
+        != measured_record["profile_sha256"]
+    ):
+        raise ValueError("accelerated source profile binding drifted")
+    slots = _accelerated_target_slots(
+        campaign, classes=classes, measured_profile=measured_record
+    )
+    for fixture_id, record in fixtures.items():
+        record["profiles"] = slots[fixture_id]
+
+    body = {
+        "schema": 3,
+        "kind": _INDEX_KIND,
+        "discovery_plan": {
+            "path": str(discovery_path),
+            "file_sha256": discovery_file_sha,
+        },
+        "discovery_execution_authorization": {
+            "path": str(authorization_path),
+            "file_sha256": authorization_file_sha,
+            "authorization_sha256": authorization["authorization_sha256"],
+        },
+        "accelerated_discovery_campaign": {
+            "path": str(campaign_path),
+            "file_sha256": campaign_file_sha,
+            "campaign_sha256": campaign["campaign_sha256"],
+        },
+        "throughput_equivalence_classes": list(classes),
+        "measured_profile_count": 1,
+        "target_slot_count": len(_FIXTURES) * len(classes),
+        "timing_evidence_mode": "conservative_proxy_not_measured_equivalence",
+        "measured_campaign_runtime_identity_sha256": measured_record[
+            "campaign_runtime_identity_sha256"
+        ],
+        "fixtures": fixtures,
+        "gpu_execution_authorized": False,
+    }
+    index = {**body, "index_sha256": krea_provenance.canonical_sha256(body)}
+    validate_profile_index(index)
+    return index
+
+
 def validate_profile_index(value: dict[str, Any]) -> dict[str, Any]:
     value = _object(value, "discovery-profile index")
+    if value.get("schema") == 3:
+        return _validate_accelerated_profile_index(value)
     _exact(
         value,
         {
@@ -635,6 +816,155 @@ def validate_profile_index(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _validate_accelerated_profile_index(value: dict[str, Any]) -> dict[str, Any]:
+    _exact(
+        value,
+        {
+            "schema",
+            "kind",
+            "discovery_plan",
+            "discovery_execution_authorization",
+            "accelerated_discovery_campaign",
+            "throughput_equivalence_classes",
+            "measured_profile_count",
+            "target_slot_count",
+            "timing_evidence_mode",
+            "measured_campaign_runtime_identity_sha256",
+            "fixtures",
+            "gpu_execution_authorized",
+            "index_sha256",
+        },
+        "accelerated discovery-profile index",
+    )
+    body = {key: item for key, item in value.items() if key != "index_sha256"}
+    if (
+        value["kind"] != _INDEX_KIND
+        or value["gpu_execution_authorized"] is not False
+        or value["measured_profile_count"] != 1
+        or value["target_slot_count"] != 6
+        or value["timing_evidence_mode"]
+        != "conservative_proxy_not_measured_equivalence"
+        or value["index_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("accelerated profile-index identity is invalid")
+    discovery_binding = _object(value["discovery_plan"], "index discovery plan")
+    _exact(discovery_binding, {"path", "file_sha256"}, "index discovery plan")
+    discovery_path, discovery, discovery_file_sha, classes = _load_discovery(
+        discovery_binding["path"]
+    )
+    if discovery_file_sha != discovery_binding["file_sha256"]:
+        raise ValueError("accelerated index discovery freeze drifted")
+    authorization_path, authorization, authorization_file_sha = (
+        krea_discovery_authorization.load_binding(
+            value["discovery_execution_authorization"]
+        )
+    )
+    krea_discovery_authorization.assert_matches_discovery(
+        authorization,
+        discovery_path=discovery_path,
+        discovery=discovery,
+        discovery_file_sha256=discovery_file_sha,
+        action="profile_indexed_discovery_execution",
+    )
+    campaign_path, campaign, campaign_file_sha = (
+        krea_accelerated_discovery.load_campaign_binding(
+            value["accelerated_discovery_campaign"]
+        )
+    )
+    if (
+        value["throughput_equivalence_classes"] != list(classes)
+        or campaign["discovery_plan"]["path"] != str(discovery_path)
+        or campaign["discovery_plan"]["file_sha256"] != discovery_file_sha
+        or campaign["discovery_execution_authorization"]["path"]
+        != str(authorization_path)
+        or campaign["discovery_execution_authorization"]["file_sha256"]
+        != authorization_file_sha
+        or campaign["discovery_execution_authorization"]["authorization_sha256"]
+        != authorization["authorization_sha256"]
+        or campaign["fixture_admission_envelope"]
+        != authorization["fixture_admission_envelope"]
+        or value["accelerated_discovery_campaign"]
+        != {
+            "path": str(campaign_path),
+            "file_sha256": campaign_file_sha,
+            "campaign_sha256": campaign["campaign_sha256"],
+        }
+    ):
+        raise ValueError("accelerated index authority binding drifted")
+    fixtures = _object(value["fixtures"], "accelerated indexed fixtures")
+    if set(fixtures) != set(_FIXTURES):
+        raise ValueError("accelerated index must bind D1 and D2")
+    class_contracts = _class_contracts(discovery, classes)
+    measured_records: list[dict[str, Any]] = []
+    expected_slots: dict[str, dict[str, Any]] | None = None
+    for fixture_id in _FIXTURES:
+        record = _object(fixtures[fixture_id], f"indexed fixture {fixture_id}")
+        _exact(
+            record,
+            {
+                "manifest",
+                "approval",
+                "concept_id",
+                "training_pair_count",
+                "training_dataset_shape_sha256",
+                "profiles",
+            },
+            f"accelerated indexed fixture {fixture_id}",
+        )
+        fixture, rebuilt = _load_fixture(
+            fixture_id,
+            {
+                "manifest": record["manifest"]["path"],
+                "approval": record["approval"]["path"],
+            },
+        )
+        if {key: record[key] for key in rebuilt} != rebuilt:
+            raise ValueError(f"accelerated indexed fixture {fixture_id} drifted")
+        if expected_slots is None:
+            measured_class = campaign["measured_profile"][
+                "throughput_equivalence_class"
+            ]
+            source = _object(
+                _object(record["profiles"], "D1 target slots")[measured_class],
+                "accelerated target slot",
+            )["source_profile"]
+            measured_records.append(
+                _load_profile(
+                    "D1",
+                    campaign["measured_profile"]["throughput_equivalence_class"],
+                    source["path"],
+                    fixture=fixture if fixture_id == "D1" else _load_fixture(
+                        "D1",
+                        {
+                            "manifest": fixtures["D1"]["manifest"]["path"],
+                            "approval": fixtures["D1"]["approval"]["path"],
+                        },
+                    )[0],
+                    class_contract=class_contracts[
+                        campaign["measured_profile"][
+                            "throughput_equivalence_class"
+                        ]
+                    ],
+                )
+            )
+            expected_slots = _accelerated_target_slots(
+                campaign, classes=classes, measured_profile=measured_records[0]
+            )
+        if record["profiles"] != expected_slots[fixture_id]:
+            raise ValueError(f"accelerated target slots {fixture_id} drifted")
+    measured = measured_records[0]
+    if (
+        value["measured_campaign_runtime_identity_sha256"]
+        != measured["campaign_runtime_identity_sha256"]
+        or campaign["measured_profile"]["file_sha256"]
+        != measured["file_sha256"]
+        or campaign["measured_profile"]["profile_sha256"]
+        != measured["profile_sha256"]
+    ):
+        raise ValueError("accelerated measured profile identity drifted")
+    return value
+
+
 def _load_profile_index(path: str | Path) -> dict[str, Any]:
     _, value, _ = _load_json(path, "discovery-profile index", canonical=True)
     return validate_profile_index(value)
@@ -666,13 +996,19 @@ def validate_plan_against_profile_index(
     if fixture_id not in _FIXTURES:
         raise ValueError("execution plan fixture is not D1 or D2")
     fixture_slot = profile_index["fixtures"][fixture_id]
+    profile_slot = fixture_slot["profiles"][class_name]
+    source_profile = (
+        profile_slot["source_profile"]
+        if profile_index.get("schema") == 3
+        else profile_slot
+    )
     if (
         resolved["fixture"]["manifest_sha256"]
         != fixture_slot["manifest"]["manifest_sha256"]
         or plan["throughput_profile"]["sha256"]
-        != fixture_slot["profiles"][class_name]["file_sha256"]
+        != source_profile["file_sha256"]
         or resolved["throughput_profile"]["profile_sha256"]
-        != fixture_slot["profiles"][class_name]["profile_sha256"]
+        != source_profile["profile_sha256"]
     ):
         raise ValueError("execution plan escaped its fixture/class profile-index cell")
 
