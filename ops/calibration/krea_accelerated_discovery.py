@@ -213,6 +213,18 @@ def _binding(value: Any, label: str, semantic_key: str) -> dict[str, str]:
     return dict(row)
 
 
+def _canonical_binding(value: Any, label: str, semantic_key: str) -> dict[str, str]:
+    row = _binding(value, label, semantic_key)
+    path = Path(os.path.abspath(os.path.expanduser(row["path"])))
+    document, file_sha = _canonical_file(path, label)
+    if (
+        file_sha != row["file_sha256"]
+        or document.get(semantic_key) != row[semantic_key]
+    ):
+        raise ValueError(f"{label} binding drifted")
+    return {**row, "path": str(path)}
+
+
 def _cells(*, cadence_multiplier: int) -> list[dict[str, Any]]:
     policy, _ = _policy()
     factors = policy["proxy_runtime_factors"]
@@ -521,7 +533,7 @@ def validate_schedule_slip(value: dict[str, Any]) -> dict[str, Any]:
 def build_k4_correction(
     *,
     campaign_sha256: str,
-    source_run_bundle_sha256: str,
+    source_run_bundle: Any,
     predicted_first_checkpoint_s: Any,
     observed_first_checkpoint_s: Any,
     observed_at_utc: str,
@@ -543,8 +555,8 @@ def build_k4_correction(
         "campaign_sha256": _digest(campaign_sha256, "campaign SHA-256"),
         "source_cell_id": "D1-K4",
         "target_cell_id": "D2-K4",
-        "source_run_bundle_sha256": _digest(
-            source_run_bundle_sha256, "source run bundle SHA-256"
+        "source_run_bundle": _canonical_binding(
+            source_run_bundle, "D1-K4 run-evidence bundle", "bundle_sha256"
         ),
         "predicted_first_checkpoint_s": format(predicted, "f"),
         "observed_first_checkpoint_s": format(observed, "f"),
@@ -567,7 +579,7 @@ def validate_k4_correction(value: dict[str, Any]) -> dict[str, Any]:
             "campaign_sha256",
             "source_cell_id",
             "target_cell_id",
-            "source_run_bundle_sha256",
+            "source_run_bundle",
             "predicted_first_checkpoint_s",
             "observed_first_checkpoint_s",
             "base_runtime_factor",
@@ -581,7 +593,7 @@ def validate_k4_correction(value: dict[str, Any]) -> dict[str, Any]:
     )
     rebuilt = build_k4_correction(
         campaign_sha256=value["campaign_sha256"],
-        source_run_bundle_sha256=value["source_run_bundle_sha256"],
+        source_run_bundle=value["source_run_bundle"],
         predicted_first_checkpoint_s=value["predicted_first_checkpoint_s"],
         observed_first_checkpoint_s=value["observed_first_checkpoint_s"],
         observed_at_utc=value["observed_at_utc"],
@@ -589,6 +601,134 @@ def validate_k4_correction(value: dict[str, Any]) -> dict[str, Any]:
     if value != rebuilt:
         raise ValueError("K4 correction is not canonical or one-way")
     return value
+
+
+def load_k4_correction_binding(value: Any) -> tuple[Path, dict[str, Any], str]:
+    binding = _object(value, "K4 correction binding")
+    _exact(
+        binding,
+        {"path", "file_sha256", "correction_sha256"},
+        "K4 correction binding",
+    )
+    path = Path(os.path.abspath(os.path.expanduser(binding["path"])))
+    correction, file_sha = _canonical_file(path, "K4 correction")
+    validate_k4_correction(correction)
+    if (
+        file_sha != _digest(binding["file_sha256"], "K4 correction file SHA-256")
+        or correction["correction_sha256"]
+        != _digest(binding["correction_sha256"], "K4 correction semantic SHA-256")
+    ):
+        raise ValueError("K4 correction binding drifted")
+    return path, correction, file_sha
+
+
+def derive_cell_controls(
+    *,
+    campaign_path: Path,
+    profile_index_path: Path,
+    throughput_profile_path: Path,
+    fixture_id: str,
+    arm_id: str,
+) -> dict[str, Any]:
+    """Derive the sole budget/schedule overrides for one queued cell."""
+
+    try:
+        from . import krea_budget
+        from . import krea_runtime_binding
+    except ImportError:  # pragma: no cover - direct script execution.
+        import krea_budget  # type: ignore[no-redef]
+        import krea_runtime_binding  # type: ignore[no-redef]
+
+    campaign, campaign_file_sha = _canonical_file(
+        campaign_path, "accelerated discovery campaign"
+    )
+    validate_campaign(campaign)
+    index, index_file_sha = _canonical_file(
+        profile_index_path, "accelerated profile index"
+    )
+    krea_runtime_binding.validate_profile_index(index)
+    if (
+        index.get("schema") != 3
+        or index["accelerated_discovery_campaign"]
+        != {
+            "path": str(Path(campaign_path).resolve(strict=True)),
+            "file_sha256": campaign_file_sha,
+            "campaign_sha256": campaign["campaign_sha256"],
+        }
+    ):
+        raise ValueError("cell derivation campaign/index binding drifted")
+    cell = campaign_cell(campaign, fixture_id, arm_id)
+    slot = index["fixtures"][fixture_id]["profiles"][
+        cell["throughput_equivalence_class"]
+    ]
+    source_profile, source_file_sha = _canonical_file(
+        throughput_profile_path, "D1/A source throughput profile"
+    )
+    profile = krea_budget.load_throughput_profile(source_profile)
+    if (
+        slot["source_profile"]["path"]
+        != str(Path(throughput_profile_path).resolve(strict=True))
+        or slot["source_profile"]["file_sha256"] != source_file_sha
+        or slot["source_profile"]["profile_sha256"]
+        != source_profile["profile_sha256"]
+    ):
+        raise ValueError("cell derivation source profile drifted")
+    effective_cell = dict(cell)
+    if cell["cell_id"] == "D2-K4" and index.get("k4_correction") is not None:
+        effective_cell = {
+            **effective_cell,
+            "base_runtime_factor": cell["runtime_factor"],
+            "base_effective_hard_budget_s": cell["effective_hard_budget_s"],
+            "runtime_factor": slot["runtime_factor"],
+            "effective_hard_budget_s": slot["effective_hard_budget_s"],
+            "k4_correction": dict(index["k4_correction"]),
+        }
+    budget = krea_budget.plan_budget(
+        profile,
+        hard_budget_s=effective_cell["effective_hard_budget_s"],
+    ).to_record()
+    if arm_id == "K0":
+        baseline = {"D1": (260, 53), "D2": (367, 74)}
+        planned, base_cadence = baseline[fixture_id]
+        if planned > budget["max_affordable_steps"]:
+            raise ValueError("accelerated K0 release depth does not fit its cell budget")
+        cadence = base_cadence * effective_cell["cadence_multiplier"]
+        mode = "release_control"
+    else:
+        planned = budget["max_affordable_steps"]
+        cadence = budget["save_every"] * effective_cell["cadence_multiplier"]
+        mode = "measured_budget_fill"
+    candidates = list(range(cadence, planned, cadence)) + [planned]
+    landmarks = {"K2": 960, "K3": 1200, "K4": 840}
+    landmark = landmarks.get(arm_id)
+    required_landmarks = [landmark] if landmark in candidates else []
+    schedule = {
+        "mode": mode,
+        "planned_steps": planned,
+        "save_every": cadence,
+        "candidate_steps": candidates,
+        "required_landmarks": required_landmarks,
+        "landmark_policy": (
+            "preserve_if_budget_safe" if required_landmarks else "none"
+        ),
+    }
+    body = {
+        "schema": 1,
+        "kind": "forge-krea-accelerated-cell-controls",
+        "campaign_sha256": campaign["campaign_sha256"],
+        "profile_index_sha256": index["index_sha256"],
+        "profile_index_file_sha256": index_file_sha,
+        "source_profile_sha256": source_profile["profile_sha256"],
+        "cell": effective_cell,
+        "budget_plan": budget,
+        "budget_plan_sha256": krea_provenance.canonical_sha256(budget),
+        "schedule": schedule,
+        "recipe_overrides": {
+            "planned_steps": planned,
+            "save_cadence": cadence,
+        },
+    }
+    return {**body, "controls_sha256": krea_provenance.canonical_sha256(body)}
 
 
 def _publish(path: Path, value: dict[str, Any]) -> None:
@@ -628,6 +768,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     seal.add_argument("--output", type=Path, required=True)
     validate = commands.add_parser("validate-campaign")
     validate.add_argument("--campaign", type=Path, required=True)
+    slip = commands.add_parser("seal-schedule-slip")
+    slip.add_argument("--payload", type=Path, required=True)
+    slip.add_argument("--output", type=Path, required=True)
+    correction = commands.add_parser("seal-k4-correction")
+    correction.add_argument("--payload", type=Path, required=True)
+    correction.add_argument("--output", type=Path, required=True)
+    derive = commands.add_parser("derive-cell-controls")
+    derive.add_argument("--campaign", type=Path, required=True)
+    derive.add_argument("--profile-index", type=Path, required=True)
+    derive.add_argument("--throughput-profile", type=Path, required=True)
+    derive.add_argument("--fixture", choices=_FIXTURES, required=True)
+    derive.add_argument("--arm", choices=_ARMS, required=True)
+    derive.add_argument("--output", type=Path, required=True)
     commands.add_parser("show-policy-binding")
     return parser.parse_args(argv)
 
@@ -641,6 +794,75 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload, _ = _canonical_file(args.payload, "accelerated campaign payload")
         campaign = build_campaign(payload)
         _publish(args.output, campaign)
+    elif args.command == "seal-schedule-slip":
+        payload, _ = _canonical_file(args.payload, "schedule-slip payload")
+        _exact(
+            payload,
+            {
+                "campaign_sha256",
+                "observed_at_utc",
+                "schedule_slip_s",
+                "completed_cell_ids",
+            },
+            "schedule-slip payload",
+        )
+        slip = build_schedule_slip(**payload)
+        _publish(args.output, slip)
+        print(
+            krea_provenance.canonical_bytes(
+                {
+                    "status": "PASS",
+                    "action": args.command,
+                    "slip_sha256": slip["slip_sha256"],
+                }
+            ).decode("ascii")
+        )
+        return 0
+    elif args.command == "seal-k4-correction":
+        payload, _ = _canonical_file(args.payload, "K4 correction payload")
+        _exact(
+            payload,
+            {
+                "campaign_sha256",
+                "source_run_bundle",
+                "predicted_first_checkpoint_s",
+                "observed_first_checkpoint_s",
+                "observed_at_utc",
+            },
+            "K4 correction payload",
+        )
+        correction = build_k4_correction(**payload)
+        _publish(args.output, correction)
+        print(
+            krea_provenance.canonical_bytes(
+                {
+                    "status": "PASS",
+                    "action": args.command,
+                    "correction_sha256": correction["correction_sha256"],
+                }
+            ).decode("ascii")
+        )
+        return 0
+    elif args.command == "derive-cell-controls":
+        controls = derive_cell_controls(
+            campaign_path=args.campaign,
+            profile_index_path=args.profile_index,
+            throughput_profile_path=args.throughput_profile,
+            fixture_id=args.fixture,
+            arm_id=args.arm,
+        )
+        _publish(args.output, controls)
+        print(
+            krea_provenance.canonical_bytes(
+                {
+                    "status": "PASS",
+                    "action": args.command,
+                    "cell_id": controls["cell"]["cell_id"],
+                    "controls_sha256": controls["controls_sha256"],
+                }
+            ).decode("ascii")
+        )
+        return 0
     else:
         campaign, _ = _canonical_file(
             args.campaign, "accelerated discovery campaign"
@@ -663,7 +885,9 @@ __all__ = [
     "build_k4_correction",
     "build_schedule_slip",
     "campaign_cell",
+    "derive_cell_controls",
     "load_campaign_binding",
+    "load_k4_correction_binding",
     "policy_binding",
     "validate_campaign",
     "validate_k4_correction",

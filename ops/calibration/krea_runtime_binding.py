@@ -11,6 +11,7 @@ cycle.  It grants no GPU authority.
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, ROUND_FLOOR
 import hashlib
 import json
 import math
@@ -548,20 +549,66 @@ def _accelerated_target_slots(
     return result
 
 
+def _validate_k4_source_run(correction: dict[str, Any]) -> None:
+    """Require the correction source to be a complete, validated D1-K4 run."""
+
+    try:
+        from . import krea_training_evidence
+    except ImportError:  # pragma: no cover - direct script execution.
+        import krea_training_evidence  # type: ignore[no-redef]
+
+    source = correction["source_run_bundle"]
+    bundle = krea_training_evidence.validate_run_evidence(Path(source["path"]))
+    if (
+        krea_provenance.file_sha256(Path(source["path"]))
+        != source["file_sha256"]
+        or bundle["bundle_sha256"] != source["bundle_sha256"]
+        or bundle["arm_id"] != "K4"
+    ):
+        raise ValueError("K4 correction source bundle drifted")
+    first = bundle["candidate_bindings"][0]["binding"]
+    _, candidate, _ = _load_json(
+        first["path"], "D1-K4 source candidate binding", canonical=True
+    )
+    plan_binding = candidate["execution_plan"]
+    _, plan, plan_file_sha = _load_json(
+        plan_binding["path"], "D1-K4 source execution plan", canonical=True
+    )
+    if (
+        plan_file_sha != plan_binding["sha256"]
+        or plan["plan_sha256"] != bundle["execution_plan_sha256"]
+        or plan["arm_id"] != "K4"
+        or plan["discovery_fixture_id"] != "D1"
+    ):
+        raise ValueError("K4 correction source is not the completed D1-K4 cell")
+    source_index_binding = plan["discovery_profile_index"]
+    source_index = _load_profile_index(source_index_binding["path"])
+    if (
+        krea_provenance.file_sha256(Path(source_index_binding["path"]))
+        != source_index_binding["file_sha256"]
+        or source_index["index_sha256"] != source_index_binding["index_sha256"]
+        or source_index["accelerated_discovery_campaign"]["campaign_sha256"]
+        != correction["campaign_sha256"]
+        or source_index.get("k4_correction") is not None
+    ):
+        raise ValueError(
+            "K4 correction source must be the same campaign's uncorrected D1-K4 run"
+        )
+
+
 def _build_accelerated_profile_index(payload: dict[str, Any]) -> dict[str, Any]:
     """Bind one immutable D1/A measurement as an explicit conservative proxy."""
 
-    _exact(
-        payload,
-        {
-            "discovery_plan",
-            "discovery_execution_authorization",
-            "fixtures",
-            "accelerated_discovery_campaign",
-            "measured_profile",
-        },
-        "accelerated profile-index payload",
-    )
+    payload_keys = {
+        "discovery_plan",
+        "discovery_execution_authorization",
+        "fixtures",
+        "accelerated_discovery_campaign",
+        "measured_profile",
+    }
+    if "k4_correction" in payload:
+        payload_keys.add("k4_correction")
+    _exact(payload, payload_keys, "accelerated profile-index payload")
     discovery_path, discovery, discovery_file_sha, classes = _load_discovery(
         payload["discovery_plan"]
     )
@@ -632,6 +679,37 @@ def _build_accelerated_profile_index(payload: dict[str, Any]) -> dict[str, Any]:
     slots = _accelerated_target_slots(
         campaign, classes=classes, measured_profile=measured_record
     )
+    correction_binding = None
+    if payload.get("k4_correction") is not None:
+        correction_path, correction, correction_file_sha = (
+            krea_accelerated_discovery.load_k4_correction_binding(
+                payload["k4_correction"]
+            )
+        )
+        if correction["campaign_sha256"] != campaign["campaign_sha256"]:
+            raise ValueError("K4 correction binds a different accelerated campaign")
+        _validate_k4_source_run(correction)
+        corrected_factor = Decimal(correction["corrected_runtime_factor"])
+        corrected_budget = int(
+            (Decimal(2700) / corrected_factor).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        )
+        d2_k4 = krea_accelerated_discovery.campaign_cell(campaign, "D2", "K4")
+        k4_slot = slots["D2"][d2_k4["throughput_equivalence_class"]]
+        if (
+            d2_k4["runtime_factor"] != correction["base_runtime_factor"]
+            or k4_slot["effective_hard_budget_s"] < corrected_budget
+        ):
+            raise ValueError("K4 correction is not a conservative one-way reduction")
+        k4_slot["runtime_factor"] = correction["corrected_runtime_factor"]
+        k4_slot["effective_hard_budget_s"] = corrected_budget
+        k4_slot["k4_correction_sha256"] = correction["correction_sha256"]
+        correction_binding = {
+            "path": str(correction_path),
+            "file_sha256": correction_file_sha,
+            "correction_sha256": correction["correction_sha256"],
+        }
     for fixture_id, record in fixtures.items():
         record["profiles"] = slots[fixture_id]
 
@@ -652,6 +730,7 @@ def _build_accelerated_profile_index(payload: dict[str, Any]) -> dict[str, Any]:
             "file_sha256": campaign_file_sha,
             "campaign_sha256": campaign["campaign_sha256"],
         },
+        "k4_correction": correction_binding,
         "throughput_equivalence_classes": list(classes),
         "measured_profile_count": 1,
         "target_slot_count": len(_FIXTURES) * len(classes),
@@ -819,23 +898,27 @@ def validate_profile_index(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_accelerated_profile_index(value: dict[str, Any]) -> dict[str, Any]:
+    has_correction_field = "k4_correction" in value
+    keys = {
+        "schema",
+        "kind",
+        "discovery_plan",
+        "discovery_execution_authorization",
+        "accelerated_discovery_campaign",
+        "throughput_equivalence_classes",
+        "measured_profile_count",
+        "target_slot_count",
+        "timing_evidence_mode",
+        "measured_campaign_runtime_identity_sha256",
+        "fixtures",
+        "gpu_execution_authorized",
+        "index_sha256",
+    }
+    if has_correction_field:
+        keys.add("k4_correction")
     _exact(
         value,
-        {
-            "schema",
-            "kind",
-            "discovery_plan",
-            "discovery_execution_authorization",
-            "accelerated_discovery_campaign",
-            "throughput_equivalence_classes",
-            "measured_profile_count",
-            "target_slot_count",
-            "timing_evidence_mode",
-            "measured_campaign_runtime_identity_sha256",
-            "fixtures",
-            "gpu_execution_authorized",
-            "index_sha256",
-        },
+        keys,
         "accelerated discovery-profile index",
     )
     body = {key: item for key, item in value.items() if key != "index_sha256"}
@@ -954,6 +1037,38 @@ def _validate_accelerated_profile_index(value: dict[str, Any]) -> dict[str, Any]
             expected_slots = _accelerated_target_slots(
                 campaign, classes=classes, measured_profile=measured_records[0]
             )
+            correction_binding = value.get("k4_correction")
+            if correction_binding is not None:
+                _, correction, _ = (
+                    krea_accelerated_discovery.load_k4_correction_binding(
+                        correction_binding
+                    )
+                )
+                if correction["campaign_sha256"] != campaign["campaign_sha256"]:
+                    raise ValueError("K4 correction binds another campaign")
+                _validate_k4_source_run(correction)
+                corrected_factor = Decimal(correction["corrected_runtime_factor"])
+                corrected_budget = int(
+                    (Decimal(2700) / corrected_factor).to_integral_value(
+                        rounding=ROUND_FLOOR
+                    )
+                )
+                d2_k4 = krea_accelerated_discovery.campaign_cell(
+                    campaign, "D2", "K4"
+                )
+                target = expected_slots["D2"][
+                    d2_k4["throughput_equivalence_class"]
+                ]
+                if (
+                    d2_k4["runtime_factor"] != correction["base_runtime_factor"]
+                    or target["effective_hard_budget_s"] < corrected_budget
+                ):
+                    raise ValueError("K4 correction is not one-way conservative")
+                target["runtime_factor"] = correction["corrected_runtime_factor"]
+                target["effective_hard_budget_s"] = corrected_budget
+                target["k4_correction_sha256"] = correction[
+                    "correction_sha256"
+                ]
         if record["profiles"] != expected_slots[fixture_id]:
             raise ValueError(f"accelerated target slots {fixture_id} drifted")
     measured = measured_records[0]
@@ -1058,6 +1173,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     plan_verify = subparsers.add_parser("validate-execution-plan")
     plan_verify.add_argument("--plan", type=Path, required=True)
     plan_verify.add_argument("--profile-index", type=Path, required=True)
+    approval = subparsers.add_parser("seal-execution-approval")
+    approval.add_argument("--plan", type=Path, required=True)
+    approval.add_argument("--admission-envelope", type=Path, required=True)
+    approval.add_argument("--technical-reviewer-actor", type=Path, required=True)
+    approval.add_argument("--approved-at-utc", required=True)
+    approval.add_argument("--output", type=Path, required=True)
     return parser.parse_args(argv)
 
 
@@ -1127,6 +1248,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "validate-profile-index":
         result = _load_profile_index(args.index)
         _status(args.command, index_sha256=result["index_sha256"])
+        return 0
+    if args.command == "seal-execution-approval":
+        try:
+            from . import krea_execution_plan
+        except ImportError:  # pragma: no cover - direct script execution.
+            import krea_execution_plan  # type: ignore[no-redef]
+
+        _, plan, _ = _load_json(args.plan, "execution plan", canonical=True)
+        _, actor, _ = _load_json(
+            args.technical_reviewer_actor,
+            "execution technical reviewer actor",
+            canonical=True,
+        )
+        result = krea_execution_plan.build_approval(
+            plan,
+            reviewer_identity=None,
+            approved_at_utc=args.approved_at_utc,
+            admission_envelope_path=args.admission_envelope,
+            approval_output_path=args.output,
+            technical_reviewer_actor=actor,
+        )
+        _publish(args.output, result)
+        _status(args.command, approval_sha256=result["approval_sha256"])
         return 0
     index = _load_profile_index(args.profile_index)
     if args.command == "seal-execution-plan":

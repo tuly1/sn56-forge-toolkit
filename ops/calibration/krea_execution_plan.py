@@ -1251,6 +1251,7 @@ def _schedule(
     recipe: dict[str, Any],
     budget_plan: dict[str, Any],
     profile: krea_budget.ThroughputProfile,
+    accelerated_cell: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     schedule = _object(value, "schedule")
     _exact(
@@ -1306,16 +1307,40 @@ def _schedule(
         raise ValueError("budget plan lacks max_affordable_steps")
     if schedule["mode"] == "measured_budget_fill" and planned != maximum:
         raise ValueError("budget-fill schedule does not fill the measured plan")
-    if schedule["mode"] == "measured_budget_fill" and (
-        cadence != budget_plan.get("save_every")
-        or expected_candidates
-        != [row["step"] for row in budget_plan.get("actual_candidates", [])]
-    ):
-        raise ValueError(
-            "budget-fill schedule differs from the measured budget cadence"
+    if schedule["mode"] == "measured_budget_fill":
+        cadence_multiplier = (
+            accelerated_cell["cadence_multiplier"]
+            if accelerated_cell is not None
+            else 1
         )
+        expected_cadence = budget_plan.get("save_every") * cadence_multiplier
+        expected_budget_candidates = (
+            [row["step"] for row in budget_plan.get("actual_candidates", [])]
+            if cadence_multiplier == 1
+            else list(range(expected_cadence, planned, expected_cadence))
+            + [planned]
+        )
+        if (
+            cadence != expected_cadence
+            or expected_candidates != expected_budget_candidates
+        ):
+            raise ValueError(
+                "budget-fill schedule differs from its sealed cadence multiplier"
+            )
     if schedule["mode"] == "release_control" and planned > maximum:
         raise ValueError("release-control schedule does not fit the measured plan")
+    if schedule["mode"] == "release_control" and accelerated_cell is not None:
+        release_baseline = {"D1": (260, 53), "D2": (367, 74)}
+        expected_depth, base_cadence = release_baseline[
+            accelerated_cell["fixture_id"]
+        ]
+        if (
+            accelerated_cell["arm_id"] != "K0"
+            or planned != expected_depth
+            or cadence
+            != base_cadence * accelerated_cell["cadence_multiplier"]
+        ):
+            raise ValueError("accelerated release-control depth/cadence drifted")
     # A release-control arm can intentionally retain a historical depth and
     # cadence.  Charge *that actual cadence* rather than assuming the discovery
     # planner's ceil(steps/8) schedule.  This closes the K0 under-accounting
@@ -1498,17 +1523,14 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         if accelerated_campaign is not None:
             accelerated_cell = accelerated_campaign["cell"]
             if (
-                accelerated_cell["cell_id"] != "D1-K1"
-                or accelerated_cell["fixture_id"] != "D1"
+                accelerated_cell["fixture_id"] != plan["discovery_fixture_id"]
+                or accelerated_cell["arm_id"] != plan["arm_id"]
                 or accelerated_cell["throughput_equivalence_class"]
-                != accelerated_campaign["document"]["measured_profile"][
-                    "throughput_equivalence_class"
-                ]
-                or accelerated_cell["runtime_factor"] != "1.00"
-                or accelerated_cell["cadence_multiplier"] != 1
+                != plan["throughput_equivalence_class"]
+                or accelerated_cell["cadence_multiplier"] not in {1, 2}
             ):
                 raise ValueError(
-                    "initial accelerated launch is restricted to the exact D1/A cell"
+                    "execution plan escaped its accelerated campaign cell"
                 )
     timing_evidence = _object(plan["timing_evidence"], "timing evidence")
     _exact(
@@ -1669,11 +1691,15 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         != plan["execution_envelope_sha256"]
     ):
         raise ValueError("profile/execution-envelope mismatch")
-    if (
-        profile_envelope.get("equivalence_class")
-        != plan["throughput_equivalence_class"]
-    ):
-        raise ValueError("profile throughput-equivalence class mismatch")
+    expected_profile_class = (
+        accelerated_campaign["document"]["measured_profile"][
+            "throughput_equivalence_class"
+        ]
+        if accelerated_campaign is not None
+        else plan["throughput_equivalence_class"]
+    )
+    if profile_envelope.get("equivalence_class") != expected_profile_class:
+        raise ValueError("profile throughput source class mismatch")
     if validated_profile.execution_envelope.to_record() != profile_envelope:
         raise ValueError("throughput execution envelope did not normalize exactly")
     if accelerated_campaign is not None:
@@ -1731,6 +1757,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         recipe=recipe,
         budget_plan=budget_plan,
         profile=validated_profile,
+        accelerated_cell=accelerated_cell,
     )
     seed = plan["seed"]
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
@@ -1799,8 +1826,11 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         for key, expected in expected_profile_fields.items()
         if getattr(envelope, key) != expected
     }
-    if mismatches:
+    proxy_mismatch_fields: list[str] = []
+    if mismatches and accelerated_cell is None:
         raise ValueError(f"recipe/fixture/base escaped measured profile: {mismatches}")
+    if accelerated_cell is not None:
+        proxy_mismatch_fields = sorted(mismatches)
     runner_path = Path(__file__).with_name("run_krea_ladder.py").resolve(strict=True)
     if krea_provenance.file_sha256(runner_path) != plan["runner_sha256"]:
         raise ValueError("execution plan runner SHA differs from local runner")
@@ -1848,13 +1878,25 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         != discovery["arm"]["internal_evidence_anchor"]
     ):
         raise ValueError("K5 execution basis differs from the frozen evidence anchor")
+    expected_probe_class = (
+        accelerated_campaign["document"]["measured_profile"][
+            "throughput_equivalence_class"
+        ]
+        if accelerated_campaign is not None
+        else plan["throughput_equivalence_class"]
+    )
+    expected_probe_fixture = (
+        accelerated_campaign["document"]["measured_profile"]["fixture_id"]
+        if accelerated_campaign is not None
+        else plan["discovery_fixture_id"]
+    )
     if (
         probe_contract["probe_contract_sha256"] != raw_samples["probe_contract_sha256"]
         or probe_contract["probe_contract_sha256"]
         != end_to_end["probe_contract_sha256"]
         or probe_contract["throughput_equivalence_class"]
-        != plan["throughput_equivalence_class"]
-        or probe_contract["discovery_fixture_id"] != plan["discovery_fixture_id"]
+        != expected_probe_class
+        or probe_contract["discovery_fixture_id"] != expected_probe_fixture
         or probe_contract["execution_envelope"]["execution_envelope_sha256"]
         != plan["execution_envelope_sha256"]
         or (
@@ -1885,6 +1927,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         "historical_host_execution_manifest": historical_host_manifest,
+        "accelerated_proxy_mismatch_fields": proxy_mismatch_fields,
         "discovery_execution_authorization": (
             {
                 "document": discovery_authorization,

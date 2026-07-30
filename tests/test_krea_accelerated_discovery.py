@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from ops.calibration import krea_accelerated_discovery as accelerated
 from ops.calibration import krea_provenance
+from ops.calibration import krea_execution_plan
 from ops.calibration import krea_runtime_binding as runtime_binding
+from ops.calibration import krea_training_evidence
 from ops.calibration import run_krea_ladder as runner
 
 
@@ -22,6 +25,18 @@ def _binding(label: str, semantic: str) -> dict[str, str]:
         "path": f"/sealed/{label}.json",
         "file_sha256": _sha(f"{label}-file"),
         semantic: _sha(f"{label}-semantic"),
+    }
+
+
+def _run_bundle_binding(tmp_path: Path, label: str = "D1-K4-run") -> dict[str, str]:
+    body = {"schema": 2, "kind": "forge-krea-run-evidence-bundle", "label": label}
+    bundle = {**body, "bundle_sha256": krea_provenance.canonical_sha256(body)}
+    path = tmp_path / f"{label}.bundle.json"
+    path.write_bytes(krea_provenance.canonical_bytes(bundle) + b"\n")
+    return {
+        "path": str(path),
+        "file_sha256": krea_provenance.file_sha256(path),
+        "bundle_sha256": bundle["bundle_sha256"],
     }
 
 
@@ -107,10 +122,11 @@ def test_cadence_relief_requires_positive_bound_slip(tmp_path) -> None:
     assert all(not row["depth_increase_from_cadence_relief"] for row in campaign["cells"])
 
 
-def test_k4_correction_is_one_way_and_capped() -> None:
+def test_k4_correction_is_one_way_and_capped(tmp_path: Path) -> None:
+    run_bundle = _run_bundle_binding(tmp_path)
     correction = accelerated.build_k4_correction(
         campaign_sha256=_sha("campaign"),
-        source_run_bundle_sha256=_sha("D1-K4-run"),
+        source_run_bundle=run_bundle,
         predicted_first_checkpoint_s="100",
         observed_first_checkpoint_s="120",
         observed_at_utc="2026-07-30T21:15:00Z",
@@ -122,15 +138,79 @@ def test_k4_correction_is_one_way_and_capped() -> None:
     with pytest.raises(ValueError, match="exceeds the preauthorized"):
         accelerated.build_k4_correction(
             campaign_sha256=_sha("campaign"),
-            source_run_bundle_sha256=_sha("D1-K4-run"),
+            source_run_bundle=run_bundle,
             predicted_first_checkpoint_s="100",
             observed_first_checkpoint_s="200",
             observed_at_utc="2026-07-30T21:15:00Z",
         )
 
 
+def test_k4_correction_source_is_same_campaign_uncorrected_d1_k4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _run_bundle_binding(tmp_path)
+    correction = {"source_run_bundle": source, "campaign_sha256": _sha("campaign")}
+    candidate_path = tmp_path / "candidate.json"
+    plan_path = tmp_path / "D1-K4.plan.json"
+    index_path = tmp_path / "source.index.json"
+    for path in (candidate_path, plan_path, index_path):
+        path.write_bytes(b"{}\n")
+    plan = {
+        "plan_sha256": _sha("plan"),
+        "arm_id": "K4",
+        "discovery_fixture_id": "D1",
+        "discovery_profile_index": {
+            "path": str(index_path),
+            "file_sha256": krea_provenance.file_sha256(index_path),
+            "index_sha256": _sha("index"),
+        },
+    }
+    bundle = {
+        "bundle_sha256": source["bundle_sha256"],
+        "arm_id": "K4",
+        "execution_plan_sha256": plan["plan_sha256"],
+        "candidate_bindings": [{"binding": {"path": str(candidate_path)}}],
+    }
+    candidate = {
+        "execution_plan": {
+            "path": str(plan_path),
+            "sha256": krea_provenance.file_sha256(plan_path),
+        }
+    }
+    monkeypatch.setattr(
+        krea_training_evidence, "validate_run_evidence", lambda _path: bundle
+    )
+
+    def fake_load(path, _label, *, canonical):
+        assert canonical is True
+        if Path(path) == candidate_path:
+            return candidate_path, candidate, krea_provenance.file_sha256(candidate_path)
+        assert Path(path) == plan_path
+        return plan_path, plan, krea_provenance.file_sha256(plan_path)
+
+    monkeypatch.setattr(runtime_binding, "_load_json", fake_load)
+    source_index = {
+        "index_sha256": _sha("index"),
+        "accelerated_discovery_campaign": {
+            "campaign_sha256": correction["campaign_sha256"]
+        },
+        "k4_correction": None,
+    }
+    monkeypatch.setattr(
+        runtime_binding, "_load_profile_index", lambda _path: source_index
+    )
+    runtime_binding._validate_k4_source_run(correction)
+
+    source_index["accelerated_discovery_campaign"]["campaign_sha256"] = _sha(
+        "another-campaign"
+    )
+    with pytest.raises(ValueError, match="same campaign's uncorrected"):
+        runtime_binding._validate_k4_source_run(correction)
+
+
 def test_accelerated_index_contains_one_real_profile_and_six_proxy_slots(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     classes = (
         "A-rank32-adamw8bit-mse-guidance2",
@@ -233,6 +313,7 @@ def test_accelerated_index_contains_one_real_profile_and_six_proxy_slots(
         "_load_profile",
         lambda *_args, **_kwargs: dict(profile_record),
     )
+    monkeypatch.setattr(runtime_binding, "_validate_k4_source_run", lambda _row: None)
     payload = {
         "discovery_plan": "/sealed/discovery.json",
         "discovery_execution_authorization": {
@@ -260,12 +341,127 @@ def test_accelerated_index_contains_one_real_profile_and_six_proxy_slots(
         "effective_hard_budget_s"
     ] == 1080
 
+    correction = accelerated.build_k4_correction(
+        campaign_sha256=campaign["campaign_sha256"],
+        source_run_bundle=_run_bundle_binding(tmp_path),
+        predicted_first_checkpoint_s="100",
+        observed_first_checkpoint_s="120",
+        observed_at_utc="2026-07-30T22:15:00Z",
+    )
+    correction_path = tmp_path / "k4-correction.json"
+    correction_path.write_bytes(krea_provenance.canonical_bytes(correction) + b"\n")
+    corrected_payload = {
+        **payload,
+        "k4_correction": {
+            "path": str(correction_path),
+            "file_sha256": krea_provenance.file_sha256(correction_path),
+            "correction_sha256": correction["correction_sha256"],
+        },
+    }
+    corrected = runtime_binding.build_profile_index(corrected_payload)
+    corrected_k4 = corrected["fixtures"]["D2"]["profiles"][classes[2]]
+    assert corrected_k4["runtime_factor"] == "3.75"
+    assert corrected_k4["effective_hard_budget_s"] == 720
+    assert corrected_k4["k4_correction_sha256"] == correction[
+        "correction_sha256"
+    ]
+
     tampered = {**index, "target_slot_count": 5}
     tampered["index_sha256"] = krea_provenance.canonical_sha256(
         {key: value for key, value in tampered.items() if key != "index_sha256"}
     )
     with pytest.raises(ValueError, match="identity is invalid"):
         runtime_binding.validate_profile_index(tampered)
+
+
+def _recipe(planned: int, cadence: int) -> dict:
+    return {
+        "fields": {
+            "planned_steps": {"effective_value": planned},
+            "save_cadence": {"effective_value": cadence},
+        }
+    }
+
+
+def _budget(planned: int, cadence: int, hard: int) -> dict:
+    return {
+        "max_affordable_steps": planned,
+        "save_every": cadence,
+        "actual_candidates": [
+            {"step": step}
+            for step in list(range(cadence, planned, cadence)) + [planned]
+        ],
+        "hard_budget_s": str(hard),
+        "accounting": {"maximum_save_overhead_fraction": "1.0"},
+    }
+
+
+def _profile() -> SimpleNamespace:
+    return SimpleNamespace(
+        startup_upper_bound_s=1.0,
+        selection_scoring_reserve_s=0.0,
+        framework_stop_boundary_s=225.0,
+        finalization_reserve_s=1.0,
+        upload_reserve_s=1.0,
+        update_upper_bound_s=1.0,
+        save_upper_bound_s=1.0,
+    )
+
+
+def test_every_other_checkpoint_requires_slip_bound_campaign_cadence() -> None:
+    cell = {"cadence_multiplier": 2, "fixture_id": "D1", "arm_id": "K1"}
+    schedule = {
+        "mode": "measured_budget_fill",
+        "planned_steps": 100,
+        "save_every": 26,
+        "candidate_steps": [26, 52, 78, 100],
+        "required_landmarks": [],
+        "landmark_policy": "none",
+    }
+    assert krea_execution_plan._schedule(
+        schedule,
+        recipe=_recipe(100, 26),
+        budget_plan=_budget(100, 13, 1000),
+        profile=_profile(),
+        accelerated_cell=cell,
+    ) == schedule
+
+    with pytest.raises(ValueError, match="cadence multiplier"):
+        krea_execution_plan._schedule(
+            schedule,
+            recipe=_recipe(100, 26),
+            budget_plan=_budget(100, 13, 1000),
+            profile=_profile(),
+        )
+
+
+def test_release_control_relief_keeps_depth_and_doubles_exact_cadence() -> None:
+    cell = {"cadence_multiplier": 2, "fixture_id": "D2", "arm_id": "K0"}
+    schedule = {
+        "mode": "release_control",
+        "planned_steps": 367,
+        "save_every": 148,
+        "candidate_steps": [148, 296, 367],
+        "required_landmarks": [],
+        "landmark_policy": "none",
+    }
+    assert krea_execution_plan._schedule(
+        schedule,
+        recipe=_recipe(367, 148),
+        budget_plan=_budget(500, 63, 2160),
+        profile=_profile(),
+        accelerated_cell=cell,
+    ) == schedule
+
+    wrong = {**schedule, "planned_steps": 368, "candidate_steps": [148, 296, 368]}
+    with pytest.raises(ValueError, match="depth/cadence drifted"):
+        krea_execution_plan._schedule(
+            wrong,
+            recipe=_recipe(368, 148),
+            budget_plan=_budget(500, 63, 2160),
+            profile=_profile(),
+            accelerated_cell=cell,
+        )
 
 
 def test_source_transition_allows_only_the_control_patch(
@@ -309,3 +505,45 @@ def test_source_transition_allows_only_the_control_patch(
     unsafe["deletion"] = True
     with pytest.raises(RuntimeError, match="unsafe Git change"):
         runner._validate_control_only_source_transition(compatibility)
+
+
+def test_runner_allows_only_the_plan_derived_proxy_mismatch_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner, "_validate_control_only_source_transition", lambda _value: None
+    )
+    compatibility = {
+        "cell": {
+            "timing_evidence_mode": "conservative_proxy_not_measured_equivalence",
+            "cadence_multiplier": 2,
+        },
+        "historical_host": {"host_execution_identity_sha256": _sha("old-host")},
+        "proxy_mismatch_fields": [
+            "network_alpha",
+            "network_rank",
+            "optimizer",
+            "training_dataset_shape_sha256",
+            "training_pair_count",
+        ],
+    }
+    mismatch_names = set(compatibility["proxy_mismatch_fields"]) | {
+        "host_execution_identity_sha256",
+        "trainer_identity_sha256",
+    }
+    mismatches = {name: {"expected": "old", "actual": "new"} for name in mismatch_names}
+    runner._validate_accelerated_proxy_transition(
+        mismatches=mismatches,
+        actual_host_execution_identity_sha256=_sha("new-host"),
+        historical_host_execution_identity_sha256=_sha("old-host"),
+        compatibility=compatibility,
+    )
+
+    mismatches["runtime_identity_sha256"] = {"expected": "old", "actual": "new"}
+    with pytest.raises(RuntimeError, match="escaped its compatibility"):
+        runner._validate_accelerated_proxy_transition(
+            mismatches=mismatches,
+            actual_host_execution_identity_sha256=_sha("new-host"),
+            historical_host_execution_identity_sha256=_sha("old-host"),
+            compatibility=compatibility,
+        )

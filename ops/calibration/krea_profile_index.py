@@ -165,15 +165,45 @@ def validate_plan_cell(
         accelerated_cell = krea_accelerated_discovery.campaign_cell(
             campaign, fixture_id, plan["arm_id"]
         )
+        correction_binding = index.get("k4_correction")
+        corrected_k4 = (
+            accelerated_cell["cell_id"] == "D2-K4"
+            and correction_binding is not None
+        )
         if (
             accelerated_cell["throughput_equivalence_class"] != class_name
-            or accelerated_cell["runtime_factor"] != profile_slot["runtime_factor"]
-            or accelerated_cell["effective_hard_budget_s"]
-            != profile_slot["effective_hard_budget_s"]
+            or (
+                not corrected_k4
+                and accelerated_cell["runtime_factor"]
+                != profile_slot["runtime_factor"]
+            )
+            or (
+                not corrected_k4
+                and accelerated_cell["effective_hard_budget_s"]
+                != profile_slot["effective_hard_budget_s"]
+            )
+            or (
+                corrected_k4
+                and profile_slot.get("k4_correction_sha256")
+                != correction_binding["correction_sha256"]
+            )
             or accelerated_cell["cell_sha256"]
             not in profile_slot["eligible_cell_sha256"]
         ):
             raise ValueError("plan escaped its accelerated campaign cell")
+        if corrected_k4:
+            accelerated_cell = {
+                **accelerated_cell,
+                "base_runtime_factor": accelerated_cell["runtime_factor"],
+                "base_effective_hard_budget_s": accelerated_cell[
+                    "effective_hard_budget_s"
+                ],
+                "runtime_factor": profile_slot["runtime_factor"],
+                "effective_hard_budget_s": profile_slot[
+                    "effective_hard_budget_s"
+                ],
+                "k4_correction": dict(correction_binding),
+            }
     return {
         "document": index,
         "file_sha256": file_sha,

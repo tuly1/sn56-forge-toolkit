@@ -1112,25 +1112,48 @@ def _validate_measured_execution_envelope(
         if getattr(envelope, key) != value
     }
     if accelerated_compatibility is not None:
-        _validate_control_only_source_transition(accelerated_compatibility)
-        cell = accelerated_compatibility["cell"]
-        historical = accelerated_compatibility["historical_host"]
-        if (
-            cell["fixture_id"] != "D1"
-            or cell["runtime_factor"] != "1.00"
-            or cell["cadence_multiplier"] != 1
-            or envelope.host_execution_identity_sha256
-            != historical["host_execution_identity_sha256"]
-            or actual["host_execution_identity_sha256"]
-            == historical["host_execution_identity_sha256"]
-            or set(mismatches)
-            != {"host_execution_identity_sha256", "trainer_identity_sha256"}
-        ):
-            raise RuntimeError(
-                f"accelerated D1/A transition escaped its compatibility envelope: {mismatches}"
-            )
+        _validate_accelerated_proxy_transition(
+            mismatches=mismatches,
+            actual_host_execution_identity_sha256=actual[
+                "host_execution_identity_sha256"
+            ],
+            historical_host_execution_identity_sha256=(
+                envelope.host_execution_identity_sha256
+            ),
+            compatibility=accelerated_compatibility,
+        )
     elif mismatches:
         raise RuntimeError(f"run escaped measured throughput envelope: {mismatches}")
+
+
+def _validate_accelerated_proxy_transition(
+    *,
+    mismatches: dict[str, Any],
+    actual_host_execution_identity_sha256: str,
+    historical_host_execution_identity_sha256: str,
+    compatibility: dict[str, Any],
+) -> None:
+    _validate_control_only_source_transition(compatibility)
+    cell = compatibility["cell"]
+    historical = compatibility["historical_host"]
+    expected_mismatches = set(compatibility["proxy_mismatch_fields"]) | {
+        "host_execution_identity_sha256",
+        "trainer_identity_sha256",
+    }
+    if (
+        cell["timing_evidence_mode"]
+        != "conservative_proxy_not_measured_equivalence"
+        or cell["cadence_multiplier"] not in {1, 2}
+        or historical_host_execution_identity_sha256
+        != historical["host_execution_identity_sha256"]
+        or actual_host_execution_identity_sha256
+        == historical["host_execution_identity_sha256"]
+        or set(mismatches) != expected_mismatches
+    ):
+        raise RuntimeError(
+            "accelerated proxy escaped its compatibility envelope: "
+            f"expected={sorted(expected_mismatches)}, actual={mismatches}"
+        )
 
 
 def _diff_paths(left: Any, right: Any, pointer: str = "") -> set[str]:
@@ -1974,6 +1997,11 @@ def main() -> int:
             ]["host_execution_identity_sha256"],
             "runtime_factor": cell["runtime_factor"],
             "effective_hard_budget_s": cell["effective_hard_budget_s"],
+            "cadence_multiplier": cell["cadence_multiplier"],
+            "proxy_mismatch_fields": execution_controls[
+                "accelerated_proxy_mismatch_fields"
+            ],
+            "k4_correction": cell.get("k4_correction"),
             "claim_limit": accelerated["document"]["claim_limit"],
         }
     _validate_existing_campaign_prefix(campaign_dir, campaign_fixed_prefix)
@@ -2072,6 +2100,9 @@ def main() -> int:
                     **execution_controls["accelerated_discovery_campaign"],
                     "historical_host": execution_controls[
                         "historical_host_execution_manifest"
+                    ],
+                    "proxy_mismatch_fields": execution_controls[
+                        "accelerated_proxy_mismatch_fields"
                     ],
                 }
                 if execution_controls.get("accelerated_discovery_campaign")
