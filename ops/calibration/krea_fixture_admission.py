@@ -90,6 +90,39 @@ _SURFACE_SOURCE_FILE_SHA256 = (
 _INDEPENDENT_SOURCE_FILE_SHA256 = (
     "ded8bd16cfe415118d46dac5d908651caca8f050a8555ffdc8e438ada7bde324"
 )
+_SUCCESSOR_ADMISSION_COMMIT = "58822b496019177a02fa6196247ac30e788331bb"
+_SUCCESSOR_ADMISSION_TREE = "ba569913ceeddab6c425efd97b3dfb39a290a9c5"
+_SUCCESSOR_RUNTIME_BASE_COMMIT = "fc70e616b7b9b5ffbd590cf0433609cd4d3528e6"
+_GPU_GATE_IMPLEMENTATION_PATHS = {
+    "fixture_validator_file_sha256": "ops/calibration/krea_fixture.py",
+    "admission_tool_file_sha256": "ops/calibration/krea_fixture_admission.py",
+    "execution_plan_file_sha256": "ops/calibration/krea_execution_plan.py",
+    "host_identity_file_sha256": "ops/calibration/krea_host_identity.py",
+    "runtime_binding_file_sha256": "ops/calibration/krea_runtime_binding.py",
+    "host_bootstrap_file_sha256": "ops/calibration/krea_host_bootstrap.py",
+    "stage1_runtime_file_sha256": "ops/calibration/krea_stage1_runtime.py",
+    "public_source_review_file_sha256": (
+        "ops/calibration/krea_public_source_review.py"
+    ),
+    "execution_surface_policy_file_sha256": (
+        "ops/calibration/krea_execution_surface_policy.py"
+    ),
+    "discovery_authorization_file_sha256": (
+        "ops/calibration/krea_discovery_authorization.py"
+    ),
+    "profile_index_file_sha256": "ops/calibration/krea_profile_index.py",
+    "budget_planner_file_sha256": "ops/calibration/krea_budget.py",
+    "runner_file_sha256": "ops/calibration/run_krea_ladder.py",
+    "training_evidence_file_sha256": (
+        "ops/calibration/krea_training_evidence.py"
+    ),
+    "decision_tool_file_sha256": "ops/calibration/krea_decision.py",
+    "score_plan_file_sha256": "ops/calibration/krea_score_plan.py",
+    "batch_evaluator_file_sha256": "ops/calibration/batch_evaluate_krea.py",
+    "delegated_review_contract_loader_file_sha256": (
+        "ops/calibration/krea_delegated_review_contract.py"
+    ),
+}
 _GOD_ORIGIN = "https://github.com/rayonlabs/G.O.D.git"
 _GOD_IMAGE_IO = PurePosixPath("validator/evaluation/image_io.py")
 _GOD_DATASET_CONSTANTS = PurePosixPath("validator/tasks/datasets/constants.py")
@@ -695,34 +728,11 @@ def _gpu_gate_implementation_bindings() -> dict[str, str]:
     requires a fresh owner ratification before materialization or GPU approval.
     """
 
-    root = Path(__file__).parent
-    paths = {
-        "fixture_validator_file_sha256": Path(krea_fixture.__file__),
-        "admission_tool_file_sha256": Path(__file__),
-        "execution_plan_file_sha256": root / "krea_execution_plan.py",
-        "host_identity_file_sha256": root / "krea_host_identity.py",
-        "runtime_binding_file_sha256": root / "krea_runtime_binding.py",
-        "host_bootstrap_file_sha256": root / "krea_host_bootstrap.py",
-        "stage1_runtime_file_sha256": root / "krea_stage1_runtime.py",
-        "public_source_review_file_sha256": root / "krea_public_source_review.py",
-        "execution_surface_policy_file_sha256": Path(
-            krea_execution_surface_policy.__file__
-        ),
-        "discovery_authorization_file_sha256": (
-            root / "krea_discovery_authorization.py"
-        ),
-        "profile_index_file_sha256": root / "krea_profile_index.py",
-        "budget_planner_file_sha256": root / "krea_budget.py",
-        "runner_file_sha256": root / "run_krea_ladder.py",
-        "training_evidence_file_sha256": root / "krea_training_evidence.py",
-        "decision_tool_file_sha256": root / "krea_decision.py",
-        "score_plan_file_sha256": root / "krea_score_plan.py",
-        "batch_evaluator_file_sha256": root / "batch_evaluate_krea.py",
-        "delegated_review_contract_loader_file_sha256": (
-            root / "krea_delegated_review_contract.py"
-        ),
+    root = Path(__file__).resolve().parents[2]
+    return {
+        key: _file_sha256(_safe_file(root / relative, key))
+        for key, relative in _GPU_GATE_IMPLEMENTATION_PATHS.items()
     }
-    return {key: _file_sha256(_safe_file(path, key)) for key, path in paths.items()}
 
 
 def _discovery_public_evidence_bindings() -> dict[str, Any]:
@@ -924,6 +934,151 @@ def _forge_repository_identity(root: Path | None = None) -> dict[str, Any]:
     }
 
 
+def _forge_repository_identity_at_commit(
+    repository: Path, commit_sha1: str
+) -> dict[str, Any]:
+    """Reconstruct an ancestor identity from immutable Git objects.
+
+    Unlike :func:`_forge_repository_identity`, this never projects ancestor
+    bytes into the live worktree.  Every tracked byte is read by object id from
+    the current repository's object database and is checked against Git's blob
+    identity before its SHA-256 is admitted.
+    """
+
+    repository = _safe_directory(repository, "Forge repository")
+    commit_sha1 = _text(commit_sha1, "historical Forge commit").lower()
+    if not _GIT_SHA.fullmatch(commit_sha1):
+        raise ValueError("historical Forge commit is invalid")
+    try:
+        resolved = _sanitized_forge_git(
+            repository, "rev-parse", "--verify", f"{commit_sha1}^{{commit}}"
+        ).strip().decode("ascii")
+        tree = _sanitized_forge_git(
+            repository, "rev-parse", "--verify", f"{commit_sha1}^{{tree}}"
+        ).strip().decode("ascii")
+        tree_rows = _sanitized_forge_git(
+            repository,
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            commit_sha1,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
+        raise ValueError("historical Forge Git identity could not be read") from exc
+    if resolved != commit_sha1 or not _GIT_SHA.fullmatch(tree):
+        raise ValueError("historical Forge commit or tree identity is invalid")
+    tracked_files: list[dict[str, Any]] = []
+    for row in tree_rows.split(b"\0"):
+        if not row:
+            continue
+        try:
+            metadata, raw_path = row.split(b"\t", 1)
+            mode, object_type, blob_sha1 = metadata.decode("ascii").split(" ")
+            portable = raw_path.decode("utf-8")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("historical Forge tree row is malformed") from exc
+        relative = PurePosixPath(portable)
+        if (
+            relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or object_type != "blob"
+            or mode not in {"100644", "100755", "120000"}
+            or not _GIT_SHA.fullmatch(blob_sha1)
+        ):
+            raise ValueError("historical Forge tree contains unsupported content")
+        try:
+            raw = _sanitized_forge_git(repository, "cat-file", "blob", blob_sha1)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError("historical Forge blob could not be read") from exc
+        if _git_blob_sha1(raw) != blob_sha1:
+            raise ValueError("historical Forge blob identity mismatch")
+        tracked_files.append(
+            {
+                "path": portable,
+                "mode": mode,
+                "git_blob_sha1": blob_sha1,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "bytes": len(raw),
+            }
+        )
+    tracked_files.sort(key=lambda item: item["path"])
+    return {
+        "commit_sha1": commit_sha1,
+        "tree_sha1": tree,
+        "tracked_files": tracked_files,
+        "tracked_file_manifest_sha256": krea_provenance.canonical_sha256(
+            tracked_files
+        ),
+    }
+
+
+def _implementation_bindings_from_repository_identity(
+    identity: Mapping[str, Any],
+) -> dict[str, str]:
+    rows = identity.get("tracked_files")
+    if not isinstance(rows, list):
+        raise ValueError("historical repository identity lacks tracked files")
+    by_path: dict[str, dict[str, Any]] = {}
+    for row_value in rows:
+        row = _object(row_value, "historical tracked file")
+        portable = row.get("path")
+        if not isinstance(portable, str) or portable in by_path:
+            raise ValueError("historical repository paths are invalid or duplicated")
+        by_path[portable] = row
+    result: dict[str, str] = {}
+    for key, portable in _GPU_GATE_IMPLEMENTATION_PATHS.items():
+        row = by_path.get(portable)
+        if row is None or row.get("mode") not in {"100644", "100755"}:
+            raise ValueError(f"historical implementation file is absent: {portable}")
+        result[key] = _digest(row.get("sha256"), f"historical {portable} SHA-256")
+    return result
+
+
+def _require_fc70_successor(repository: Path, current_commit: str) -> None:
+    """Constrain the compatibility path to fc70 plus this bridge surface."""
+
+    try:
+        _sanitized_forge_git(
+            repository,
+            "merge-base",
+            "--is-ancestor",
+            _SUCCESSOR_ADMISSION_COMMIT,
+            _SUCCESSOR_RUNTIME_BASE_COMMIT,
+        )
+        _sanitized_forge_git(
+            repository,
+            "merge-base",
+            "--is-ancestor",
+            _SUCCESSOR_RUNTIME_BASE_COMMIT,
+            current_commit,
+        )
+        changed_raw = _sanitized_forge_git(
+            repository,
+            "diff",
+            "--name-only",
+            "-z",
+            _SUCCESSOR_RUNTIME_BASE_COMMIT,
+            current_commit,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("current Forge runtime is not an fc70 successor") from exc
+    try:
+        changed = [item.decode("utf-8") for item in changed_raw.split(b"\0") if item]
+    except UnicodeDecodeError as exc:
+        raise ValueError("successor Forge path is not UTF-8") from exc
+    allowed_runtime_path = "ops/calibration/krea_fixture_admission.py"
+    if any(
+        not (
+            path == allowed_runtime_path
+            or path.startswith("campaign_tools/")
+            or path.startswith("tests/")
+        )
+        for path in changed
+    ):
+        raise ValueError("fc70 successor changed an unauthorized runtime path")
+
+
 def build_governance_amendment(
     inputs: dict[str, Any],
     originals: dict[str, Any],
@@ -1044,6 +1199,57 @@ def build_governance_amendment(
     return _seal(body, "amendment_sha256")
 
 
+def _successor_bound_governance_amendment(
+    amendment: Mapping[str, Any], current_expected: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Rebuild the one admitted 588 amendment inside an exact fc70 successor.
+
+    The owner-ratified artifact must keep naming the code and complete Git tree
+    that actually produced it.  A successor therefore may not re-seal or
+    rewrite those fields to its own bytes.  Instead, this path proves the
+    historical commit/tree and every governed implementation file directly
+    from immutable Git objects, constrains the live clean checkout to fc70 plus
+    this bridge, and then performs the ordinary canonical derivation with only
+    those two historical bindings preserved.
+    """
+
+    bound_identity = amendment.get("forge_repository_identity")
+    if not isinstance(bound_identity, dict):
+        return None
+    if bound_identity.get("commit_sha1") != _SUCCESSOR_ADMISSION_COMMIT:
+        return None
+    repository = Path(__file__).resolve().parents[2]
+    current_identity = _object(
+        current_expected.get("forge_repository_identity"),
+        "current Forge repository identity",
+    )
+    current_commit = current_identity.get("commit_sha1")
+    if not isinstance(current_commit, str) or not _GIT_SHA.fullmatch(current_commit):
+        raise ValueError("current Forge repository identity is invalid")
+    _require_fc70_successor(repository, current_commit)
+    historical_identity = _forge_repository_identity_at_commit(
+        repository, _SUCCESSOR_ADMISSION_COMMIT
+    )
+    if (
+        historical_identity["tree_sha1"] != _SUCCESSOR_ADMISSION_TREE
+        or bound_identity != historical_identity
+    ):
+        raise ValueError("historical admission repository binding drifted")
+    historical_implementation = _implementation_bindings_from_repository_identity(
+        historical_identity
+    )
+    if amendment.get("implementation") != historical_implementation:
+        raise ValueError("historical admission implementation binding drifted")
+    body = {
+        key: value
+        for key, value in current_expected.items()
+        if key != "amendment_sha256"
+    }
+    body["implementation"] = historical_implementation
+    body["forge_repository_identity"] = historical_identity
+    return _seal(body, "amendment_sha256")
+
+
 def validate_governance_amendment(
     amendment: dict[str, Any],
     *,
@@ -1070,7 +1276,11 @@ def validate_governance_amendment(
         amended_at_utc=amendment.get("amended_at_utc"),
     )
     if amendment != expected:
-        raise ValueError("governance amendment is not the canonical derivation")
+        successor_expected = _successor_bound_governance_amendment(
+            amendment, expected
+        )
+        if successor_expected is None or amendment != successor_expected:
+            raise ValueError("governance amendment is not the canonical derivation")
     return amendment
 
 

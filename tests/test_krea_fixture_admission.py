@@ -863,3 +863,73 @@ def test_schema2_execution_approval_requires_and_binds_envelope(
         krea_execution_plan.validate_approval(
             wrong, plan=plan, approval_path=approval_path
         )
+
+
+def test_successor_rederives_exact_588_repository_and_implementation() -> None:
+    repository = Path(admission.__file__).resolve().parents[2]
+    identity = admission._forge_repository_identity_at_commit(
+        repository, admission._SUCCESSOR_ADMISSION_COMMIT
+    )
+
+    assert identity["commit_sha1"] == admission._SUCCESSOR_ADMISSION_COMMIT
+    assert identity["tree_sha1"] == admission._SUCCESSOR_ADMISSION_TREE
+    bindings = admission._implementation_bindings_from_repository_identity(identity)
+    assert set(bindings) == set(admission._GPU_GATE_IMPLEMENTATION_PATHS)
+    tracked = {row["path"]: row for row in identity["tracked_files"]}
+    for key, relative in admission._GPU_GATE_IMPLEMENTATION_PATHS.items():
+        assert bindings[key] == tracked[relative]["sha256"]
+
+
+def test_successor_bridge_preserves_only_historical_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    historical_identity = {
+        "commit_sha1": admission._SUCCESSOR_ADMISSION_COMMIT,
+        "tree_sha1": admission._SUCCESSOR_ADMISSION_TREE,
+        "tracked_files": [],
+        "tracked_file_manifest_sha256": _sha("historical-manifest"),
+    }
+    current_body = {
+        "schema": 1,
+        "kind": admission._AMENDMENT_KIND,
+        "amended_at_utc": "2026-07-29T00:00:00Z",
+        "implementation": {"current": _sha("current")},
+        "forge_repository_identity": {
+            "commit_sha1": _sha("current")[:40],
+        },
+        "unchanged_evidence": {"record": _sha("evidence")},
+    }
+    current = {
+        **current_body,
+        "amendment_sha256": krea_provenance.canonical_sha256(current_body),
+    }
+    historical_implementation = {"historical": _sha("historical")}
+    historical_body = {
+        **current_body,
+        "implementation": historical_implementation,
+        "forge_repository_identity": historical_identity,
+    }
+    amendment = {
+        **historical_body,
+        "amendment_sha256": krea_provenance.canonical_sha256(historical_body),
+    }
+    monkeypatch.setattr(admission, "_require_fc70_successor", lambda *_args: None)
+    monkeypatch.setattr(
+        admission,
+        "_forge_repository_identity_at_commit",
+        lambda *_args: historical_identity,
+    )
+    monkeypatch.setattr(
+        admission,
+        "_implementation_bindings_from_repository_identity",
+        lambda _identity: historical_implementation,
+    )
+
+    assert (
+        admission._successor_bound_governance_amendment(amendment, current)
+        == amendment
+    )
+    tampered = deepcopy(amendment)
+    tampered["implementation"] = {"historical": _sha("tampered")}
+    with pytest.raises(ValueError, match="implementation binding drifted"):
+        admission._successor_bound_governance_amendment(tampered, current)
