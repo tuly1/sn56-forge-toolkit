@@ -427,7 +427,7 @@ def assemble(
         _publish(approval_path, approval)
         run_dir = campaign_root / cell_id
         argv = [
-            "/usr/bin/python3",
+            "/app/venv/bin/python",
             "-I",
             "-c",
             (
@@ -532,7 +532,7 @@ def validate_queue(path: Path) -> dict[str, Any]:
                 raise ValueError(f"queue {cell_id} {label} drifted")
         campaign_dir = Path(row["campaign_dir"])
         expected_prefix = [
-            "/usr/bin/python3",
+            "/app/venv/bin/python",
             "-I",
             "-c",
             (
