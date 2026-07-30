@@ -150,8 +150,13 @@ sudo /usr/bin/python3 -I -c "$SYSTEM_MODULE" verify-layout \
 
 The bootstrap mounts these fixed targets:
 
-- read-only: `/app/forge`, `/app/ai-toolkit`, `/app/venv`, `/dataset`;
-- read-write: `/app/checkpoints`, `/cache`, `/campaign`.
+- read-only: `/app/forge`, `/app/ai-toolkit`, `/app/venv`;
+- read-write: `/app/checkpoints`, `/dataset`, `/cache`, `/campaign`.
+
+`/dataset` must be writable because the sealed runner expands the read-only
+training archive into `/dataset/images`, writes its generated trainer config,
+and creates a task-scoped holdout directory. The archive itself remains
+read-only under `/cache/datasets` and is hash-checked before extraction.
 
 It fails before timing if the host is not root on Ubuntu 22.04 with systemd PID
 1, unified cgroup v2, one non-MIG H100 in the 78,000–85,000 MiB range, CUDA

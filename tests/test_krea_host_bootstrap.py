@@ -88,6 +88,9 @@ def test_layout_spec_is_fixed_self_bound_and_never_authorizes_gpu(tmp_path):
         "/cache",
         "/campaign",
     }
+    assert bootstrap._READ_ONLY_BINDINGS == frozenset(
+        {"forge_repo", "ai_toolkit_repo", "venv"}
+    )
     assert bootstrap._CALIBRATION_ARTIFACTS["timing_tool"] == (
         "ops/calibration/krea_timing_probe.py"
     )

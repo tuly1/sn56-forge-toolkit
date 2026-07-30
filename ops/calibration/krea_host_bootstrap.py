@@ -45,7 +45,7 @@ _FIXED_TARGETS = {
     "cache": "/cache",
     "campaign": "/campaign",
 }
-_READ_ONLY_BINDINGS = frozenset({"forge_repo", "ai_toolkit_repo", "venv", "dataset"})
+_READ_ONLY_BINDINGS = frozenset({"forge_repo", "ai_toolkit_repo", "venv"})
 _RUNTIME_CACHE_ROOT = Path("/cache/krea-runtime")
 _RUNTIME_CACHE_POLICY = {
     "root": str(_RUNTIME_CACHE_ROOT),
