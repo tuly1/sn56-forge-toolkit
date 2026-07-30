@@ -1210,7 +1210,9 @@ def _validate_live_observation(
 ) -> dict[str, Any]:
     observed = _object(observed, "host observation")
     _exact(observed, {"static", "live"}, "host observation")
-    if observed["static"] != manifest["static"]:
+    if not _static_execution_identity_matches(
+        observed["static"], manifest["static"]
+    ):
         raise RuntimeError(
             "host/storage/GPU identity drifted from the measured profile"
         )
@@ -1279,7 +1281,55 @@ def _validate_live_observation(
             manifest=manifest,
             observation_time=observation_time,
         )
-    return observed
+    return {"static": manifest["static"], "live": live}
+
+
+def _static_execution_identity_matches(
+    observed: dict[str, Any], expected: dict[str, Any]
+) -> bool:
+    """Compare stable execution identity while allowing transient cgroup units.
+
+    Timing workloads run in fresh systemd scopes.  Their cgroup paths therefore
+    change by design, while the effective CPU and memory geometry remains bound
+    by the surrounding static identity.  Preserve both paths as observations,
+    but exclude only that dynamic locator from equality.
+    """
+
+    observed = _object(observed, "observed host static identity")
+    expected = _object(expected, "expected host static identity")
+    if set(observed) != set(expected):
+        return False
+    observed_instance = _object(
+        observed.get("instance"), "observed host instance binding"
+    )
+    expected_instance = _object(
+        expected.get("instance"), "expected host instance binding"
+    )
+    if set(observed_instance) != set(expected_instance):
+        return False
+    _absolute_linux_path(
+        observed_instance.get("cgroup_v2_path"), "observed host cgroup_v2_path"
+    )
+    _absolute_linux_path(
+        expected_instance.get("cgroup_v2_path"), "expected host cgroup_v2_path"
+    )
+    observed_stable = {
+        **observed,
+        "instance": {
+            key: value
+            for key, value in observed_instance.items()
+            if key != "cgroup_v2_path"
+        },
+    }
+    expected_stable = {
+        **expected,
+        "instance": {
+            key: value
+            for key, value in expected_instance.items()
+            if key != "cgroup_v2_path"
+        },
+    }
+    return observed_stable == expected_stable
 
 
 def verify_live(manifest: dict[str, Any], *, checkpoint_path: Path) -> dict[str, Any]:
@@ -1290,7 +1340,9 @@ def verify_live(manifest: dict[str, Any], *, checkpoint_path: Path) -> dict[str,
         checkpoint_path,
         storage_probe_bytes=manifest["preflight_policy"]["storage_probe_bytes"],
     )
-    _validate_live_observation(observed, manifest=manifest, require_probe=True)
+    observed = _validate_live_observation(
+        observed, manifest=manifest, require_probe=True
+    )
     policy = manifest["preflight_policy"]
     live = observed["live"]
     effective_cpus = float(manifest["static"]["cpu"]["effective_cpu_capacity"])
@@ -1328,5 +1380,6 @@ def verify_static(manifest: dict[str, Any], *, checkpoint_path: Path) -> dict[st
     if manifest.get("schema") == 3:
         bootstrap_runtime(manifest, recapture=True)
     observed = observe(checkpoint_path)
-    _validate_live_observation(observed, manifest=manifest, require_probe=False)
-    return observed
+    return _validate_live_observation(
+        observed, manifest=manifest, require_probe=False
+    )

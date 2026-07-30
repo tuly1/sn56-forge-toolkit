@@ -604,6 +604,18 @@ def test_host_manifest_and_live_preflight_accept_complete_bound_observation(
     assert host.verify_live(manifest, checkpoint_path=Path("/checkpoints")) == observed
 
 
+def test_host_live_preflight_accepts_transient_systemd_scope_path(monkeypatch):
+    manifest = _host_manifest()
+    observed = deepcopy(_live(manifest))
+    observed["static"]["instance"]["cgroup_v2_path"] = (
+        "/system.slice/forge-krea-timing-example.scope"
+    )
+    monkeypatch.setattr(host, "observe", lambda *args, **kwargs: observed)
+    normalized = host.verify_live(manifest, checkpoint_path=Path("/checkpoints"))
+    assert normalized["static"] == manifest["static"]
+    assert normalized["live"] == observed["live"]
+
+
 def test_schema3_host_manifest_reopens_exact_bootstrap_receipt(tmp_path):
     spec_payload = {
         "schema": 1,
