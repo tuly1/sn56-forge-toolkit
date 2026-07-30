@@ -319,6 +319,7 @@ def _cell_payload(
     _set_recipe_value(recipe, "planned_steps", controls["recipe_overrides"]["planned_steps"])
     _set_recipe_value(recipe, "save_cadence", controls["recipe_overrides"]["save_cadence"])
     profile = modules["budget"].load_throughput_profile(throughput_profile)
+    envelope = profile.execution_envelope
     runner_path = forge_root / "ops/calibration/run_krea_ladder.py"
     seed = discovery["training_seed_a"]
     return {
@@ -356,8 +357,8 @@ def _cell_payload(
         "schedule": copy.deepcopy(controls["schedule"]),
         "base_model": copy.deepcopy(spec["base_model"]),
         "seed": seed,
-        "runtime_identity_sha256": profile.runtime_identity_sha256,
-        "execution_envelope_sha256": profile.execution_envelope.execution_envelope_sha256,
+        "runtime_identity_sha256": envelope.runtime_identity_sha256,
+        "execution_envelope_sha256": envelope.execution_envelope_sha256,
         "throughput_equivalence_class": cell["throughput_equivalence_class"],
         "predeclared_recipe_axes": list(_AXES[arm_id]),
         "in_task_proxy_selection": {"enabled": False, "reserve_s": 0},

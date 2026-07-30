@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from campaign_tools import krea_fc70_cell_queue as queue
+from ops.calibration import krea_budget
 
 
 def _sha(label: str) -> str:
@@ -18,6 +18,62 @@ def _sha(label: str) -> str:
 
 def _canonical(path: Path, value: dict) -> None:
     path.write_bytes(queue._canonical_bytes(value) + b"\n")
+
+
+def _throughput_profile() -> dict:
+    envelope = krea_budget.seal_execution_envelope(
+        equivalence_class="a-rank32-adamw8bit-mse-guidance2",
+        network_rank=32,
+        network_alpha=32,
+        optimizer="adamw8bit",
+        optimizer_config_sha256=_sha("optimizer"),
+        loss="mse",
+        differential_guidance_enabled=True,
+        guidance_scale=2.0,
+        training_pair_count=24,
+        training_dataset_shape_sha256=_sha("dataset-shape"),
+        micro_batch_size=1,
+        gradient_accumulation_steps=1,
+        data_parallel_replicas=1,
+        resolution_policy_sha256=_sha("resolution"),
+        precision_policy_sha256=_sha("precision"),
+        cache_latents_to_disk=False,
+        cache_text_embeddings=True,
+        compile_enabled=False,
+        jit_enabled=True,
+        dataloader_workers=2,
+        base_model_identity_sha256=_sha("base-model"),
+        runtime_identity_sha256=_sha("runtime"),
+        host_execution_identity_sha256=_sha("host"),
+        execution_surface="staged_host_venv",
+        execution_scope="discovery_only",
+        venv_tree_manifest_sha256=_sha("venv-tree"),
+        reference_container_image_sha256=_sha("container"),
+        gpu_identity_sha256=_sha("gpu"),
+        trainer_identity_sha256=_sha("trainer"),
+        measurement_tool_sha256=_sha("measurement"),
+    )
+    return krea_budget.seal_throughput_profile(
+        execution_envelope=envelope,
+        raw_sample_manifest_sha256=_sha("raw-timing"),
+        startup_sample_count=3,
+        update_sample_count=100,
+        save_sample_count=8,
+        startup_upper_bound_s=10,
+        update_upper_bound_s=1,
+        save_upper_bound_s=2,
+        bound_method="observed-max-plus-predeclared-margin",
+        margin_policy_sha256=_sha("margin"),
+        end_to_end_validation_count=1,
+        end_to_end_validation_sha256=_sha("heldout"),
+        framework_stop_boundary_s=225,
+        framework_stop_boundary_source_sha256=_sha("stop-boundary"),
+        selection_mode="offline_post_training",
+        selection_scorer_identity_sha256=None,
+        selection_scoring_reserve_s=0,
+        finalization_reserve_s=10,
+        upload_reserve_s=10,
+    )
 
 
 def _spec() -> dict:
@@ -123,13 +179,8 @@ def test_all_twelve_cells_are_assembled_from_exact_controls(
         "budget_plan_sha256": _sha("budget"),
         "schedule": {"planned_steps": 700, "save_every": 91},
     }
-    profile = SimpleNamespace(
-        runtime_identity_sha256=_sha("runtime"),
-        execution_envelope=SimpleNamespace(
-            execution_envelope_sha256=_sha("envelope")
-        ),
-    )
-    modules = {"budget": SimpleNamespace(load_throughput_profile=lambda _v: profile)}
+    throughput_profile = _throughput_profile()
+    modules = {"budget": krea_budget}
     host_path = tmp_path / "host.json"
     profile_path = tmp_path / "profile.json"
     index_path = tmp_path / "index.json"
@@ -143,7 +194,7 @@ def test_all_twelve_cells_are_assembled_from_exact_controls(
         profile_index=profile_index,
         profile_index_path=index_path,
         profile_index_file_sha=_sha("index-file"),
-        throughput_profile={},
+        throughput_profile=throughput_profile,
         throughput_profile_path=profile_path,
         throughput_profile_file_sha=_sha("profile-file"),
         host_manifest_path=host_path,
@@ -169,6 +220,12 @@ def test_all_twelve_cells_are_assembled_from_exact_controls(
         f"/{fixture_id}/manifest.json"
     )
     assert payload["runner_sha256"] == queue._file_sha(runner_path)
+    assert payload["runtime_identity_sha256"] == throughput_profile[
+        "execution_envelope"
+    ]["runtime_identity_sha256"]
+    assert payload["execution_envelope_sha256"] == throughput_profile[
+        "execution_envelope"
+    ]["execution_envelope_sha256"]
 
 
 def test_tracked_discovery_plan_rejects_wrong_path_and_digest(
