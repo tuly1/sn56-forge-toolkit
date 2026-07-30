@@ -2,7 +2,7 @@
 
 Scorer-only fixes must not require re-emitting otherwise valid training
 evidence.  This module loads the complete validator graph from the exact clean
-5469851 accelerated-discovery successor worktree under an isolated package
+f6ce1ad accelerated-discovery successor worktree under an isolated package
 name. It
 never treats current scorer code as an equivalent training validator and it
 has no generic commit allowlist.
@@ -20,8 +20,8 @@ from types import ModuleType
 from typing import Any
 
 
-_COMMIT = "546985195687696cf10dff3e2c58f7f0d1dd12d5"
-_TREE = "27e43dc171f01c50cdd68331890394e32298687d"
+_COMMIT = "f6ce1ad044ff2aa920f2c63074dedd9c32035922"
+_TREE = "ec0aade08124b65c1e74f45a8a3a9e3e19a6b92d"
 _POLICY_SHA256 = "98b59fd90dbf4ea213c860f873bc472cadc66714c7b9118672de2474f020f5f3"
 _MODULE_SHA256 = {
     "krea_training_evidence.py": (
@@ -34,10 +34,13 @@ _MODULE_SHA256 = {
         "29b92928aed6adc5d9d7f59207610f673845e3ab4a196debcca9aba654c786ac"
     ),
     "krea_fixture_admission.py": (
-        "327214e624b6af89829b2ca7a79b85b2d6b909f9e685430e01a7432196bea437"
+        "cc86293172d43ba3eb16ef59d1f7d54fd50688f11e7075f5debbb8501422e056"
+    ),
+    "krea_runtime_binding.py": (
+        "af7a95154eb00c4653bc9ecd1cef465fea69cfc5fd7912126a07573360f2f250"
     ),
 }
-_ALIAS = "_forge_krea_training_validator_5469851"
+_ALIAS = "_forge_krea_training_validator_f6ce1ad"
 _LOADED_ROOT: Path | None = None
 
 
@@ -119,14 +122,14 @@ def capture_identity(root: Path | str) -> dict[str, Any]:
     )
     if top != root_path or commit != _COMMIT or tree != _TREE or status:
         raise ValueError(
-            "historical validator must be the exact clean 5469851 worktree"
+            "historical validator must be the exact clean f6ce1ad worktree"
         )
     calibration = root_path / "ops" / "calibration"
     observed = {
         name: _file_sha256(calibration / name) for name in sorted(_MODULE_SHA256)
     }
     if observed != _MODULE_SHA256:
-        raise ValueError("historical training-validator modules differ from 5469851")
+        raise ValueError("historical training-validator modules differ from f6ce1ad")
     return {
         "schema": 1,
         "kind": "forge-krea-historical-training-evidence-validator",
