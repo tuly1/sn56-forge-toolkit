@@ -34,6 +34,7 @@ SCHEMA = 1
 SYSTEM_PYTHON = Path("/usr/bin/python3")
 SYSTEM_GIT = Path("/usr/bin/git")
 NVIDIA_SMI = Path("/usr/bin/nvidia-smi")
+CANONICAL_OS_RELEASE = Path("/usr/lib/os-release")
 TRANSIENT_CACHE_PARENT = Path("/var/tmp")
 EXPECTED_UBUNTU_ID = "ubuntu"
 EXPECTED_UBUNTU_VERSION = "22.04"
@@ -303,8 +304,46 @@ def _file_identity(path: Path) -> dict[str, Any]:
     return {"bytes": after.st_size, "path": str(path), "sha256": digest}
 
 
-def _read_os_release(path: Path = Path("/etc/os-release")) -> dict[str, Any]:
-    _regular_file(path, "os-release")
+def _canonical_os_release_file(
+    path: Path, *, canonical_path: Path = CANONICAL_OS_RELEASE
+) -> Path:
+    """Resolve only Ubuntu's standard ``/etc/os-release`` leaf symlink.
+
+    Ubuntu 22.04 normally exposes ``/etc/os-release`` as the relative symlink
+    ``../usr/lib/os-release``.  The general path policy remains fail-closed:
+    ancestors may not be symlinks, and the one permitted leaf symlink must
+    point *directly* (after lexical normalization) at the expected canonical
+    file.  Reading and hashing then use that non-symlink canonical path, so a
+    later swap of the ``/etc`` link cannot redirect the read.
+    """
+
+    _reject_symlink_ancestors(path, "os-release", include_leaf=False)
+    if not path.is_symlink():
+        return _regular_file(path, "os-release")
+
+    canonical_path = _normalized_absolute(canonical_path, "canonical os-release")
+    _regular_file(canonical_path, "canonical os-release")
+    raw_target = Path(os.readlink(path))
+    lexical_target = (
+        raw_target if raw_target.is_absolute() else path.parent / raw_target
+    )
+    lexical_target = Path(os.path.abspath(os.path.normpath(lexical_target)))
+    if lexical_target != canonical_path:
+        raise ValueError(
+            "os-release symlink must point directly to canonical "
+            f"{canonical_path}: {path} -> {raw_target}"
+        )
+    if path.resolve(strict=True) != canonical_path:
+        raise ValueError("os-release symlink did not resolve to its canonical file")
+    return canonical_path
+
+
+def _read_os_release(
+    path: Path = Path("/etc/os-release"),
+    *,
+    canonical_path: Path = CANONICAL_OS_RELEASE,
+) -> dict[str, Any]:
+    path = _canonical_os_release_file(path, canonical_path=canonical_path)
     fields: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line or line.startswith("#") or "=" not in line:

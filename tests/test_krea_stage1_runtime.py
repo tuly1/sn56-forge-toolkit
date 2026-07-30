@@ -304,6 +304,67 @@ def test_symlink_or_path_alias_is_rejected(tmp_path, monkeypatch):
         )
 
 
+def test_read_os_release_accepts_standard_ubuntu_symlink_layout(tmp_path):
+    root = tmp_path / "ubuntu-root"
+    etc = root / "etc"
+    canonical = root / "usr/lib/os-release"
+    etc.mkdir(parents=True)
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text('ID=ubuntu\nVERSION_ID="22.04"\n', encoding="utf-8")
+    exposed = etc / "os-release"
+    exposed.symlink_to("../usr/lib/os-release")
+
+    result = runtime._read_os_release(exposed, canonical_path=canonical)
+
+    assert result["id"] == "ubuntu"
+    assert result["version_id"] == "22.04"
+    assert result["file"]["path"] == str(canonical)
+    assert result["file"]["sha256"] == runtime.file_sha256(canonical)
+
+
+@pytest.mark.parametrize("indirection", [False, True])
+def test_read_os_release_rejects_arbitrary_or_chained_symlink(tmp_path, indirection):
+    root = tmp_path / "ubuntu-root"
+    etc = root / "etc"
+    canonical = root / "usr/lib/os-release"
+    attacker = root / "attacker/os-release"
+    etc.mkdir(parents=True)
+    canonical.parent.mkdir(parents=True)
+    attacker.parent.mkdir(parents=True)
+    contents = 'ID=ubuntu\nVERSION_ID="22.04"\n'
+    canonical.write_text(contents, encoding="utf-8")
+    attacker.write_text(contents, encoding="utf-8")
+    exposed = etc / "os-release"
+    if indirection:
+        redirect = root / "redirect"
+        redirect.symlink_to("usr/lib/os-release")
+        exposed.symlink_to("../redirect")
+    else:
+        exposed.symlink_to("../attacker/os-release")
+
+    with pytest.raises(ValueError, match="point directly to canonical"):
+        runtime._read_os_release(exposed, canonical_path=canonical)
+
+
+def test_read_os_release_rejects_symlinked_canonical_file(tmp_path):
+    root = tmp_path / "ubuntu-root"
+    etc = root / "etc"
+    canonical = root / "usr/lib/os-release"
+    attacker = root / "attacker/os-release"
+    etc.mkdir(parents=True)
+    canonical.parent.mkdir(parents=True)
+    attacker.parent.mkdir(parents=True)
+    attacker.write_text('ID=ubuntu\nVERSION_ID="22.04"\n', encoding="utf-8")
+    canonical.symlink_to("../../attacker/os-release")
+    exposed = etc / "os-release"
+    exposed.symlink_to("../usr/lib/os-release")
+
+    with pytest.raises(
+        ValueError, match="canonical os-release has a symlink component"
+    ):
+        runtime._read_os_release(exposed, canonical_path=canonical)
+
+
 def test_materialization_receipt_is_canonical_create_only_and_detects_tree_drift(
     tmp_path, monkeypatch
 ):
