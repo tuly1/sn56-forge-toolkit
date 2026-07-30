@@ -108,6 +108,33 @@ _TIMING_ENV = (
 )
 
 
+def _checkpoint_root_for_save(save_root: Path) -> Path:
+    """Return the sealed host-check root for an authorized task namespace."""
+
+    checkpoint_root = _CHECKPOINT_ROOT.resolve(strict=True)
+    resolved_save_root = save_root.resolve()
+    if resolved_save_root == checkpoint_root or not resolved_save_root.is_relative_to(
+        checkpoint_root
+    ):
+        raise ValueError(
+            "trainer checkpoint namespace escaped /app/checkpoints: "
+            f"{resolved_save_root}"
+        )
+    return checkpoint_root
+
+
+def _verify_host_preflight(
+    host_identity, manifest: dict[str, Any], checkpoint_root: Path
+):
+    return host_identity.verify_live(manifest, checkpoint_path=checkpoint_root)
+
+
+def _verify_host_post_run(
+    host_identity, manifest: dict[str, Any], checkpoint_root: Path
+):
+    return host_identity.verify_static(manifest, checkpoint_path=checkpoint_root)
+
+
 def _minimal_runtime_environment(
     *,
     timing: dict[str, str] | None = None,
@@ -1686,11 +1713,7 @@ def main() -> int:
         dataset_zip=None,
     )
     save_root = Path(spec.save_root).resolve()
-    checkpoint_root = _CHECKPOINT_ROOT.resolve(strict=True)
-    if save_root == checkpoint_root or not save_root.is_relative_to(checkpoint_root):
-        raise ValueError(
-            "trainer checkpoint namespace escaped /app/checkpoints: " f"{save_root}"
-        )
+    checkpoint_root = _checkpoint_root_for_save(save_root)
     mutable_paths = [
         Path(spec.config_path),
         Path(spec.training_folder),
@@ -1709,10 +1732,10 @@ def main() -> int:
     # identity on which it was measured.  The live load/RAM/free-space policy
     # is checked before any Forge import can allocate the GPU or mutate its
     # checkpoint namespace.
-    checkpoint_parent = Path(spec.save_root).parent.resolve(strict=True)
-    host_preflight_before = krea_host_identity.verify_live(
+    host_preflight_before = _verify_host_preflight(
+        krea_host_identity,
         execution_controls["host_execution_manifest"],
-        checkpoint_path=checkpoint_parent,
+        checkpoint_root,
     )
     condition_claim_path.parent.mkdir(parents=True, exist_ok=True)
     claim_fd = os.open(
@@ -2304,9 +2327,10 @@ def main() -> int:
                 "host_execution_manifest"
             ]["host_execution_identity_sha256"],
             "host_preflight_before": host_preflight_before,
-            "host_observation_after": krea_host_identity.verify_static(
+            "host_observation_after": _verify_host_post_run(
+                krea_host_identity,
                 execution_controls["host_execution_manifest"],
-                checkpoint_path=checkpoint_parent,
+                checkpoint_root,
             ),
         },
         "attempt": {

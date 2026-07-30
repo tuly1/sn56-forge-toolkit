@@ -44,6 +44,53 @@ DRIVER_RUNTIME = {"distributions_sha256": "0" * 64}
 TRAINING_RUNTIME_SHA = "a" * 64
 
 
+def test_host_checks_use_sealed_checkpoint_root_before_and_after_run(
+    tmp_path, monkeypatch
+):
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    save_root = checkpoint_root / "task-id" / "repo"
+    assert not save_root.parent.exists()
+    monkeypatch.setattr(ladder, "_CHECKPOINT_ROOT", checkpoint_root)
+
+    bound_root = ladder._checkpoint_root_for_save(save_root)
+    calls = []
+
+    class HostIdentity:
+        @staticmethod
+        def verify_live(manifest, *, checkpoint_path):
+            calls.append(("preflight", manifest, checkpoint_path))
+            return {"phase": "preflight"}
+
+        @staticmethod
+        def verify_static(manifest, *, checkpoint_path):
+            calls.append(("post_run", manifest, checkpoint_path))
+            return {"phase": "post_run"}
+
+    manifest = {"sealed": True}
+    assert ladder._verify_host_preflight(HostIdentity, manifest, bound_root) == {
+        "phase": "preflight"
+    }
+    assert ladder._verify_host_post_run(HostIdentity, manifest, bound_root) == {
+        "phase": "post_run"
+    }
+    assert calls == [
+        ("preflight", manifest, checkpoint_root),
+        ("post_run", manifest, checkpoint_root),
+    ]
+
+
+def test_checkpoint_root_binding_rejects_root_and_escape(tmp_path, monkeypatch):
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    monkeypatch.setattr(ladder, "_CHECKPOINT_ROOT", checkpoint_root)
+
+    with pytest.raises(ValueError, match="escaped /app/checkpoints"):
+        ladder._checkpoint_root_for_save(checkpoint_root)
+    with pytest.raises(ValueError, match="escaped /app/checkpoints"):
+        ladder._checkpoint_root_for_save(tmp_path / "other" / "repo")
+
+
 def _recipe():
     def row(
         classification,
