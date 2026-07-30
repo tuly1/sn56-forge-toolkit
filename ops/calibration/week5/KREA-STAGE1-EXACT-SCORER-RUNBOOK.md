@@ -159,11 +159,11 @@ DECISION_MODULE='import runpy,sys;sys.path.insert(0,"/app/forge");runpy.run_modu
 DELEGATE_MODULE='import runpy,sys;sys.path.insert(0,"/app/forge");runpy.run_module("ops.calibration.krea_delegated_review_contract",run_name="__main__")'
 AUTH=/campaign/controls/discovery-execution-authorization.json
 SCORE_ACTOR=/campaign/controls/exact-score-plan-technical-actor.json
-TRAINING_VALIDATOR_ROOT=/app/forge-58822b4
+TRAINING_VALIDATOR_ROOT=/app/forge-fc70e616
 ASSET_RECEIPT_FILE_SHA256=$(sha256sum "$ASSET_RECEIPT" | awk '{print $1}')
 
-test "$(git -C "$TRAINING_VALIDATOR_ROOT" rev-parse HEAD)" = 58822b496019177a02fa6196247ac30e788331bb
-test "$(git -C "$TRAINING_VALIDATOR_ROOT" rev-parse HEAD^{tree})" = ba569913ceeddab6c425efd97b3dfb39a290a9c5
+test "$(git -C "$TRAINING_VALIDATOR_ROOT" rev-parse HEAD)" = fc70e616b7b9b5ffbd590cf0433609cd4d3528e6
+test "$(git -C "$TRAINING_VALIDATOR_ROOT" rev-parse HEAD^{tree})" = 4dc987b9f41d3c59b2e587e403901d57fdc1fc79
 test -z "$(git -C "$TRAINING_VALIDATOR_ROOT" status --porcelain=v1 --untracked-files=all)"
 
 "$PY" -I -c "$DELEGATE_MODULE" \
