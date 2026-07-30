@@ -12,14 +12,16 @@ The order is fail-closed:
    repositories, 24 revisions, 80 unique LFS objects, and manifest-set SHA-256
    `62a0476de06ea729591899beecc4d365e96af4bb0cc79a6714bd783f22a4ea84`.
 2. Immutable K2-K4 public-arm provenance manifests are generated and
-   byte-reproduced, but remain explicitly `unreviewed`; K5 has a hash-bound
-   internal evidence record.
-3. Name every accountable human DRI and obtain an externally anchored reviewer
-   approval for the sealed execution plan.
+   byte-reproduced; their technical review remains pending until after the
+   owner-ratified admission is bound. K5 has a hash-bound internal evidence
+   record.
+3. Bind the sole accountable human owner, then use fresh, explicitly-agent
+   technical review identities for each later execution decision. Agent review
+   is never represented as independent human review.
 4. Curate and seal D1/D2 matched-but-disjoint train/evaluation splits under
    `KREA-FIXTURE-CURATION-CONTRACT.md`. A C1-C4 pre-finalist commitment was
-   published externally; it remains sealed and requires named-human acceptance
-   before it can satisfy the independent-review gate. The later public-shape
+   published externally; it remains in external agent custody pending owner
+   ratification and a fresh technical agent review. The later public-shape
    correction is bound by `krea-c1c4-shape-contract-amendment.json`: C1-C4 use
    their exact published concept classes and 20/6, 45/6, 30/8, and 12/5
    train/evaluation counts. It is an amendment to the plan contract, never a
@@ -32,6 +34,12 @@ The order is fail-closed:
    reviewer reveals C1-C4.
 9. Update `evidence-ledger.json` only from linked evidence. A missing field is a
    red gate, not permission to use a guessed default.
+
+Literal GPU procedures are
+`KREA-FIRST-GPU-TIMING-RUNBOOK.md` and
+`KREA-STAGE1-EXACT-SCORER-RUNBOOK.md`. The latter binds the 229-distribution
+Jul-22 Krea scorer runtime; the later Jul-24 flux evaluator freeze is not a
+substitute.
 
 `krea-discovery-plan.json` is currently `draft_blocked_pre_gpu`, not an
 execution freeze. Final Round-1 evidence changed the screen from five to six
@@ -49,10 +57,10 @@ rejects role labels or unnamed human owners; it is not a GPU authorization gate.
 geometry, conservative component bounds, a predeclared margin policy, and a
 held-out end-to-end validation record.
 
-The CPU tree is currently covered by 436 passing tests plus Black, pyflakes,
-compilation, and whitespace checks. A literal Hetzner systemd smoke verifies
-the exact-score containment primitive. Those results do not replace the
-required schema-2 H100 host capture and literal first-GPU bootstrap smoke.
+Run the current test suite and record its exact count at the release freeze; do
+not rely on a stale fixed count in this document. CPU tests, formatting,
+compilation, and the literal Hetzner systemd containment smoke do not replace
+the required schema-2 H100 host capture and literal first-GPU bootstrap smoke.
 
 Offline exact-evaluator output is calibration evidence only. It must never be
 written to the production `forge_holdout_scores.json` proxy contract.

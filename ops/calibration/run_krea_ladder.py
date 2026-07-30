@@ -38,6 +38,23 @@ _KREA_TEXT_ENCODER = "/cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct"
 _CONDITION_NAME = "forge_calibration_condition.json"
 _BASELINE_NAME = "krea_ladder_baseline.json"
 _REEXEC_MARKER = "FORGE_KREA_CALIBRATION_SEEDED"
+_TRUSTED_LAUNCH_MARKER = "FORGE_KREA_STAGE1_TRUSTED_REEXEC"
+_RUNTIME_CACHE_ROOT = Path("/cache/krea-runtime")
+_RUNTIME_CACHE_ENV = {
+    "HOME": "home",
+    "XDG_CACHE_HOME": "xdg",
+    "TORCHINDUCTOR_CACHE_DIR": "torchinductor",
+    "TRITON_CACHE_DIR": "triton",
+}
+_RUNTIME_CACHE_NAMESPACE_ENV = "FORGE_KREA_RUNTIME_CACHE_NAMESPACE"
+_STAGED_VENV_ROOT = Path("/app/venv")
+_CAMPAIGN_ROOT = Path("/campaign")
+_CONTROL_ROOT = _CAMPAIGN_ROOT / "controls"
+_CHECKPOINT_ROOT = Path("/app/checkpoints")
+_ISOLATED_MODULE_BOOTSTRAP = (
+    "import runpy,sys;sys.path.insert(0,'/app/forge');"
+    "runpy.run_module('ops.calibration.run_krea_ladder',run_name='__main__')"
+)
 _PROBE_SEED = 42565431
 _PROBE_EPOCHS = 2
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -84,6 +101,64 @@ _ALLOWED_BUILDER_MUTATIONS = frozenset(
     (*_SCIENTIFIC_AXIS_POINTERS, *_DERIVED_POINTERS, _TRAINING_SEED_POINTER)
 )
 
+_TIMING_ENV = (
+    "FORGE_KREA_TIMING_SOCKET",
+    "FORGE_KREA_TIMING_PROBE_CONTRACT_SHA256",
+    "FORGE_KREA_TIMING_CAPTURE_ID",
+)
+
+
+def _minimal_runtime_environment(
+    *,
+    timing: dict[str, str] | None = None,
+    cache: dict[str, str] | None = None,
+    trusted_marker: str | None = None,
+    jit_enabled: str | None = None,
+    seed: str | None = None,
+) -> dict[str, str]:
+    """Construct, rather than inherit, the Stage-1 runtime environment."""
+
+    environment = {
+        "PATH": "/app/venv/bin:/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "AI_TOOLKIT_DIR": "/app/ai-toolkit",
+        "FORGE_TEMPLATES_DIR": "/app/forge/forge/templates",
+        "FORGE_HOLDOUT_SELECTION_TYPES": "",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+    if timing:
+        if set(timing) != set(_TIMING_ENV) or any(
+            not isinstance(value, str) or not value for value in timing.values()
+        ):
+            raise RuntimeError("timing environment is incomplete or non-canonical")
+        environment.update(timing)
+    if cache:
+        expected_cache_keys = set(_RUNTIME_CACHE_ENV) | {_RUNTIME_CACHE_NAMESPACE_ENV}
+        if set(cache) != expected_cache_keys or any(
+            not isinstance(value, str) or not value for value in cache.values()
+        ):
+            raise RuntimeError("runtime-cache environment is incomplete")
+        environment.update(cache)
+    if trusted_marker is not None:
+        if not _SHA256.fullmatch(trusted_marker):
+            raise RuntimeError("trusted launch marker is invalid")
+        environment[_TRUSTED_LAUNCH_MARKER] = trusted_marker
+    if jit_enabled is not None:
+        if jit_enabled not in {"0", "1"}:
+            raise RuntimeError("JIT environment is invalid")
+        environment["FORGE_CALIBRATION_JIT_ENABLED"] = jit_enabled
+    if seed is not None:
+        if not seed.isdecimal() or not 0 <= int(seed) < 2**32:
+            raise RuntimeError("seed environment is invalid")
+        environment["PYTHONHASHSEED"] = seed
+        environment["SEED"] = seed
+        environment[_REEXEC_MARKER] = seed
+    return environment
+
 
 def _parse() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -105,6 +180,406 @@ def _parse() -> argparse.Namespace:
     )
     parser.add_argument("--model", choices=(_MODEL,), default=_MODEL)
     return parser.parse_args()
+
+
+def _authorized_child_path(value: Path, root: Path, label: str) -> Path:
+    """Resolve one operator path and keep it inside its authorized mount."""
+
+    path = value.expanduser().resolve()
+    authorized_root = root.resolve(strict=True)
+    if path == authorized_root or not path.is_relative_to(authorized_root):
+        raise ValueError(f"{label} must be below {authorized_root}: {path}")
+    return path
+
+
+def _validate_execution_paths(args: argparse.Namespace) -> None:
+    """Reject root-run control/output paths outside the fixed Stage-1 mounts."""
+
+    _authorized_child_path(args.campaign_dir, _CAMPAIGN_ROOT, "campaign-dir")
+    if args.execution_plan is not None:
+        _authorized_child_path(args.execution_plan, _CONTROL_ROOT, "execution plan")
+    if args.execution_approval is not None:
+        _authorized_child_path(
+            args.execution_approval, _CONTROL_ROOT, "execution approval"
+        )
+    if args.timing_probe_plan is not None:
+        _authorized_child_path(
+            args.timing_probe_plan, _CONTROL_ROOT, "timing probe plan"
+        )
+    if args.timing_probe_approval is not None:
+        _authorized_child_path(
+            args.timing_probe_approval, _CONTROL_ROOT, "timing probe approval"
+        )
+
+
+def _preimport_tree_identity(root: Path) -> dict[str, Any]:
+    """Recompute staged-venv bytes without importing or executing them."""
+
+    root = root.resolve(strict=True)
+    rows: list[list[Any]] = []
+    for path in sorted(
+        root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
+    ):
+        relative = path.relative_to(root).as_posix()
+        mode = path.lstat().st_mode & 0o7777
+        if path.is_symlink():
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(root):
+                raise RuntimeError(f"staged venv symlink escapes tree: {relative}")
+            rows.append(
+                [
+                    relative,
+                    "symlink",
+                    mode,
+                    os.readlink(path),
+                    resolved.relative_to(root).as_posix(),
+                ]
+            )
+        elif path.is_dir():
+            rows.append([relative, "directory", mode])
+        elif path.is_file():
+            rows.append(
+                [relative, "file", mode, path.stat().st_size, _sha256_file(path)]
+            )
+        else:
+            raise RuntimeError(f"staged venv contains unsupported entry: {relative}")
+    return {"entry_count": len(rows), "manifest_sha256": _canonical_hash(rows)}
+
+
+def _runtime_cache_environment(
+    plan_file_sha256: str, *, timing_capture_id: str | None, create: bool
+) -> dict[str, str]:
+    """Return one clean, plan-scoped compiler/cache namespace.
+
+    A namespace left by an earlier attempt is evidence of prior execution and
+    fails closed. It is never silently warmed or deleted.
+    """
+
+    if not _SHA256.fullmatch(plan_file_sha256):
+        raise RuntimeError("runtime cache namespace lacks a plan file SHA-256")
+    root = _RUNTIME_CACHE_ROOT
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError("sealed runtime cache root is absent or a symlink")
+    metadata = root.stat()
+    if (
+        metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o7777 != 0o700
+        or not os.access(root, os.R_OK | os.W_OK | os.X_OK)
+    ):
+        raise RuntimeError("sealed runtime cache root is not protected and writable")
+    if timing_capture_id is not None:
+        if not _SAFE_COMPONENT.fullmatch(timing_capture_id):
+            raise RuntimeError("runtime cache timing capture id is unsafe")
+        namespace_id = _canonical_hash(
+            {
+                "plan_file_sha256": plan_file_sha256,
+                "timing_capture_id": timing_capture_id,
+            }
+        )
+    else:
+        namespace_id = plan_file_sha256
+    namespace = root / namespace_id
+    if create:
+        if os.path.lexists(namespace):
+            raise RuntimeError(
+                "runtime cache namespace already exists; cross-plan/attempt reuse is forbidden"
+            )
+        namespace.mkdir(mode=0o700)
+        for leaf in _RUNTIME_CACHE_ENV.values():
+            (namespace / leaf).mkdir(mode=0o700)
+    if namespace.is_symlink() or not namespace.is_dir():
+        raise RuntimeError("runtime cache namespace is absent or unsafe")
+    expected = {
+        name: str(namespace / leaf) for name, leaf in _RUNTIME_CACHE_ENV.items()
+    }
+    expected[_RUNTIME_CACHE_NAMESPACE_ENV] = str(namespace)
+    for path_text in expected.values():
+        path = Path(path_text)
+        if (
+            path.is_symlink()
+            or not path.is_dir()
+            or path.stat().st_uid != os.geteuid()
+            or path.stat().st_mode & 0o7777 != 0o700
+            or not path.is_relative_to(root)
+        ):
+            raise RuntimeError("runtime cache namespace leaf is unsafe")
+    return expected
+
+
+def _preimport_canonical_json(
+    path: Path, expected_sha: str | None = None
+) -> dict[str, Any]:
+    raw = path.read_bytes()
+    if expected_sha is not None and hashlib.sha256(raw).hexdigest() != expected_sha:
+        raise RuntimeError(f"pre-import control digest drifted: {path}")
+    value = json.loads(raw)
+    if not isinstance(value, dict) or raw != _canonical_bytes(value) + b"\n":
+        raise RuntimeError(f"pre-import control is not canonical JSON: {path}")
+    return value
+
+
+def _preimport_executable_identity(path: Path) -> dict[str, Any]:
+    requested = path
+    requested_stat = requested.lstat()
+    resolved = requested.resolve(strict=True)
+    resolved_stat = resolved.stat()
+    if (
+        requested_stat.st_uid != 0
+        or requested_stat.st_mode & 0o022
+        or not stat.S_ISREG(resolved_stat.st_mode)
+        or resolved_stat.st_uid != 0
+        or resolved_stat.st_mode & 0o022
+        or not os.access(resolved, os.X_OK)
+        or not resolved.is_relative_to(Path("/usr"))
+    ):
+        raise RuntimeError(f"untrusted system executable: {requested}")
+    return {
+        "requested_path": str(requested),
+        "resolved_path": str(resolved),
+        "sha256": _sha256_file(resolved),
+        "mode": resolved_stat.st_mode & 0o7777,
+        "uid": resolved_stat.st_uid,
+    }
+
+
+def _preimport_git_identity(path: Path, expected_commit: str) -> dict[str, Any]:
+    git = "/usr/bin/git"
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
+    }
+
+    def command(*arguments: str) -> str:
+        return subprocess.run(
+            [
+                git,
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                f"safe.directory={path}",
+                *arguments,
+            ],
+            cwd=path,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
+
+    commit = command("rev-parse", "HEAD")
+    if commit != expected_commit or command(
+        "status", "--porcelain", "--untracked-files=all"
+    ):
+        raise RuntimeError(f"pre-import source tree drifted: {path}")
+    flags = command("ls-files", "-v").splitlines()
+    if any(row and (row[0].islower() or row[0] == "S") for row in flags):
+        raise RuntimeError(f"pre-import source tree hides tracked changes: {path}")
+    tracked = [name for name in command("ls-files", "-z").split("\x00") if name]
+    manifest = []
+    for name in tracked:
+        file_path = path / name
+        if file_path.is_symlink() or not file_path.is_file():
+            raise RuntimeError(
+                f"pre-import tracked entry is not a regular file: {file_path}"
+            )
+        manifest.append([name, file_path.stat().st_size, _sha256_file(file_path)])
+    return {
+        "commit": commit,
+        "tree": command("rev-parse", "HEAD^{tree}"),
+        "tracked_file_count": len(manifest),
+        "worktree_manifest_sha256": _canonical_hash(manifest),
+    }
+
+
+def _trusted_stage1_reexec(args: argparse.Namespace) -> None:
+    """Verify receipt/source/venv under system Python, then exec the sealed venv."""
+
+    marker = os.environ.get(_TRUSTED_LAUNCH_MARKER)
+    forbidden = {
+        name: os.environ[name]
+        for name in ("LD_PRELOAD", "PYTHONHOME", "PYTHONPATH", "CUDA_VISIBLE_DEVICES")
+        if os.environ.get(name)
+    }
+    if not marker:
+        for name in (
+            "XDG_CACHE_HOME",
+            "TORCHINDUCTOR_CACHE_DIR",
+            "TRITON_CACHE_DIR",
+            _RUNTIME_CACHE_NAMESPACE_ENV,
+        ):
+            if os.environ.get(name):
+                forbidden[name] = os.environ[name]
+    supplied_ai_toolkit = os.environ.get("AI_TOOLKIT_DIR")
+    if supplied_ai_toolkit not in {None, "", "/app/ai-toolkit"}:
+        forbidden["AI_TOOLKIT_DIR"] = supplied_ai_toolkit
+    supplied_templates = os.environ.get("FORGE_TEMPLATES_DIR")
+    if supplied_templates not in {None, "", "/app/forge/forge/templates"}:
+        forbidden["FORGE_TEMPLATES_DIR"] = supplied_templates
+    if forbidden:
+        raise RuntimeError(
+            f"operator environment contains unsealed execution controls: {sorted(forbidden)}"
+        )
+    # Forge reads this variable at import time.  Install the bootstrap-bound
+    # mount before any project import and preserve it through both re-execs.
+    os.environ["AI_TOOLKIT_DIR"] = "/app/ai-toolkit"
+    os.environ["FORGE_TEMPLATES_DIR"] = "/app/forge/forge/templates"
+    plan_path = (args.timing_probe_plan or args.execution_plan).resolve(strict=True)
+    plan = _preimport_canonical_json(plan_path)
+    plan_file_sha256 = _sha256_file(plan_path)
+    binding = plan.get("host_execution_manifest")
+    if not isinstance(binding, dict) or set(binding) != {"path", "sha256"}:
+        raise RuntimeError("Stage-1 plan lacks an exact host-manifest binding")
+    host = _preimport_canonical_json(Path(binding["path"]), binding["sha256"])
+    receipt_binding = host.get("bootstrap_receipt")
+    if not isinstance(receipt_binding, dict):
+        raise RuntimeError("Stage-1 host manifest lacks a bootstrap receipt")
+    receipt_path = Path(receipt_binding["path"])
+    receipt = _preimport_canonical_json(receipt_path, receipt_binding["file_sha256"])
+    receipt_body = {
+        key: value for key, value in receipt.items() if key != "receipt_sha256"
+    }
+    if receipt.get("receipt_sha256") != _canonical_hash(receipt_body):
+        raise RuntimeError("bootstrap receipt semantic digest drifted")
+    spec = receipt.get("spec")
+    if not isinstance(spec, dict):
+        raise RuntimeError("bootstrap receipt lacks its spec")
+    spec_body = {key: value for key, value in spec.items() if key != "spec_sha256"}
+    if spec.get("spec_sha256") != _canonical_hash(spec_body):
+        raise RuntimeError("bootstrap spec semantic digest drifted")
+    expected_cache_policy = {
+        "root": str(_RUNTIME_CACHE_ROOT),
+        "namespace_derivation": (
+            "timing_plan_file_sha256_plus_capture_id_or_execution_plan_file_sha256"
+        ),
+        "initial_state": "root-empty-before-bootstrap",
+        "cross_capture_or_plan_reuse": False,
+        "within_process_reuse": True,
+    }
+    runtime_spec = spec.get("runtime")
+    if (
+        not isinstance(runtime_spec, dict)
+        or runtime_spec.get("runtime_cache_policy") != expected_cache_policy
+    ):
+        raise RuntimeError("bootstrap receipt lacks the sealed runtime cache policy")
+    layout = receipt.get("layout_identity")
+    if not isinstance(layout, dict) or not isinstance(layout.get("sources"), dict):
+        raise RuntimeError("bootstrap receipt lacks source identity")
+    trusted = layout.get("host", {}).get("trusted_executables")
+    if not isinstance(trusted, dict):
+        raise RuntimeError("bootstrap receipt lacks trusted system executables")
+    for name, identity in trusted.items():
+        if (
+            not isinstance(identity, dict)
+            or _preimport_executable_identity(Path(identity.get("requested_path", "")))
+            != identity
+        ):
+            raise RuntimeError(f"trusted system executable drifted: {name}")
+    sources = spec.get("sources", {})
+    source_identity = layout["sources"]
+    binding_identity = layout.get("bindings")
+    if (
+        not isinstance(binding_identity, dict)
+        or not isinstance(binding_identity.get("runtime_cache"), dict)
+        or binding_identity["runtime_cache"].get("policy") != expected_cache_policy
+    ):
+        raise RuntimeError("bootstrap layout lacks the runtime cache binding")
+    for key, commit_key in (
+        ("forge_repo", "forge_commit"),
+        ("ai_toolkit_repo", "ai_toolkit_commit"),
+    ):
+        observed = _preimport_git_identity(
+            Path(sources[key]), spec["source_identities"][commit_key]
+        )
+        if observed != source_identity[key]:
+            raise RuntimeError(f"pre-import {key} identity drifted")
+    if _preimport_tree_identity(Path(sources["venv"])) != source_identity["venv_tree"]:
+        raise RuntimeError("pre-import staged venv identity drifted")
+    if marker:
+        cache_capture_id = (
+            os.environ.get("FORGE_KREA_TIMING_CAPTURE_ID")
+            if args.timing_probe_plan
+            else None
+        )
+        expected_cache_environment = _runtime_cache_environment(
+            plan_file_sha256,
+            timing_capture_id=cache_capture_id,
+            create=False,
+        )
+        if any(
+            os.environ.get(name) != expected
+            for name, expected in expected_cache_environment.items()
+        ):
+            raise RuntimeError("runtime cache environment differs from sealed policy")
+        executable = Path(sys.executable).resolve(strict=True)
+        if (
+            marker != receipt["receipt_sha256"]
+            or not executable.is_relative_to(_STAGED_VENV_ROOT.resolve(strict=True))
+            or _sha256_file(executable)
+            != source_identity["venv_python"]["resolved_sha256"]
+        ):
+            raise RuntimeError("trusted Stage-1 re-exec marker is invalid")
+        return
+    if not os.path.samefile(sys.executable, "/usr/bin/python3"):
+        raise RuntimeError(
+            "Stage-1 must start with /usr/bin/python3 before the staged venv"
+        )
+    bootstrap_code = (
+        "import sys;sys.path.insert(0,'/app/forge');"
+        "from ops.calibration import krea_host_bootstrap as m;"
+        "raise SystemExit(m.main(['verify-layout','--receipt',sys.argv[1]]))"
+    )
+    subprocess.run(
+        ["/usr/bin/python3", "-I", "-c", bootstrap_code, str(receipt_path)],
+        check=True,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        timeout=180,
+    )
+    venv_python = _STAGED_VENV_ROOT / "bin/python"
+    resolved = venv_python.resolve(strict=True)
+    if _sha256_file(resolved) != source_identity["venv_python"]["resolved_sha256"]:
+        raise RuntimeError("staged venv Python drifted after receipt recapture")
+    cache_capture_id = (
+        os.environ.get("FORGE_KREA_TIMING_CAPTURE_ID")
+        if args.timing_probe_plan
+        else None
+    )
+    if args.timing_probe_plan and not cache_capture_id:
+        raise RuntimeError("timing capture lacks its cache namespace identity")
+    if args.execution_plan and os.environ.get("FORGE_KREA_TIMING_CAPTURE_ID"):
+        raise RuntimeError("execution plan inherited a timing capture identity")
+    cache_environment = _runtime_cache_environment(
+        plan_file_sha256,
+        timing_capture_id=cache_capture_id,
+        create=True,
+    )
+    timing_environment = None
+    if args.timing_probe_plan:
+        timing_environment = {name: os.environ.get(name, "") for name in _TIMING_ENV}
+    environment = _minimal_runtime_environment(
+        timing=timing_environment,
+        cache=cache_environment,
+        trusted_marker=receipt["receipt_sha256"],
+    )
+    os.execve(
+        str(venv_python),
+        [
+            str(venv_python),
+            "-I",
+            "-c",
+            _ISOLATED_MODULE_BOOTSTRAP,
+            *sys.argv[1:],
+        ],
+        environment,
+    )
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -207,13 +682,29 @@ def _ensure_seeded_process(seed: int) -> None:
         return
     if os.environ.get(_REEXEC_MARKER):
         raise RuntimeError("seeded re-exec did not install the requested hash seed")
-    env = dict(os.environ)
-    env["PYTHONHASHSEED"] = expected
-    env["SEED"] = expected
-    env[_REEXEC_MARKER] = expected
+    timing_environment = None
+    if os.environ.get("FORGE_KREA_TIMING_CAPTURE_ID"):
+        timing_environment = {name: os.environ.get(name, "") for name in _TIMING_ENV}
+    cache_environment = {
+        name: os.environ.get(name, "")
+        for name in (*_RUNTIME_CACHE_ENV, _RUNTIME_CACHE_NAMESPACE_ENV)
+    }
+    env = _minimal_runtime_environment(
+        timing=timing_environment,
+        cache=cache_environment,
+        trusted_marker=os.environ.get(_TRUSTED_LAUNCH_MARKER),
+        jit_enabled=os.environ.get("FORGE_CALIBRATION_JIT_ENABLED"),
+        seed=expected,
+    )
     os.execve(
         sys.executable,
-        [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _ISOLATED_MODULE_BOOTSTRAP,
+            *sys.argv[1:],
+        ],
         env,
     )
 
@@ -398,8 +889,17 @@ def _runtime_fingerprint() -> dict[str, Any]:
         "seed_env": os.environ.get("SEED"),
         "pythonhashseed_env": os.environ.get("PYTHONHASHSEED"),
     }
+    runtime_cache = {
+        "namespace": os.environ.get(_RUNTIME_CACHE_NAMESPACE_ENV),
+        "cross_capture_or_plan_reuse": False,
+        "within_process_reuse": True,
+        "environment": {
+            name: os.environ.get(name) for name in sorted(_RUNTIME_CACHE_ENV)
+        },
+    }
     return {
         **compute_payload,
+        "runtime_cache": runtime_cache,
         "stochastic_controls": stochastic_controls,
         "stochastic_controls_sha256": _canonical_hash(stochastic_controls),
         "sha256": _canonical_hash(compute_payload),
@@ -428,6 +928,7 @@ def _validate_measured_execution_envelope(
     base_model: dict[str, Any],
     pre: dict[str, Any],
     host_execution_identity_sha256: str,
+    venv_tree_manifest_sha256: str,
 ) -> None:
     """Recompute every locally observable timing-equivalence field."""
 
@@ -441,9 +942,6 @@ def _validate_measured_execution_envelope(
         raise RuntimeError(
             "FORGE_CALIBRATION_JIT_ENABLED must explicitly bind the measured JIT path"
         )
-    container_sha = os.environ.get("FORGE_CONTAINER_IMAGE_SHA256")
-    if not isinstance(container_sha, str) or not _SHA256.fullmatch(container_sha):
-        raise RuntimeError("FORGE_CONTAINER_IMAGE_SHA256 must bind the runtime image")
     actual = {
         "network_rank": network["linear"],
         "network_alpha": network["linear_alpha"],
@@ -478,7 +976,9 @@ def _validate_measured_execution_envelope(
         "base_model_identity_sha256": pre["training_identity_sha256"],
         "runtime_identity_sha256": pre["runtime"]["sha256"],
         "host_execution_identity_sha256": host_execution_identity_sha256,
-        "container_image_sha256": container_sha,
+        "execution_surface": "staged_host_venv",
+        "execution_scope": "discovery_only",
+        "venv_tree_manifest_sha256": venv_tree_manifest_sha256,
         "gpu_identity_sha256": _canonical_hash(pre["runtime"]["gpu"]),
         "trainer_identity_sha256": _canonical_hash(
             {
@@ -1037,9 +1537,13 @@ def _validate_telemetry(telemetry: dict[str, Any], *, args: argparse.Namespace) 
 
 def main() -> int:
     args = _parse()
+    _validate_execution_paths(args)
+    _trusted_stage1_reexec(args)
     try:
+        from . import krea_execution_surface_policy
         from . import krea_training_evidence
     except ImportError:  # pragma: no cover - direct script execution.
+        import krea_execution_surface_policy  # type: ignore[no-redef]
         import krea_training_evidence  # type: ignore[no-redef]
 
     timing_bootstrap = args.timing_probe_plan is not None
@@ -1096,6 +1600,37 @@ def main() -> int:
     args.guidance = "on" if guidance_value["enabled"] else "off"
     args.hours = float(execution_plan["budget_plan"]["hard_budget_s"]) / 3600.0
     args.throughput_profile = execution_controls.get("throughput_profile_path")
+    sealed_runtime = execution_controls.get("bootstrap_runtime")
+    if not isinstance(sealed_runtime, dict):
+        raise ValueError("execution controls lack the sealed bootstrap runtime")
+    sealed_surface = execution_controls.get("bootstrap_execution_surface")
+    if (
+        not isinstance(sealed_surface, dict)
+        or sealed_runtime.get("execution_surface") != "staged_host_venv"
+    ):
+        raise ValueError("execution controls do not authorize the staged host venv")
+    sealed_venv = sealed_surface.get("venv_python")
+    if not isinstance(sealed_venv, dict):
+        raise ValueError("execution controls lack the staged venv identity")
+    executable = Path(sys.executable).resolve(strict=True)
+    expected_executable = (
+        Path("/app/venv") / sealed_venv["resolved_relative_path"]
+    ).resolve(strict=True)
+    if (
+        executable != expected_executable
+        or _sha256_file(executable) != sealed_venv["resolved_sha256"]
+    ):
+        raise ValueError("runner Python differs from the bootstrap-bound host venv")
+    sealed_environment = {
+        "FORGE_CALIBRATION_JIT_ENABLED": (
+            "1" if sealed_runtime["jit_enabled"] else "0"
+        ),
+    }
+    for name, expected in sealed_environment.items():
+        supplied = os.environ.get(name)
+        if supplied is not None and supplied != expected:
+            raise ValueError(f"operator environment contradicts sealed {name}")
+        os.environ[name] = expected
     _validate_args(args)
     _ensure_seeded_process(args.seed)
 
@@ -1129,13 +1664,9 @@ def main() -> int:
         import krea_budget  # type: ignore[no-redef]
         import krea_host_identity  # type: ignore[no-redef]
 
-    campaign_dir = args.campaign_dir.expanduser().resolve()
-    for volatile_root in (Path("/app/checkpoints"), Path("/dataset"), Path("/cache")):
-        if campaign_dir == volatile_root or campaign_dir.is_relative_to(volatile_root):
-            raise ValueError(
-                "campaign-dir must be durable and outside trainer/cache paths: "
-                f"{campaign_dir}"
-            )
+    campaign_dir = _authorized_child_path(
+        args.campaign_dir, _CAMPAIGN_ROOT, "campaign-dir"
+    )
     condition_path = campaign_dir / "conditions" / f"{args.task_id}.json"
     condition_claim_path = campaign_dir / "conditions" / f".{args.task_id}.claim"
     evidence_dir = campaign_dir / "evidence" / args.task_id
@@ -1147,6 +1678,12 @@ def main() -> int:
         trigger_word=None,
         dataset_zip=None,
     )
+    save_root = Path(spec.save_root).resolve()
+    checkpoint_root = _CHECKPOINT_ROOT.resolve(strict=True)
+    if save_root == checkpoint_root or not save_root.is_relative_to(checkpoint_root):
+        raise ValueError(
+            "trainer checkpoint namespace escaped /app/checkpoints: " f"{save_root}"
+        )
     mutable_paths = [
         Path(spec.config_path),
         Path(spec.training_folder),
@@ -1283,6 +1820,7 @@ def main() -> int:
         "execution_envelope": profile.execution_envelope.to_record(),
         "execution_envelope_sha256": profile.execution_envelope.execution_envelope_sha256,
         "throughput_equivalence_class": profile.execution_envelope.equivalence_class,
+        "execution_surface_policy": krea_execution_surface_policy.POLICY,
         "throughput_profile_sha256": profile.profile_sha256,
         "budget_plan_sha256": _canonical_hash(budget_plan.to_record()),
         "timing_probe_contract_sha256": (
@@ -1381,6 +1919,7 @@ def main() -> int:
             host_execution_identity_sha256=execution_controls[
                 "host_execution_manifest"
             ]["host_execution_identity_sha256"],
+            venv_tree_manifest_sha256=sealed_surface["venv_tree"]["manifest_sha256"],
         )
         captured.update(
             baseline=copy.deepcopy(baseline),
@@ -1684,6 +2223,28 @@ def main() -> int:
         "execution_plan_file_sha256": execution_plan_file_sha,
         "execution_approval_sha256": execution_approval["approval_sha256"],
         "execution_approval_file_sha256": execution_approval_file_sha,
+        "discovery_profile_index_sha256": (
+            execution_controls["discovery_profile_index"]["index_sha256"]
+            if not timing_bootstrap
+            else None
+        ),
+        "discovery_profile_index_file_sha256": (
+            execution_controls["discovery_profile_index"]["file_sha256"]
+            if not timing_bootstrap
+            else None
+        ),
+        "discovery_execution_authorization_sha256": execution_controls[
+            "discovery_execution_authorization"
+        ]["authorization_sha256"],
+        "discovery_execution_authorization_file_sha256": execution_controls[
+            "discovery_execution_authorization"
+        ]["file_sha256"],
+        "host_bootstrap_receipt_sha256": execution_controls["host_execution_manifest"][
+            "bootstrap_receipt"
+        ]["receipt_sha256"],
+        "host_bootstrap_receipt_file_sha256": execution_controls[
+            "host_execution_manifest"
+        ]["bootstrap_receipt"]["file_sha256"],
         "timing_probe_contract_sha256": (
             probe["probe_contract_sha256"] if timing_bootstrap else None
         ),

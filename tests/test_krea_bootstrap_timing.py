@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -20,6 +21,19 @@ from ops.calibration import run_krea_ladder
 SHA = {letter: letter * 64 for letter in "0123456789abcdef"}
 
 
+def _agent_actor(instance: str, role: str) -> dict[str, str]:
+    return {
+        "actor_class": "agent",
+        "actor_id": f"codex-{instance}",
+        "display_name": "Codex timing reviewer",
+        "role": role,
+        "review_instance_id": instance,
+        "identity_assurance": (
+            "self-declared-agent-identity-not-human-or-cryptographic-authentication"
+        ),
+    }
+
+
 def _envelope(*, tool_sha=None):
     return krea_budget.seal_execution_envelope(
         equivalence_class="A-rank32-adamw8bit-mse-guidance2",
@@ -30,7 +44,7 @@ def _envelope(*, tool_sha=None):
         loss="mse",
         differential_guidance_enabled=True,
         guidance_scale=2.0,
-        training_pair_count=24,
+        training_pair_count=18,
         training_dataset_shape_sha256=SHA["2"],
         micro_batch_size=1,
         gradient_accumulation_steps=1,
@@ -45,7 +59,10 @@ def _envelope(*, tool_sha=None):
         base_model_identity_sha256=SHA["5"],
         runtime_identity_sha256=SHA["6"],
         host_execution_identity_sha256=SHA["7"],
-        container_image_sha256=SHA["8"],
+        execution_surface="staged_host_venv",
+        execution_scope="discovery_only",
+        venv_tree_manifest_sha256=SHA["8"],
+        reference_container_image_sha256=SHA["f"],
         gpu_identity_sha256=SHA["9"],
         trainer_identity_sha256=SHA["a"],
         measurement_tool_sha256=tool_sha or SHA["b"],
@@ -148,6 +165,62 @@ def test_profile_is_recomputed_from_receipt_clock_blocks_not_opaque_claims():
     assert profile["finalization_reserve_s"] == 38.0
     assert profile["upload_reserve_s"] == 25.5
     assert profile["raw_sample_manifest_sha256"] == raw["raw_sample_manifest_sha256"]
+
+
+def test_schema2_timing_approval_requires_fresh_agent_review(monkeypatch):
+    prior = _agent_actor("fixture-review", "independent_reviewer")
+    authorization = {
+        "file_sha256": SHA["1"],
+        "authorization_sha256": SHA["2"],
+        "document": {
+            "accountable_owner_identity": "Jordan Example",
+            "authorized_at_utc": "2026-07-28T00:00:00Z",
+            "fixture_admission_envelope": {"owner_ratification_sha256": SHA["3"]},
+        },
+    }
+    resolved = {
+        "fixture": {"governance": {"independent_agent_review": {"actor": prior}}},
+        "host_execution_manifest": {"host_execution_identity_sha256": SHA["4"]},
+        "discovery_execution_authorization": authorization,
+    }
+    plan = {"schema": 2, "probe_contract_sha256": SHA["5"]}
+    monkeypatch.setattr(
+        krea_execution_plan, "validate_timing_probe_plan", lambda _plan: resolved
+    )
+    monkeypatch.setattr(
+        krea_execution_plan.krea_discovery_authorization,
+        "validate_technical_actor",
+        lambda _authorization, actor, **_kwargs: actor,
+    )
+
+    with pytest.raises(ValueError, match="fresh technical review actor"):
+        krea_execution_plan.build_timing_probe_approval(
+            plan,
+            reviewer_identity=None,
+            approved_at_utc="2026-07-28T00:01:00Z",
+            technical_reviewer_actor=prior,
+        )
+
+    approval = krea_execution_plan.build_timing_probe_approval(
+        plan,
+        reviewer_identity=None,
+        approved_at_utc="2026-07-28T00:01:00Z",
+        technical_reviewer_actor=_agent_actor(
+            "timing-review", "timing_probe_execution_reviewer"
+        ),
+    )
+    assert (
+        krea_execution_plan.validate_timing_probe_approval(approval, plan=plan)
+        == approval
+    )
+    predates = json.loads(json.dumps(approval))
+    predates["approved_at_utc"] = "2026-07-27T23:59:59Z"
+    predates_body = {
+        key: value for key, value in predates.items() if key != "approval_sha256"
+    }
+    predates["approval_sha256"] = krea_provenance.canonical_sha256(predates_body)
+    with pytest.raises(ValueError, match="predates discovery authorization"):
+        krea_execution_plan.validate_timing_probe_approval(predates, plan=plan)
 
 
 def test_margin_policy_must_be_frozen_before_every_governed_capture():
@@ -274,6 +347,41 @@ def test_runtime_compute_identity_excludes_seed_but_binds_it_separately(monkeypa
     }
 
 
+def test_root_run_paths_are_confined_to_campaign_controls_and_checkpoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign_root = tmp_path / "campaign"
+    controls = campaign_root / "controls"
+    controls.mkdir(parents=True)
+    monkeypatch.setattr(run_krea_ladder, "_CAMPAIGN_ROOT", campaign_root)
+    monkeypatch.setattr(run_krea_ladder, "_CONTROL_ROOT", controls)
+    args = argparse.Namespace(
+        campaign_dir=campaign_root / "D1",
+        execution_plan=controls / "D1.plan.json",
+        execution_approval=controls / "D1.approval.json",
+        timing_probe_plan=None,
+        timing_probe_approval=None,
+    )
+    run_krea_ladder._validate_execution_paths(args)
+    args.campaign_dir = tmp_path / "outside"
+    with pytest.raises(ValueError, match="campaign-dir must be below"):
+        run_krea_ladder._validate_execution_paths(args)
+    args.campaign_dir = campaign_root / "D1"
+    args.execution_plan = tmp_path / "attacker.plan.json"
+    with pytest.raises(ValueError, match="execution plan must be below"):
+        run_krea_ladder._validate_execution_paths(args)
+
+    assert krea_execution_plan._lexical_child(
+        "/campaign/controls/probe.json", Path("/campaign/controls")
+    )
+    assert not krea_execution_plan._lexical_child(
+        "/campaign/controls/../../etc/probe.json", Path("/campaign/controls")
+    )
+    assert not krea_execution_plan._lexical_child(
+        "/etc/campaign.json", Path("/campaign")
+    )
+
+
 def _recipe_for_k1():
     values = {
         "planned_steps": 100,
@@ -314,7 +422,7 @@ def test_discovery_binding_parses_arm_fixture_seed_class_and_allowed_axes(tmp_pa
         arm_id="K1",
         fixture_id="D1",
         fixture_manifest_sha256=SHA["1"],
-        training_pair_count=24,
+        training_pair_count=18,
         seed_role="A",
         seed=42565431,
         throughput_equivalence_class="A-rank32-adamw8bit-mse-guidance2",
@@ -331,7 +439,7 @@ def test_discovery_binding_parses_arm_fixture_seed_class_and_allowed_axes(tmp_pa
             arm_id="K1",
             fixture_id="D1",
             fixture_manifest_sha256=SHA["1"],
-            training_pair_count=24,
+            training_pair_count=18,
             seed_role="B",
             seed=42565431,
             throughput_equivalence_class="A-rank32-adamw8bit-mse-guidance2",
@@ -346,7 +454,7 @@ def test_discovery_binding_parses_arm_fixture_seed_class_and_allowed_axes(tmp_pa
             arm_id="K1",
             fixture_id="D1",
             fixture_manifest_sha256=SHA["1"],
-            training_pair_count=24,
+            training_pair_count=18,
             seed_role="A",
             seed=42565431,
             throughput_equivalence_class="A-rank32-adamw8bit-mse-guidance2",
@@ -803,6 +911,34 @@ def test_timing_scope_wrapper_is_recursive_bounded_and_collected(monkeypatch, tm
     assert receipt["scope_observed_active"] is True
     assert receipt["recursive_cleanup_proven"] is True
     assert receipt["unit_collected"] is True
+
+
+def test_capture_child_environment_is_constructed_not_inherited(monkeypatch):
+    for name in (
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "HF_HOME",
+        "LD_LIBRARY_PATH",
+        "HTTPS_PROXY",
+        "OMP_NUM_THREADS",
+        "NCCL_DEBUG",
+    ):
+        monkeypatch.setenv(name, "operator-value")
+
+    environment = krea_timing_probe._capture_child_environment(
+        socket_path="/tmp/receipt.sock",
+        contract_sha256="b" * 64,
+        capture_id="timing-a",
+    )
+
+    assert environment == {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "FORGE_KREA_TIMING_SOCKET": "/tmp/receipt.sock",
+        "FORGE_KREA_TIMING_PROBE_CONTRACT_SHA256": "b" * 64,
+        "FORGE_KREA_TIMING_CAPTURE_ID": "timing-a",
+    }
 
 
 def test_timing_scope_timeout_cleans_recursive_cgroup(monkeypatch, tmp_path):

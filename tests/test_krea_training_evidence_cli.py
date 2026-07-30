@@ -113,9 +113,14 @@ def approved_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     profile = {
         "schema": 2,
         "profile_sha256": "b" * 64,
-        "execution_envelope": {"data_parallel_replicas": 1},
+        "execution_envelope": {
+            "data_parallel_replicas": 1,
+            "execution_surface": "staged_host_venv",
+            "execution_scope": "discovery_only",
+        },
     }
     plan = {
+        "schema": 3,
         "arm_id": "KREA-K2",
         "task_id": "fixture-c1",
         "expected_repo_name": "krea-k2",
@@ -127,12 +132,35 @@ def approved_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         "execution_envelope_sha256": "d" * 64,
         "base_model": base_model,
     }
-    approval = {"approval_sha256": "e" * 64, "reviewer_identity": "Human Reviewer"}
+    approval = {
+        "schema": 4,
+        "approval_sha256": "e" * 64,
+        "reviewer_identity": "Human Reviewer",
+    }
+    profile_index = {
+        "index_sha256": "0" * 64,
+        "file_sha256": "1" * 64,
+        "fixture_id": "D1",
+        "throughput_equivalence_class": "A-class",
+        "profile_sha256": profile["profile_sha256"],
+    }
+    bootstrap_receipt = {
+        "receipt_sha256": "2" * 64,
+        "file_sha256": "3" * 64,
+        "container_image_sha256": "4" * 64,
+    }
+    discovery_authorization = {
+        "authorization_sha256": "5" * 64,
+        "file_sha256": "6" * 64,
+    }
     resolved = {
         "fixture": fixture,
         "host_execution_manifest": {"host_execution_identity_sha256": "f" * 64},
         "throughput_profile": profile,
         "execution_recipe": plan["execution_recipe"],
+        "discovery_profile_index": profile_index,
+        "host_bootstrap_receipt": bootstrap_receipt,
+        "discovery_execution_authorization": discovery_authorization,
     }
     plan_path = tmp_path / "execution-plan.json"
     approval_path = tmp_path / "execution-approval.json"
@@ -199,7 +227,22 @@ def approved_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         "execution_plan_file_sha256": plan_file_sha,
         "execution_approval_sha256": approval["approval_sha256"],
         "execution_approval_file_sha256": approval_file_sha,
+        "discovery_profile_index_sha256": profile_index["index_sha256"],
+        "discovery_profile_index_file_sha256": profile_index["file_sha256"],
+        "discovery_execution_authorization_sha256": discovery_authorization[
+            "authorization_sha256"
+        ],
+        "discovery_execution_authorization_file_sha256": discovery_authorization[
+            "file_sha256"
+        ],
+        "host_bootstrap_receipt_sha256": bootstrap_receipt["receipt_sha256"],
+        "host_bootstrap_receipt_file_sha256": bootstrap_receipt["file_sha256"],
         "in_task_proxy_selection": {"enabled": False, "reserve_s": 0},
+        "campaign_baseline": {
+            "envelope": {
+                "execution_surface_policy": evidence.krea_execution_surface_policy.POLICY
+            }
+        },
         "budget": {
             "plan": budget_plan,
             "plan_sha256": plan["budget_plan_sha256"],

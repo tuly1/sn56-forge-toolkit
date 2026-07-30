@@ -25,11 +25,13 @@ from typing import Any, Iterable, Sequence
 try:
     from . import batch_evaluate_krea as batch
     from . import krea_execution_plan
+    from . import krea_execution_surface_policy
     from . import krea_fixture
     from . import krea_provenance
 except ImportError:  # pragma: no cover - direct script execution.
     import batch_evaluate_krea as batch  # type: ignore[no-redef]
     import krea_execution_plan  # type: ignore[no-redef]
+    import krea_execution_surface_policy  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
 
@@ -125,6 +127,17 @@ def load_execution_controls(
     krea_execution_plan.validate_approval(
         approval, plan=plan, approval_path=execution_approval_path
     )
+    if (
+        plan.get("schema") != 3
+        or approval.get("schema") != 4
+        or resolved.get("discovery_profile_index") is None
+        or resolved.get("host_bootstrap_receipt") is None
+        or resolved.get("discovery_execution_authorization") is None
+    ):
+        raise ValueError(
+            "executable training requires a profile-index-bound schema-3 plan "
+            "and authorization/bootstrap-bound schema-4 approval"
+        )
     return plan, plan_file_sha, approval, approval_file_sha, resolved
 
 
@@ -190,10 +203,35 @@ def _validate_completed_condition(
         or condition.get("execution_plan_file_sha256") != plan_file_sha
         or condition.get("execution_approval_sha256") != approval["approval_sha256"]
         or condition.get("execution_approval_file_sha256") != approval_file_sha
+        or condition.get("discovery_profile_index_sha256")
+        != resolved["discovery_profile_index"]["index_sha256"]
+        or condition.get("discovery_profile_index_file_sha256")
+        != resolved["discovery_profile_index"]["file_sha256"]
+        or condition.get("discovery_execution_authorization_sha256")
+        != resolved["discovery_execution_authorization"]["authorization_sha256"]
+        or condition.get("discovery_execution_authorization_file_sha256")
+        != resolved["discovery_execution_authorization"]["file_sha256"]
+        or condition.get("host_bootstrap_receipt_sha256")
+        != resolved["host_bootstrap_receipt"]["receipt_sha256"]
+        or condition.get("host_bootstrap_receipt_file_sha256")
+        != resolved["host_bootstrap_receipt"]["file_sha256"]
         or condition.get("in_task_proxy_selection")
         != {"enabled": False, "reserve_s": 0}
     ):
         raise ValueError("run record is not a completed approved Krea execution")
+    campaign = batch._object(condition.get("campaign_baseline"), "campaign baseline")
+    envelope = batch._object(campaign.get("envelope"), "campaign baseline envelope")
+    krea_execution_surface_policy.validate(envelope.get("execution_surface_policy"))
+    measured = (
+        condition.get("budget", {})
+        .get("throughput_profile", {})
+        .get("execution_envelope", {})
+    )
+    if (
+        measured.get("execution_surface") != "staged_host_venv"
+        or measured.get("execution_scope") != "discovery_only"
+    ):
+        raise ValueError("run record escaped the ratified Stage-1 surface/scope")
     budget = batch._object(condition.get("budget"), "run budget")
     provenance = batch._object(condition.get("provenance"), "run provenance")
     after_split = batch._object(
@@ -472,6 +510,29 @@ def emit_run_evidence(
             "throughput_profile_sha256": resolved["throughput_profile"][
                 "profile_sha256"
             ],
+            "discovery_profile_index_sha256": resolved["discovery_profile_index"][
+                "index_sha256"
+            ],
+            "discovery_profile_index_file_sha256": resolved["discovery_profile_index"][
+                "file_sha256"
+            ],
+            "discovery_execution_authorization_sha256": resolved[
+                "discovery_execution_authorization"
+            ]["authorization_sha256"],
+            "discovery_execution_authorization_file_sha256": resolved[
+                "discovery_execution_authorization"
+            ]["file_sha256"],
+            "host_bootstrap_receipt_sha256": resolved["host_bootstrap_receipt"][
+                "receipt_sha256"
+            ],
+            "host_bootstrap_receipt_file_sha256": resolved["host_bootstrap_receipt"][
+                "file_sha256"
+            ],
+            "execution_surface_policy_sha256": krea_execution_surface_policy.POLICY[
+                "policy_sha256"
+            ],
+            "execution_surface": "staged_host_venv",
+            "execution_scope": "discovery_only",
             "budget_plan_sha256": plan["budget_plan_sha256"],
             "schedule": plan["schedule"],
             "run_record_sha256": condition_sha,
@@ -542,6 +603,20 @@ def emit_run_evidence(
             "kind": "forge-krea-run-evidence-bundle",
             "arm_id": plan["arm_id"],
             "execution_plan_sha256": plan["plan_sha256"],
+            "discovery_profile_index_sha256": resolved["discovery_profile_index"][
+                "index_sha256"
+            ],
+            "discovery_execution_authorization_sha256": resolved[
+                "discovery_execution_authorization"
+            ]["authorization_sha256"],
+            "host_bootstrap_receipt_sha256": resolved["host_bootstrap_receipt"][
+                "receipt_sha256"
+            ],
+            "execution_surface_policy_sha256": krea_execution_surface_policy.POLICY[
+                "policy_sha256"
+            ],
+            "execution_surface": "staged_host_venv",
+            "execution_scope": "discovery_only",
             "run_completion": {
                 "path": str(final_dir / completion_path.name),
                 "sha256": completion_sha,
@@ -800,6 +875,12 @@ def validate_run_evidence(bundle_path: Path) -> dict[str, Any]:
             "kind",
             "arm_id",
             "execution_plan_sha256",
+            "discovery_profile_index_sha256",
+            "discovery_execution_authorization_sha256",
+            "host_bootstrap_receipt_sha256",
+            "execution_surface_policy_sha256",
+            "execution_surface",
+            "execution_scope",
             "run_completion",
             "candidate_bindings",
             "bundle_sha256",
@@ -853,6 +934,16 @@ def validate_run_evidence(bundle_path: Path) -> dict[str, Any]:
         != {"path": str(approval_path), "sha256": approval_file_sha}
         or bundle["arm_id"] != plan["arm_id"]
         or bundle["execution_plan_sha256"] != plan["plan_sha256"]
+        or bundle["discovery_profile_index_sha256"]
+        != resolved["discovery_profile_index"]["index_sha256"]
+        or bundle["discovery_execution_authorization_sha256"]
+        != resolved["discovery_execution_authorization"]["authorization_sha256"]
+        or bundle["host_bootstrap_receipt_sha256"]
+        != resolved["host_bootstrap_receipt"]["receipt_sha256"]
+        or bundle["execution_surface_policy_sha256"]
+        != krea_execution_surface_policy.POLICY["policy_sha256"]
+        or bundle["execution_surface"] != "staged_host_venv"
+        or bundle["execution_scope"] != "discovery_only"
     ):
         raise ValueError("run-evidence bundle is not bound to its approved plan")
 
@@ -882,6 +973,15 @@ def validate_run_evidence(bundle_path: Path) -> dict[str, Any]:
             "execution_envelope_sha256",
             "host_execution_identity_sha256",
             "throughput_profile_sha256",
+            "discovery_profile_index_sha256",
+            "discovery_profile_index_file_sha256",
+            "discovery_execution_authorization_sha256",
+            "discovery_execution_authorization_file_sha256",
+            "host_bootstrap_receipt_sha256",
+            "host_bootstrap_receipt_file_sha256",
+            "execution_surface_policy_sha256",
+            "execution_surface",
+            "execution_scope",
             "budget_plan_sha256",
             "schedule",
             "run_record_sha256",
@@ -917,6 +1017,29 @@ def validate_run_evidence(bundle_path: Path) -> dict[str, Any]:
             "host_execution_identity_sha256"
         ],
         "throughput_profile_sha256": resolved["throughput_profile"]["profile_sha256"],
+        "discovery_profile_index_sha256": resolved["discovery_profile_index"][
+            "index_sha256"
+        ],
+        "discovery_profile_index_file_sha256": resolved["discovery_profile_index"][
+            "file_sha256"
+        ],
+        "discovery_execution_authorization_sha256": resolved[
+            "discovery_execution_authorization"
+        ]["authorization_sha256"],
+        "discovery_execution_authorization_file_sha256": resolved[
+            "discovery_execution_authorization"
+        ]["file_sha256"],
+        "host_bootstrap_receipt_sha256": resolved["host_bootstrap_receipt"][
+            "receipt_sha256"
+        ],
+        "host_bootstrap_receipt_file_sha256": resolved["host_bootstrap_receipt"][
+            "file_sha256"
+        ],
+        "execution_surface_policy_sha256": krea_execution_surface_policy.POLICY[
+            "policy_sha256"
+        ],
+        "execution_surface": "staged_host_venv",
+        "execution_scope": "discovery_only",
         "budget_plan_sha256": plan["budget_plan_sha256"],
         "schedule": plan["schedule"],
         "natural_completion": True,

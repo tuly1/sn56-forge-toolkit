@@ -128,17 +128,77 @@ def _digest(value: Any, label: str) -> str:
     return value
 
 
+def _bootstrap_receipt_binding(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    binding = _object(value, "bootstrap receipt binding")
+    _exact(
+        binding,
+        {
+            "path",
+            "file_sha256",
+            "receipt_sha256",
+            "container_image_sha256",
+        },
+        "bootstrap receipt binding",
+    )
+    path = Path(os.path.abspath(os.path.expanduser(binding["path"])))
+    current = path
+    while current != current.parent:
+        if current.is_symlink():
+            raise ValueError(f"bootstrap receipt has a symlink component: {current}")
+        current = current.parent
+    if not path.is_file():
+        raise ValueError("bootstrap receipt must be a regular file")
+    raw = path.read_bytes()
+    try:
+        receipt = _object(json.loads(raw), "bootstrap receipt")
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("bootstrap receipt is not JSON") from exc
+    canonical = (
+        json.dumps(
+            receipt,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if raw != canonical:
+        raise ValueError("bootstrap receipt must be canonical JSON")
+    try:
+        from . import krea_host_bootstrap
+    except ImportError:  # pragma: no cover - direct script execution.
+        import krea_host_bootstrap  # type: ignore[no-redef]
+
+    krea_host_bootstrap.validate_receipt(receipt, recapture=False)
+    image_sha = receipt["spec"]["runtime"]["container_image_sha256"]
+    if (
+        hashlib.sha256(raw).hexdigest()
+        != _digest(binding["file_sha256"], "bootstrap receipt file SHA-256")
+        or receipt["receipt_sha256"]
+        != _digest(binding["receipt_sha256"], "bootstrap receipt semantic SHA-256")
+        or image_sha
+        != _digest(binding["container_image_sha256"], "bootstrap image SHA-256")
+    ):
+        raise ValueError("bootstrap receipt binding drifted")
+    return binding, receipt
+
+
 def validate_manifest(value: dict[str, Any]) -> dict[str, Any]:
     value = _object(value, "host execution manifest")
+    schema = value.get("schema")
+    manifest_keys = {
+        "schema",
+        "kind",
+        "static",
+        "preflight_policy",
+        "host_execution_identity_sha256",
+    }
+    if schema == 3:
+        manifest_keys.add("bootstrap_receipt")
     _exact(
         value,
-        {
-            "schema",
-            "kind",
-            "static",
-            "preflight_policy",
-            "host_execution_identity_sha256",
-        },
+        manifest_keys,
         "host execution manifest",
     )
     static = _object(value["static"], "host static identity")
@@ -377,13 +437,26 @@ def validate_manifest(value: dict[str, Any]) -> dict[str, Any]:
     if policy["storage_probe_tool_sha256"] != expected_probe_tool:
         raise ValueError("storage probe tool identity differs from this module")
     body = {
-        "schema": value["schema"],
+        "schema": schema,
         "kind": value["kind"],
         "static": static,
         "preflight_policy": policy,
     }
+    if schema == 3:
+        binding, receipt = _bootstrap_receipt_binding(value["bootstrap_receipt"])
+        body["bootstrap_receipt"] = binding
+        receipt_checkpoint = Path(receipt["spec"]["sources"]["checkpoints"])
+        receipt_target = Path("/app/checkpoints")
+        manifest_checkpoint = Path(static["checkpoint_filesystem"]["checkpoint_path"])
+        if not any(
+            manifest_checkpoint == root or manifest_checkpoint.is_relative_to(root)
+            for root in (receipt_checkpoint, receipt_target)
+        ):
+            raise ValueError(
+                "host manifest checkpoint path escaped its bootstrap receipt"
+            )
     if (
-        value["schema"] != 2
+        schema not in {2, 3}
         or value["kind"] != "forge-krea-host-execution-identity"
         or not isinstance(value["host_execution_identity_sha256"], str)
         or not _SHA256.fullmatch(value["host_execution_identity_sha256"])
@@ -391,6 +464,109 @@ def validate_manifest(value: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("host execution identity digest mismatch")
     return value
+
+
+def bootstrap_runtime(manifest: dict[str, Any], *, recapture: bool) -> dict[str, Any]:
+    """Return the schema-3 sealed runtime after optional live recapture."""
+
+    validate_manifest(manifest)
+    if manifest.get("schema") != 3:
+        raise ValueError("executable host manifest lacks a bootstrap receipt")
+    _, receipt = _bootstrap_receipt_binding(manifest["bootstrap_receipt"])
+    if recapture:
+        try:
+            from . import krea_host_bootstrap
+        except ImportError:  # pragma: no cover - direct script execution.
+            import krea_host_bootstrap  # type: ignore[no-redef]
+
+        krea_host_bootstrap.validate_receipt(receipt, recapture=True)
+    return dict(receipt["spec"]["runtime"])
+
+
+def bootstrap_execution_surface(
+    manifest: dict[str, Any], *, recapture: bool
+) -> dict[str, Any]:
+    """Return the receipt-bound host-venv execution surface identity."""
+
+    runtime = bootstrap_runtime(manifest, recapture=recapture)
+    _, receipt = _bootstrap_receipt_binding(manifest["bootstrap_receipt"])
+    layout = _object(receipt["layout_identity"], "bootstrap layout identity")
+    sources = _object(layout.get("sources"), "bootstrap source identity")
+    venv = _object(sources.get("venv_python"), "bootstrap venv identity")
+    _exact(
+        venv,
+        {
+            "relative_path",
+            "is_symlink",
+            "resolved_relative_path",
+            "resolved_sha256",
+        },
+        "bootstrap venv identity",
+    )
+    venv_tree = _object(sources.get("venv_tree"), "bootstrap venv tree identity")
+    _exact(
+        venv_tree,
+        {"entry_count", "manifest_sha256"},
+        "bootstrap venv tree identity",
+    )
+    _positive_int(venv_tree["entry_count"], "venv tree entry_count")
+    _digest(venv_tree["manifest_sha256"], "venv tree manifest SHA-256")
+    stage1_runtime = _object(
+        sources.get("stage1_runtime"), "bootstrap Stage-1 runtime identity"
+    )
+    _exact(
+        stage1_runtime,
+        {
+            "path",
+            "file_sha256",
+            "receipt_sha256",
+            "venv_tree_entries_sha256",
+            "verification",
+        },
+        "bootstrap Stage-1 runtime identity",
+    )
+    for key in (
+        "file_sha256",
+        "receipt_sha256",
+        "venv_tree_entries_sha256",
+    ):
+        _digest(stage1_runtime[key], f"Stage-1 runtime {key}")
+    bindings = _object(layout.get("bindings"), "bootstrap binding identity")
+    runtime_cache = _object(
+        bindings.get("runtime_cache"), "bootstrap runtime cache identity"
+    )
+    _exact(
+        runtime_cache,
+        {"path", "device_id", "mode", "uid", "policy"},
+        "bootstrap runtime cache identity",
+    )
+    if (
+        runtime_cache["path"] != "/cache/krea-runtime"
+        or runtime_cache["mode"] != 0o700
+        or runtime_cache["uid"] != 0
+        or not isinstance(runtime_cache["device_id"], int)
+        or runtime_cache["device_id"] < 0
+    ):
+        raise ValueError("bootstrap runtime cache identity is unsafe")
+    cache_policy = _object(runtime_cache["policy"], "bootstrap runtime cache policy")
+    expected_cache_policy = {
+        "root": "/cache/krea-runtime",
+        "namespace_derivation": (
+            "timing_plan_file_sha256_plus_capture_id_or_execution_plan_file_sha256"
+        ),
+        "initial_state": "root-empty-before-bootstrap",
+        "cross_capture_or_plan_reuse": False,
+        "within_process_reuse": True,
+    }
+    if cache_policy != expected_cache_policy:
+        raise ValueError("bootstrap runtime cache policy drifted")
+    return {
+        "runtime": runtime,
+        "venv_python": dict(venv),
+        "venv_tree": dict(venv_tree),
+        "stage1_runtime": dict(stage1_runtime),
+        "runtime_cache": dict(runtime_cache),
+    }
 
 
 def _run(command: list[str]) -> str:
@@ -894,9 +1070,17 @@ def observe(
 
 
 def build_manifest(
-    *, checkpoint_path: Path, preflight_policy: dict[str, Any]
+    *,
+    checkpoint_path: Path,
+    preflight_policy: dict[str, Any],
+    bootstrap_receipt_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Capture and seal a schema-2 static host identity before timing work."""
+    """Capture and seal a static host identity before timing work.
+
+    Schema 3 is the executable Week-5 form and binds the recaptured host layout,
+    local container image ID, and staged source identity from the bootstrap
+    receipt.  Schema 2 remains validation-only compatibility evidence.
+    """
 
     policy = dict(_object(preflight_policy, "host preflight policy"))
     supplied_tool = policy.get("storage_probe_tool_sha256")
@@ -905,12 +1089,40 @@ def build_manifest(
     elif supplied_tool != _module_sha256():
         raise ValueError("storage probe tool identity differs from this module")
     observed = observe(checkpoint_path)
-    body = {
-        "schema": 2,
+    body: dict[str, Any] = {
+        "schema": 3 if bootstrap_receipt_path is not None else 2,
         "kind": "forge-krea-host-execution-identity",
         "static": observed["static"],
         "preflight_policy": policy,
     }
+    if bootstrap_receipt_path is not None:
+        receipt_path = Path(os.path.abspath(os.path.expanduser(bootstrap_receipt_path)))
+        raw = receipt_path.read_bytes()
+        receipt = _object(json.loads(raw), "bootstrap receipt")
+        try:
+            from . import krea_host_bootstrap
+        except ImportError:  # pragma: no cover - direct script execution.
+            import krea_host_bootstrap  # type: ignore[no-redef]
+
+        krea_host_bootstrap.validate_receipt(receipt, recapture=True)
+        receipt_checkpoint = Path(receipt["spec"]["sources"]["checkpoints"])
+        mounted_checkpoint = Path("/app/checkpoints")
+        checkpoint_real = Path(checkpoint_path).resolve(strict=True)
+        if not any(
+            candidate.exists() and os.path.samefile(checkpoint_real, candidate)
+            for candidate in (receipt_checkpoint, mounted_checkpoint)
+        ):
+            raise ValueError(
+                "checkpoint path is not the bootstrap-bound checkpoint filesystem"
+            )
+        body["bootstrap_receipt"] = {
+            "path": str(receipt_path),
+            "file_sha256": hashlib.sha256(raw).hexdigest(),
+            "receipt_sha256": receipt["receipt_sha256"],
+            "container_image_sha256": receipt["spec"]["runtime"][
+                "container_image_sha256"
+            ],
+        }
     manifest = {
         **body,
         "host_execution_identity_sha256": canonical_sha256(body),
@@ -1059,6 +1271,8 @@ def _validate_live_observation(
 
 def verify_live(manifest: dict[str, Any], *, checkpoint_path: Path) -> dict[str, Any]:
     manifest = validate_manifest(manifest)
+    if manifest.get("schema") == 3:
+        bootstrap_runtime(manifest, recapture=True)
     observed = observe(
         checkpoint_path,
         storage_probe_bytes=manifest["preflight_policy"]["storage_probe_bytes"],
@@ -1098,6 +1312,8 @@ def verify_static(manifest: dict[str, Any], *, checkpoint_path: Path) -> dict[st
     """Recheck identity without imposing idle-host thresholds after a run."""
 
     manifest = validate_manifest(manifest)
+    if manifest.get("schema") == 3:
+        bootstrap_runtime(manifest, recapture=True)
     observed = observe(checkpoint_path)
     _validate_live_observation(observed, manifest=manifest, require_probe=False)
     return observed

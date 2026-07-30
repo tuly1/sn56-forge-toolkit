@@ -224,7 +224,7 @@ def validate_amendment(value: Any) -> dict[str, Any]:
 
 def _expected_commitment() -> dict[str, Any]:
     return {
-        "state": "published_external_unaccepted_by_named_human",
+        "state": "published_external_agent_custody_pending_owner_ratification",
         "public_record": PUBLIC_RECORD,
         "public_record_sha256": PUBLIC_RECORD_SHA256,
         "commitment_sha256": COMMITMENT_SHA256,

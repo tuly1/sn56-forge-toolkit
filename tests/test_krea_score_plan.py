@@ -5,7 +5,9 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
+import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,17 +18,699 @@ sys.path.insert(0, str(_CALIBRATION))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import batch_evaluate_krea as batch  # noqa: E402
+import evaluate_krea_local  # noqa: E402
 import krea_decision  # noqa: E402
+import krea_fixture_admission  # noqa: E402
 import krea_provenance  # noqa: E402
 import krea_score_plan as score_plan  # noqa: E402
 import test_krea_training_evidence_cli as stage3_test  # noqa: E402
 from test_krea_v2_batch_contract import ProducerHarness  # noqa: E402
 
 
+def test_exact_scorer_environments_do_not_inherit_operator_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in (
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "CUDA_HOME",
+        "LD_LIBRARY_PATH",
+        "HTTPS_PROXY",
+        "OMP_NUM_THREADS",
+        "NCCL_DEBUG",
+        "CUBLAS_WORKSPACE_CONFIG",
+    ):
+        monkeypatch.setenv(name, "operator-value")
+    outer_root = tmp_path / "outer"
+    outer_root.mkdir()
+    outer = batch._minimal_evaluator_environment(
+        driver_python=sys.executable, isolated_root=outer_root
+    )
+    inner_root = tmp_path / "inner"
+    inner_root.mkdir()
+    inner = evaluate_krea_local._comfy_child_environment(
+        comfy_python=Path(sys.executable), isolation_root=inner_root
+    )
+    for environment in (outer, inner):
+        for name in (
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "CUDA_HOME",
+            "LD_LIBRARY_PATH",
+            "HTTPS_PROXY",
+            "OMP_NUM_THREADS",
+            "NCCL_DEBUG",
+            "CUBLAS_WORKSPACE_CONFIG",
+        ):
+            assert name not in environment
+        assert environment["HF_HUB_OFFLINE"] == "1"
+        assert environment["HF_HOME"].startswith(str(tmp_path))
+
+    inspection = evaluate_krea_local._inspection_environment()
+    for name in (
+        "PYTHONPATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "GIT_CONFIG_GLOBAL",
+    ):
+        if name == "GIT_CONFIG_GLOBAL":
+            assert inspection[name] == "/dev/null"
+        else:
+            assert name not in inspection
+    assert inspection["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert inspection["GIT_CONFIG_VALUE_0"] == "false"
+
+
 def _canonical_file(path: Path, value: dict) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(krea_provenance.canonical_bytes(value) + b"\n")
     return krea_provenance.file_sha256(path)
+
+
+def _agent_admission_result(envelope: dict, fixture: dict) -> dict:
+    manifests = {
+        role: (
+            fixture["manifest_sha256"]
+            if role == fixture["experimental_role"]
+            else role.lower() * 32
+        )
+        for role in ("D1", "D2", "C1", "C2", "C3", "C4")
+    }
+    return {
+        "envelope": envelope,
+        "fixtures": {fixture["experimental_role"]: fixture},
+        "blinded_acceptance": {
+            "fixture_manifest_sha256s": manifests,
+            "assertions": {
+                "all_six_cross_fixture_review_preexists_discovery_execution": True,
+                "agent_review_is_not_human_review": True,
+            },
+            "decision": "accepted_for_d1_d2_discovery_admission",
+            "c1c4_revealed": False,
+        },
+    }
+
+
+def test_agent_admission_envelope_is_the_score_plan_cross_fixture_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = {
+        "experimental_role": "D1",
+        "manifest_sha256": "d" * 64,
+    }
+    envelope = {
+        "schema": 1,
+        "kind": "forge-krea-fixture-admission-envelope",
+        "envelope_sha256": "e" * 64,
+    }
+    envelope_path = tmp_path / "admission-envelope.json"
+    _canonical_file(envelope_path, envelope)
+    resolved = _agent_admission_result(envelope, fixture)
+    monkeypatch.setattr(
+        krea_fixture_admission, "validate_envelope", lambda _path: resolved
+    )
+    assert (
+        batch._validate_cross_fixture_review_surface(
+            envelope, fixture=fixture, source_path=envelope_path
+        )
+        == envelope
+    )
+    resolved["blinded_acceptance"]["assertions"][
+        "agent_review_is_not_human_review"
+    ] = False
+    with pytest.raises(ValueError, match="does not bind this discovery fixture"):
+        batch._validate_cross_fixture_review_surface(
+            envelope, fixture=fixture, source_path=envelope_path
+        )
+
+
+def test_d1_score_plan_builder_binds_agent_admission_not_fictional_human_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_cross_validator = batch._validate_cross_fixture_review_surface
+    harness = BuilderHarness(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        batch, "_validate_cross_fixture_review_surface", real_cross_validator
+    )
+    envelope = {
+        "schema": 1,
+        "kind": "forge-krea-fixture-admission-envelope",
+        "envelope_sha256": "e" * 64,
+    }
+    harness.base.fixture["experimental_role"] = "D1"
+    harness.base.fixture_path.write_bytes(
+        krea_provenance.canonical_bytes(harness.base.fixture) + b"\n"
+    )
+    harness.base.cross_review_path.write_bytes(
+        krea_provenance.canonical_bytes(envelope) + b"\n"
+    )
+    resolved = _agent_admission_result(envelope, harness.base.fixture)
+    monkeypatch.setattr(
+        krea_fixture_admission, "validate_envelope", lambda _path: resolved
+    )
+    _campaign, draft = score_plan.build_documents(**harness.kwargs())
+    assert draft["cross_fixture_review"] == {
+        "path": str(harness.base.cross_review_path),
+        "sha256": krea_provenance.file_sha256(harness.base.cross_review_path),
+    }
+
+
+def _schema3_approval_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    binding_path = tmp_path / "candidate-binding.json"
+    binding_document = {"mode": "local_run_candidate"}
+    binding_sha = _canonical_file(binding_path, binding_document)
+    evaluator = {
+        "expected_god_commit": "a" * 40,
+        "expected_comfy_commit": "b" * 40,
+        "expected_tooling_commit": "c" * 40,
+        "expected_evaluator_script_sha256": "1" * 64,
+        "expected_dataset_identity_module_sha256": "2" * 64,
+        "expected_eval_defaults": {"steps": 25},
+        "expected_runtime_identity": {
+            "comfy_python_identity_sha256": "3" * 64,
+            "driver_python_identity_sha256": "4" * 64,
+        },
+        "expected_assets": {"asset": {"sha256": "5" * 64}},
+        "cache_provenance_sha256": "6" * 64,
+        "containment": {"term_grace_s": 20.0},
+        "startup_timeout_s": 300.0,
+        "evaluation_timeout_s": 3600.0,
+        "shutdown_timeout_s": 20.0,
+    }
+    plan = {
+        "schema": 2,
+        "kind": "forge-krea-exact-score-plan",
+        "fixture_manifest": {"sha256": "7" * 64},
+        "fixture_approval": {"sha256": "8" * 64},
+        "campaign_manifest": {"sha256": "9" * 64},
+        "decision_context": {"phase": "discovery"},
+        "evaluator": evaluator,
+        "candidates": [
+            {
+                "id": "K1-step-50",
+                "candidate_binding": {
+                    "path": str(binding_path),
+                    "sha256": binding_sha,
+                },
+            }
+        ],
+    }
+    actor = batch.krea_delegated_review_contract.actor("exact_score_plan_reviewer")
+    authorization = {
+        "authorization_sha256": "d" * 64,
+        "accountable_owner_identity": "Atulya Shetty",
+        "fixture_admission_envelope": {"owner_ratification_sha256": "e" * 64},
+        "authorized_actions": ["offline_exact_scoring"],
+    }
+    authorization_binding = {
+        "path": str(tmp_path / "authorization.json"),
+        "file_sha256": "f" * 64,
+        "authorization_sha256": authorization["authorization_sha256"],
+    }
+    readiness = {
+        "schema": 1,
+        "kind": "forge-krea-stage1-exact-scorer-readiness",
+        "ready": True,
+        "readiness_sha256": "0" * 64,
+    }
+    monkeypatch.setattr(batch, "_validate_evaluator", lambda value: dict(value))
+    monkeypatch.setattr(batch, "_validate_stage1_exact_scorer", lambda value: value)
+    monkeypatch.setattr(
+        batch, "_stage1_exact_scorer_readiness", lambda value: readiness
+    )
+    monkeypatch.setattr(
+        batch.krea_discovery_authorization,
+        "load_binding",
+        lambda value: (
+            Path(authorization_binding["path"]),
+            authorization,
+            authorization_binding["file_sha256"],
+        ),
+    )
+    return plan, evaluator, actor, authorization, authorization_binding, readiness
+
+
+def test_schema3_agent_score_approval_builds_and_revalidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, evaluator, actor, authorization, binding, readiness = _schema3_approval_case(
+        tmp_path, monkeypatch
+    )
+    approval = batch.build_agent_sealed_plan_approval(
+        plan,
+        technical_reviewer_actor=actor,
+        discovery_execution_authorization=binding,
+    )
+    assert approval["schema"] == 3
+    assert approval["technical_reviewer_actor"] == actor
+    assert approval["accountable_owner_identity"] == "Atulya Shetty"
+    assert approval["scorer_readiness"] == readiness
+    candidate = {
+        "id": "K1-step-50",
+        "candidate_binding": {
+            "mode": "local_run_candidate",
+            "binding_manifest_sha256": plan["candidates"][0]["candidate_binding"][
+                "sha256"
+            ],
+        },
+    }
+    result = batch._validate_v2_approval(
+        approval,
+        krea_provenance.canonical_bytes(approval) + b"\n",
+        plan=plan,
+        candidates=[candidate],
+        evaluator=evaluator,
+        common_authorization_sha256=authorization["authorization_sha256"],
+    )
+    assert result == {
+        "technical_reviewer_actor": actor,
+        "accountable_owner_identity": "Atulya Shetty",
+        "decision": "approved",
+        "agent_review_is_not_human_review": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("candidate", "runtime", "assets", "timeout", "readiness", "owner", "contract"),
+)
+def test_schema3_agent_score_approval_rejects_tampered_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    plan, evaluator, actor, authorization, binding, readiness = _schema3_approval_case(
+        tmp_path, monkeypatch
+    )
+    approval = batch.build_agent_sealed_plan_approval(
+        plan,
+        technical_reviewer_actor=actor,
+        discovery_execution_authorization=binding,
+    )
+    candidate = {
+        "id": "K1-step-50",
+        "candidate_binding": {
+            "mode": "local_run_candidate",
+            "binding_manifest_sha256": plan["candidates"][0]["candidate_binding"][
+                "sha256"
+            ],
+        },
+    }
+    if mutation == "candidate":
+        candidate["id"] = "K1-step-evil"
+    elif mutation == "runtime":
+        evaluator["expected_runtime_identity"] = {
+            "comfy_python_identity_sha256": "a" * 64,
+            "driver_python_identity_sha256": "b" * 64,
+        }
+    elif mutation == "assets":
+        evaluator["expected_assets"] = {"asset": {"sha256": "a" * 64}}
+    elif mutation == "timeout":
+        evaluator["startup_timeout_s"] = 301.0
+    elif mutation == "readiness":
+        approval["scorer_readiness"] = {**readiness, "ready": False}
+    elif mutation == "owner":
+        approval["accountable_owner_identity"] = "Another Owner"
+    else:
+        approval["delegated_review_contract"] = {
+            **approval["delegated_review_contract"],
+            "contract_sha256": "a" * 64,
+        }
+    with pytest.raises(ValueError):
+        batch._validate_v2_approval(
+            approval,
+            krea_provenance.canonical_bytes(approval) + b"\n",
+            plan=plan,
+            candidates=[candidate],
+            evaluator=evaluator,
+            common_authorization_sha256=authorization["authorization_sha256"],
+        )
+
+
+def test_schema3_score_approval_rejects_legacy_wrong_actor_action_and_missing_deps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, evaluator, actor, authorization, binding, _readiness = _schema3_approval_case(
+        tmp_path, monkeypatch
+    )
+    candidate = {
+        "id": "K1-step-50",
+        "candidate_binding": {
+            "mode": "local_run_candidate",
+            "binding_manifest_sha256": plan["candidates"][0]["candidate_binding"][
+                "sha256"
+            ],
+        },
+    }
+    legacy = batch.build_sealed_plan_approval(plan, reviewer_identity="Legacy Human")
+    with pytest.raises(ValueError, match="requires the delegated schema-3 approval"):
+        batch._validate_v2_approval(
+            legacy,
+            krea_provenance.canonical_bytes(legacy) + b"\n",
+            plan=plan,
+            candidates=[candidate],
+            evaluator=evaluator,
+            common_authorization_sha256=authorization["authorization_sha256"],
+        )
+
+    bad_actor = {**actor, "actor_id": "not-owner-ratified"}
+    with pytest.raises(ValueError, match="owner-ratified delegated actor"):
+        batch.build_agent_sealed_plan_approval(
+            plan,
+            technical_reviewer_actor=bad_actor,
+            discovery_execution_authorization=binding,
+        )
+    authorization["authorized_actions"] = []
+    with pytest.raises(ValueError, match="does not permit exact scoring"):
+        batch.build_agent_sealed_plan_approval(
+            plan,
+            technical_reviewer_actor=actor,
+            discovery_execution_authorization=binding,
+        )
+
+    draft_path = tmp_path / "draft.json"
+    _canonical_file(draft_path, plan)
+    monkeypatch.setattr(score_plan, "validate_draft", lambda value: value)
+    monkeypatch.setattr(
+        score_plan.batch,
+        "build_agent_sealed_plan_approval",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("exact scorer dependency lock is missing")
+        ),
+    )
+    authorization_path = tmp_path / "authorization.json"
+    _canonical_file(authorization_path, {"authorization_sha256": "d" * 64})
+    approval_output = tmp_path / "approval.json"
+    plan_output = tmp_path / "plan.json"
+    with pytest.raises(ValueError, match="dependency lock is missing"):
+        score_plan.approve_draft(
+            draft_path=draft_path,
+            reviewer_identity=None,
+            approval_output=approval_output,
+            plan_output=plan_output,
+            technical_reviewer_actor=actor,
+            discovery_authorization_path=authorization_path,
+        )
+    assert not approval_output.exists()
+    assert not plan_output.exists()
+
+
+def _readiness_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    contract = batch.krea_execution_surface_policy.POLICY[
+        "stage1_exact_scorer_contract"
+    ]
+    comfy = tmp_path / "ComfyUI"
+    god = tmp_path / "G.O.D"
+    tooling = comfy / "custom_nodes" / "comfyui-tooling-nodes"
+    for path in (comfy, god, tooling, comfy / "models" / "loras"):
+        path.mkdir(parents=True, exist_ok=True)
+    requirements = {
+        "comfyui": comfy / "requirements.txt",
+        "tooling_nodes": tooling / "requirements.txt",
+        "god_validator": god / "ops/docker/requirements/validator.txt",
+    }
+    for path in requirements.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("bound requirement\n", encoding="utf-8")
+    expected_assets = {}
+    for name, row in contract["assets"].items():
+        path = comfy / row["relative_path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(name.encode("utf-8"))
+        expected_assets[name] = {
+            "canonical_path": str(path),
+            "sha256": row["sha256"],
+            "bytes": path.stat().st_size,
+        }
+    python_path = Path(sys.executable).resolve()
+    python_environment = {
+        "executable": str(python_path),
+        "prefix": str(python_path.parent.parent),
+        "base_prefix": str(python_path.parent.parent),
+        "python": contract["runtime_materialization"]["python_version"],
+        "distribution_count": contract["runtime_materialization"]["distribution_count"],
+        "distributions_sha256": contract["runtime_materialization"][
+            "distributions_sha256"
+        ],
+        "normalized_distributions_sha256": contract["runtime_materialization"][
+            "exact_lock"
+        ]["normalized_name_version_sha256"],
+        "requested_executable": str(python_path),
+        "venv_root": str(python_path.parent.parent),
+        "environment_kind": "venv",
+        "identity_marker": str(tmp_path / "pyvenv.cfg"),
+        "identity_marker_sha256": "1" * 64,
+    }
+    driver_environment = {
+        key: python_environment[key]
+        for key in (
+            "executable",
+            "prefix",
+            "base_prefix",
+            "python",
+            "distribution_count",
+            "distributions_sha256",
+            "normalized_distributions_sha256",
+        )
+    }
+    evaluator = {
+        "comfy_root": str(comfy),
+        "comfy_python": str(python_path),
+        "driver_python": str(python_path),
+        "god_root": str(god),
+        "expected_god_commit": contract["god_commit"],
+        "expected_comfy_commit": contract["comfy_commit"],
+        "expected_tooling_commit": contract["tooling_commit"],
+        "expected_evaluator_script_sha256": contract["evaluator_script_sha256"],
+        "expected_dataset_identity_module_sha256": contract[
+            "dataset_identity_module_sha256"
+        ],
+        "expected_eval_defaults": contract["eval_defaults"],
+        "expected_runtime_identity": {
+            "comfy_python_identity_sha256": krea_provenance.canonical_sha256(
+                python_environment
+            ),
+            "driver_python_identity_sha256": krea_provenance.canonical_sha256(
+                driver_environment
+            ),
+        },
+        "expected_assets": expected_assets,
+        "containment": {
+            "term_grace_s": contract["timeouts_s"]["containment_term_grace"]
+        },
+        "startup_timeout_s": contract["timeouts_s"]["startup"],
+        "evaluation_timeout_s": contract["timeouts_s"]["evaluation"],
+        "shutdown_timeout_s": contract["timeouts_s"]["shutdown"],
+    }
+    snapshots = {
+        "god": {
+            "commit": contract["god_commit"],
+            "tree": contract["source_trees"]["god"],
+        },
+        "comfyui": {
+            "commit": contract["comfy_commit"],
+            "tree": contract["source_trees"]["comfyui"],
+        },
+        "tooling_nodes": {
+            "commit": contract["tooling_commit"],
+            "tree": contract["source_trees"]["tooling_nodes"],
+        },
+    }
+
+    def git_snapshot(path, *, expected_commit):
+        if path == god:
+            return dict(snapshots["god"])
+        if path == comfy:
+            return dict(snapshots["comfyui"])
+        return dict(snapshots["tooling_nodes"])
+
+    live_hashes = {
+        **{
+            str(path): contract["runtime_materialization"]["requirements_sha256"][name]
+            for name, path in requirements.items()
+        },
+        **{row["canonical_path"]: row["sha256"] for row in expected_assets.values()},
+    }
+    real_sha256 = batch._sha256
+
+    def fake_sha256(path):
+        return live_hashes.get(str(path), real_sha256(path))
+
+    monkeypatch.setattr(batch, "_validate_stage1_exact_scorer", lambda value: value)
+    monkeypatch.setattr(evaluate_krea_local, "_git_snapshot", git_snapshot)
+    monkeypatch.setattr(
+        evaluate_krea_local, "_python_environment", lambda _path: python_environment
+    )
+    monkeypatch.setattr(batch, "_sha256", fake_sha256)
+    monkeypatch.setattr(
+        batch.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: json.dumps(
+            contract["runtime_materialization"]["critical_distributions"]
+        ),
+    )
+    return evaluator, contract, snapshots, live_hashes, python_environment
+
+
+def test_stage1_exact_scorer_readiness_recomputes_complete_bound_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluator, contract, _snapshots, _hashes, _python = _readiness_case(
+        tmp_path, monkeypatch
+    )
+    result = batch._stage1_exact_scorer_readiness(evaluator)
+    assert result["ready"] is True
+    assert (
+        result["dependency_lock_sha256"]
+        == contract["runtime_materialization"]["exact_lock"]["sha256"]
+    )
+    assert result["source_snapshots"]["god"]["tree"] == contract["source_trees"]["god"]
+
+
+@pytest.mark.parametrize(
+    "drift", ("source", "requirements", "asset", "runtime", "torch")
+)
+def test_stage1_exact_scorer_readiness_fails_closed_on_dependency_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    evaluator, contract, snapshots, live_hashes, python_environment = _readiness_case(
+        tmp_path, monkeypatch
+    )
+    if drift == "source":
+        snapshots["god"]["tree"] = "f" * 40
+    elif drift == "requirements":
+        requirement = Path(evaluator["comfy_root"]) / "requirements.txt"
+        live_hashes[str(requirement)] = "f" * 64
+    elif drift == "asset":
+        asset = next(iter(evaluator["expected_assets"].values()))
+        live_hashes[asset["canonical_path"]] = "f" * 64
+    elif drift == "runtime":
+        python_environment["normalized_distributions_sha256"] = "f" * 64
+    else:
+        monkeypatch.setattr(
+            batch.subprocess,
+            "check_output",
+            lambda *_args, **_kwargs: json.dumps(
+                {
+                    **contract["runtime_materialization"]["critical_distributions"],
+                    "torch": "0",
+                }
+            ),
+        )
+    with pytest.raises(ValueError):
+        batch._stage1_exact_scorer_readiness(evaluator)
+
+
+def test_stage1_policy_binds_live_evaluator_and_exact_krea_lock() -> None:
+    contract = batch.krea_execution_surface_policy.POLICY[
+        "stage1_exact_scorer_contract"
+    ]
+    assert contract["evaluator_script_sha256"] == krea_provenance.file_sha256(
+        _CALIBRATION / "evaluate_krea_local.py"
+    )
+    lock = (
+        _CALIBRATION
+        / contract["runtime_materialization"]["exact_lock"]["relative_path"]
+    )
+    assert (
+        krea_provenance.file_sha256(lock)
+        == contract["runtime_materialization"]["exact_lock"]["sha256"]
+    )
+    assert len(lock.read_text(encoding="utf-8").splitlines()) == 229
+
+
+def test_stage1_evaluator_config_builder_emits_complete_live_containment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = batch.krea_execution_surface_policy.POLICY[
+        "stage1_exact_scorer_contract"
+    ]
+    comfy = tmp_path / "ComfyUI"
+    god = tmp_path / "G.O.D"
+    comfy.mkdir()
+    god.mkdir()
+    systemd_run = tmp_path / "systemd-run"
+    systemctl = tmp_path / "systemctl"
+    for binary in (systemd_run, systemctl):
+        binary.write_bytes(b"test systemd binary\n")
+        binary.chmod(0o700)
+    python_path = Path(sys.executable).resolve()
+    python_environment = {
+        "executable": str(python_path),
+        "prefix": str(python_path.parent.parent),
+        "base_prefix": str(python_path.parent.parent),
+        "python": contract["runtime_materialization"]["python_version"],
+        "distribution_count": contract["runtime_materialization"]["distribution_count"],
+        "distributions_sha256": contract["runtime_materialization"][
+            "distributions_sha256"
+        ],
+        "normalized_distributions_sha256": contract["runtime_materialization"][
+            "exact_lock"
+        ]["normalized_name_version_sha256"],
+        "requested_executable": str(python_path),
+        "venv_root": str(python_path.parent.parent),
+        "environment_kind": "venv",
+        "identity_marker": str(tmp_path / "pyvenv.cfg"),
+        "identity_marker_sha256": "a" * 64,
+    }
+    monkeypatch.setattr(
+        evaluate_krea_local, "_python_environment", lambda _path: python_environment
+    )
+    result = score_plan.build_stage1_evaluator_config(
+        comfy_root=comfy,
+        god_root=god,
+        python_path=python_path,
+        cache_provenance_sha256="b" * 64,
+        systemd_run_path=systemd_run,
+        systemctl_path=systemctl,
+    )
+    assert result["base_name"] == "krea2_raw_fp8_scaled.safetensors"
+    assert result["containment"]["unit_type"] == "transient_service"
+    assert result["containment"]["network_policy"] == {
+        "private_network": True,
+        "restrict_address_families": ["AF_UNIX", "AF_INET", "AF_INET6"],
+        "loopback_allowed": True,
+        "outbound_network_blocked": True,
+    }
+    assert result["containment"]["systemd_run_sha256"] == (
+        krea_provenance.file_sha256(systemd_run)
+    )
+
+
+def test_stage1_asset_stager_is_pinned_create_only_and_token_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    comfy = tmp_path / "ComfyUI"
+    comfy.mkdir()
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    policy = deepcopy(score_plan.krea_execution_surface_policy.POLICY)
+    observed = []
+    for name, filename in score_plan._KREA_ASSET_SOURCE_PATHS.items():
+        content = f"asset:{name}".encode()
+        source = sources / Path(filename).name
+        source.write_bytes(content)
+        row = policy["stage1_exact_scorer_contract"]["assets"][name]
+        row["sha256"] = score_plan.hashlib.sha256(content).hexdigest()
+        row["bytes"] = len(content)
+
+    def download(*, repo_id, filename, revision, token):
+        observed.append((repo_id, filename, revision, token))
+        return str(sources / Path(filename).name)
+
+    monkeypatch.setattr(score_plan.krea_execution_surface_policy, "POLICY", policy)
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", SimpleNamespace(hf_hub_download=download)
+    )
+    receipt_path = tmp_path / "asset-receipt.json"
+    receipt = score_plan.stage_stage1_evaluator_assets(
+        comfy_root=comfy, token="secret-token", receipt_output=receipt_path
+    )
+    assert len(observed) == 3
+    assert all(row[0] == "Comfy-Org/Krea-2" for row in observed)
+    assert all(row[2] == score_plan._KREA_ASSET_REVISION for row in observed)
+    assert b"secret-token" not in receipt_path.read_bytes()
+    assert receipt["credential_recorded"] is False
+    with pytest.raises(FileExistsError):
+        score_plan.stage_stage1_evaluator_assets(
+            comfy_root=comfy, token="secret-token", receipt_output=receipt_path
+        )
 
 
 class BuilderHarness:
@@ -153,6 +837,14 @@ class BuilderHarness:
             "kind": "forge-krea-run-evidence-bundle",
             "arm_id": base.arm,
             "execution_plan_sha256": base.execution_sha,
+            "discovery_profile_index_sha256": "1" * 64,
+            "discovery_execution_authorization_sha256": "2" * 64,
+            "host_bootstrap_receipt_sha256": "3" * 64,
+            "execution_surface_policy_sha256": (
+                score_plan.krea_execution_surface_policy.POLICY["policy_sha256"]
+            ),
+            "execution_surface": "staged_host_venv",
+            "execution_scope": "discovery_only",
             "run_completion": {"path": str(completion), "sha256": completion_sha},
             "candidate_bindings": [
                 {

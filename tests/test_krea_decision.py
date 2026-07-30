@@ -55,7 +55,8 @@ CONFIRMATION_CONTRACT = {
     "minimum_point_estimate_wins_or_ties": 3,
     "point_win_or_tie_cap": 0.01,
     "strongest_public_reference_rule": (
-        "minimum loss among exhaustive K2-K4 faithful replicas for the same "
+        "minimum loss among exhaustive approved K2-K4 local public-family "
+        "reproductions for the same "
         "concept and seed"
     ),
     "boundary_gate": "mechanics_only_natural_completion_upload_ready_clean",
@@ -77,33 +78,82 @@ def _binding(path: Path, digest: str) -> dict:
     return {"path": str(path), "sha256": digest}
 
 
+def _agent_actor(name: str) -> dict:
+    return krea_decision.krea_delegated_review_contract.actor(name)
+
+
+def _custodian_actor() -> dict:
+    return {
+        "actor_class": "agent",
+        "actor_id": "codex-week5-sealed-confirmation-custodian",
+        "display_name": "Codex Week-5 sealed confirmation custodian (agent)",
+        "role": "sealed_confirmation_custodian",
+        "review_instance_id": "week5-krea-sealed-confirmation-custody-20260727-v2",
+        "identity_assurance": (
+            "self-declared-agent-identity-not-human-or-cryptographic-authentication"
+        ),
+    }
+
+
 class Harness:
     def __init__(self, root: Path):
         self.root = root
         source = Path("ops/calibration/week5/krea-discovery-plan.json")
         self.plan = json.loads(source.read_text())
-        self.plan["status"] = "sealed_executable"
-        self.plan["gpu_execution_authorized"] = True
-        self.plan["gpu_blockers"] = []
-        for fixture in ("D1", "D2"):
-            self.plan["discovery_tasks"][fixture]["identity"] = {
-                "concept_id": f"concept-{fixture}"
-            }
-            self.plan["discovery_tasks"][fixture]["fixture_split_manifest_sha256"] = (
-                _sha(f"fixture-internal-{fixture}")
-            )
-        for name in self.plan["budget_contract"][
-            "throughput_profiles_by_equivalence_class"
-        ]:
-            self.plan["budget_contract"]["throughput_profiles_by_equivalence_class"][
-                name
-            ] = _sha(f"profile-{name}")
+        self.plan["status"] = "draft_blocked_pre_gpu"
+        self.plan["gpu_execution_authorized"] = False
         identities = {
             fixture: _sha(f"fixture-internal-{fixture}")
             for fixture in ("C1", "C2", "C3", "C4")
         }
         self.plan["confirmation_contract"]["identities"] = identities
         self.plan_path, self.plan_sha = _write(root / "plan.json", self.plan)
+        authorization_payload = {
+            "schema": 2,
+            "kind": "forge-krea-discovery-execution-authorization",
+            "discovery_plan": {
+                "path": str(self.plan_path),
+                "file_sha256": self.plan_sha,
+                "discovery_sha256": krea_provenance.canonical_sha256(self.plan),
+            },
+            "fixture_admission_envelope": {
+                "path": str(root / "synthetic-admission.json"),
+                "file_sha256": _sha("fixture-admission-file"),
+                "envelope_sha256": _sha("fixture-admission"),
+                "owner_ratification_sha256": _sha("owner-ratification"),
+            },
+            "execution_surface_policy_sha256": _sha("surface-policy"),
+            "frozen_status": "draft_blocked_pre_gpu",
+            "frozen_gpu_blockers": list(self.plan["gpu_blockers"]),
+            "authorized_actions": [
+                "bootstrap_timing_probe",
+                "profile_indexed_discovery_execution",
+            ],
+            "authorized_scope": "stage1_discovery_only",
+            "status": "sealed_executable",
+            "gpu_blockers_closed_for_authorized_scope": True,
+            "gpu_execution_authorized": False,
+            "technical_reviewer_actor": {
+                "actor_class": "agent",
+                "actor_id": "codex-krea-runtime-reviewer",
+                "display_name": "Codex Krea runtime reviewer",
+                "role": "discovery_execution_authorization_reviewer",
+                "review_instance_id": "decision-harness-authorization-review",
+                "identity_assurance": (
+                    "self-declared-agent-identity-not-human-or-cryptographic-"
+                    "authentication"
+                ),
+            },
+            "accountable_owner_identity": "Jordan Example",
+            "authorized_at_utc": "2026-07-28T00:00:00Z",
+            "claim_limit": "synthetic decision-flow fixture",
+        }
+        self.authorization = krea_decision.seal_discovery_execution_authorization(
+            authorization_payload
+        )
+        self.authorization_path, self.authorization_sha = _write(
+            root / "discovery-authorization.json", self.authorization
+        )
         seal_payload = {
             "schema": 1,
             "kind": "forge-krea-confirmation-fixture-commitments",
@@ -595,6 +645,9 @@ class Harness:
             "phase": "discovery",
             "prepared_by": "Priya Engineer",
             "discovery_plan": _binding(self.plan_path, self.plan_sha),
+            "discovery_execution_authorization": _binding(
+                self.authorization_path, self.authorization_sha
+            ),
             "confirmation_fixture_seal": _binding(self.seal_path, self.seal_sha),
             "score_batches": batches,
             "bootstrap": BOOTSTRAP,
@@ -677,6 +730,9 @@ class Harness:
             "phase": "confirmation",
             "prepared_by": "Priya Engineer",
             "discovery_plan": _binding(self.plan_path, self.plan_sha),
+            "discovery_execution_authorization": _binding(
+                self.authorization_path, self.authorization_sha
+            ),
             "confirmation_fixture_seal": _binding(self.seal_path, self.seal_sha),
             "discovery_decision": _binding(discovery_path, discovery_sha),
             "candidate_family_id": candidate,
@@ -704,8 +760,169 @@ class Harness:
 
 
 @pytest.fixture
-def harness(tmp_path: Path) -> Harness:
+def harness(tmp_path: Path, monkeypatch) -> Harness:
+    # Decision-policy tests exercise the policy math and exact authorization
+    # binding.  Full admission-bundle rederivation is covered independently by
+    # test_krea_discovery_authorization.py.
+    monkeypatch.setattr(
+        krea_decision.krea_discovery_authorization,
+        "validate",
+        lambda value: value,
+    )
     return Harness(tmp_path)
+
+
+def _enable_agent_decision_governance(
+    harness: Harness, monkeypatch, *, custodian: dict | None = None
+) -> None:
+    custodian = deepcopy(custodian or _custodian_actor())
+    authorization_body = {
+        key: value
+        for key, value in harness.authorization.items()
+        if key != "authorization_sha256"
+    }
+    authorization_body["authorized_actions"] = [
+        "bootstrap_timing_probe",
+        "profile_indexed_discovery_execution",
+        "offline_exact_scoring",
+        "discovery_decision_evaluation",
+    ]
+    harness.authorization = {
+        **authorization_body,
+        "authorization_sha256": krea_provenance.canonical_sha256(authorization_body),
+    }
+    harness.authorization_path, harness.authorization_sha = _write(
+        harness.authorization_path, harness.authorization
+    )
+    admission = {
+        "accountable_owner_identity": "Jordan Example",
+        "governance": {"sealed_custodian_actor": {"actor": custodian}},
+    }
+    ratification = {"ratification_sha256": _sha("owner-ratification")}
+    monkeypatch.setattr(
+        krea_decision.krea_discovery_authorization,
+        "_load_admission_binding",
+        lambda _value: (
+            harness.root / "synthetic-admission.json",
+            admission,
+            _sha("fixture-admission-file"),
+            ratification,
+            {},
+        ),
+    )
+    seal_payload = {
+        "schema": 2,
+        "kind": "forge-krea-agent-confirmation-fixture-commitments",
+        "discovery_protocol_sha256": krea_decision._discovery_protocol_sha(
+            harness.plan
+        ),
+        "sealed_at_utc": "2026-07-28T00:00:30Z",
+        "technical_custodian_actor": custodian,
+        "accountable_owner_identity": "Jordan Example",
+        "owner_ratification_sha256": _sha("owner-ratification"),
+        "discovery_execution_authorization": _binding(
+            harness.authorization_path, harness.authorization_sha
+        ),
+        "agent_review_is_not_human_review": True,
+        "sealed_before_discovery_unblinding": True,
+        "cross_fixture_review_sha256": _sha("cross-fixture-review"),
+        "fixtures": [
+            {
+                "fixture_id": fixture,
+                "identity_commitment_sha256": harness.plan["confirmation_contract"][
+                    "identities"
+                ][fixture],
+                "fixture_manifest_sha256": _sha(f"fixture-file-{fixture}"),
+                "fixture_approval_sha256": _sha(f"fixture-approval-{fixture}"),
+            }
+            for fixture in ("C1", "C2", "C3", "C4")
+        ],
+    }
+    harness.seal = krea_decision.seal_confirmation_fixture_commitments(seal_payload)
+    harness.seal_path, harness.seal_sha = _write(harness.seal_path, harness.seal)
+
+
+def _agent_discovery_case(
+    harness: Harness,
+    *,
+    losses_by_fixture: dict[str, dict[str, float]],
+) -> tuple[dict, list[Path], dict, dict]:
+    paths = []
+    batches = []
+    for fixture in ("D1", "D2"):
+        path, batch = harness.aggregate(
+            batch_id=f"{fixture}-A",
+            phase="discovery",
+            fixture_id=fixture,
+            seed_role="A",
+            arms=ARMS,
+            losses=losses_by_fixture[fixture],
+        )
+        paths.append(path)
+        batches.append(batch)
+    payload = {
+        "schema": 3,
+        "kind": "forge-krea-agent-discovery-decision-policy",
+        "phase": "discovery",
+        "technical_preparer_actor": _agent_actor("discovery_decision_policy_preparer"),
+        "accountable_owner_identity": "Jordan Example",
+        "owner_ratification_sha256": _sha("owner-ratification"),
+        "fixture_admission_envelope": dict(
+            harness.authorization["fixture_admission_envelope"]
+        ),
+        "discovery_plan": _binding(harness.plan_path, harness.plan_sha),
+        "discovery_execution_authorization": _binding(
+            harness.authorization_path, harness.authorization_sha
+        ),
+        "confirmation_fixture_seal": _binding(harness.seal_path, harness.seal_sha),
+        "score_batches": sorted(batches, key=lambda row: row["batch_id"]),
+        "bootstrap": BOOTSTRAP,
+        "delegated_review_contract": (
+            krea_decision.krea_delegated_review_contract.binding()
+        ),
+        "agent_review_is_not_human_review": True,
+    }
+    policy = krea_decision.seal_discovery_policy(payload)
+    policy_path, _ = _write(harness.root / "agent-discovery-policy.json", policy)
+    approval = krea_decision.build_approval(
+        policy,
+        technical_reviewer_actor=_agent_actor("discovery_decision_reviewer"),
+        approved_at_utc="2026-07-28T00:01:00Z",
+    )
+    approval_path, _ = _write(harness.root / "agent-discovery-approval.json", approval)
+    record = krea_decision.decide_discovery(
+        policy_path=policy_path,
+        approval_path=approval_path,
+        aggregate_paths=paths,
+        output=harness.root / "krea-discovery-decision-agent.json",
+        decided_at_utc="2026-07-28T00:02:00Z",
+    )
+    return record, paths, policy, approval
+
+
+def test_discovery_freeze_rejects_status_blocker_and_dummy_profile_rewrites(
+    harness: Harness,
+):
+    for mutation, message in (
+        (
+            lambda plan: plan.__setitem__("status", "ready"),
+            "status",
+        ),
+        (
+            lambda plan: plan.__setitem__("gpu_blockers", []),
+            "blockers",
+        ),
+        (
+            lambda plan: plan["budget_contract"][
+                "throughput_profiles_by_equivalence_class"
+            ].__setitem__("A-rank32-adamw8bit-mse-guidance2", _sha("dummy-profile")),
+            "deferred index sentinel",
+        ),
+    ):
+        changed = deepcopy(harness.plan)
+        mutation(changed)
+        with pytest.raises(ValueError, match=message):
+            krea_decision._validate_discovery_plan(changed)
 
 
 def _agreement_losses() -> dict[str, dict[str, float]]:
@@ -727,6 +944,154 @@ def _agreement_losses() -> dict[str, dict[str, float]]:
             "K5": 0.091,
         },
     }
+
+
+def test_agent_decision_governance_closes_custody_policy_approval_and_record(
+    harness: Harness, monkeypatch
+):
+    _enable_agent_decision_governance(harness, monkeypatch)
+    record, _, policy, approval = _agent_discovery_case(
+        harness, losses_by_fixture=_agreement_losses()
+    )
+
+    assert harness.seal["schema"] == 2
+    assert harness.seal["technical_custodian_actor"] == _custodian_actor()
+    assert policy["schema"] == 3
+    assert policy["technical_preparer_actor"] == _agent_actor(
+        "discovery_decision_policy_preparer"
+    )
+    assert approval["technical_reviewer_actor"] == _agent_actor(
+        "discovery_decision_reviewer"
+    )
+    assert record["schema"] == 3
+    assert record["kind"] == "forge-krea-agent-discovery-decision-record"
+    assert record["decision_reviewer_actor"] == approval["technical_reviewer_actor"]
+    assert record["accountable_owner_identity"] == "Jordan Example"
+    assert record["agent_review_is_not_human_review"] is True
+    assert "decision_reviewer_identity" not in record
+
+    # The unchanged legacy confirmation path must be able to consume the
+    # agent-governed discovery record without relabeling its actor as human.
+    quality = {
+        "K0": 0.100,
+        "K1": 0.080,
+        "K2": 0.082,
+        "K3": 0.084,
+        "K4": 0.086,
+    }
+    confirmation, _, _ = harness.confirmation_case(record, quality_losses=quality)
+    assert confirmation["schema"] == 2
+    assert confirmation["discovery_decision_sha256"]
+
+
+def test_agent_fixture_seal_rejects_wrong_custodian_owner_action_and_chronology(
+    harness: Harness, monkeypatch
+):
+    _enable_agent_decision_governance(harness, monkeypatch)
+    body = {key: value for key, value in harness.seal.items() if key != "seal_sha256"}
+
+    wrong_custodian = deepcopy(body)
+    wrong_custodian["technical_custodian_actor"]["actor_id"] = "other-custodian"
+    with pytest.raises(ValueError, match="owner-ratified custodian"):
+        krea_decision.seal_confirmation_fixture_commitments(wrong_custodian)
+
+    wrong_owner = deepcopy(body)
+    wrong_owner["owner_ratification_sha256"] = _sha("other-ratification")
+    with pytest.raises(ValueError, match="owner-ratified custodian"):
+        krea_decision.seal_confirmation_fixture_commitments(wrong_owner)
+
+    pre_authorization = deepcopy(body)
+    pre_authorization["sealed_at_utc"] = "2026-07-28T00:00:00Z"
+    with pytest.raises(ValueError, match="sealed after authorization"):
+        krea_decision.seal_confirmation_fixture_commitments(pre_authorization)
+
+    authorization = deepcopy(harness.authorization)
+    authorization_body = {
+        key: value
+        for key, value in authorization.items()
+        if key != "authorization_sha256"
+    }
+    authorization_body["authorized_actions"].remove("discovery_decision_evaluation")
+    authorization = {
+        **authorization_body,
+        "authorization_sha256": krea_provenance.canonical_sha256(authorization_body),
+    }
+    _, file_sha = _write(harness.authorization_path, authorization)
+    missing_action = deepcopy(body)
+    missing_action["discovery_execution_authorization"]["sha256"] = file_sha
+    with pytest.raises(ValueError, match="does not permit"):
+        krea_decision.seal_confirmation_fixture_commitments(missing_action)
+
+
+def test_agent_policy_and_approval_reject_actor_reuse_and_tampering(
+    harness: Harness, monkeypatch
+):
+    _enable_agent_decision_governance(harness, monkeypatch)
+    _, _, policy, approval = _agent_discovery_case(
+        harness, losses_by_fixture=_agreement_losses()
+    )
+
+    policy_body = {
+        key: value for key, value in policy.items() if key != "policy_sha256"
+    }
+    wrong_preparer = deepcopy(policy_body)
+    wrong_preparer["technical_preparer_actor"][
+        "review_instance_id"
+    ] = "unratified-review-instance"
+    with pytest.raises(ValueError, match="owner-ratified delegated actor"):
+        krea_decision.seal_discovery_policy(wrong_preparer)
+
+    with pytest.raises(ValueError, match="prebound technical reviewer"):
+        krea_decision.build_approval(
+            policy,
+            reviewer_identity="Morgan Auditor",
+            approved_at_utc="2026-07-28T00:01:00Z",
+        )
+
+    reused = deepcopy(_agent_actor("discovery_decision_reviewer"))
+    reused["actor_id"] = policy["technical_preparer_actor"]["actor_id"]
+    with pytest.raises(ValueError, match="owner-ratified delegated actor"):
+        krea_decision.build_approval(
+            policy,
+            technical_reviewer_actor=reused,
+            approved_at_utc="2026-07-28T00:01:00Z",
+        )
+
+    tampered = deepcopy(approval)
+    tampered["accountable_owner_identity"] = "Taylor Other"
+    tampered_body = {
+        key: value for key, value in tampered.items() if key != "approval_sha256"
+    }
+    tampered["approval_sha256"] = krea_provenance.canonical_sha256(tampered_body)
+    with pytest.raises(ValueError, match="owner-ratified authority"):
+        krea_decision.validate_approval(tampered, policy=policy)
+
+
+def test_agent_record_rejects_self_rehashed_actor_and_owner_tampering(
+    harness: Harness, monkeypatch
+):
+    _enable_agent_decision_governance(harness, monkeypatch)
+    record, _, _, _ = _agent_discovery_case(
+        harness, losses_by_fixture=_agreement_losses()
+    )
+
+    for field, value, message in (
+        (
+            "decision_reviewer_actor",
+            {
+                **record["decision_reviewer_actor"],
+                "review_instance_id": "unratified-decision-instance",
+            },
+            "owner-ratified delegated actor",
+        ),
+        ("owner_ratification_sha256", _sha("forged-owner"), "owner-ratified authority"),
+    ):
+        tampered = deepcopy(record)
+        tampered[field] = value
+        body = {key: item for key, item in tampered.items() if key != "decision_sha256"}
+        tampered["decision_sha256"] = krea_provenance.canonical_sha256(body)
+        with pytest.raises(ValueError, match=message):
+            krea_decision._validate_discovery_record(tampered)
 
 
 def test_discovery_agreement_freezes_shared_winner_minimax_and_k0(harness: Harness):
@@ -1003,6 +1368,9 @@ def test_strict_freeze_chronology_rejects_same_second_unblinding(harness: Harnes
                 "phase": "confirmation",
                 "prepared_by": "Priya Engineer",
                 "discovery_plan": _binding(frozen.plan_path, frozen.plan_sha),
+                "discovery_execution_authorization": _binding(
+                    frozen.authorization_path, frozen.authorization_sha
+                ),
                 "confirmation_fixture_seal": _binding(
                     frozen.seal_path, frozen.seal_sha
                 ),
@@ -1023,12 +1391,17 @@ def test_confirmation_passes_all_scientific_gates_but_never_claims_win_or_deploy
     quality = {"K0": 0.100, "K1": 0.080, "K2": 0.082, "K3": 0.084, "K4": 0.086}
     record, _, _ = harness.confirmation_case(discovery, quality_losses=quality)
 
-    assert record["outcome"] == "PASS"
-    assert record["field_parity_ready"] is True
-    assert record["round1_ready"] is True
+    assert record["outcome"] == "FAIL"
+    assert record["field_parity_ready"] is False
+    assert record["round1_ready"] is False
     assert record["win_ready"] is False
     assert record["production_mutation_authorized"] is False
-    assert all(record["gates"].values())
+    assert record["gates"]["stage2_production_surface_ratified"] is False
+    assert all(
+        passed
+        for name, passed in record["gates"].items()
+        if name != "stage2_production_surface_ratified"
+    )
     assert record["metrics"]["point_wins_or_ties"] == 4
     assert len(record["metrics"]["concept_results"]) == 4
     assert len(record["boundary_results"]) == 6
@@ -1131,6 +1504,9 @@ def test_confirmation_policy_requires_all_eight_quality_and_six_boundary_cells(
         "phase": "confirmation",
         "prepared_by": "Priya Engineer",
         "discovery_plan": _binding(harness.plan_path, harness.plan_sha),
+        "discovery_execution_authorization": _binding(
+            harness.authorization_path, harness.authorization_sha
+        ),
         "confirmation_fixture_seal": _binding(harness.seal_path, harness.seal_sha),
         "discovery_decision": _binding(discovery_path, discovery_sha),
         "candidate_family_id": "K1",
@@ -1234,6 +1610,9 @@ def test_boundary_fallback_or_late_decision_is_rejected_before_statistics(
         "phase": "confirmation",
         "prepared_by": "Priya Engineer",
         "discovery_plan": _binding(other.plan_path, other.plan_sha),
+        "discovery_execution_authorization": _binding(
+            other.authorization_path, other.authorization_sha
+        ),
         "confirmation_fixture_seal": _binding(other.seal_path, other.seal_sha),
         "discovery_decision": _binding(discovery_path, discovery_sha),
         "candidate_family_id": candidate,
@@ -1271,6 +1650,9 @@ def test_confirmation_candidate_must_be_predeclared_noncontrol_finalist(
         "phase": "confirmation",
         "prepared_by": "Priya Engineer",
         "discovery_plan": _binding(harness.plan_path, harness.plan_sha),
+        "discovery_execution_authorization": _binding(
+            harness.authorization_path, harness.authorization_sha
+        ),
         "confirmation_fixture_seal": _binding(harness.seal_path, harness.seal_sha),
         "discovery_decision": _binding(path, digest),
         "candidate_family_id": "K5",

@@ -11,17 +11,16 @@
   "training_seed_b_contingency": 309817421,
   "gpu_execution_authorized": false,
   "gpu_blockers": [
-    "D1 and D2 identities, train/evaluation split manifests, and content hashes are unset",
-    "measured conservative throughput bounds and held-out end-to-end timing validation are unset",
-    "K2-K4 public-arm provenance manifests and the K5 internal evidence record exist but named-human review approvals are unset",
-    "the published C1-C4 pre-finalist commitment exists but named-human reviewer acceptance and continued no-unblinding custody are unset",
-    "all accountable human DRI names, including the independent reviewer, remain unset"
+    "create-only Stage-1 discovery execution authorization bound to the admitted D1/D2 envelope is external to this immutable freeze",
+    "six fixture-scoped D1/D2 by A/B/C throughput profiles and their post-timing profile index do not exist before authorized timing probes"
   ],
   "discovery_tasks": {
     "D1": {
-      "identity": null,
-      "fixture_split_manifest_sha256": null,
-      "required_training_pair_range": [18, 24],
+      "identity": "6d29327af01d5c715807867702196f98d5357c26fedc7a4e6fb4b4e87f603aba",
+      "fixture_split_manifest_sha256": "6d29327af01d5c715807867702196f98d5357c26fedc7a4e6fb4b4e87f603aba",
+      "required_training_pair_range": [18, 18],
+      "required_evaluation_rows": 24,
+      "identity_semantics": "pre-governance candidate_manifest_sha256; final governance-bearing manifest and approval are bound only through the admitted envelope and external execution authorization",
       "requirements": [
         "matched but disjoint held-out evaluation rows",
         "concept differs from D2",
@@ -29,9 +28,11 @@
       ]
     },
     "D2": {
-      "identity": null,
-      "fixture_split_manifest_sha256": null,
-      "required_training_pair_range": [36, 48],
+      "identity": "f0762eb01923e6c583369a11a81b7e5697a757e83a6b202db3d3f3c1ce6065e3",
+      "fixture_split_manifest_sha256": "f0762eb01923e6c583369a11a81b7e5697a757e83a6b202db3d3f3c1ce6065e3",
+      "required_training_pair_range": [36, 36],
+      "required_evaluation_rows": 40,
+      "identity_semantics": "pre-governance candidate_manifest_sha256; final governance-bearing manifest and approval are bound only through the admitted envelope and external execution authorization",
       "requirements": [
         "matched but disjoint held-out evaluation rows",
         "concept differs from D1",
@@ -40,11 +41,13 @@
     }
   },
   "cross_fixture_human_review": {
+    "status": "deferred_to_owner_ratified_agent_governance_admission_envelope",
     "path": null,
-    "sha256": null
+    "sha256": null,
+    "independent_human_review_performed": false
   },
   "confirmation_fixture_commitment": {
-    "state": "published_external_unaccepted_by_named_human",
+    "state": "published_external_agent_custody_pending_owner_ratification",
     "public_record": "SN56-project/SN56-WEEK5-C1C4-SEALED-COMMITMENT-2026-07-27.md",
     "public_record_sha256": "f907c40e362378c1b82e7455d96ffd8bd876696f25cef21705e14bbba2d4ffc0",
     "commitment_sha256": "0a12c416bcef48805132e80f9de65d0d248ef4415d617715d5736c189a379dbc",
@@ -56,11 +59,24 @@
     "implementation_read_sealed_contents": false
   },
   "day0_source_evidence": {
-    "thin_evidence_manifest_file_sha256": "35fc00e534e779da04844a829f2dbfb3cef1451971a2e5a15f8b97f708912868",
-    "public_source_review_state": "unreviewed",
-    "K2_manifest_file_sha256": "6bbeae58d5e4bcf02ba5fda576875c95c4016ebd2353cc74c20bc95ced311e50",
-    "K3_manifest_file_sha256": "1a29c0f948360c6fdf5e77cf9ad4a32b9b9b02827daad38ceeb6e85c9f469e5b",
-    "K4_manifest_file_sha256": "1553fc7c13a9a3dbcf8e3bdf599e49ade4740d0f80af9056a42ff1bf982bf4da",
+    "evidence_bindings": {
+      "thin_manifest_file_sha256": "35fc00e534e779da04844a829f2dbfb3cef1451971a2e5a15f8b97f708912868",
+      "public_source_provenance": {
+        "K2": {
+          "file_sha256": "6bbeae58d5e4bcf02ba5fda576875c95c4016ebd2353cc74c20bc95ced311e50",
+          "manifest_sha256": "a54145aa233b999330cf145d8e371eaf1790dd0c08bd4abca5b57061d1d63a2e"
+        },
+        "K3": {
+          "file_sha256": "1a29c0f948360c6fdf5e77cf9ad4a32b9b9b02827daad38ceeb6e85c9f469e5b",
+          "manifest_sha256": "91a04ed0e94af9859ba1cf19903439fa69016888ed7b254bad96badfe3783eba"
+        },
+        "K4": {
+          "file_sha256": "1553fc7c13a9a3dbcf8e3bdf599e49ade4740d0f80af9056a42ff1bf982bf4da",
+          "manifest_sha256": "8507031d5a5a152e4443b83d5bdb0066b6626c74fc707caebd918bb5a5db808e"
+        }
+      }
+    },
+    "public_source_review_state": "pending_post_ratification_agent_review",
     "K5_internal_evidence_anchor": {
       "project_root_contract": "explicit_bound_input_not_process_cwd",
       "record_path": "K5-INTERNAL-EVIDENCE-RECORD.json",
@@ -237,9 +253,21 @@
   ],
   "budget_contract": {
     "throughput_profiles_by_equivalence_class": {
-      "A-rank32-adamw8bit-mse-guidance2": null,
-      "B-rank32-adamw8bit-mae-guidance3": null,
-      "C-rank64-automagic-mse-guidance2": null
+      "A-rank32-adamw8bit-mse-guidance2": "deferred_to_fixture_scoped_profile_index",
+      "B-rank32-adamw8bit-mae-guidance3": "deferred_to_fixture_scoped_profile_index",
+      "C-rank64-automagic-mse-guidance2": "deferred_to_fixture_scoped_profile_index"
+    },
+    "profile_index_contract": {
+      "fixtures": ["D1", "D2"],
+      "equivalence_classes": [
+        "A-rank32-adamw8bit-mse-guidance2",
+        "B-rank32-adamw8bit-mae-guidance3",
+        "C-rank64-automagic-mse-guidance2"
+      ],
+      "required_profile_count": 6,
+      "cross_fixture_profile_reuse_forbidden": true,
+      "post_timing_only": true,
+      "gpu_execution_authorized": false
     },
     "profile_required": true,
     "profile_sharing_rule": "arms may share a profile only when rank, optimizer, loss, guidance compute path, effective geometry, resolution, precision, caching, compilation, workers, and runtime identities match; otherwise a separate measured profile and held-out end-to-end validation are mandatory",
@@ -342,7 +370,7 @@
     "concept_regression_cap": 0.03,
     "minimum_point_estimate_wins_or_ties": 3,
     "point_win_or_tie_cap": 0.01,
-    "strongest_public_reference_rule": "minimum loss among exhaustive K2-K4 faithful replicas for the same concept and seed",
+    "strongest_public_reference_rule": "minimum loss among exhaustive approved K2-K4 local public-family reproductions for the same concept and seed",
     "boundary_hours": [0.5, 0.75, 1.0],
     "dataset_boundaries": ["small", "large"],
     "boundary_gate": "mechanics_only_natural_completion_upload_ready_clean"

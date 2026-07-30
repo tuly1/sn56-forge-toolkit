@@ -26,6 +26,7 @@ First-GPU sequence (all outputs are exclusive-create, canonical JSON):
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -66,6 +67,35 @@ _METRICS = frozenset(
 _SYSTEMD_RUN_PATH = Path("/usr/bin/systemd-run")
 _SYSTEMCTL_PATH = Path("/usr/bin/systemctl")
 _SCOPE_TERM_GRACE_S = 10.0
+
+
+def _capture_child_environment(
+    *, socket_path: str, contract_sha256: str, capture_id: str
+) -> dict[str, str]:
+    """Build the entire timing-child environment from sealed values.
+
+    In particular, do not copy the operator environment.  Cache roots, dynamic
+    loader controls, allocator settings, proxy variables, and thread/BLAS/NCCL
+    knobs can all change startup or throughput while remaining invisible to the
+    timing receipt.  The trusted runner installs its own plan-scoped cache and
+    offline environment after this initial system-Python launch.
+    """
+
+    _digest = _SHA256.fullmatch(contract_sha256)
+    if _digest is None:
+        raise ValueError("timing child lacks a valid probe-contract SHA-256")
+    _safe_id(capture_id, "capture_id")
+    if not isinstance(socket_path, str) or not socket_path.startswith("/"):
+        raise ValueError("timing socket path must be absolute")
+    return {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        _SOCKET_ENV: socket_path,
+        _CONTRACT_ENV: contract_sha256,
+        _CAPTURE_ENV: capture_id,
+    }
 
 
 class _CaptureCancellation(BaseException):
@@ -785,9 +815,9 @@ def capture(
         raise ValueError("probe plan does not authorize both capture roles")
     if command != plan["command_argv"]:
         raise ValueError("executed argv differs from the sealed timing probe command")
-    if Path(command[3]).expanduser().resolve(strict=True) != _safe_file(
+    if Path(command[5]).expanduser().resolve(strict=True) != _safe_file(
         probe_plan_path, "timing probe plan"
-    ) or Path(command[5]).expanduser().resolve(strict=True) != _safe_file(
+    ) or Path(command[7]).expanduser().resolve(strict=True) != _safe_file(
         probe_approval_path, "timing probe approval"
     ):
         raise ValueError("timing command does not consume these exact probe controls")
@@ -828,10 +858,11 @@ def capture(
 
         thread = threading.Thread(target=receiver, name="krea-timing-receiver")
         thread.start()
-        env = dict(os.environ)
-        env[_SOCKET_ENV] = socket_path
-        env[_CONTRACT_ENV] = plan["probe_contract_sha256"]
-        env[_CAPTURE_ENV] = capture_id
+        env = _capture_child_environment(
+            socket_path=socket_path,
+            contract_sha256=plan["probe_contract_sha256"],
+            capture_id=capture_id,
+        )
         started_unix_ns = time.time_ns()
         started_monotonic_ns = time.monotonic_ns()
         try:
@@ -873,6 +904,7 @@ def capture(
             "sha256": approval_file_sha,
             "approval_sha256": approval["approval_sha256"],
         },
+        "margin_policy": plan.get("margin_policy"),
         "execution_envelope": plan["execution_envelope"],
         "measurement_tool_sha256": _sha256_file(Path(__file__).resolve(strict=True)),
         "containment": containment,
@@ -905,6 +937,7 @@ def validate_capture(value: dict[str, Any]) -> dict[str, Any]:
         "measurement_role",
         "probe_contract",
         "probe_approval",
+        "margin_policy",
         "execution_envelope",
         "measurement_tool_sha256",
         "containment",
@@ -954,6 +987,7 @@ def validate_capture(value: dict[str, Any]) -> dict[str, Any]:
         or plan["probe_contract_sha256"] != plan_binding["probe_contract_sha256"]
         or approval_file_sha != approval_binding["sha256"]
         or approval["approval_sha256"] != approval_binding["approval_sha256"]
+        or value["margin_policy"] != plan.get("margin_policy")
         or value["execution_envelope"] != plan["execution_envelope"]
         or value["measurement_tool_sha256"]
         != _sha256_file(Path(__file__).resolve(strict=True))
@@ -995,6 +1029,17 @@ def validate_capture(value: dict[str, Any]) -> dict[str, Any]:
         or not _SHA256.fullmatch(command["event_stream_sha256"])
     ):
         raise ValueError("timing capture command identity/result is invalid")
+    resolved_plan = krea_execution_plan.validate_timing_probe_plan(plan)
+    if plan.get("schema") == 2:
+        margin = resolved_plan["margin_policy"]["document"]
+        approved_ns = int(
+            datetime.strptime(margin["approved_at_utc"], "%Y-%m-%dT%H:%M:%SZ")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+            * 1_000_000_000
+        )
+        if approved_ns >= command["started_unix_ns"]:
+            raise ValueError("timing margin was not frozen before capture")
     samples = value["samples"]
     if not isinstance(samples, dict) or set(samples) != _METRICS:
         raise ValueError("timing capture samples schema mismatch")
@@ -1204,10 +1249,18 @@ def _parse() -> argparse.Namespace:
     seal_probe.add_argument("--output", required=True, type=Path)
 
     approve_probe = sub.add_parser(
-        "approve-probe", help="create the separate named-human probe approval"
+        "approve-probe", help="create the separate governance-bound probe approval"
     )
     approve_probe.add_argument("--probe-plan", required=True, type=Path)
-    approve_probe.add_argument("--reviewer", required=True)
+    approve_probe.add_argument(
+        "--reviewer",
+        help="legacy schema-1 named human; omit for agent-governed schema-2 probes",
+    )
+    approve_probe.add_argument(
+        "--technical-actor",
+        type=Path,
+        help="canonical fresh agent actor for schema-2 timing review",
+    )
     approve_probe.add_argument("--approved-at-utc", required=True)
     approve_probe.add_argument("--output", required=True, type=Path)
 
@@ -1241,9 +1294,12 @@ def _parse() -> argparse.Namespace:
     e2e.add_argument("--output", required=True, type=Path)
 
     margin = sub.add_parser(
-        "seal-margin", help="freeze the named-human timing margin before capture"
+        "seal-margin", help="freeze the pre-ratified timing margin before capture"
     )
-    margin.add_argument("--reviewer", required=True)
+    margin_actor = margin.add_mutually_exclusive_group(required=True)
+    margin_actor.add_argument("--reviewer")
+    margin_actor.add_argument("--technical-actor", type=Path)
+    margin.add_argument("--discovery-authorization", type=Path)
     margin.add_argument("--approved-at-utc", required=True)
     margin.add_argument("--multiplier", required=True, type=float)
     for metric in sorted(_METRICS):
@@ -1292,10 +1348,16 @@ def main() -> int:
         return 0
     if args.command_name == "approve-probe":
         plan, _ = _load_canonical(args.probe_plan, "timing probe plan")
+        technical_actor = None
+        if args.technical_actor is not None:
+            technical_actor, _ = _load_canonical(
+                args.technical_actor, "timing technical actor"
+            )
         approval = krea_execution_plan.build_timing_probe_approval(
             plan,
             reviewer_identity=args.reviewer,
             approved_at_utc=args.approved_at_utc,
+            technical_reviewer_actor=technical_actor,
         )
         _publish(args.output, approval)
         return 0
@@ -1335,15 +1397,42 @@ def main() -> int:
         )
         return 0
     if args.command_name == "seal-margin":
-        record = krea_budget.seal_margin_policy(
-            reviewer_identity=args.reviewer,
-            approved_at_utc=args.approved_at_utc,
-            frozen_before_capture=True,
-            multiplicative_margin={name: args.multiplier for name in _METRICS},
-            additive_margin_s={
+        margins = {
+            "multiplicative_margin": {name: args.multiplier for name in _METRICS},
+            "additive_margin_s": {
                 name: getattr(args, f"{name}_additive_s") for name in _METRICS
             },
-        )
+        }
+        if args.technical_actor is not None:
+            if args.discovery_authorization is None:
+                raise ValueError("agent margin requires --discovery-authorization")
+            actor, _ = _load_canonical(args.technical_actor, "margin technical actor")
+            authorization, authorization_file_sha = _load_canonical(
+                args.discovery_authorization,
+                "discovery execution authorization",
+            )
+            record = krea_budget.seal_agent_margin_policy(
+                technical_reviewer_actor=actor,
+                discovery_execution_authorization={
+                    "path": str(args.discovery_authorization.resolve(strict=True)),
+                    "file_sha256": authorization_file_sha,
+                    "authorization_sha256": authorization["authorization_sha256"],
+                },
+                approved_at_utc=args.approved_at_utc,
+                frozen_before_capture=True,
+                **margins,
+            )
+        else:
+            if args.discovery_authorization is not None:
+                raise ValueError(
+                    "legacy human margin cannot claim discovery authorization"
+                )
+            record = krea_budget.seal_margin_policy(
+                reviewer_identity=args.reviewer,
+                approved_at_utc=args.approved_at_utc,
+                frozen_before_capture=True,
+                **margins,
+            )
         _publish(args.output, record)
         return 0
     if args.command_name == "build-profile":

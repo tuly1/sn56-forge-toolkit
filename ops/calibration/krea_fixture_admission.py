@@ -41,12 +41,16 @@ from typing import Any, Mapping
 try:
     from . import krea_c1c4_amendment
     from . import krea_dataset_identity
+    from . import krea_delegated_review_contract
+    from . import krea_execution_surface_policy
     from . import krea_fixture
     from . import krea_fixture_package
     from . import krea_provenance
 except ImportError:  # pragma: no cover - direct script execution.
     import krea_c1c4_amendment  # type: ignore[no-redef]
     import krea_dataset_identity  # type: ignore[no-redef]
+    import krea_delegated_review_contract  # type: ignore[no-redef]
+    import krea_execution_surface_policy  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
     import krea_fixture_package  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
@@ -55,6 +59,7 @@ except ImportError:  # pragma: no cover - direct script execution.
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_SHA = re.compile(r"[0-9a-f]{40}")
 _POLICY_PATH = Path(__file__).with_name("week5") / "krea-governance-policy-v2.json"
+_DISCOVERY_PLAN_PATH = Path(__file__).with_name("week5") / "krea-discovery-plan.json"
 _POLICY_KIND = "forge-krea-agent-review-owner-ratification-policy"
 _SURFACE_KIND = "forge-krea-agent-surface-review"
 _INDEPENDENT_KIND = "forge-krea-independent-agent-verification"
@@ -75,7 +80,9 @@ _ROLES = ("D1", "D2")
 _SURFACES = ("rights", "captions", "similarity")
 _EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 _CLAIM_LIMIT = (
-    "owner-ratified-agent-evidence-not-independent-human-review-or-quality-proof"
+    "owner-ratified-agent-evidence; Stage-1 is staged-host-venv discovery-only, "
+    "not production/release/tournament evidence; Stage-2 requires a separate "
+    "Forge commit and fresh named-owner ratification"
 )
 _SURFACE_SOURCE_FILE_SHA256 = (
     "a7d4b01404822fcbee8ae2143ff8527958851a29828a45bbb8610a0149cd34dc"
@@ -262,6 +269,20 @@ def _agent_actor(
         "identity_assurance": _AGENT_ASSURANCE,
     }
     return krea_fixture._agent_actor(actor, "agent actor")
+
+
+def load_sealed_custodian_actor(
+    path: Path, *, parent_independent_actor: dict[str, Any]
+) -> tuple[dict[str, str], str]:
+    """Load the exact non-human custodian identity selected before ratification."""
+
+    actor, file_sha256 = _json(path, "sealed custodian actor", canonical=True)
+    actor = krea_fixture._agent_actor(actor, "sealed custodian actor")
+    parent = krea_fixture._agent_actor(
+        parent_independent_actor, "parent independent review actor"
+    )
+    krea_fixture._validate_cross_agent_distinct(actor, parent)
+    return actor, file_sha256
 
 
 def load_policy(path: Path = _POLICY_PATH) -> dict[str, Any]:
@@ -666,6 +687,243 @@ def validate_independent_agent_review(
     return record
 
 
+def _gpu_gate_implementation_bindings() -> dict[str, str]:
+    """Bind every local module that can shape Week-5 GPU authorization.
+
+    This is deliberately an exact, non-optional surface.  Adding, removing, or
+    changing any bound module invalidates the governance amendment and therefore
+    requires a fresh owner ratification before materialization or GPU approval.
+    """
+
+    root = Path(__file__).parent
+    paths = {
+        "fixture_validator_file_sha256": Path(krea_fixture.__file__),
+        "admission_tool_file_sha256": Path(__file__),
+        "execution_plan_file_sha256": root / "krea_execution_plan.py",
+        "host_identity_file_sha256": root / "krea_host_identity.py",
+        "runtime_binding_file_sha256": root / "krea_runtime_binding.py",
+        "host_bootstrap_file_sha256": root / "krea_host_bootstrap.py",
+        "stage1_runtime_file_sha256": root / "krea_stage1_runtime.py",
+        "public_source_review_file_sha256": root / "krea_public_source_review.py",
+        "execution_surface_policy_file_sha256": Path(
+            krea_execution_surface_policy.__file__
+        ),
+        "discovery_authorization_file_sha256": (
+            root / "krea_discovery_authorization.py"
+        ),
+        "profile_index_file_sha256": root / "krea_profile_index.py",
+        "budget_planner_file_sha256": root / "krea_budget.py",
+        "runner_file_sha256": root / "run_krea_ladder.py",
+        "training_evidence_file_sha256": root / "krea_training_evidence.py",
+        "decision_tool_file_sha256": root / "krea_decision.py",
+        "score_plan_file_sha256": root / "krea_score_plan.py",
+        "batch_evaluator_file_sha256": root / "batch_evaluate_krea.py",
+        "delegated_review_contract_loader_file_sha256": (
+            root / "krea_delegated_review_contract.py"
+        ),
+    }
+    return {key: _file_sha256(_safe_file(path, key)) for key, path in paths.items()}
+
+
+def _discovery_public_evidence_bindings() -> dict[str, Any]:
+    """Load the sole public-source evidence authority from the frozen plan."""
+
+    plan_path = _safe_file(_DISCOVERY_PLAN_PATH, "Krea discovery plan")
+    try:
+        plan = json.loads(plan_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Krea discovery plan is not JSON") from exc
+    day0 = _object(plan.get("day0_source_evidence"), "Day-0 source evidence")
+    evidence = _object(day0.get("evidence_bindings"), "public evidence bindings")
+    _exact(
+        evidence,
+        {"thin_manifest_file_sha256", "public_source_provenance"},
+        "public evidence bindings",
+    )
+    thin_sha = _digest(
+        evidence["thin_manifest_file_sha256"],
+        "thin evidence manifest file SHA-256",
+    )
+    sources = _object(
+        evidence["public_source_provenance"], "public source provenance bindings"
+    )
+    _exact(sources, {"K2", "K3", "K4"}, "public source provenance bindings")
+    normalized_sources: dict[str, dict[str, str]] = {}
+    for arm, binding_value in sorted(sources.items()):
+        binding = _object(binding_value, f"{arm} public source binding")
+        _exact(
+            binding,
+            {"file_sha256", "manifest_sha256"},
+            f"{arm} public source binding",
+        )
+        normalized_sources[arm] = {
+            "file_sha256": _digest(
+                binding["file_sha256"], f"{arm} provenance file SHA-256"
+            ),
+            "manifest_sha256": _digest(
+                binding["manifest_sha256"], f"{arm} manifest semantic SHA-256"
+            ),
+        }
+    return {
+        "discovery_plan_file_sha256": _file_sha256(plan_path),
+        "thin_manifest_file_sha256": thin_sha,
+        "public_source_provenance": normalized_sources,
+    }
+
+
+def _sanitized_forge_git(root: Path, *arguments: str) -> bytes:
+    """Run a read-only Git builtin without user/system config or hooks."""
+
+    executable = _safe_file(Path("/usr/bin/git"), "system Git executable")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    completed = subprocess.run(
+        [
+            str(executable),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.autocrlf=false",
+            "-C",
+            str(root),
+            *arguments,
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+        env=environment,
+    )
+    return completed.stdout
+
+
+def _git_blob_sha1(raw: bytes) -> str:
+    header = f"blob {len(raw)}\0".encode("ascii")
+    return hashlib.sha1(
+        header + raw, usedforsecurity=False
+    ).hexdigest()  # Git object identity, not a security digest.
+
+
+def _forge_repository_identity(root: Path | None = None) -> dict[str, Any]:
+    """Bind a clean worktree byte-for-byte to its exact Git commit tree."""
+
+    repository = _safe_directory(
+        Path(__file__).resolve().parents[2] if root is None else root,
+        "Forge repository",
+    )
+    try:
+        top = _sanitized_forge_git(repository, "rev-parse", "--show-toplevel")
+        commit_raw = _sanitized_forge_git(
+            repository, "rev-parse", "--verify", "HEAD^{commit}"
+        )
+        tree_raw = _sanitized_forge_git(
+            repository, "rev-parse", "--verify", "HEAD^{tree}"
+        )
+        status = _sanitized_forge_git(
+            repository,
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+        )
+        cache_tags = _sanitized_forge_git(repository, "ls-files", "-v", "-z")
+        tree_rows = _sanitized_forge_git(
+            repository, "ls-tree", "-r", "-z", "--full-tree", "HEAD"
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("Forge Git identity could not be read safely") from exc
+    try:
+        top_path = Path(top.rstrip(b"\n").decode("utf-8"))
+        commit = commit_raw.strip().decode("ascii")
+        tree = tree_raw.strip().decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Forge Git identity is not portable UTF-8/ASCII") from exc
+    if top_path.resolve() != repository.resolve():
+        raise ValueError("Forge repository root differs from the governed root")
+    if not _GIT_SHA.fullmatch(commit) or not _GIT_SHA.fullmatch(tree):
+        raise ValueError("Forge commit or tree identity is invalid")
+    if status:
+        raise ValueError("Forge worktree must be clean, including untracked files")
+
+    indexed_paths: set[str] = set()
+    for row in cache_tags.split(b"\0"):
+        if not row:
+            continue
+        if not row.startswith(b"H "):
+            raise ValueError(
+                "Forge index contains skip-worktree, assume-unchanged, or "
+                "non-canonical cache state"
+            )
+        try:
+            indexed_paths.add(row[2:].decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ValueError("Forge tracked path is not UTF-8") from exc
+
+    tracked_files: list[dict[str, Any]] = []
+    tree_paths: set[str] = set()
+    for row in tree_rows.split(b"\0"):
+        if not row:
+            continue
+        try:
+            metadata, raw_path = row.split(b"\t", 1)
+            mode, object_type, blob_sha1 = metadata.decode("ascii").split(" ")
+            portable = raw_path.decode("utf-8")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("Forge commit tree row is malformed") from exc
+        relative = PurePosixPath(portable)
+        if (
+            relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or object_type != "blob"
+            or mode not in {"100644", "100755", "120000"}
+            or not _GIT_SHA.fullmatch(blob_sha1)
+        ):
+            raise ValueError("Forge commit tree contains unsupported content")
+        worktree_path = repository.joinpath(*relative.parts)
+        if mode == "120000":
+            if not worktree_path.is_symlink():
+                raise ValueError("Forge worktree symlink differs from commit tree")
+            raw = os.fsencode(os.readlink(worktree_path))
+        else:
+            if worktree_path.is_symlink() or not worktree_path.is_file():
+                raise ValueError("Forge tracked file is missing or not regular")
+            file_mode = worktree_path.stat().st_mode
+            executable = bool(file_mode & stat.S_IXUSR)
+            if executable != (mode == "100755"):
+                raise ValueError("Forge tracked executable mode differs from tree")
+            raw = worktree_path.read_bytes()
+        if _git_blob_sha1(raw) != blob_sha1:
+            raise ValueError("Forge tracked file bytes differ from commit tree")
+        tree_paths.add(portable)
+        tracked_files.append(
+            {
+                "path": portable,
+                "mode": mode,
+                "git_blob_sha1": blob_sha1,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "bytes": len(raw),
+            }
+        )
+    if indexed_paths != tree_paths:
+        raise ValueError("Forge index path set differs from the commit tree")
+    tracked_files.sort(key=lambda row: row["path"])
+    return {
+        "commit_sha1": commit,
+        "tree_sha1": tree,
+        "tracked_files": tracked_files,
+        "tracked_file_manifest_sha256": krea_provenance.canonical_sha256(tracked_files),
+    }
+
+
 def build_governance_amendment(
     inputs: dict[str, Any],
     originals: dict[str, Any],
@@ -673,11 +931,26 @@ def build_governance_amendment(
     surface_review: dict[str, Any],
     independent_review: dict[str, Any],
     *,
+    sealed_custodian_actor: dict[str, Any],
+    sealed_custodian_actor_file_sha256: str,
     surface_review_file_sha256: str,
     independent_review_file_sha256: str,
     amended_at_utc: str,
 ) -> dict[str, Any]:
     package = inputs["package"]
+    custodian = krea_fixture._agent_actor(
+        sealed_custodian_actor, "sealed custodian actor"
+    )
+    krea_fixture._validate_cross_agent_distinct(custodian, independent_review["actor"])
+    prior_actors = [surface_review["actor"], independent_review["actor"], custodian]
+    delegated_actors = list(krea_delegated_review_contract.load()["actors"].values())
+    prior_ids = {actor["actor_id"] for actor in prior_actors}
+    prior_instances = {actor["review_instance_id"] for actor in prior_actors}
+    if any(
+        actor["actor_id"] in prior_ids or actor["review_instance_id"] in prior_instances
+        for actor in delegated_actors
+    ):
+        raise ValueError("delegated Stage-1 actor reuses prior review identity")
     body = {
         "schema": 1,
         "kind": _AMENDMENT_KIND,
@@ -687,13 +960,12 @@ def build_governance_amendment(
             "file_sha256": _file_sha256(_POLICY_PATH),
             "policy_sha256": policy["policy_sha256"],
         },
-        "implementation": {
-            "fixture_validator_file_sha256": _file_sha256(Path(krea_fixture.__file__)),
-            "admission_tool_file_sha256": _file_sha256(Path(__file__)),
-            "execution_plan_file_sha256": _file_sha256(
-                Path(__file__).with_name("krea_execution_plan.py")
-            ),
-        },
+        "implementation": _gpu_gate_implementation_bindings(),
+        "stage1_delegated_agent_review_contract": (
+            krea_delegated_review_contract.binding()
+        ),
+        "forge_repository_identity": _forge_repository_identity(),
+        "public_source_evidence": _discovery_public_evidence_bindings(),
         "source_package": {
             "package_manifest_file_sha256": inputs["package_manifest_file_sha256"],
             "package_sha256": package["package_sha256"],
@@ -725,6 +997,14 @@ def build_governance_amendment(
                 "review_sha256": independent_review["review_sha256"],
                 "actor": independent_review["actor"],
             },
+        },
+        "sealed_custodian_actor": {
+            "file_sha256": _digest(
+                sealed_custodian_actor_file_sha256,
+                "sealed custodian actor file SHA-256",
+            ),
+            "actor_sha256": krea_provenance.canonical_sha256(custodian),
+            "actor": custodian,
         },
         "findings_resolution": {
             "F1": (
@@ -772,6 +1052,8 @@ def validate_governance_amendment(
     policy: dict[str, Any],
     surface_review: dict[str, Any],
     independent_review: dict[str, Any],
+    sealed_custodian_actor: dict[str, Any],
+    sealed_custodian_actor_file_sha256: str,
     surface_review_file_sha256: str,
     independent_review_file_sha256: str,
 ) -> dict[str, Any]:
@@ -781,6 +1063,8 @@ def validate_governance_amendment(
         policy,
         surface_review,
         independent_review,
+        sealed_custodian_actor=sealed_custodian_actor,
+        sealed_custodian_actor_file_sha256=sealed_custodian_actor_file_sha256,
         surface_review_file_sha256=surface_review_file_sha256,
         independent_review_file_sha256=independent_review_file_sha256,
         amended_at_utc=amendment.get("amended_at_utc"),
@@ -803,14 +1087,33 @@ def _ratification_decision_bindings(
         "candidate_manifest_sha256s": package["candidate_manifest_sha256s"],
         "governance_policy_sha256": amendment["governance_policy"]["policy_sha256"],
         "governance_amendment_sha256": amendment["amendment_sha256"],
+        "forge_repository_identity": amendment["forge_repository_identity"],
+        "public_source_evidence": amendment["public_source_evidence"],
         "surface_agent_review_sha256": amendment["canonical_agent_evidence"][
             "surface_review"
         ]["review_sha256"],
         "independent_agent_review_sha256": amendment["canonical_agent_evidence"][
             "independent_review"
         ]["review_sha256"],
+        "sealed_custodian_actor_sha256": amendment["sealed_custodian_actor"][
+            "actor_sha256"
+        ],
         "god_evaluator_contract_sha256": evaluator_contract["contract_sha256"],
         "god_commit": evaluator_contract["commit"],
+        "stage1_execution_surface_policy": {
+            "file_sha256": amendment["implementation"][
+                "execution_surface_policy_file_sha256"
+            ],
+            "policy_sha256": krea_execution_surface_policy.POLICY["policy_sha256"],
+            "execution_surface": "staged_host_venv",
+            "execution_scope": "discovery_only",
+        },
+        "stage1_delegated_agent_review_contract": (
+            amendment["stage1_delegated_agent_review_contract"]
+        ),
+        "stage2_requirement": krea_execution_surface_policy.POLICY[
+            "stage2_requirement"
+        ],
     }
 
 
@@ -823,6 +1126,12 @@ def _draft_acknowledgements() -> dict[str, bool]:
         "admission_and_gpu_authorization_are_still_separate": True,
         "owner_authorizes_mechanical_gpu_approval_after_envelope_and_host_plan_validation": True,
         "c1c4_remain_sealed": True,
+        "stage1_is_discovery_only": True,
+        "stage1_is_not_release_or_tournament_evidence": True,
+        "stage2_requires_separate_commit_and_fresh_owner_ratification": True,
+        "owner_accepts_exact_stage1_timing_margins": True,
+        "owner_authorizes_only_prebound_stage1_technical_agents": True,
+        "delegated_agents_cannot_change_frozen_rules": True,
     }
 
 
@@ -835,6 +1144,8 @@ def build_portable_ratification_draft(
     surface_review_file_sha256: str,
     independent_review: dict[str, Any],
     independent_review_file_sha256: str,
+    sealed_custodian_actor: dict[str, Any],
+    sealed_custodian_actor_file_sha256: str,
     amendment: dict[str, Any],
     amendment_file_sha256: str,
     evaluator_contract: dict[str, Any],
@@ -842,6 +1153,19 @@ def build_portable_ratification_draft(
     prepared_at_utc: str,
 ) -> dict[str, Any]:
     package = inputs["package"]
+    custodian = krea_fixture._agent_actor(
+        sealed_custodian_actor, "sealed custodian actor"
+    )
+    krea_fixture._validate_cross_agent_distinct(custodian, independent_review["actor"])
+    if amendment["sealed_custodian_actor"] != {
+        "file_sha256": _digest(
+            sealed_custodian_actor_file_sha256,
+            "sealed custodian actor file SHA-256",
+        ),
+        "actor_sha256": krea_provenance.canonical_sha256(custodian),
+        "actor": custodian,
+    }:
+        raise ValueError("portable draft custodian differs from the amendment")
     body = {
         "schema": 1,
         "kind": _PORTABLE_DRAFT_KIND,
@@ -877,6 +1201,13 @@ def build_portable_ratification_draft(
                     "independent review file SHA-256",
                 ),
                 "review_sha256": independent_review["review_sha256"],
+            },
+            "sealed_custodian_actor": {
+                "file_sha256": _digest(
+                    sealed_custodian_actor_file_sha256,
+                    "sealed custodian actor file SHA-256",
+                ),
+                "actor_sha256": krea_provenance.canonical_sha256(custodian),
             },
             "governance_amendment": {
                 "file_sha256": _digest(amendment_file_sha256, "amendment file SHA-256"),
@@ -921,6 +1252,7 @@ def build_ratification_draft(
     independent_record_path: Path,
     surface_review_path: Path,
     independent_review_path: Path,
+    sealed_custodian_actor_path: Path,
     amendment_path: Path,
     evaluator_contract_path: Path,
     portable_draft_path: Path,
@@ -948,6 +1280,9 @@ def build_ratification_draft(
             ),
             "independent_agent_review": str(
                 _safe_file(independent_review_path, "independent agent review")
+            ),
+            "sealed_custodian_actor": str(
+                _safe_file(sealed_custodian_actor_path, "sealed custodian actor")
             ),
             "governance_amendment": str(
                 _safe_file(amendment_path, "governance amendment")
@@ -1018,6 +1353,15 @@ def _resolve_draft(draft_path: Path) -> dict[str, Any]:
         surface_review=surface_review,
         surface_review_file_sha256=surface_file_sha,
     )
+    sealed_custodian_actor_path = _safe_file(
+        Path(paths["sealed_custodian_actor"]), "sealed custodian actor"
+    )
+    sealed_custodian_actor, sealed_custodian_actor_file_sha = (
+        load_sealed_custodian_actor(
+            sealed_custodian_actor_path,
+            parent_independent_actor=independent_review["actor"],
+        )
+    )
     policy = load_policy(Path(paths["governance_policy"]))
     amendment, amendment_file_sha = _json(
         Path(paths["governance_amendment"]), "governance amendment", canonical=True
@@ -1029,6 +1373,8 @@ def _resolve_draft(draft_path: Path) -> dict[str, Any]:
         policy=policy,
         surface_review=surface_review,
         independent_review=independent_review,
+        sealed_custodian_actor=sealed_custodian_actor,
+        sealed_custodian_actor_file_sha256=sealed_custodian_actor_file_sha,
         surface_review_file_sha256=surface_file_sha,
         independent_review_file_sha256=independent_file_sha,
     )
@@ -1057,6 +1403,8 @@ def _resolve_draft(draft_path: Path) -> dict[str, Any]:
         surface_review_file_sha256=surface_file_sha,
         independent_review=independent_review,
         independent_review_file_sha256=independent_file_sha,
+        sealed_custodian_actor=sealed_custodian_actor,
+        sealed_custodian_actor_file_sha256=sealed_custodian_actor_file_sha,
         amendment=amendment,
         amendment_file_sha256=amendment_file_sha,
         evaluator_contract=evaluator_contract,
@@ -1070,6 +1418,7 @@ def _resolve_draft(draft_path: Path) -> dict[str, Any]:
         independent_record_path=Path(paths["independent_source_record"]),
         surface_review_path=Path(paths["surface_agent_review"]),
         independent_review_path=Path(paths["independent_agent_review"]),
+        sealed_custodian_actor_path=sealed_custodian_actor_path,
         amendment_path=Path(paths["governance_amendment"]),
         evaluator_contract_path=evaluator_contract_path,
         portable_draft_path=portable_draft_path,
@@ -1089,6 +1438,9 @@ def _resolve_draft(draft_path: Path) -> dict[str, Any]:
         "surface_review_file_sha256": surface_file_sha,
         "independent_review": independent_review,
         "independent_review_file_sha256": independent_file_sha,
+        "sealed_custodian_actor": sealed_custodian_actor,
+        "sealed_custodian_actor_path": sealed_custodian_actor_path,
+        "sealed_custodian_actor_file_sha256": sealed_custodian_actor_file_sha,
         "policy": policy,
         "amendment": amendment,
         "amendment_file_sha256": amendment_file_sha,
@@ -1129,6 +1481,12 @@ def build_owner_ratification(
             "ratification_is_not_a_cryptographic_or_legal_signature": True,
             "owner_authorizes_mechanical_gpu_approval_after_envelope_and_host_plan_validation": True,
             "c1c4_remain_sealed": True,
+            "stage1_is_discovery_only": True,
+            "stage1_is_not_release_or_tournament_evidence": True,
+            "stage2_requires_separate_commit_and_fresh_owner_ratification": True,
+            "owner_accepts_exact_stage1_timing_margins": True,
+            "owner_authorizes_only_prebound_stage1_technical_agents": True,
+            "delegated_agents_cannot_change_frozen_rules": True,
         },
         "decision": "ratified_for_fixture_admission_input",
         "admission_authorized": False,
@@ -1162,6 +1520,7 @@ def prepare_governance(
     package_root: Path,
     surface_record_path: Path,
     independent_record_path: Path,
+    sealed_custodian_actor_path: Path,
     god_checkout: Path,
     god_commit: str,
     output_dir: Path,
@@ -1199,12 +1558,26 @@ def prepare_governance(
         independent_path = output_dir / "independent-agent-verification.json"
         _write_canonical(independent_path, independent)
         independent_file_sha = _file_sha256(independent_path)
+        custodian, _ = load_sealed_custodian_actor(
+            sealed_custodian_actor_path,
+            parent_independent_actor=independent["actor"],
+        )
+        custodian_path = output_dir / "sealed-custodian-actor.json"
+        _copy_regular(sealed_custodian_actor_path, custodian_path)
+        copied_custodian, custodian_file_sha = load_sealed_custodian_actor(
+            custodian_path,
+            parent_independent_actor=independent["actor"],
+        )
+        if copied_custodian != custodian:
+            raise RuntimeError("sealed custodian actor changed while copying")
         amendment = build_governance_amendment(
             inputs,
             originals,
             policy,
             surface,
             independent,
+            sealed_custodian_actor=custodian,
+            sealed_custodian_actor_file_sha256=custodian_file_sha,
             surface_review_file_sha256=surface_file_sha,
             independent_review_file_sha256=independent_file_sha,
             amended_at_utc=prepared_at_utc,
@@ -1219,6 +1592,8 @@ def prepare_governance(
             surface_review_file_sha256=surface_file_sha,
             independent_review=independent,
             independent_review_file_sha256=independent_file_sha,
+            sealed_custodian_actor=custodian,
+            sealed_custodian_actor_file_sha256=custodian_file_sha,
             amendment=amendment,
             amendment_file_sha256=_file_sha256(amendment_path),
             evaluator_contract=evaluator_contract,
@@ -1233,6 +1608,7 @@ def prepare_governance(
             independent_record_path=independent_record_path,
             surface_review_path=surface_path,
             independent_review_path=independent_path,
+            sealed_custodian_actor_path=custodian_path,
             amendment_path=amendment_path,
             evaluator_contract_path=evaluator_contract_path,
             portable_draft_path=portable_draft_path,
@@ -1247,6 +1623,7 @@ def prepare_governance(
         return {
             "surface_review": surface_path,
             "independent_review": independent_path,
+            "sealed_custodian_actor": custodian_path,
             "amendment": amendment_path,
             "evaluator_contract": evaluator_contract_path,
             "portable_draft": portable_draft_path,
@@ -1969,6 +2346,7 @@ _MATERIALIZED_SUPPORT_PATHS = frozenset(
         "governance/amendment.json",
         "governance/ratification-draft.json",
         "governance/owner-ratification.json",
+        "governance/sealed-custodian-actor.json",
         "reviews/surface-agent-review.json",
         "reviews/independent-agent-verification.json",
         "reviews/surface-source-record.json",
@@ -2051,13 +2429,26 @@ def build_blinded_acceptance_request(
     *,
     package: dict[str, Any],
     manifests: dict[str, dict[str, Any]],
+    independent_review: dict[str, Any],
+    independent_review_file_sha256: str,
+    sealed_custodian_actor: dict[str, Any],
+    sealed_custodian_actor_file_sha256: str,
+    ratification: dict[str, Any],
+    ratification_file_sha256: str,
     public_record_file_sha256: str,
     amendment_file_sha256: str,
     amendment_sha256: str,
     requested_at_utc: str,
 ) -> dict[str, Any]:
+    parent_actor = krea_fixture._agent_actor(
+        independent_review["actor"], "parent independent review actor"
+    )
+    custodian = krea_fixture._agent_actor(
+        sealed_custodian_actor, "sealed custodian actor"
+    )
+    krea_fixture._validate_cross_agent_distinct(custodian, parent_actor)
     body = {
-        "schema": 1,
+        "schema": 2,
         "kind": "forge-krea-blinded-confirmation-acceptance-request",
         "requested_at_utc": _utc(requested_at_utc, "acceptance request time"),
         "source_package": {
@@ -2066,6 +2457,33 @@ def build_blinded_acceptance_request(
         },
         "discovery_fixture_manifest_sha256s": {
             role: manifests[role]["manifest_sha256"] for role in _ROLES
+        },
+        "governance": {
+            "parent_independent_review": {
+                "file_sha256": _digest(
+                    independent_review_file_sha256,
+                    "parent independent review file SHA-256",
+                ),
+                "review_sha256": independent_review["review_sha256"],
+                "actor": parent_actor,
+            },
+            "sealed_custodian_actor": {
+                "file_sha256": _digest(
+                    sealed_custodian_actor_file_sha256,
+                    "sealed custodian actor file SHA-256",
+                ),
+                "actor_sha256": krea_provenance.canonical_sha256(custodian),
+                "actor": custodian,
+            },
+            "owner_ratification": {
+                "file_sha256": _digest(
+                    ratification_file_sha256,
+                    "owner ratification file SHA-256",
+                ),
+                "ratification_sha256": ratification["ratification_sha256"],
+            },
+            "agent_review_is_not_human_review": True,
+            "independent_human_review_performed": False,
         },
         "confirmation_commitment": {
             "public_record_file_sha256": _digest(
@@ -2083,13 +2501,7 @@ def build_blinded_acceptance_request(
             ),
             "c1c4_revealed": False,
         },
-        "required_private_digest_only_fields": [
-            "C1-C4 file-to-semantic manifest SHA-256 mapping",
-            "all-six D1,D2,C1,C2,C3,C4 semantic manifest map",
-            "cross-review file SHA-256, fixture-set SHA-256, pair count and SHA-256",
-            "cross-review binding SHA-256",
-            "custody and unrevealed assertions",
-        ],
+        "required_private_digest_only_fields": list(_BLINDED_PRIVATE_FIELDS),
         "admission_authorized": False,
         "gpu_execution_authorized": False,
     }
@@ -2139,6 +2551,10 @@ def materialize_discovery_inputs(
         )
         _copy_regular(
             ratification_path, temporary / "governance" / "owner-ratification.json"
+        )
+        _copy_regular(
+            resolved["sealed_custodian_actor_path"],
+            temporary / "governance" / "sealed-custodian-actor.json",
         )
         _copy_regular(
             resolved["portable_draft_path"],
@@ -2204,6 +2620,14 @@ def materialize_discovery_inputs(
         request = build_blinded_acceptance_request(
             package=resolved["inputs"]["package"],
             manifests=manifests,
+            independent_review=resolved["independent_review"],
+            independent_review_file_sha256=resolved["independent_review_file_sha256"],
+            sealed_custodian_actor=resolved["sealed_custodian_actor"],
+            sealed_custodian_actor_file_sha256=resolved[
+                "sealed_custodian_actor_file_sha256"
+            ],
+            ratification=ratification,
+            ratification_file_sha256=ratification_file_sha,
             public_record_file_sha256=_file_sha256(public_record_path),
             amendment_file_sha256=shape_file_sha,
             amendment_sha256=shape["amendment_sha256"],
@@ -2240,69 +2664,215 @@ def materialize_discovery_inputs(
         raise
 
 
+_BLINDED_PRIVATE_FIELDS = [
+    "C1-C4 file-to-semantic manifest SHA-256 mapping",
+    "all-six D1,D2,C1,C2,C3,C4 semantic manifest map",
+    "cross-review file SHA-256, fixture-set SHA-256, pair count and SHA-256",
+    "cross-review binding SHA-256",
+    "exact pre-ratified sealed-custodian actor",
+    "custody and unrevealed assertions",
+]
+
+
+def validate_blinded_acceptance_request(request: dict[str, Any]) -> dict[str, Any]:
+    request = _object(request, "blinded acceptance request")
+    _exact(
+        request,
+        {
+            "schema",
+            "kind",
+            "requested_at_utc",
+            "source_package",
+            "discovery_fixture_manifest_sha256s",
+            "governance",
+            "confirmation_commitment",
+            "required_private_digest_only_fields",
+            "admission_authorized",
+            "gpu_execution_authorized",
+            "request_sha256",
+        },
+        "blinded acceptance request",
+    )
+    body = {key: value for key, value in request.items() if key != "request_sha256"}
+    source = _object(request["source_package"], "acceptance source package")
+    _exact(source, {"package_sha256", "file_set_sha256"}, "acceptance source package")
+    for key, value in source.items():
+        _digest(value, f"acceptance source package {key}")
+    discovery = _object(
+        request["discovery_fixture_manifest_sha256s"],
+        "discovery fixture manifest hashes",
+    )
+    _exact(discovery, set(_ROLES), "discovery fixture manifest hashes")
+    for role, digest in discovery.items():
+        _digest(digest, f"{role} semantic manifest SHA-256")
+    governance = _object(request["governance"], "acceptance request governance")
+    _exact(
+        governance,
+        {
+            "parent_independent_review",
+            "sealed_custodian_actor",
+            "owner_ratification",
+            "agent_review_is_not_human_review",
+            "independent_human_review_performed",
+        },
+        "acceptance request governance",
+    )
+    parent = _object(
+        governance["parent_independent_review"], "parent independent review"
+    )
+    custodian_binding = _object(
+        governance["sealed_custodian_actor"], "sealed custodian actor binding"
+    )
+    owner = _object(governance["owner_ratification"], "owner ratification binding")
+    _exact(
+        parent,
+        {"file_sha256", "review_sha256", "actor"},
+        "parent independent review",
+    )
+    _exact(
+        custodian_binding,
+        {"file_sha256", "actor_sha256", "actor"},
+        "sealed custodian actor binding",
+    )
+    _exact(
+        owner,
+        {"file_sha256", "ratification_sha256"},
+        "owner ratification binding",
+    )
+    parent_actor = krea_fixture._agent_actor(
+        parent["actor"], "parent independent review actor"
+    )
+    custodian = krea_fixture._agent_actor(
+        custodian_binding["actor"], "sealed custodian actor"
+    )
+    krea_fixture._validate_cross_agent_distinct(custodian, parent_actor)
+    for binding, keys, label in (
+        (parent, ("file_sha256", "review_sha256"), "parent independent review"),
+        (
+            custodian_binding,
+            ("file_sha256", "actor_sha256"),
+            "sealed custodian actor",
+        ),
+        (owner, ("file_sha256", "ratification_sha256"), "owner ratification"),
+    ):
+        for key in keys:
+            _digest(binding[key], f"{label} {key}")
+    commitment = _object(request["confirmation_commitment"], "confirmation commitment")
+    _exact(
+        commitment,
+        {
+            "public_record_file_sha256",
+            "commitment_sha256",
+            "published_manifest_file_sha256s",
+            "shape_amendment_file_sha256",
+            "shape_amendment_sha256",
+            "c1c4_revealed",
+        },
+        "confirmation commitment",
+    )
+    for key in (
+        "public_record_file_sha256",
+        "commitment_sha256",
+        "shape_amendment_file_sha256",
+        "shape_amendment_sha256",
+    ):
+        _digest(commitment[key], f"confirmation commitment {key}")
+    published = _object(
+        commitment["published_manifest_file_sha256s"],
+        "published C manifest file hashes",
+    )
+    _exact(published, {"C1", "C2", "C3", "C4"}, "published C hashes")
+    for role, digest in published.items():
+        _digest(digest, f"published {role} manifest file SHA-256")
+    if (
+        request["schema"] != 2
+        or request["kind"] != "forge-krea-blinded-confirmation-acceptance-request"
+        or custodian_binding["actor_sha256"]
+        != krea_provenance.canonical_sha256(custodian)
+        or governance["agent_review_is_not_human_review"] is not True
+        or governance["independent_human_review_performed"] is not False
+        or commitment["public_record_file_sha256"]
+        != krea_c1c4_amendment.PUBLIC_RECORD_SHA256
+        or commitment["commitment_sha256"] != krea_c1c4_amendment.COMMITMENT_SHA256
+        or commitment["published_manifest_file_sha256s"]
+        != krea_c1c4_amendment.MANIFEST_FILE_SHA256S
+        or commitment["shape_amendment_file_sha256"]
+        != krea_c1c4_amendment.AMENDMENT_FILE_SHA256
+        or commitment["shape_amendment_sha256"] != krea_c1c4_amendment.AMENDMENT_SHA256
+        or commitment["c1c4_revealed"] is not False
+        or request["required_private_digest_only_fields"] != _BLINDED_PRIVATE_FIELDS
+        or request["admission_authorized"] is not False
+        or request["gpu_execution_authorized"] is not False
+        or request["request_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("blinded acceptance request is invalid")
+    _utc(request["requested_at_utc"], "acceptance request time")
+    return request
+
+
 def build_blinded_acceptance(
     request: dict[str, Any],
     *,
-    actor: dict[str, Any],
+    custodian_actor: dict[str, Any],
     c1c4_semantic_manifest_sha256s: dict[str, str],
     cross_fixture_review: dict[str, Any],
     reviewed_at_utc: str,
 ) -> dict[str, Any]:
-    """Schema helper for the C custodian; callers still supply private results."""
+    """Build only the digest-only output of the pre-ratified sealed custodian."""
 
-    actor = krea_fixture._agent_actor(actor, "blinded acceptance actor")
+    validate_blinded_acceptance_request(request)
+    governance = request["governance"]
+    custodian = krea_fixture._agent_actor(custodian_actor, "sealed custodian actor")
+    if custodian != governance["sealed_custodian_actor"]["actor"]:
+        raise ValueError("blinded acceptance actor is not the pre-ratified custodian")
+    parent = {
+        "review_sha256": governance["parent_independent_review"]["review_sha256"],
+        "actor": governance["parent_independent_review"]["actor"],
+    }
     expected_c_roles = {"C1", "C2", "C3", "C4"}
     if set(c1c4_semantic_manifest_sha256s) != expected_c_roles:
         raise ValueError("blinded acceptance needs exactly C1-C4 semantic hashes")
     for role, digest in c1c4_semantic_manifest_sha256s.items():
         _digest(digest, f"{role} semantic manifest SHA-256")
-    discovery = request["discovery_fixture_manifest_sha256s"]
-    all_six = {**discovery, **c1c4_semantic_manifest_sha256s}
-    _exact(
+    all_six = {
+        **request["discovery_fixture_manifest_sha256s"],
+        **c1c4_semantic_manifest_sha256s,
+    }
+    krea_fixture.validate_agent_cross_fixture_binding_digest_only(
         cross_fixture_review,
-        {
-            "review_file_sha256",
-            "fixture_manifest_set_sha256",
-            "reviewed_pair_count",
-            "reviewed_pairs_sha256",
-            "binding_sha256",
-        },
-        "cross-fixture blinded review",
+        fixture_manifest_sha256s=all_six,
+        parent_independent_review=parent,
+        owner_ratification_sha256=governance["owner_ratification"][
+            "ratification_sha256"
+        ],
+        acceptance_request_sha256=request["request_sha256"],
     )
-    for key in (
-        "review_file_sha256",
-        "fixture_manifest_set_sha256",
-        "reviewed_pairs_sha256",
-        "binding_sha256",
-    ):
-        _digest(cross_fixture_review[key], f"cross fixture {key}")
-    fixture_set_sha256 = krea_provenance.canonical_sha256(all_six)
-    if cross_fixture_review["fixture_manifest_set_sha256"] != fixture_set_sha256:
-        raise ValueError("cross-fixture binding names a different fixture set")
-    pair_count = cross_fixture_review["reviewed_pair_count"]
-    if (
-        isinstance(pair_count, bool)
-        or not isinstance(pair_count, int)
-        or pair_count <= 0
-    ):
-        raise ValueError("cross-fixture reviewed_pair_count is invalid")
+    if cross_fixture_review["actor"] != custodian:
+        raise ValueError("cross-fixture review was not made by the bound custodian")
     body = {
-        "schema": 1,
+        "schema": 2,
         "kind": "forge-krea-blinded-confirmation-acceptance",
-        "actor": actor,
+        "actor": custodian,
+        "parent_independent_review": parent,
+        "owner_ratification_sha256": governance["owner_ratification"][
+            "ratification_sha256"
+        ],
         "reviewed_at_utc": _utc(reviewed_at_utc, "blinded acceptance time"),
         "request_sha256": request["request_sha256"],
         "source_package": request["source_package"],
         "public_confirmation_commitment": request["confirmation_commitment"],
         "fixture_manifest_sha256s": all_six,
-        "fixture_manifest_set_sha256": fixture_set_sha256,
+        "fixture_manifest_set_sha256": krea_provenance.canonical_sha256(all_six),
         "cross_fixture_review": cross_fixture_review,
         "assertions": {
             "c1c4_file_to_semantic_mapping_verified_in_custody": True,
             "all_six_cross_fixture_review_preexists_discovery_execution": True,
             "c1c4_remain_sealed_and_unrevealed": True,
             "no_c1c4_content_or_path_disclosed": True,
+            "d2_selector_key_was_not_accessed_for_this_review": True,
             "d2_committed_selector_opening_bound_to_source_package": True,
+            "sealed_custodian_actor_matches_owner_ratified_request": True,
+            "custodian_is_distinct_from_parent_independent_actor": True,
             "agent_review_is_not_human_review": True,
         },
         "decision": "accepted_for_d1_d2_discovery_admission",
@@ -2310,19 +2880,19 @@ def build_blinded_acceptance(
         "gpu_execution_authorized": False,
         "c1c4_revealed": False,
         "claim_limit": (
-            "digest-only-discovery-custody-acceptance-not-c1c4-admission-"
-            "content-disclosure-human-review-or-gpu-authorization"
+            "digest-only-agent-custody-acceptance-not-c1c4-admission-content-"
+            "disclosure-human-review-quality-proof-or-gpu-authorization"
         ),
     }
-    return _seal(body, "acceptance_sha256")
+    acceptance = _seal(body, "acceptance_sha256")
+    validate_blinded_acceptance(acceptance, request=request)
+    return acceptance
 
 
 def validate_blinded_acceptance(
-    acceptance: dict[str, Any],
-    *,
-    request: dict[str, Any],
-    independent_actor: dict[str, Any],
+    acceptance: dict[str, Any], *, request: dict[str, Any]
 ) -> dict[str, Any]:
+    validate_blinded_acceptance_request(request)
     acceptance = _object(acceptance, "blinded acceptance")
     _exact(
         acceptance,
@@ -2330,6 +2900,8 @@ def validate_blinded_acceptance(
             "schema",
             "kind",
             "actor",
+            "parent_independent_review",
+            "owner_ratification_sha256",
             "reviewed_at_utc",
             "request_sha256",
             "source_package",
@@ -2350,48 +2922,51 @@ def validate_blinded_acceptance(
     body = {
         key: value for key, value in acceptance.items() if key != "acceptance_sha256"
     }
-    actor = krea_fixture._agent_actor(acceptance["actor"], "blinded acceptance actor")
-    independent_actor = krea_fixture._agent_actor(
-        independent_actor, "independent review actor"
+    governance = request["governance"]
+    custodian = krea_fixture._agent_actor(
+        acceptance["actor"], "blinded acceptance actor"
     )
+    expected_custodian = governance["sealed_custodian_actor"]["actor"]
+    parent = {
+        "review_sha256": governance["parent_independent_review"]["review_sha256"],
+        "actor": governance["parent_independent_review"]["actor"],
+    }
     manifests = _object(
         acceptance["fixture_manifest_sha256s"], "all-six fixture manifest map"
     )
-    if set(manifests) != {"D1", "D2", "C1", "C2", "C3", "C4"}:
+    if set(manifests) != set(krea_fixture._CROSS_FIXTURE_ROLES):
         raise ValueError("blinded acceptance does not cover exactly all six fixtures")
     for role, digest in manifests.items():
         _digest(digest, f"{role} semantic manifest SHA-256")
-    cross = _object(acceptance["cross_fixture_review"], "cross-fixture review")
-    _exact(
-        cross,
-        {
-            "review_file_sha256",
-            "fixture_manifest_set_sha256",
-            "reviewed_pair_count",
-            "reviewed_pairs_sha256",
-            "binding_sha256",
-        },
-        "cross-fixture review",
+    krea_fixture.validate_agent_cross_fixture_binding_digest_only(
+        acceptance["cross_fixture_review"],
+        fixture_manifest_sha256s=manifests,
+        parent_independent_review=parent,
+        owner_ratification_sha256=governance["owner_ratification"][
+            "ratification_sha256"
+        ],
+        acceptance_request_sha256=request["request_sha256"],
     )
-    for key in (
-        "review_file_sha256",
-        "fixture_manifest_set_sha256",
-        "reviewed_pairs_sha256",
-        "binding_sha256",
-    ):
-        _digest(cross[key], f"cross fixture {key}")
     request_time = datetime.strptime(
         _utc(request["requested_at_utc"], "acceptance request time"),
         "%Y-%m-%dT%H:%M:%SZ",
     ).replace(tzinfo=timezone.utc)
-    review_time = datetime.strptime(
+    acceptance_time = datetime.strptime(
         _utc(acceptance["reviewed_at_utc"], "acceptance time"),
         "%Y-%m-%dT%H:%M:%SZ",
     ).replace(tzinfo=timezone.utc)
+    cross_review_time = datetime.strptime(
+        acceptance["cross_fixture_review"]["reviewed_at_utc"],
+        "%Y-%m-%dT%H:%M:%SZ",
+    ).replace(tzinfo=timezone.utc)
     if (
-        acceptance["schema"] != 1
+        acceptance["schema"] != 2
         or acceptance["kind"] != "forge-krea-blinded-confirmation-acceptance"
-        or actor != independent_actor
+        or custodian != expected_custodian
+        or acceptance["cross_fixture_review"]["actor"] != custodian
+        or acceptance["parent_independent_review"] != parent
+        or acceptance["owner_ratification_sha256"]
+        != governance["owner_ratification"]["ratification_sha256"]
         or acceptance["request_sha256"] != request["request_sha256"]
         or acceptance["source_package"] != request["source_package"]
         or acceptance["public_confirmation_commitment"]
@@ -2400,18 +2975,16 @@ def validate_blinded_acceptance(
         != request["discovery_fixture_manifest_sha256s"]
         or acceptance["fixture_manifest_set_sha256"]
         != krea_provenance.canonical_sha256(manifests)
-        or cross["fixture_manifest_set_sha256"]
-        != acceptance["fixture_manifest_set_sha256"]
-        or isinstance(cross["reviewed_pair_count"], bool)
-        or not isinstance(cross["reviewed_pair_count"], int)
-        or cross["reviewed_pair_count"] <= 0
         or acceptance["assertions"]
         != {
             "c1c4_file_to_semantic_mapping_verified_in_custody": True,
             "all_six_cross_fixture_review_preexists_discovery_execution": True,
             "c1c4_remain_sealed_and_unrevealed": True,
             "no_c1c4_content_or_path_disclosed": True,
+            "d2_selector_key_was_not_accessed_for_this_review": True,
             "d2_committed_selector_opening_bound_to_source_package": True,
+            "sealed_custodian_actor_matches_owner_ratified_request": True,
+            "custodian_is_distinct_from_parent_independent_actor": True,
             "agent_review_is_not_human_review": True,
         }
         or acceptance["decision"] != "accepted_for_d1_d2_discovery_admission"
@@ -2420,11 +2993,12 @@ def validate_blinded_acceptance(
         or acceptance["c1c4_revealed"] is not False
         or acceptance["claim_limit"]
         != (
-            "digest-only-discovery-custody-acceptance-not-c1c4-admission-"
-            "content-disclosure-human-review-or-gpu-authorization"
+            "digest-only-agent-custody-acceptance-not-c1c4-admission-content-"
+            "disclosure-human-review-quality-proof-or-gpu-authorization"
         )
         or acceptance["acceptance_sha256"] != krea_provenance.canonical_sha256(body)
-        or review_time < request_time
+        or acceptance_time < request_time
+        or acceptance_time < cross_review_time
     ):
         raise ValueError("blinded confirmation acceptance is invalid")
     return acceptance
@@ -2509,6 +3083,12 @@ def _validate_portable_ratification(
         "ratification_is_not_a_cryptographic_or_legal_signature": True,
         "owner_authorizes_mechanical_gpu_approval_after_envelope_and_host_plan_validation": True,
         "c1c4_remain_sealed": True,
+        "stage1_is_discovery_only": True,
+        "stage1_is_not_release_or_tournament_evidence": True,
+        "stage2_requires_separate_commit_and_fresh_owner_ratification": True,
+        "owner_accepts_exact_stage1_timing_margins": True,
+        "owner_authorizes_only_prebound_stage1_technical_agents": True,
+        "delegated_agents_cannot_change_frozen_rules": True,
     }
     if (
         ratification.get("schema") != 1
@@ -2660,6 +3240,10 @@ def validate_materialized_inputs(
         surface_review=surface,
         surface_review_file_sha256=surface_file_sha,
     )
+    custodian, custodian_file_sha = load_sealed_custodian_actor(
+        root / "governance" / "sealed-custodian-actor.json",
+        parent_independent_actor=independent["actor"],
+    )
     amendment, amendment_file_sha = _json(
         root / "governance" / "amendment.json",
         "governance amendment",
@@ -2672,6 +3256,8 @@ def validate_materialized_inputs(
         policy=policy,
         surface_review=surface,
         independent_review=independent,
+        sealed_custodian_actor=custodian,
+        sealed_custodian_actor_file_sha256=custodian_file_sha,
         surface_review_file_sha256=surface_file_sha,
         independent_review_file_sha256=independent_file_sha,
     )
@@ -2695,6 +3281,8 @@ def validate_materialized_inputs(
         surface_review_file_sha256=surface_file_sha,
         independent_review=independent,
         independent_review_file_sha256=independent_file_sha,
+        sealed_custodian_actor=custodian,
+        sealed_custodian_actor_file_sha256=custodian_file_sha,
         amendment=amendment,
         amendment_file_sha256=amendment_file_sha,
         evaluator_contract=evaluator_contract,
@@ -2814,6 +3402,12 @@ def validate_materialized_inputs(
     expected_request = build_blinded_acceptance_request(
         package=package,
         manifests=manifests,
+        independent_review=independent,
+        independent_review_file_sha256=independent_file_sha,
+        sealed_custodian_actor=custodian,
+        sealed_custodian_actor_file_sha256=custodian_file_sha,
+        ratification=ratification,
+        ratification_file_sha256=ratification_file_sha,
         public_record_file_sha256=_file_sha256(public_path),
         amendment_file_sha256=shape_file_sha,
         amendment_sha256=shape["amendment_sha256"],
@@ -2834,6 +3428,8 @@ def validate_materialized_inputs(
         "surface_review_file_sha256": surface_file_sha,
         "independent_review": independent,
         "independent_review_file_sha256": independent_file_sha,
+        "sealed_custodian_actor": custodian,
+        "sealed_custodian_actor_file_sha256": custodian_file_sha,
         "amendment": amendment,
         "amendment_file_sha256": amendment_file_sha,
         "portable_draft": portable_draft,
@@ -2887,7 +3483,6 @@ def finalize_discovery_envelope(
     validate_blinded_acceptance(
         acceptance,
         request=resolved["request"],
-        independent_actor=resolved["independent_review"]["actor"],
     )
     admitted_at_utc = _utc(admitted_at_utc, "admission time")
     admitted_at = datetime.strptime(admitted_at_utc, "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -2916,6 +3511,7 @@ def finalize_discovery_envelope(
         amendment_path = temporary / "governance" / "amendment.json"
         portable_draft_path = temporary / "governance" / "ratification-draft.json"
         ratification_path = temporary / "governance" / "owner-ratification.json"
+        custodian_path = temporary / "governance" / "sealed-custodian-actor.json"
         public_path = temporary / "confirmation" / "public-commitment.md"
         shape_path = temporary / "confirmation" / "shape-amendment.json"
         request_path = temporary / "confirmation" / "blinded-acceptance.request.json"
@@ -2995,6 +3591,14 @@ def finalize_discovery_envelope(
                     semantic_key="review_sha256",
                     semantic_value=resolved["independent_review"]["review_sha256"],
                 ),
+                "sealed_custodian_actor": {
+                    "relative_path": custodian_path.relative_to(temporary).as_posix(),
+                    "file_sha256": _file_sha256(custodian_path),
+                    "actor_sha256": krea_provenance.canonical_sha256(
+                        resolved["sealed_custodian_actor"]
+                    ),
+                    "actor": resolved["sealed_custodian_actor"],
+                },
                 "agent_review_is_not_human_review": True,
                 "independent_human_review_performed": False,
             },
@@ -3232,6 +3836,7 @@ def validate_envelope(root_or_path: Path) -> dict[str, Any]:
             "owner_ratification",
             "portable_ratification_draft",
             "independent_agent_review",
+            "sealed_custodian_actor",
             "agent_review_is_not_human_review",
             "independent_human_review_performed",
         },
@@ -3283,6 +3888,36 @@ def validate_envelope(root_or_path: Path) -> dict[str, Any]:
             or record[semantic_key] != expected
         ):
             raise ValueError(f"governance {key} semantic mismatch")
+    custodian_binding = _object(
+        governance["sealed_custodian_actor"], "envelope sealed custodian actor"
+    )
+    _exact(
+        custodian_binding,
+        {"relative_path", "file_sha256", "actor_sha256", "actor"},
+        "envelope sealed custodian actor",
+    )
+    custodian_path = _load_relative_file(
+        root,
+        {
+            "relative_path": custodian_binding["relative_path"],
+            "file_sha256": custodian_binding["file_sha256"],
+        },
+        "envelope sealed custodian actor",
+    )
+    if custodian_binding["relative_path"] != "governance/sealed-custodian-actor.json":
+        raise ValueError("sealed custodian actor path is not literal")
+    custodian, custodian_file_sha = load_sealed_custodian_actor(
+        custodian_path,
+        parent_independent_actor=materialized["independent_review"]["actor"],
+    )
+    if (
+        custodian != materialized["sealed_custodian_actor"]
+        or custodian_binding["actor"] != custodian
+        or custodian_binding["actor_sha256"]
+        != krea_provenance.canonical_sha256(custodian)
+        or custodian_file_sha != materialized["sealed_custodian_actor_file_sha256"]
+    ):
+        raise ValueError("envelope sealed custodian actor binding mismatch")
     fixtures = _object(envelope["discovery_fixtures"], "discovery fixtures")
     _exact(fixtures, set(_ROLES), "discovery fixtures")
     for role in _ROLES:
@@ -3383,7 +4018,6 @@ def validate_envelope(root_or_path: Path) -> dict[str, Any]:
     validate_blinded_acceptance(
         acceptance,
         request=request,
-        independent_actor=materialized["independent_review"]["actor"],
     )
     admitted_at = datetime.strptime(
         envelope["admitted_at_utc"], "%Y-%m-%dT%H:%M:%SZ"
@@ -3406,16 +4040,12 @@ def validate_envelope(root_or_path: Path) -> dict[str, Any]:
     )
     _exact(published_c, {"C1", "C2", "C3", "C4"}, "published C hashes")
     _exact(semantic_c, {"C1", "C2", "C3", "C4"}, "C semantic hashes")
-    _exact(
+    krea_fixture.validate_agent_cross_fixture_binding_digest_only(
         cross_review,
-        {
-            "review_file_sha256",
-            "fixture_manifest_set_sha256",
-            "reviewed_pair_count",
-            "reviewed_pairs_sha256",
-            "binding_sha256",
-        },
-        "cross-fixture review binding",
+        fixture_manifest_sha256s=acceptance["fixture_manifest_sha256s"],
+        parent_independent_review=acceptance["parent_independent_review"],
+        owner_ratification_sha256=acceptance["owner_ratification_sha256"],
+        acceptance_request_sha256=request["request_sha256"],
     )
     for label, values in (("published C", published_c), ("semantic C", semantic_c)):
         for role, digest in values.items():
@@ -3491,6 +4121,7 @@ def _parse_args() -> argparse.Namespace:
     prepare.add_argument("--package", required=True, type=Path)
     prepare.add_argument("--surface-record", required=True, type=Path)
     prepare.add_argument("--independent-record", required=True, type=Path)
+    prepare.add_argument("--sealed-custodian-actor", required=True, type=Path)
     prepare.add_argument("--god-checkout", required=True, type=Path)
     prepare.add_argument("--god-commit", required=True)
     prepare.add_argument("--output-dir", required=True, type=Path)
@@ -3534,6 +4165,7 @@ def main() -> int:
             package_root=args.package,
             surface_record_path=args.surface_record,
             independent_record_path=args.independent_record,
+            sealed_custodian_actor_path=args.sealed_custodian_actor,
             god_checkout=args.god_checkout,
             god_commit=args.god_commit,
             output_dir=args.output_dir,

@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -29,6 +30,8 @@ dataset_identity = _load("krea_dataset_identity")
 sys.modules["krea_dataset_identity"] = dataset_identity
 fixture = _load("krea_fixture")
 host = _load("krea_host_identity")
+sys.modules["krea_host_identity"] = host
+bootstrap = _load("krea_host_bootstrap")
 
 
 def _utc(seconds: int = 0) -> str:
@@ -269,6 +272,136 @@ def _cross_review(fixtures: list[dict]) -> dict:
     }
 
 
+def _agent(name: str, role: str) -> dict[str, str]:
+    return {
+        "actor_class": "agent",
+        "actor_id": name,
+        "display_name": name.replace("-", " ").title(),
+        "role": role,
+        "review_instance_id": f"review-{name}",
+        "identity_assurance": fixture._AGENT_IDENTITY_ASSURANCE,
+    }
+
+
+def _agent_cross_review(fixtures: list[dict]) -> dict:
+    return fixture.build_agent_cross_fixture_review(
+        fixtures,
+        actor=_agent("sealed-custodian", fixture._SEALED_CUSTODIAN_ROLE),
+        parent_independent_review={
+            "review_sha256": _sha("parent-independent-review"),
+            "actor": _agent("independent-agent", "independent_technical_reviewer"),
+        },
+        owner_ratification_sha256=_sha("owner-ratification"),
+        acceptance_request_sha256=_sha("acceptance-request"),
+        reviewed_at_utc=_utc(-30),
+        visual_reviewed_pairs=[],
+    )
+
+
+def test_agent_cross_fixture_review_is_explicit_nonhuman_and_exhaustive(
+    monkeypatch,
+) -> None:
+    fixtures = _fixtures()
+    monkeypatch.setattr(fixture, "validate_manifest", lambda value: value)
+
+    review = _agent_cross_review(fixtures)
+
+    assert (
+        fixture.validate_agent_cross_fixture_review(review, fixtures=fixtures) == review
+    )
+    assert review["schema"] == 2
+    assert review["actor"]["role"] == fixture._SEALED_CUSTODIAN_ROLE
+    assert review["reviewed_pair_count"] == 60
+    assert review["reviewed_pairs"] == fixture._cross_fixture_pairs(fixtures)
+    assert review["review_scope"]["automated"]["coverage"] == "all-cross-role-pairs"
+    assert review["review_scope"]["visual"] == {
+        "performed": False,
+        "method": "not-performed",
+        "coverage": "none",
+        "reviewed_pair_count": 0,
+        "reviewed_pairs_sha256": provenance.canonical_sha256([]),
+    }
+    assert review["assertions"]["agent_review_is_not_human_review"] is True
+    assert review["assertions"]["independent_human_review_performed"] is False
+    assert review["assertions"]["d2_selector_key_accessed"] is False
+    assert review["admission_authorized"] is False
+    assert review["gpu_execution_authorized"] is False
+
+
+def test_agent_cross_fixture_binding_binds_exact_review_and_actor(
+    monkeypatch,
+) -> None:
+    fixtures = _fixtures()
+    monkeypatch.setattr(fixture, "validate_manifest", lambda value: value)
+    review = _agent_cross_review(fixtures)
+    binding = fixture.build_agent_cross_fixture_binding(
+        review,
+        fixtures=fixtures,
+        review_file_sha256=_sha("agent-cross-review-file"),
+    )
+
+    assert (
+        fixture.validate_agent_cross_fixture_binding(
+            binding,
+            fixtures=fixtures,
+            review_record=review,
+            review_file_sha256=_sha("agent-cross-review-file"),
+        )
+        == binding
+    )
+    assert binding["actor"] == review["actor"]
+    assert binding["parent_independent_review"] == review["parent_independent_review"]
+    assert binding["owner_ratification_sha256"] == review["owner_ratification_sha256"]
+    assert binding["acceptance_request_sha256"] == review["acceptance_request_sha256"]
+    assert binding["review_sha256"] == review["review_sha256"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "custodian_is_parent",
+        "wrong_role",
+        "missing_pair",
+        "reordered_pair",
+        "visual_outside_universe",
+        "claims_human",
+        "accessed_d2_key",
+        "true_gpu_authority",
+    ],
+)
+def test_agent_cross_fixture_review_tampering_fails_closed(
+    monkeypatch, mutation
+) -> None:
+    fixtures = _fixtures()
+    monkeypatch.setattr(fixture, "validate_manifest", lambda value: value)
+    review = _agent_cross_review(fixtures)
+    if mutation == "custodian_is_parent":
+        review["actor"] = deepcopy(review["parent_independent_review"]["actor"])
+        review["actor"]["role"] = fixture._SEALED_CUSTODIAN_ROLE
+    elif mutation == "wrong_role":
+        review["actor"]["role"] = "independent_technical_reviewer"
+    elif mutation == "missing_pair":
+        review["reviewed_pairs"] = review["reviewed_pairs"][:-1]
+    elif mutation == "reordered_pair":
+        review["reviewed_pairs"][0], review["reviewed_pairs"][1] = (
+            review["reviewed_pairs"][1],
+            review["reviewed_pairs"][0],
+        )
+    elif mutation == "visual_outside_universe":
+        review["visual_reviewed_pairs"] = [["D1:not-a-row", "C1:not-a-row"]]
+    elif mutation == "claims_human":
+        review["assertions"]["independent_human_review_performed"] = True
+    elif mutation == "accessed_d2_key":
+        review["assertions"]["d2_selector_key_accessed"] = True
+    else:
+        review["gpu_execution_authorized"] = True
+    body = {key: value for key, value in review.items() if key != "review_sha256"}
+    review["review_sha256"] = provenance.canonical_sha256(body)
+
+    with pytest.raises(ValueError):
+        fixture.validate_agent_cross_fixture_review(review, fixtures=fixtures)
+
+
 def test_cross_fixture_review_is_exhaustive_portable_and_consumer_bound(
     tmp_path, monkeypatch
 ):
@@ -469,6 +602,92 @@ def test_host_manifest_and_live_preflight_accept_complete_bound_observation(
     monkeypatch.setattr(host, "observe", lambda *args, **kwargs: observed)
     assert host.validate_manifest(manifest) == manifest
     assert host.verify_live(manifest, checkpoint_path=Path("/checkpoints")) == observed
+
+
+def test_schema3_host_manifest_reopens_exact_bootstrap_receipt(tmp_path):
+    spec_payload = {
+        "schema": 1,
+        "kind": "forge-krea-host-bootstrap-spec",
+        "sources": {
+            "forge_repo": "/stage/forge",
+            "ai_toolkit_repo": "/stage/ai-toolkit",
+            "venv": "/stage/venv",
+            "checkpoints": "/checkpoints",
+            "dataset": "/volatile/dataset",
+            "cache": "/volatile/cache",
+            "campaign": "/evidence/campaign",
+            "evidence_root": "/evidence",
+        },
+        "source_identities": {
+            "forge_commit": "a" * 40,
+            "ai_toolkit_commit": "b" * 40,
+        },
+        "requirements": {
+            "ubuntu_release": "22.04",
+            "minimum_effective_cpu_capacity": 16,
+            "minimum_effective_memory_bytes": 64 * 1024**3,
+            "minimum_checkpoint_filesystem_bytes": 500 * 1024**3,
+            "minimum_checkpoint_free_bytes": 350 * 1024**3,
+            "minimum_evidence_filesystem_bytes": 200 * 1024**3,
+            "minimum_evidence_free_bytes": 100 * 1024**3,
+            "minimum_gpu_memory_mib": 78_000,
+            "maximum_gpu_memory_mib": 85_000,
+            "minimum_cuda_version": "12.8",
+            "required_docker_runtime": "nvidia",
+            "systemd_pid1_required": True,
+            "unified_cgroup_v2_required": True,
+            "rootful_docker_required": True,
+            "separate_evidence_filesystem_required": True,
+        },
+        "runtime": {
+            "container_image_reference": "sha256:" + "c" * 64,
+            "container_image_sha256": "c" * 64,
+            "execution_surface": "staged_host_venv",
+            "ai_toolkit_dir": "/app/ai-toolkit",
+            "jit_enabled": True,
+            "stage1_runtime_receipt": {
+                "path": "/evidence/campaign/controls/stage1-runtime.json",
+                "file_sha256": "d" * 64,
+                "receipt_sha256": "e" * 64,
+            },
+            "runtime_cache_policy": {
+                "root": "/cache/krea-runtime",
+                "namespace_derivation": "timing_plan_file_sha256_plus_capture_id_or_execution_plan_file_sha256",
+                "initial_state": "root-empty-before-bootstrap",
+                "cross_capture_or_plan_reuse": False,
+                "within_process_reuse": True,
+            },
+        },
+        "gpu_execution_authorized": False,
+    }
+    spec = bootstrap.seal_spec(spec_payload)
+    receipt_body = {
+        "schema": 1,
+        "kind": "forge-krea-host-bootstrap-receipt",
+        "spec": spec,
+        "layout_identity": {"sealed_test_identity": True},
+        "gpu_execution_authorized": False,
+    }
+    receipt = {
+        **receipt_body,
+        "receipt_sha256": provenance.canonical_sha256(receipt_body),
+    }
+    receipt_path = tmp_path / "bootstrap-receipt.json"
+    raw = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    receipt_path.write_bytes(raw)
+
+    manifest = _host_manifest()
+    manifest["schema"] = 3
+    manifest["bootstrap_receipt"] = {
+        "path": str(receipt_path),
+        "file_sha256": hashlib.sha256(raw).hexdigest(),
+        "receipt_sha256": receipt["receipt_sha256"],
+        "container_image_sha256": "c" * 64,
+    }
+    _reseal(manifest)
+
+    assert host.validate_manifest(manifest) == manifest
+    assert host.bootstrap_runtime(manifest, recapture=False) == spec["runtime"]
 
 
 @pytest.mark.parametrize(

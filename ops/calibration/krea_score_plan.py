@@ -22,11 +22,13 @@ from typing import Any, Sequence
 try:
     from . import batch_evaluate_krea as batch
     from . import krea_fixture
+    from . import krea_execution_surface_policy
     from . import krea_provenance
     from . import krea_training_evidence
 except ImportError:  # pragma: no cover - direct script execution.
     import batch_evaluate_krea as batch  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
+    import krea_execution_surface_policy  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_training_evidence  # type: ignore[no-redef]
 
@@ -42,6 +44,13 @@ _DRAFT_KEYS = {
     "decision_context",
     "candidates",
     "evaluator",
+}
+_KREA_ASSET_REPOSITORY = "Comfy-Org/Krea-2"
+_KREA_ASSET_REVISION = "952f49d49653cb42e7d6cf7cbfad74738073ec7d"
+_KREA_ASSET_SOURCE_PATHS = {
+    "diffusion_model": "diffusion_models/krea2_raw_fp8_scaled.safetensors",
+    "text_encoder": "text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
+    "vae": "vae/qwen_image_vae.safetensors",
 }
 
 
@@ -95,6 +104,12 @@ def _bundle_candidates(
             "kind",
             "arm_id",
             "execution_plan_sha256",
+            "discovery_profile_index_sha256",
+            "discovery_execution_authorization_sha256",
+            "host_bootstrap_receipt_sha256",
+            "execution_surface_policy_sha256",
+            "execution_surface",
+            "execution_scope",
             "run_completion",
             "candidate_bindings",
             "bundle_sha256",
@@ -108,6 +123,19 @@ def _bundle_candidates(
         or bundle["bundle_sha256"] != krea_provenance.canonical_sha256(body)
         or not isinstance(bundle["arm_id"], str)
         or not batch._SAFE_ID.fullmatch(bundle["arm_id"])
+        or bundle["execution_surface_policy_sha256"]
+        != krea_execution_surface_policy.POLICY["policy_sha256"]
+        or bundle["execution_surface"] != "staged_host_venv"
+        or bundle["execution_scope"] != "discovery_only"
+        or any(
+            not isinstance(bundle[name], str)
+            or not batch._SHA256.fullmatch(bundle[name])
+            for name in (
+                "discovery_profile_index_sha256",
+                "discovery_execution_authorization_sha256",
+                "host_bootstrap_receipt_sha256",
+            )
+        )
     ):
         raise ValueError(f"invalid run-evidence bundle: {path}")
 
@@ -436,7 +464,9 @@ def build_documents(
     cross_path, cross_review, cross_file_sha = _load(
         cross_fixture_review_path, "cross-fixture review"
     )
-    batch._validate_cross_fixture_review_surface(cross_review, fixture=fixture)
+    batch._validate_cross_fixture_review_surface(
+        cross_review, fixture=fixture, source_path=cross_path
+    )
     evaluator_path, evaluator, _ = _load(evaluator_config_path, "evaluator config")
     del evaluator_path
     evaluator = batch._validate_evaluator(evaluator)
@@ -541,7 +571,9 @@ def validate_draft(
     _cross_path, cross_review, _cross_file_sha = _bound_document(
         draft["cross_fixture_review"], "cross-fixture review"
     )
-    batch._validate_cross_fixture_review_surface(cross_review, fixture=fixture)
+    batch._validate_cross_fixture_review_surface(
+        cross_review, fixture=fixture, source_path=_cross_path
+    )
     if dataset_spec["sha256"] != fixture["evaluation_dataset_identity"]["sha256"]:
         raise ValueError("draft dataset differs from the approved fixture identity")
     evaluator = batch._validate_evaluator(draft["evaluator"])
@@ -645,11 +677,13 @@ def publish_build(
 def approve_draft(
     *,
     draft_path: Path,
-    reviewer_identity: str,
+    reviewer_identity: str | None,
     approval_output: Path,
     plan_output: Path,
+    technical_reviewer_actor: dict[str, Any] | None = None,
+    discovery_authorization_path: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Publish a separate human approval and the corresponding executable plan."""
+    """Publish a separately attributed approval and executable plan."""
 
     _, draft, _ = _load(draft_path, "exact-score plan draft")
     validate_draft(draft)
@@ -663,9 +697,46 @@ def approve_draft(
         if os.path.lexists(path) or os.path.lexists(Path(f"{path}.tmp")):
             raise FileExistsError(f"refusing existing approval/plan output: {path}")
 
-    approval = batch.build_sealed_plan_approval(
-        draft, reviewer_identity=reviewer_identity
-    )
+    if technical_reviewer_actor is not None:
+        if reviewer_identity is not None or discovery_authorization_path is None:
+            raise ValueError(
+                "agent score approval requires only a technical actor and authorization"
+            )
+        authorization_path, authorization, authorization_file_sha = _load(
+            discovery_authorization_path, "discovery execution authorization"
+        )
+        approval = batch.build_agent_sealed_plan_approval(
+            draft,
+            technical_reviewer_actor=technical_reviewer_actor,
+            discovery_execution_authorization={
+                "path": str(authorization_path),
+                "file_sha256": authorization_file_sha,
+                "authorization_sha256": authorization["authorization_sha256"],
+            },
+        )
+    else:
+        if reviewer_identity is None or discovery_authorization_path is not None:
+            raise ValueError("legacy score approval requires one named human")
+        if draft["decision_context"].get("phase") == "discovery":
+            for raw_candidate in draft["candidates"]:
+                _path, binding, _sha = _bound_document(
+                    raw_candidate["candidate_binding"],
+                    "candidate binding for approval governance",
+                )
+                if binding.get("mode") != "local_run_candidate":
+                    continue
+                _execution_path, execution, _execution_sha = _bound_document(
+                    binding["execution_plan"],
+                    "candidate execution plan for approval governance",
+                )
+                if execution.get("discovery_execution_authorization") is not None:
+                    raise ValueError(
+                        "authorization-bound Stage-1 discovery scoring requires "
+                        "the delegated technical reviewer"
+                    )
+        approval = batch.build_sealed_plan_approval(
+            draft, reviewer_identity=reviewer_identity
+        )
     batch._publish_exclusive(approval_output, approval)
     executable = {
         **draft,
@@ -684,6 +755,174 @@ def validate_plan(path: Path) -> dict[str, Any]:
     _, plan, _ = _load(path, "approved exact-score plan")
     batch._validate_plan(plan)
     return plan
+
+
+def stage_stage1_evaluator_assets(
+    *, comfy_root: Path, token: str, receipt_output: Path
+) -> dict[str, Any]:
+    """Download and verify only the three immutable Stage-1 Krea assets."""
+
+    if not isinstance(token, str) or not token:
+        raise ValueError("HF_TOKEN is required for Krea asset staging")
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:  # pragma: no cover - host dependency gate.
+        raise RuntimeError("huggingface_hub is required for asset staging") from exc
+
+    comfy_root = comfy_root.resolve(strict=True)
+    contract = krea_execution_surface_policy.POLICY["stage1_exact_scorer_contract"]
+    if (comfy_root / "extra_model_paths.yaml").exists():
+        raise ValueError("asset staging refuses Comfy extra_model_paths.yaml")
+    lora_root = comfy_root / "models" / "loras"
+    if lora_root.exists() and any(lora_root.iterdir()):
+        raise ValueError("asset staging requires an empty Comfy LoRA directory")
+    staged = []
+    for name in sorted(contract["assets"]):
+        expected = contract["assets"][name]
+        destination = comfy_root / expected["relative_path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(destination):
+            raise FileExistsError(f"refusing existing evaluator asset: {destination}")
+        source = Path(
+            hf_hub_download(
+                repo_id=_KREA_ASSET_REPOSITORY,
+                filename=_KREA_ASSET_SOURCE_PATHS[name],
+                revision=_KREA_ASSET_REVISION,
+                token=token,
+            )
+        ).resolve(strict=True)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with source.open("rb") as reader, destination.open("xb") as writer:
+                for block in iter(lambda: reader.read(16 * 1024 * 1024), b""):
+                    writer.write(block)
+                    digest.update(block)
+                    size += len(block)
+                writer.flush()
+                os.fsync(writer.fileno())
+            destination.chmod(0o400)
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        if digest.hexdigest() != expected["sha256"] or size != expected["bytes"]:
+            destination.unlink()
+            raise ValueError(f"downloaded evaluator asset differs: {name}")
+        staged.append(
+            {
+                "name": name,
+                "source_filename": _KREA_ASSET_SOURCE_PATHS[name],
+                "canonical_path": str(destination),
+                "sha256": expected["sha256"],
+                "bytes": expected["bytes"],
+            }
+        )
+    body = {
+        "schema": 1,
+        "kind": "forge-krea-stage1-evaluator-asset-stage",
+        "repository": _KREA_ASSET_REPOSITORY,
+        "revision": _KREA_ASSET_REVISION,
+        "assets": staged,
+        "credential_recorded": False,
+    }
+    receipt = {**body, "receipt_sha256": krea_provenance.canonical_sha256(body)}
+    _canonical_file(receipt_output, receipt)
+    return receipt
+
+
+def build_stage1_evaluator_config(
+    *,
+    comfy_root: Path,
+    god_root: Path,
+    python_path: Path,
+    cache_provenance_sha256: str,
+    systemd_run_path: Path = Path("/usr/bin/systemd-run"),
+    systemctl_path: Path = Path("/usr/bin/systemctl"),
+) -> dict[str, Any]:
+    """Materialize the literal owner-bound Stage-1 exact-scorer config."""
+
+    try:
+        from . import evaluate_krea_local as local_evaluator
+    except ImportError:  # pragma: no cover - direct script execution.
+        import evaluate_krea_local as local_evaluator  # type: ignore[no-redef]
+
+    if not isinstance(cache_provenance_sha256, str) or not batch._SHA256.fullmatch(
+        cache_provenance_sha256
+    ):
+        raise ValueError("cache provenance SHA-256 is invalid")
+    comfy_root = comfy_root.resolve(strict=True)
+    god_root = god_root.resolve(strict=True)
+    python_path = python_path.resolve(strict=True)
+    contract = krea_execution_surface_policy.POLICY["stage1_exact_scorer_contract"]
+    python_environment = local_evaluator._python_environment(python_path)
+    driver_environment = {
+        key: python_environment[key]
+        for key in (
+            "executable",
+            "prefix",
+            "base_prefix",
+            "python",
+            "distribution_count",
+            "distributions_sha256",
+            "normalized_distributions_sha256",
+        )
+    }
+    assets = {
+        name: {
+            "canonical_path": str(comfy_root / row["relative_path"]),
+            "sha256": row["sha256"],
+            "bytes": row["bytes"],
+        }
+        for name, row in contract["assets"].items()
+    }
+    systemd_run = systemd_run_path.resolve(strict=True)
+    systemctl = systemctl_path.resolve(strict=True)
+    config = {
+        "comfy_root": str(comfy_root),
+        "comfy_python": str(python_path),
+        "god_root": str(god_root),
+        "driver_python": str(python_path),
+        "expected_god_commit": contract["god_commit"],
+        "expected_comfy_commit": contract["comfy_commit"],
+        "expected_tooling_commit": contract["tooling_commit"],
+        "expected_evaluator_script_sha256": contract["evaluator_script_sha256"],
+        "expected_dataset_identity_module_sha256": contract[
+            "dataset_identity_module_sha256"
+        ],
+        "expected_eval_defaults": contract["eval_defaults"],
+        "expected_runtime_identity": {
+            "comfy_python_identity_sha256": krea_provenance.canonical_sha256(
+                python_environment
+            ),
+            "driver_python_identity_sha256": krea_provenance.canonical_sha256(
+                driver_environment
+            ),
+        },
+        "expected_assets": assets,
+        "cache_provenance_sha256": cache_provenance_sha256,
+        "containment": {
+            "mode": "systemd_transient_service",
+            "term_grace_s": contract["timeouts_s"]["containment_term_grace"],
+            "systemd_run_path": str(systemd_run),
+            "systemd_run_sha256": krea_provenance.file_sha256(systemd_run),
+            "systemctl_path": str(systemctl),
+            "systemctl_sha256": krea_provenance.file_sha256(systemctl),
+            "unit_type": "transient_service",
+            "network_policy": {
+                "private_network": True,
+                "restrict_address_families": ["AF_UNIX", "AF_INET", "AF_INET6"],
+                "loopback_allowed": True,
+                "outbound_network_blocked": True,
+            },
+        },
+        "base_name": contract["assets"]["diffusion_model"]["basename"],
+        "startup_timeout_s": contract["timeouts_s"]["startup"],
+        "evaluation_timeout_s": contract["timeouts_s"]["evaluation"],
+        "shutdown_timeout_s": contract["timeouts_s"]["shutdown"],
+    }
+    normalized = batch._validate_evaluator(config)
+    batch._validate_stage1_exact_scorer(normalized)
+    return normalized
 
 
 def _add_build_arguments(parser: argparse.ArgumentParser) -> None:
@@ -709,13 +948,25 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     _add_build_arguments(commands.add_parser("dry-run"))
     approve = commands.add_parser("approve")
     approve.add_argument("--draft", required=True, type=Path)
-    approve.add_argument("--reviewer-identity", required=True)
+    approval_actor = approve.add_mutually_exclusive_group(required=True)
+    approval_actor.add_argument("--reviewer-identity")
+    approval_actor.add_argument("--technical-actor", type=Path)
+    approve.add_argument("--discovery-authorization", type=Path)
     approve.add_argument("--approval-output", required=True, type=Path)
     approve.add_argument("--plan-output", required=True, type=Path)
     validate = commands.add_parser("validate")
     target = validate.add_mutually_exclusive_group(required=True)
     target.add_argument("--draft", type=Path)
     target.add_argument("--plan", type=Path)
+    evaluator = commands.add_parser("build-stage1-evaluator")
+    evaluator.add_argument("--comfy-root", required=True, type=Path)
+    evaluator.add_argument("--god-root", required=True, type=Path)
+    evaluator.add_argument("--python", required=True, type=Path)
+    evaluator.add_argument("--cache-provenance-sha256", required=True)
+    evaluator.add_argument("--output", required=True, type=Path)
+    assets = commands.add_parser("stage-stage1-assets")
+    assets.add_argument("--comfy-root", required=True, type=Path)
+    assets.add_argument("--receipt", required=True, type=Path)
     return parser.parse_args(argv)
 
 
@@ -738,7 +989,30 @@ def _build_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse(argv)
-    if args.command in {"build", "dry-run"}:
+    if args.command == "stage-stage1-assets":
+        receipt = stage_stage1_evaluator_assets(
+            comfy_root=args.comfy_root,
+            token=os.environ.get("HF_TOKEN", ""),
+            receipt_output=args.receipt,
+        )
+        result = {
+            "status": "stage1_exact_evaluator_assets_staged",
+            "receipt_sha256": receipt["receipt_sha256"],
+        }
+    elif args.command == "build-stage1-evaluator":
+        evaluator = build_stage1_evaluator_config(
+            comfy_root=args.comfy_root,
+            god_root=args.god_root,
+            python_path=args.python,
+            cache_provenance_sha256=args.cache_provenance_sha256,
+        )
+        _canonical_file(args.output, evaluator)
+        result = {
+            "status": "stage1_exact_evaluator_config_published",
+            "path": str(args.output),
+            "file_sha256": krea_provenance.file_sha256(args.output),
+        }
+    elif args.command in {"build", "dry-run"}:
         campaign, draft = _build_from_args(args)
         if args.command == "build":
             campaign_path, draft_path = publish_build(
@@ -761,11 +1035,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "candidate_count": len(draft["candidates"]),
             }
     elif args.command == "approve":
+        technical_actor = None
+        if args.technical_actor is not None:
+            _, technical_actor, _ = _load(
+                args.technical_actor, "exact-score technical actor"
+            )
         approval, plan = approve_draft(
             draft_path=args.draft,
             reviewer_identity=args.reviewer_identity,
             approval_output=args.approval_output,
             plan_output=args.plan_output,
+            technical_reviewer_actor=technical_actor,
+            discovery_authorization_path=args.discovery_authorization,
         )
         result = {
             "status": "approved_plan_published",

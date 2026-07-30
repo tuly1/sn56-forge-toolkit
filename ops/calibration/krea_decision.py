@@ -10,6 +10,7 @@ boundary evidence and may only report PASS, FAIL, or no-go for human review.
 
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -23,11 +24,17 @@ from typing import Any, Iterable, Mapping, Sequence
 try:
     from . import batch_evaluate_krea as krea_batch
     from . import krea_c1c4_amendment
+    from . import krea_delegated_review_contract
+    from . import krea_fixture
     from . import krea_provenance
+    from . import krea_discovery_authorization
 except ImportError:  # pragma: no cover - direct script execution.
     import batch_evaluate_krea as krea_batch  # type: ignore[no-redef]
     import krea_c1c4_amendment  # type: ignore[no-redef]
+    import krea_delegated_review_contract  # type: ignore[no-redef]
+    import krea_fixture  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
+    import krea_discovery_authorization  # type: ignore[no-redef]
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -58,6 +65,18 @@ _DISCOVERY_FIXTURES = ("D1", "D2")
 _CONFIRMATION_FIXTURES = ("C1", "C2", "C3", "C4")
 _PUBLIC_FAMILIES = ("K2", "K3", "K4")
 _CONTROL_FAMILY = "K0"
+_DISCOVERY_STATUS = "draft_blocked_pre_gpu"
+_DISCOVERY_GPU_BLOCKERS = [
+    (
+        "create-only Stage-1 discovery execution authorization bound to the "
+        "admitted D1/D2 envelope is external to this immutable freeze"
+    ),
+    (
+        "six fixture-scoped D1/D2 by A/B/C throughput profiles and their "
+        "post-timing profile index do not exist before authorized timing probes"
+    ),
+]
+_PROFILE_INDEX_SENTINEL = "deferred_to_fixture_scoped_profile_index"
 _DISCOVERY_TIE = Decimal("0.01")
 _FIELD_CAP = Decimal("0.01")
 _CONCEPT_CAP = Decimal("0.03")
@@ -177,7 +196,8 @@ _CONFIRMATION_CAMPAIGN_CONTRACT = {
     "minimum_point_estimate_wins_or_ties": 3,
     "point_win_or_tie_cap": 0.01,
     "strongest_public_reference_rule": (
-        "minimum loss among exhaustive K2-K4 faithful replicas for the same "
+        "minimum loss among exhaustive approved K2-K4 local public-family "
+        "reproductions for the same "
         "concept and seed"
     ),
     "boundary_gate": "mechanics_only_natural_completion_upload_ready_clean",
@@ -454,6 +474,101 @@ def _binding(value: Any, label: str) -> tuple[Path, dict[str, Any], str]:
     return path, document, actual
 
 
+def _actor(value: Any, label: str) -> dict[str, Any]:
+    return krea_fixture._agent_actor(value, label)
+
+
+def _require_distinct_actors(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    if (
+        left["actor_id"] == right["actor_id"]
+        or left["review_instance_id"] == right["review_instance_id"]
+    ):
+        raise ValueError(f"{label} must use distinct actor and review-instance ids")
+
+
+def _decision_authorization_context(value: Any) -> dict[str, Any]:
+    """Reopen the Stage-1 authority and its owner-ratified admission bundle."""
+
+    path, authorization, file_sha = _binding(value, "discovery execution authorization")
+    krea_discovery_authorization.validate(authorization)
+    if "discovery_decision_evaluation" not in authorization.get(
+        "authorized_actions", []
+    ):
+        raise ValueError(
+            "discovery authorization does not permit discovery_decision_evaluation"
+        )
+    (
+        _,
+        admission,
+        _,
+        ratification,
+        _,
+    ) = krea_discovery_authorization._load_admission_binding(
+        authorization["fixture_admission_envelope"]
+    )
+    governance = _object(admission.get("governance"), "admission governance")
+    custodian_binding = _object(
+        governance.get("sealed_custodian_actor"), "sealed custodian binding"
+    )
+    custodian = _actor(custodian_binding.get("actor"), "sealed confirmation custodian")
+    if custodian["role"] != "sealed_confirmation_custodian":
+        raise ValueError("admission custodian has the wrong role")
+    owner = krea_fixture.named_human(
+        authorization.get("accountable_owner_identity"),
+        "authorization accountable owner",
+    )
+    ratification_sha = _digest(
+        authorization["fixture_admission_envelope"].get("owner_ratification_sha256"),
+        "authorization owner ratification",
+    )
+    if (
+        admission.get("accountable_owner_identity") != owner
+        or ratification.get("ratification_sha256") != ratification_sha
+    ):
+        raise ValueError("decision authority differs from its admitted owner")
+    return {
+        "binding": {"path": str(path), "sha256": file_sha},
+        "authorization": authorization,
+        "owner": owner,
+        "owner_ratification_sha256": ratification_sha,
+        "custodian_actor": custodian,
+    }
+
+
+def _validate_agent_governance(
+    value: Mapping[str, Any],
+    *,
+    actor_field: str,
+    delegated_actor_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    context = _decision_authorization_context(
+        value["discovery_execution_authorization"]
+    )
+    actor = krea_delegated_review_contract.validate_actor(
+        delegated_actor_name, value[actor_field]
+    )
+    krea_delegated_review_contract.validate_binding(value["delegated_review_contract"])
+    if (
+        value["accountable_owner_identity"] != context["owner"]
+        or value["owner_ratification_sha256"] != context["owner_ratification_sha256"]
+        or value["fixture_admission_envelope"]
+        != context["authorization"]["fixture_admission_envelope"]
+        or value["agent_review_is_not_human_review"] is not True
+    ):
+        raise ValueError("agent governance differs from owner-ratified authority")
+    _require_distinct_actors(
+        actor,
+        context["custodian_actor"],
+        label=f"{actor_field} and sealed confirmation custodian",
+    )
+    return actor, context
+
+
 def _validate_bootstrap(value: Any) -> dict[str, Any]:
     value = _object(value, "bootstrap policy")
     _exact(
@@ -507,12 +622,16 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
         or value["model_type"] != "krea2"
     ):
         raise ValueError("discovery plan is not the Week-5 Krea freeze")
-    if value["gpu_execution_authorized"] is not True or value["gpu_blockers"] != []:
-        raise ValueError("discovery plan is not GPU-authorized and blocker-free")
-    if not isinstance(value["status"], str) or any(
-        marker in value["status"].casefold() for marker in ("draft", "blocked")
-    ):
-        raise ValueError("discovery plan status is not a sealed executable state")
+    if value["gpu_execution_authorized"] is not False:
+        raise ValueError(
+            "immutable discovery freeze must never self-authorize GPU work"
+        )
+    if value["status"] != _DISCOVERY_STATUS:
+        raise ValueError(
+            "discovery plan status is not the frozen non-authorizing state"
+        )
+    if value["gpu_blockers"] != _DISCOVERY_GPU_BLOCKERS:
+        raise ValueError("discovery plan blockers differ from the frozen sentinels")
     seed_a = _seed(value["training_seed_a"], "training_seed_a")
     seed_b = _seed(value["training_seed_b_contingency"], "training_seed_b")
     if seed_a == seed_b:
@@ -523,12 +642,28 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("discovery tasks must be exactly D1 and D2")
     for fixture_id in _DISCOVERY_FIXTURES:
         task = _object(tasks[fixture_id], f"discovery task {fixture_id}")
-        if task.get("identity") is None:
-            raise ValueError(f"discovery task {fixture_id} identity is unsealed")
-        _digest(
-            task.get("fixture_split_manifest_sha256"),
-            f"{fixture_id} fixture manifest",
+        identity = _digest(
+            task.get("identity"), f"{fixture_id} stable candidate identity"
         )
+        candidate_sha = _digest(
+            task.get("fixture_split_manifest_sha256"),
+            f"{fixture_id} candidate manifest",
+        )
+        expected_shape = {"D1": ([18, 18], 24), "D2": ([36, 36], 40)}[fixture_id]
+        if (
+            identity != candidate_sha
+            or task.get("required_training_pair_range") != expected_shape[0]
+            or task.get("required_evaluation_rows") != expected_shape[1]
+            or task.get("identity_semantics")
+            != (
+                "pre-governance candidate_manifest_sha256; final governance-bearing "
+                "manifest and approval are bound only through the admitted envelope "
+                "and external execution authorization"
+            )
+        ):
+            raise ValueError(
+                f"discovery task {fixture_id} shape/identity is not frozen"
+            )
 
     arms = value["arms"]
     if not isinstance(arms, list) or not arms:
@@ -550,7 +685,25 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
     )
     for name, digest in profiles.items():
         _identifier(name, "throughput equivalence class")
-        _digest(digest, f"throughput profile {name}")
+        if digest != _PROFILE_INDEX_SENTINEL:
+            raise ValueError(
+                f"throughput profile {name} must remain the deferred index sentinel"
+            )
+    profile_index_contract = _object(
+        _object(value["budget_contract"], "budget_contract").get(
+            "profile_index_contract"
+        ),
+        "profile index contract",
+    )
+    if profile_index_contract != {
+        "fixtures": ["D1", "D2"],
+        "equivalence_classes": sorted(profiles),
+        "required_profile_count": 6,
+        "cross_fixture_profile_reuse_forbidden": True,
+        "post_timing_only": True,
+        "gpu_execution_authorized": False,
+    }:
+        raise ValueError("six-cell deferred profile-index contract is invalid")
 
     candidate = _object(value["candidate_contract"], "candidate_contract")
     if candidate.get("exact_score_during_discovery") != (
@@ -641,7 +794,7 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
         commitment["shape_contract_amendment"], "shape_contract_amendment"
     )
     expected_commitment = {
-        "state": "published_external_unaccepted_by_named_human",
+        "state": "published_external_agent_custody_pending_owner_ratification",
         "public_record": _C1C4_PUBLIC_RECORD,
         "public_record_sha256": _C1C4_PUBLIC_RECORD_SHA256,
         "commitment_sha256": _C1C4_COMMITMENT_SHA256,
@@ -685,7 +838,8 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
         "minimum_point_estimate_wins_or_ties": 3,
         "point_win_or_tie_cap": 0.01,
         "strongest_public_reference_rule": (
-            "minimum loss among exhaustive K2-K4 faithful replicas for the same "
+            "minimum loss among exhaustive approved K2-K4 local public-family "
+            "reproductions for the same "
             "concept and seed"
         ),
         "boundary_hours": [0.5, 0.75, 1.0],
@@ -721,6 +875,18 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
         "confirmation_shape_contract": _CONFIRMATION_SHAPE_CONTRACT,
         "protocol_sha256": _discovery_protocol_sha(value),
     }
+
+
+def seal_discovery_execution_authorization(payload: dict[str, Any]) -> dict[str, Any]:
+    """Seal readiness separately from the immutable non-authorizing freeze."""
+
+    return krea_discovery_authorization.seal(payload)
+
+
+def validate_discovery_execution_authorization(
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    return krea_discovery_authorization.validate(value)
 
 
 def _discovery_protocol_sha(value: Mapping[str, Any]) -> str:
@@ -759,6 +925,8 @@ def seal_confirmation_fixture_commitments(payload: dict[str, Any]) -> dict[str, 
 
 def validate_confirmation_fixture_commitments(value: dict[str, Any]) -> dict[str, Any]:
     value = _object(value, "confirmation fixture commitments")
+    if value.get("schema") == 2:
+        return _validate_agent_confirmation_fixture_commitments(value)
     _exact(
         value,
         {
@@ -815,11 +983,101 @@ def validate_confirmation_fixture_commitments(value: dict[str, Any]) -> dict[str
     return value
 
 
+def _validate_agent_confirmation_fixture_commitments(
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    _exact(
+        value,
+        {
+            "schema",
+            "kind",
+            "discovery_protocol_sha256",
+            "sealed_at_utc",
+            "technical_custodian_actor",
+            "accountable_owner_identity",
+            "owner_ratification_sha256",
+            "discovery_execution_authorization",
+            "agent_review_is_not_human_review",
+            "sealed_before_discovery_unblinding",
+            "cross_fixture_review_sha256",
+            "fixtures",
+            "seal_sha256",
+        },
+        "agent confirmation fixture commitments",
+    )
+    body = {key: item for key, item in value.items() if key != "seal_sha256"}
+    if (
+        value["schema"] != 2
+        or value["kind"] != "forge-krea-agent-confirmation-fixture-commitments"
+        or value["sealed_before_discovery_unblinding"] is not True
+        or value["agent_review_is_not_human_review"] is not True
+        or value["seal_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("agent confirmation fixture commitment identity is invalid")
+    _digest(value["discovery_protocol_sha256"], "fixture seal discovery protocol")
+    _digest(value["cross_fixture_review_sha256"], "cross-fixture review")
+    sealed_at = _timestamp_value(value["sealed_at_utc"], "fixture sealed_at_utc")
+    context = _decision_authorization_context(
+        value["discovery_execution_authorization"]
+    )
+    custodian = _actor(
+        value["technical_custodian_actor"], "fixture seal technical custodian"
+    )
+    if (
+        custodian != context["custodian_actor"]
+        or value["accountable_owner_identity"] != context["owner"]
+        or value["owner_ratification_sha256"] != context["owner_ratification_sha256"]
+    ):
+        raise ValueError("fixture seal differs from owner-ratified custodian authority")
+    authorized_at = _timestamp_value(
+        context["authorization"]["authorized_at_utc"], "authorized_at_utc"
+    )
+    if sealed_at <= authorized_at:
+        raise ValueError("fixture commitments must be sealed after authorization")
+    fixtures = value["fixtures"]
+    if not isinstance(fixtures, list) or len(fixtures) != 4:
+        raise ValueError("confirmation fixture seal must contain C1-C4")
+    normalized = []
+    for raw in fixtures:
+        row = _object(raw, "confirmation fixture commitment")
+        _exact(
+            row,
+            {
+                "fixture_id",
+                "identity_commitment_sha256",
+                "fixture_manifest_sha256",
+                "fixture_approval_sha256",
+            },
+            "confirmation fixture commitment",
+        )
+        fixture_id = _identifier(row["fixture_id"], "confirmation fixture id")
+        for key in (
+            "identity_commitment_sha256",
+            "fixture_manifest_sha256",
+            "fixture_approval_sha256",
+        ):
+            _digest(row[key], f"{fixture_id}.{key}")
+        normalized.append(dict(row))
+    if [row["fixture_id"] for row in normalized] != list(_CONFIRMATION_FIXTURES):
+        raise ValueError("confirmation fixtures must be ordered C1, C2, C3, C4")
+    return value
+
+
 def _bound_plan_and_seal(
     policy: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     _, plan, _ = _binding(policy["discovery_plan"], "discovery plan")
     plan_state = _validate_discovery_plan(plan)
+    _, authorization, _ = _binding(
+        policy["discovery_execution_authorization"],
+        "discovery execution authorization",
+    )
+    validate_discovery_execution_authorization(authorization)
+    if (
+        authorization["discovery_plan"]["file_sha256"]
+        != policy["discovery_plan"]["sha256"]
+    ):
+        raise ValueError("discovery authorization binds another immutable freeze")
     _, seal, _ = _binding(
         policy["confirmation_fixture_seal"], "confirmation fixture seal"
     )
@@ -899,6 +1157,9 @@ def _validate_score_batch(value: Any, *, confirmation: bool) -> dict[str, Any]:
 def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate the discovery policy payload (compatibility public API)."""
 
+    if payload.get("schema") == 3:
+        return _validate_agent_discovery_policy_payload(payload)
+
     _exact(
         payload,
         {
@@ -907,6 +1168,7 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "phase",
             "prepared_by",
             "discovery_plan",
+            "discovery_execution_authorization",
             "confirmation_fixture_seal",
             "score_batches",
             "bootstrap",
@@ -921,6 +1183,16 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("unsupported discovery decision policy")
     prepared_by = _named_human(payload["prepared_by"], "policy preparer")
     plan_state, _, seal = _bound_plan_and_seal(payload)
+    _, authorization, _ = _binding(
+        payload["discovery_execution_authorization"],
+        "discovery execution authorization",
+    )
+    if "discovery_decision_evaluation" in authorization.get("authorized_actions", []):
+        raise ValueError(
+            "owner-ratified Stage-1 decision authority requires the agent policy"
+        )
+    if seal.get("schema") != 1:
+        raise ValueError("legacy discovery policy requires the legacy human seal")
     if prepared_by == seal["reviewer_identity"]:
         raise ValueError("fixture sealer must be independent from policy preparer")
     bootstrap = _validate_bootstrap(payload["bootstrap"])
@@ -958,9 +1230,126 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "phase": "discovery",
         "prepared_by": prepared_by,
         "discovery_plan": dict(payload["discovery_plan"]),
+        "discovery_execution_authorization": dict(
+            payload["discovery_execution_authorization"]
+        ),
         "confirmation_fixture_seal": dict(payload["confirmation_fixture_seal"]),
         "score_batches": batches,
         "bootstrap": bootstrap,
+    }
+
+
+def _validate_agent_discovery_policy_payload(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    _exact(
+        payload,
+        {
+            "schema",
+            "kind",
+            "phase",
+            "technical_preparer_actor",
+            "accountable_owner_identity",
+            "owner_ratification_sha256",
+            "fixture_admission_envelope",
+            "discovery_plan",
+            "discovery_execution_authorization",
+            "confirmation_fixture_seal",
+            "score_batches",
+            "bootstrap",
+            "delegated_review_contract",
+            "agent_review_is_not_human_review",
+        },
+        "agent discovery decision policy payload",
+    )
+    if (
+        payload["schema"] != 3
+        or payload["kind"] != "forge-krea-agent-discovery-decision-policy"
+        or payload["phase"] != "discovery"
+    ):
+        raise ValueError("unsupported agent discovery decision policy")
+    preparer, context = _validate_agent_governance(
+        payload,
+        actor_field="technical_preparer_actor",
+        delegated_actor_name="discovery_decision_policy_preparer",
+    )
+    plan_state, plan, seal = _bound_plan_and_seal(payload)
+    if (
+        context["authorization"]["discovery_plan"]["file_sha256"]
+        != payload["discovery_plan"]["sha256"]
+    ):
+        raise ValueError("decision authority binds another discovery freeze")
+    if seal.get("schema") != 2:
+        raise ValueError("agent discovery policy requires the agent C1-C4 seal")
+    if (
+        seal["discovery_execution_authorization"]
+        != payload["discovery_execution_authorization"]
+        or seal["accountable_owner_identity"] != context["owner"]
+        or seal["owner_ratification_sha256"] != context["owner_ratification_sha256"]
+    ):
+        raise ValueError("agent discovery policy and fixture seal authority differ")
+    _require_distinct_actors(
+        preparer,
+        _actor(seal["technical_custodian_actor"], "fixture seal custodian"),
+        label="decision policy preparer and fixture custodian",
+    )
+    if (
+        seal["discovery_protocol_sha256"] != plan_state["protocol_sha256"]
+        or {
+            row["fixture_id"]: row["identity_commitment_sha256"]
+            for row in seal["fixtures"]
+        }
+        != plan_state["confirmation_identities"]
+    ):
+        raise ValueError("agent fixture seal differs from the discovery freeze")
+    bootstrap = _validate_bootstrap(payload["bootstrap"])
+    raw_batches = payload["score_batches"]
+    if not isinstance(raw_batches, list) or not raw_batches:
+        raise ValueError("discovery policy requires score batches")
+    batches = [_validate_score_batch(row, confirmation=False) for row in raw_batches]
+    if batches != sorted(batches, key=lambda row: row["batch_id"]):
+        raise ValueError("score batches must be sorted by batch_id")
+    if len({row["batch_id"] for row in batches}) != len(batches) or len(
+        {row["plan_canonical_sha256"] for row in batches}
+    ) != len(batches):
+        raise ValueError("score batches contain duplicate ids or plans")
+    roles = [(row["fixture_id"], row["seed_role"]) for row in batches]
+    if roles.count(("D1", "A")) != 1 or roles.count(("D2", "A")) != 1:
+        raise ValueError("discovery policy requires exactly D1/A and D2/A")
+    b_roles = [role for role in roles if role[1] == "B"]
+    if b_roles and (set(b_roles) != {("D1", "B"), ("D2", "B")} or len(b_roles) != 2):
+        raise ValueError("Seed B must be absent or predeclared for both D1 and D2")
+    if len(set(roles)) != len(roles):
+        raise ValueError("duplicate discovery fixture/seed role")
+    for row in batches:
+        expected_seed = (
+            plan_state["seed_a"] if row["seed_role"] == "A" else plan_state["seed_b"]
+        )
+        if row["seed"] != expected_seed:
+            raise ValueError("discovery score batch seed differs from frozen plan")
+        if row["fixture_id"] not in _DISCOVERY_FIXTURES:
+            raise ValueError("discovery batch fixture must be D1 or D2")
+        if row["hours"] is not None or row["dataset_boundary"] is not None:
+            raise ValueError("discovery batch must not masquerade as a boundary cell")
+    return {
+        "schema": 3,
+        "kind": "forge-krea-agent-discovery-decision-policy",
+        "phase": "discovery",
+        "technical_preparer_actor": preparer,
+        "accountable_owner_identity": context["owner"],
+        "owner_ratification_sha256": context["owner_ratification_sha256"],
+        "fixture_admission_envelope": dict(
+            context["authorization"]["fixture_admission_envelope"]
+        ),
+        "discovery_plan": dict(payload["discovery_plan"]),
+        "discovery_execution_authorization": dict(
+            payload["discovery_execution_authorization"]
+        ),
+        "confirmation_fixture_seal": dict(payload["confirmation_fixture_seal"]),
+        "score_batches": batches,
+        "bootstrap": bootstrap,
+        "delegated_review_contract": krea_delegated_review_contract.binding(),
+        "agent_review_is_not_human_review": True,
     }
 
 
@@ -979,32 +1368,38 @@ seal_discovery_policy = seal_policy
 
 def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
     value = _object(value, "discovery policy")
-    if set(value) != {
-        "schema",
-        "kind",
-        "phase",
-        "prepared_by",
-        "discovery_plan",
-        "confirmation_fixture_seal",
-        "score_batches",
-        "bootstrap",
-        "policy_sha256",
-    }:
-        _exact(
-            value,
-            {
-                "schema",
-                "kind",
-                "phase",
-                "prepared_by",
-                "discovery_plan",
-                "confirmation_fixture_seal",
-                "score_batches",
-                "bootstrap",
-                "policy_sha256",
-            },
-            "discovery policy",
-        )
+    if value.get("schema") == 3:
+        required = {
+            "schema",
+            "kind",
+            "phase",
+            "technical_preparer_actor",
+            "accountable_owner_identity",
+            "owner_ratification_sha256",
+            "fixture_admission_envelope",
+            "discovery_plan",
+            "discovery_execution_authorization",
+            "confirmation_fixture_seal",
+            "score_batches",
+            "bootstrap",
+            "delegated_review_contract",
+            "agent_review_is_not_human_review",
+            "policy_sha256",
+        }
+    else:
+        required = {
+            "schema",
+            "kind",
+            "phase",
+            "prepared_by",
+            "discovery_plan",
+            "discovery_execution_authorization",
+            "confirmation_fixture_seal",
+            "score_batches",
+            "bootstrap",
+            "policy_sha256",
+        }
+    _exact(value, required, "discovery policy")
     body = {key: item for key, item in value.items() if key != "policy_sha256"}
     normalized = _validate_policy_payload(body)
     if normalized != body or value["policy_sha256"] != krea_provenance.canonical_sha256(
@@ -1026,6 +1421,7 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
             "phase",
             "prepared_by",
             "discovery_plan",
+            "discovery_execution_authorization",
             "confirmation_fixture_seal",
             "discovery_decision",
             "candidate_family_id",
@@ -1044,7 +1440,7 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
         raise ValueError("unsupported confirmation decision policy")
     prepared_by = _named_human(payload["prepared_by"], "policy preparer")
     plan_state, _, seal = _bound_plan_and_seal(payload)
-    if prepared_by == seal["reviewer_identity"]:
+    if seal.get("schema") == 1 and prepared_by == seal["reviewer_identity"]:
         raise ValueError("fixture sealer must be independent from policy preparer")
     _, discovery, _ = _binding(payload["discovery_decision"], "discovery decision")
     _validate_discovery_record(discovery)
@@ -1139,6 +1535,9 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
         "phase": "confirmation",
         "prepared_by": prepared_by,
         "discovery_plan": dict(payload["discovery_plan"]),
+        "discovery_execution_authorization": dict(
+            payload["discovery_execution_authorization"]
+        ),
         "confirmation_fixture_seal": dict(payload["confirmation_fixture_seal"]),
         "discovery_decision": dict(payload["discovery_decision"]),
         "candidate_family_id": candidate_family_id,
@@ -1169,6 +1568,7 @@ def validate_confirmation_policy(value: dict[str, Any]) -> dict[str, Any]:
         "phase",
         "prepared_by",
         "discovery_plan",
+        "discovery_execution_authorization",
         "confirmation_fixture_seal",
         "discovery_decision",
         "candidate_family_id",
@@ -1189,23 +1589,76 @@ def validate_confirmation_policy(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_approval(
-    policy: dict[str, Any], *, reviewer_identity: str, approved_at_utc: str
+    policy: dict[str, Any],
+    *,
+    reviewer_identity: str | None = None,
+    technical_reviewer_actor: dict[str, Any] | None = None,
+    approved_at_utc: str,
 ) -> dict[str, Any]:
     if policy.get("kind") == "forge-krea-discovery-decision-policy":
         validate_policy(policy)
         phase = "discovery"
+    elif policy.get("kind") == "forge-krea-agent-discovery-decision-policy":
+        validate_policy(policy)
+        if reviewer_identity is not None or technical_reviewer_actor is None:
+            raise ValueError(
+                "agent discovery approval requires its prebound technical reviewer"
+            )
+        reviewer, context = _validate_agent_governance(
+            {
+                **policy,
+                "technical_reviewer_actor": technical_reviewer_actor,
+            },
+            actor_field="technical_reviewer_actor",
+            delegated_actor_name="discovery_decision_reviewer",
+        )
+        _require_distinct_actors(
+            reviewer,
+            policy["technical_preparer_actor"],
+            label="decision policy preparer and reviewer",
+        )
+        _, seal, _ = _binding(
+            policy["confirmation_fixture_seal"], "confirmation fixture seal"
+        )
+        _require_distinct_actors(
+            reviewer,
+            _actor(seal["technical_custodian_actor"], "fixture seal custodian"),
+            label="decision policy reviewer and fixture custodian",
+        )
+        body = {
+            "schema": 3,
+            "kind": "forge-krea-agent-discovery-decision-policy-approval",
+            "phase": "discovery",
+            "policy_sha256": policy["policy_sha256"],
+            "technical_reviewer_actor": reviewer,
+            "accountable_owner_identity": context["owner"],
+            "owner_ratification_sha256": context["owner_ratification_sha256"],
+            "fixture_admission_envelope": dict(
+                context["authorization"]["fixture_admission_envelope"]
+            ),
+            "discovery_execution_authorization": dict(
+                policy["discovery_execution_authorization"]
+            ),
+            "delegated_review_contract": krea_delegated_review_contract.binding(),
+            "agent_review_is_not_human_review": True,
+            "approved_at_utc": _timestamp(approved_at_utc, "approved_at_utc"),
+            "decision": "approved",
+        }
+        return {**body, "approval_sha256": krea_provenance.canonical_sha256(body)}
     elif policy.get("kind") == "forge-krea-confirmation-decision-policy":
         validate_confirmation_policy(policy)
         phase = "confirmation"
     else:
         raise ValueError("unsupported decision policy for approval")
+    if technical_reviewer_actor is not None or reviewer_identity is None:
+        raise ValueError("legacy decision approval requires a named human reviewer")
     reviewer = _named_human(reviewer_identity, "reviewer_identity")
     if reviewer == policy["prepared_by"]:
         raise ValueError("policy reviewer must be independent from its preparer")
     _, seal, _ = _binding(
         policy["confirmation_fixture_seal"], "confirmation fixture seal"
     )
-    if reviewer == seal["reviewer_identity"]:
+    if seal.get("schema") == 1 and reviewer == seal["reviewer_identity"]:
         raise ValueError("policy reviewer must differ from the fixture sealer")
     body = {
         "schema": 2,
@@ -1225,6 +1678,9 @@ def validate_approval(
     if policy.get("kind") == "forge-krea-discovery-decision-policy":
         validate_policy(policy)
         phase = "discovery"
+    elif policy.get("kind") == "forge-krea-agent-discovery-decision-policy":
+        validate_policy(policy)
+        return _validate_agent_discovery_approval(value, policy=policy)
     elif policy.get("kind") == "forge-krea-confirmation-decision-policy":
         validate_confirmation_policy(policy)
         phase = "confirmation"
@@ -1262,7 +1718,7 @@ def validate_approval(
     _, seal, _ = _binding(
         policy["confirmation_fixture_seal"], "confirmation fixture seal"
     )
-    if reviewer == seal["reviewer_identity"]:
+    if seal.get("schema") == 1 and reviewer == seal["reviewer_identity"]:
         raise ValueError("decision reviewer equals the fixture sealer")
     approved = _timestamp_value(value["approved_at_utc"], "approved_at_utc")
     if approved <= _timestamp_value(seal["sealed_at_utc"], "fixture sealed_at_utc"):
@@ -1273,6 +1729,75 @@ def validate_approval(
             discovery["decided_at_utc"], "discovery decided_at_utc"
         ):
             raise ValueError("confirmation policy was approved before discovery froze")
+    return value
+
+
+def _validate_agent_discovery_approval(
+    value: dict[str, Any], *, policy: dict[str, Any]
+) -> dict[str, Any]:
+    value = _object(value, "agent discovery policy approval")
+    _exact(
+        value,
+        {
+            "schema",
+            "kind",
+            "phase",
+            "policy_sha256",
+            "technical_reviewer_actor",
+            "accountable_owner_identity",
+            "owner_ratification_sha256",
+            "fixture_admission_envelope",
+            "discovery_execution_authorization",
+            "delegated_review_contract",
+            "agent_review_is_not_human_review",
+            "approved_at_utc",
+            "decision",
+            "approval_sha256",
+        },
+        "agent discovery policy approval",
+    )
+    body = {key: item for key, item in value.items() if key != "approval_sha256"}
+    if (
+        value["schema"] != 3
+        or value["kind"] != "forge-krea-agent-discovery-decision-policy-approval"
+        or value["phase"] != "discovery"
+        or value["policy_sha256"] != policy["policy_sha256"]
+        or value["decision"] != "approved"
+        or value["discovery_execution_authorization"]
+        != policy["discovery_execution_authorization"]
+        or value["approval_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("agent decision approval does not bind this policy")
+    reviewer, context = _validate_agent_governance(
+        value,
+        actor_field="technical_reviewer_actor",
+        delegated_actor_name="discovery_decision_reviewer",
+    )
+    _require_distinct_actors(
+        reviewer,
+        policy["technical_preparer_actor"],
+        label="decision policy preparer and reviewer",
+    )
+    _, seal, _ = _binding(
+        policy["confirmation_fixture_seal"], "confirmation fixture seal"
+    )
+    _require_distinct_actors(
+        reviewer,
+        _actor(seal["technical_custodian_actor"], "fixture seal custodian"),
+        label="decision policy reviewer and fixture custodian",
+    )
+    if (
+        context["owner"] != policy["accountable_owner_identity"]
+        or context["owner_ratification_sha256"] != policy["owner_ratification_sha256"]
+    ):
+        raise ValueError("agent approval owner differs from decision policy")
+    approved = _timestamp_value(value["approved_at_utc"], "approved_at_utc")
+    if approved <= _timestamp_value(seal["sealed_at_utc"], "fixture sealed_at_utc"):
+        raise ValueError("policy approval predates its sealed fixture commitments")
+    if approved <= _timestamp_value(
+        context["authorization"]["authorized_at_utc"], "authorized_at_utc"
+    ):
+        raise ValueError("policy approval predates discovery authorization")
     return value
 
 
@@ -1321,7 +1846,13 @@ def _validate_decision_aggregate_bindings(value: Any) -> dict[str, dict[str, Any
             "sealed_plan_approval_sha256",
         ):
             _digest(row[key], f"{label}.{key}")
-        _named_human(row["score_plan_reviewer"], f"{label}.score_plan_reviewer")
+        score_reviewer = row["score_plan_reviewer"]
+        if isinstance(score_reviewer, dict):
+            krea_delegated_review_contract.validate_actor(
+                "exact_score_plan_reviewer", score_reviewer
+            )
+        else:
+            _named_human(score_reviewer, f"{label}.score_plan_reviewer")
         evidence = _validate_decision_evidence_binding(row["decision_evidence"])
         if row["hours"] is not None:
             _decimal(
@@ -1520,7 +2051,6 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
         "policy_file_sha256",
         "policy_approval_sha256",
         "policy_approval_file_sha256",
-        "decision_reviewer_identity",
         "discovery_plan_file_sha256",
         "confirmation_fixture_seal_sha256",
         "aggregate_bindings",
@@ -1537,6 +2067,19 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
         "release_review_required",
         "decision_sha256",
     }
+    agent_record = value.get("schema") == 3
+    if agent_record:
+        common |= {
+            "decision_reviewer_actor",
+            "accountable_owner_identity",
+            "owner_ratification_sha256",
+            "fixture_admission_envelope",
+            "discovery_execution_authorization",
+            "delegated_review_contract",
+            "agent_review_is_not_human_review",
+        }
+    else:
+        common.add("decision_reviewer_identity")
     outcome = value.get("outcome")
     frozen_only = {
         "seeds_used",
@@ -1547,8 +2090,13 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
     expected = common | (frozen_only if outcome == "finalists_frozen" else set())
     _exact(value, expected, "discovery decision record")
     if (
-        value["schema"] != 2
-        or value["kind"] != "forge-krea-discovery-decision-record"
+        value["schema"] not in {2, 3}
+        or value["kind"]
+        != (
+            "forge-krea-agent-discovery-decision-record"
+            if agent_record
+            else "forge-krea-discovery-decision-record"
+        )
         or value["phase"] != "discovery"
         or value["production_mutation_authorized"] is not False
         or value["release_review_required"] is not True
@@ -1566,7 +2114,14 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
         "confirmation_fixture_seal_sha256",
     ):
         _digest(value[key], key)
-    _named_human(value["decision_reviewer_identity"], "decision reviewer")
+    if agent_record:
+        _validate_agent_governance(
+            value,
+            actor_field="decision_reviewer_actor",
+            delegated_actor_name="discovery_decision_reviewer",
+        )
+    else:
+        _named_human(value["decision_reviewer_identity"], "decision reviewer")
     _validate_bootstrap(value["bootstrap"])
     bindings = _validate_decision_aggregate_bindings(value["aggregate_bindings"])
     if not isinstance(value["blockers"], list) or any(
@@ -2321,34 +2876,23 @@ def _validate_score_plan_evidence(
     ]
     approval_candidates.sort(key=lambda row: row["id"])
     evaluator = _object(plan["evaluator"], "decision-evidence plan evaluator")
-    expected_fields = krea_batch._v2_plan_approval_expected(
-        plan,
+    document = aggregate["document"]
+    common_envelope = document.get("common_training_envelope")
+    common_authorization_sha256 = (
+        common_envelope.get("discovery_execution_authorization_sha256")
+        if isinstance(common_envelope, dict)
+        else None
+    )
+    approval_summary = krea_batch._validate_v2_approval(
+        approval,
+        approval_raw,
+        plan=plan,
         candidates=approval_candidates,
         evaluator=evaluator,
+        common_authorization_sha256=common_authorization_sha256,
     )
-    reviewer = _named_human(
-        approval.get("reviewer_identity"), "score-plan approval reviewer"
-    )
-    expected_approval = {
-        "schema": 2,
-        "kind": "forge-krea-exact-score-plan-approval",
-        "decision": "approved",
-        "reviewer_identity": reviewer,
-        **expected_fields,
-    }
-    if approval != expected_approval:
-        mismatched = sorted(
-            key
-            for key in set(approval) | set(expected_approval)
-            if approval.get(key) != expected_approval.get(key)
-        )
-        raise ValueError(
-            "score-plan approval does not bind the exact score plan: "
-            f"mismatched={mismatched}"
-        )
-    document = aggregate["document"]
     summary = _object(document["sealed_plan_approval"], "aggregate plan approval")
-    if summary != {"decision": "approved", "reviewer_identity": reviewer}:
+    if summary != approval_summary:
         raise ValueError("aggregate approval summary differs from raw approval")
     if (
         document["plan"].get("approved_payload_sha256")
@@ -2630,7 +3174,34 @@ def _aggregate(path: Path) -> tuple[dict[str, Any], str]:
     approval = _object(value["sealed_plan_approval"], "score-plan approval summary")
     if approval.get("decision") != "approved":
         raise ValueError("score-plan approval summary is not approved")
-    _named_human(approval.get("reviewer_identity"), "score-plan reviewer")
+    if "technical_reviewer_actor" in approval:
+        score_plan_reviewer: Any = krea_delegated_review_contract.validate_actor(
+            "exact_score_plan_reviewer", approval["technical_reviewer_actor"]
+        )
+        if (
+            set(approval)
+            != {
+                "technical_reviewer_actor",
+                "accountable_owner_identity",
+                "decision",
+                "agent_review_is_not_human_review",
+            }
+            or approval.get("agent_review_is_not_human_review") is not True
+        ):
+            raise ValueError("agent score-plan approval summary is incomplete")
+        krea_fixture.named_human(
+            approval.get("accountable_owner_identity"),
+            "score-plan accountable owner",
+        )
+    else:
+        _exact(
+            approval,
+            {"decision", "reviewer_identity"},
+            "score-plan approval summary",
+        )
+        score_plan_reviewer = _named_human(
+            approval.get("reviewer_identity"), "score-plan reviewer"
+        )
     evaluation = _object(value["evaluation_envelope"], "evaluation envelope")
     text_weight = _decimal(
         evaluation.get("text_weight"),
@@ -2734,7 +3305,7 @@ def _aggregate(path: Path) -> tuple[dict[str, Any], str]:
         "fixture_manifest_sha256": value["fixture_manifest_sha256"],
         "fixture_approval_sha256": value["fixture_approval_sha256"],
         "sealed_plan_approval_sha256": value["sealed_plan_approval_sha256"],
-        "score_plan_reviewer": approval["reviewer_identity"],
+        "score_plan_reviewer": score_plan_reviewer,
         "aggregate_sha256": value["aggregate_sha256"],
         "candidates": normalized_candidates,
         "zero": zeros[0],
@@ -3295,16 +3866,36 @@ def _base_discovery_body(
         approval["approved_at_utc"], "approved_at_utc"
     ):
         raise ValueError("discovery decision predates its policy approval")
+    agent_policy = policy.get("schema") == 3
+    governance = (
+        {
+            "decision_reviewer_actor": dict(approval["technical_reviewer_actor"]),
+            "accountable_owner_identity": policy["accountable_owner_identity"],
+            "owner_ratification_sha256": policy["owner_ratification_sha256"],
+            "fixture_admission_envelope": dict(policy["fixture_admission_envelope"]),
+            "discovery_execution_authorization": dict(
+                policy["discovery_execution_authorization"]
+            ),
+            "delegated_review_contract": krea_delegated_review_contract.binding(),
+            "agent_review_is_not_human_review": True,
+        }
+        if agent_policy
+        else {"decision_reviewer_identity": approval["reviewer_identity"]}
+    )
     return {
-        "schema": 2,
-        "kind": "forge-krea-discovery-decision-record",
+        "schema": 3 if agent_policy else 2,
+        "kind": (
+            "forge-krea-agent-discovery-decision-record"
+            if agent_policy
+            else "forge-krea-discovery-decision-record"
+        ),
         "phase": "discovery",
         "decided_at_utc": decided_at_utc,
         "policy_sha256": policy["policy_sha256"],
         "policy_file_sha256": policy_file_sha,
         "policy_approval_sha256": approval["approval_sha256"],
         "policy_approval_file_sha256": approval_file_sha,
-        "decision_reviewer_identity": approval["reviewer_identity"],
+        **governance,
         "discovery_plan_file_sha256": policy["discovery_plan"]["sha256"],
         "confirmation_fixture_seal_sha256": state["seal"]["seal_sha256"],
         "aggregate_bindings": aggregate_bindings,
@@ -3728,6 +4319,7 @@ def _validate_confirmation_record(value: dict[str, Any]) -> dict[str, Any]:
             "no_concept_regression_over_0.03",
             "boundary_matrix_clean",
             "decision_before_export_reserve_without_fallback",
+            "stage2_production_surface_ratified",
         }
         if set(value["gates"]) != expected_gates or any(
             not isinstance(item, bool) for item in value["gates"].values()
@@ -4022,6 +4614,7 @@ def _recompute_confirmation_record(
         "no_concept_regression_over_0.03": max(concept_excess.values()) <= _CONCEPT_CAP,
         "boundary_matrix_clean": len(boundary_batch_ids) == 6,
         "decision_before_export_reserve_without_fallback": len(boundary_batch_ids) == 6,
+        "stage2_production_surface_ratified": False,
     }
     if value["gates"] != expected_gates:
         raise ValueError("confirmation gates do not recompute")
@@ -4264,6 +4857,7 @@ def decide_confirmation(
             and not item["candidate_decision"]["fallback_used"]
             for item in boundary_results
         ),
+        "stage2_production_surface_ratified": False,
     }
     passed = all(gates.values())
     blockers = [
@@ -4293,3 +4887,73 @@ def decide_confirmation(
             "round1_ready": passed,
         },
     )
+
+
+def _cli_control(path: Path, label: str) -> dict[str, Any]:
+    path = Path(os.path.abspath(os.path.expanduser(path)))
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} must be a regular file")
+    raw = path.read_bytes()
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not JSON") from exc
+    value = _object(value, label)
+    if raw != krea_provenance.canonical_bytes(value) + b"\n":
+        raise ValueError(f"{label} must be canonical JSON plus one newline")
+    return value
+
+
+def _cli_publish(path: Path, value: dict[str, Any]) -> None:
+    path = Path(os.path.abspath(os.path.expanduser(path)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as handle:
+        handle.write(krea_provenance.canonical_bytes(value) + b"\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    seal = commands.add_parser("seal-discovery-policy")
+    seal.add_argument("--payload", required=True, type=Path)
+    seal.add_argument("--output", required=True, type=Path)
+    approve = commands.add_parser("approve-discovery-policy")
+    approve.add_argument("--policy", required=True, type=Path)
+    approve.add_argument("--technical-actor", required=True, type=Path)
+    approve.add_argument("--approved-at-utc", required=True)
+    approve.add_argument("--output", required=True, type=Path)
+    decide_parser = commands.add_parser("decide-discovery")
+    decide_parser.add_argument("--policy", required=True, type=Path)
+    decide_parser.add_argument("--approval", required=True, type=Path)
+    decide_parser.add_argument("--aggregate", action="append", required=True, type=Path)
+    decide_parser.add_argument("--decided-at-utc", required=True)
+    decide_parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args(argv)
+    if args.command == "seal-discovery-policy":
+        result = seal_discovery_policy(_cli_control(args.payload, "policy payload"))
+        _cli_publish(args.output, result)
+    elif args.command == "approve-discovery-policy":
+        result = build_approval(
+            _cli_control(args.policy, "discovery policy"),
+            technical_reviewer_actor=_cli_control(
+                args.technical_actor, "decision technical actor"
+            ),
+            approved_at_utc=args.approved_at_utc,
+        )
+        _cli_publish(args.output, result)
+    else:
+        result = decide_discovery(
+            policy_path=args.policy,
+            approval_path=args.approval,
+            aggregate_paths=args.aggregate,
+            output=args.output,
+            decided_at_utc=args.decided_at_utc,
+        )
+    print(krea_provenance.canonical_bytes(result).decode("utf-8"))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

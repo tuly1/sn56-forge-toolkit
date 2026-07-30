@@ -27,6 +27,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -47,6 +48,40 @@ except ImportError:  # pragma: no cover - direct script execution.
 _LOOPBACK = "127.0.0.1"
 _DEFAULT_PORT = 8188
 _TOOLING_NODE = "comfyui-tooling-nodes"
+
+
+def _comfy_child_environment(
+    *, comfy_python: Path, isolation_root: Path
+) -> dict[str, str]:
+    """Construct a scorer-child environment without operator inheritance."""
+
+    root = isolation_root.resolve(strict=True)
+    directories = {
+        "HOME": root / "home",
+        "XDG_CACHE_HOME": root / "xdg-cache",
+        "TORCH_HOME": root / "torch",
+        "HF_HOME": root / "huggingface",
+        "HF_HUB_CACHE": root / "huggingface" / "hub",
+        "TRANSFORMERS_CACHE": root / "transformers",
+        "TMPDIR": root / "tmp",
+    }
+    for directory in directories.values():
+        directory.mkdir(parents=True, exist_ok=True)
+    return {
+        "PATH": f"{comfy_python.parent}:/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "VIRTUAL_ENV": str(comfy_python.parent.parent),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "DIFFUSERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        **{name: str(path) for name, path in directories.items()},
+    }
 
 
 def _positive_float(value: str) -> float:
@@ -130,10 +165,37 @@ def _json_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _inspection_environment() -> dict[str, str]:
+    """Return a fixed environment for source/runtime identity inspection."""
+
+    return {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "HOME": "/nonexistent",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "core.hooksPath",
+        "GIT_CONFIG_VALUE_1": "/dev/null",
+    }
+
+
 def _run_text(command: list[str], *, cwd: Path | None = None) -> str:
     return subprocess.check_output(
         command,
         cwd=str(cwd) if cwd is not None else None,
+        env=_inspection_environment(),
         stderr=subprocess.STDOUT,
         text=True,
     ).strip()
@@ -296,14 +358,18 @@ def _python_environment(python_path: Path) -> dict[str, Any]:
             f"environment: missing {venv_marker} and {conda_marker}"
         )
     probe = (
-        "import hashlib,importlib.metadata as m,json,platform,sys;"
+        "import hashlib,importlib.metadata as m,json,platform,re,sys;"
         "rows=sorted((d.metadata.get('Name') or '',d.version) "
         "for d in m.distributions());"
         "encoded=json.dumps(rows,separators=(',',':')).encode();"
+        "normalized=sorted((re.sub(r'[-_.]+','-',n).lower(),v) for n,v in rows);"
+        "normalized_encoded=json.dumps(normalized,separators=(',',':')).encode();"
         "print(json.dumps({'executable':sys.executable,'prefix':sys.prefix,"
         "'base_prefix':sys.base_prefix,'python':platform.python_version(),"
         "'distribution_count':len(rows),"
-        "'distributions_sha256':hashlib.sha256(encoded).hexdigest()}))"
+        "'distributions_sha256':hashlib.sha256(encoded).hexdigest(),"
+        "'normalized_distributions_sha256':"
+        "hashlib.sha256(normalized_encoded).hexdigest()}))"
     )
     try:
         info = json.loads(_run_text([str(python_path), "-I", "-c", probe]))
@@ -330,6 +396,9 @@ def _driver_environment() -> dict[str, Any]:
         (distribution.metadata.get("Name") or "", distribution.version)
         for distribution in importlib.metadata.distributions()
     )
+    normalized_rows = sorted(
+        (re.sub(r"[-_.]+", "-", name).lower(), version) for name, version in rows
+    )
     return {
         "executable": sys.executable,
         "prefix": sys.prefix,
@@ -337,6 +406,7 @@ def _driver_environment() -> dict[str, Any]:
         "python": ".".join(str(item) for item in sys.version_info[:3]),
         "distribution_count": len(rows),
         "distributions_sha256": _json_sha256(rows),
+        "normalized_distributions_sha256": _json_sha256(normalized_rows),
     }
 
 
@@ -744,19 +814,10 @@ def main() -> int:
                 "--database-url",
                 "sqlite:///:memory:",
             ]
-            child_environment = dict(os.environ)
-            child_environment.update(
-                {
-                    "VIRTUAL_ENV": str(comfy_python.parent.parent),
-                    "PATH": f"{comfy_python.parent}{os.pathsep}{child_environment.get('PATH', '')}",
-                    "PYTHONNOUSERSITE": "1",
-                    "HF_HUB_OFFLINE": "1",
-                    "TRANSFORMERS_OFFLINE": "1",
-                    "DIFFUSERS_OFFLINE": "1",
-                    "HF_HUB_DISABLE_TELEMETRY": "1",
-                }
+            child_environment = _comfy_child_environment(
+                comfy_python=comfy_python,
+                isolation_root=isolation_root,
             )
-            child_environment.pop("PYTHONPATH", None)
 
             with comfy_log.open("xb") as log_handle:
                 process = subprocess.Popen(

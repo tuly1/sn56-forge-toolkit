@@ -23,19 +23,23 @@ try:
     from . import krea_budget
     from . import krea_c1c4_amendment
     from . import krea_dataset_identity
+    from . import krea_discovery_authorization
     from . import krea_fixture
     from . import krea_host_identity
     from . import krea_internal_evidence
     from . import krea_provenance
+    from . import krea_profile_index
     from . import krea_public_source
 except ImportError:  # pragma: no cover - direct script execution.
     import krea_budget  # type: ignore[no-redef]
     import krea_c1c4_amendment  # type: ignore[no-redef]
     import krea_dataset_identity  # type: ignore[no-redef]
+    import krea_discovery_authorization  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
     import krea_host_identity  # type: ignore[no-redef]
     import krea_internal_evidence  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
+    import krea_profile_index  # type: ignore[no-redef]
     import krea_public_source  # type: ignore[no-redef]
 
 
@@ -44,14 +48,36 @@ _GIT_SHA = re.compile(r"[0-9a-f]{40}")
 _IMMUTABLE_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _PUBLIC_APPROVAL_KIND = "forge-krea-source-normalization-approval"
+_AGENT_PUBLIC_REVIEW_KIND = "forge-krea-agent-source-normalization-review"
+_AGENT_PUBLIC_REVIEW_CLAIM_LIMIT = (
+    "agent technical review of the normalized public-recipe vocabulary and "
+    "disclosed local adaptations; not human review, quality proof, selector "
+    "reproduction, fixture admission, or GPU authorization"
+)
+_AGENT_PUBLIC_REVIEW_ASSERTIONS = {
+    "canonical_manifest_valid": True,
+    "public_evidence_manifest_verified": True,
+    "normalized_recipe_vocabulary_reviewed": True,
+    "unknown_and_unsupported_fields_reviewed": True,
+    "local_adaptations_reviewed": True,
+    "source_artifact_identity_reviewed": True,
+    "private_selector_not_claimed_as_reproduced": True,
+    "claim_limits_reviewed": True,
+}
 _INTERNAL_MODES = frozenset(
     {"deployed_control", "derived_matched_control", "internal_evidence_challenger"}
 )
 _DISCOVERY_KIND = "sn56-week5-krea-discovery-freeze"
 _TIMING_PROBE_KIND = "forge-krea-bootstrap-timing-probe-plan"
+_TIMING_RUNNER_BOOTSTRAP = (
+    "import runpy,sys;sys.path.insert(0,'/app/forge');"
+    "runpy.run_module('ops.calibration.run_krea_ladder',run_name='__main__')"
+)
 _TIMING_APPROVAL_KIND = "forge-krea-bootstrap-timing-probe-approval"
 _EXECUTION_APPROVAL_KIND = "forge-krea-pre-run-execution-approval"
 _POSTRUN_CERTIFICATE_KIND = "forge-krea-post-run-natural-completion-certificate"
+_CAMPAIGN_ROOT = Path("/campaign")
+_CONTROL_ROOT = _CAMPAIGN_ROOT / "controls"
 
 
 def _strict_utc(value: Any, label: str) -> str:
@@ -65,6 +91,13 @@ def _strict_utc(value: Any, label: str) -> str:
     except ValueError as exc:
         raise ValueError(f"{label} is not a valid UTC timestamp") from exc
     return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _lexical_child(value: Any, root: Path) -> bool:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return False
+    path = Path(os.path.abspath(os.path.expanduser(value)))
+    return path != root and path.is_relative_to(root)
 
 
 def _object(value: Any, label: str) -> dict[str, Any]:
@@ -230,9 +263,615 @@ def validate_internal_basis(value: dict[str, Any], *, arm_id: str) -> dict[str, 
     return value
 
 
+def _validate_source_review_owner_ratification(
+    ratification: Any,
+    *,
+    ratification_file_sha256: str,
+    portable_draft: dict[str, Any],
+    portable_draft_file_sha256: str,
+    amendment: dict[str, Any],
+    amendment_file_sha256: str,
+    custodian_actor: dict[str, Any],
+    custodian_actor_file_sha256: str,
+) -> dict[str, Any]:
+    """Validate the minimal relocatable owner-governance authority chain.
+
+    The create-only publisher first validates the original local draft through
+    admission's complete canonical resolver.  This portable consumer then
+    proves the copied ratification, portable draft, amendment, and explicitly
+    non-human custodian are the exact same self-digesting chain.  Final GPU
+    approval independently revalidates the complete admitted envelope.
+    """
+
+    ratification = _object(ratification, "source-review owner ratification")
+    portable_draft = _object(
+        portable_draft, "source-review portable ratification draft"
+    )
+    amendment = _object(amendment, "source-review governance amendment")
+
+    def require_self_digest(document: dict[str, Any], key: str, label: str) -> str:
+        digest = _digest(document.get(key), f"{label} semantic SHA-256")
+        body = {name: value for name, value in document.items() if name != key}
+        if digest != krea_provenance.canonical_sha256(body):
+            raise ValueError(f"{label} semantic SHA-256 mismatch")
+        return digest
+
+    ratification_sha = require_self_digest(
+        ratification, "ratification_sha256", "owner ratification"
+    )
+    draft_sha = require_self_digest(
+        portable_draft, "draft_sha256", "portable ratification draft"
+    )
+    amendment_sha = require_self_digest(
+        amendment, "amendment_sha256", "governance amendment"
+    )
+    ratification_draft = _object(
+        ratification.get("portable_ratification_draft"),
+        "owner ratification portable draft binding",
+    )
+    ratification_amendment = _object(
+        ratification.get("governance_amendment"),
+        "owner ratification amendment binding",
+    )
+    _exact(
+        ratification_draft,
+        {"file_sha256", "draft_sha256"},
+        "owner ratification portable draft binding",
+    )
+    _exact(
+        ratification_amendment,
+        {"file_sha256", "amendment_sha256"},
+        "owner ratification amendment binding",
+    )
+    decision_bindings = _object(
+        ratification.get("decision_bindings"), "owner ratification decisions"
+    )
+    draft_decisions = _object(
+        portable_draft.get("decision_bindings"), "portable draft decisions"
+    )
+    public_evidence = _object(
+        decision_bindings.get("public_source_evidence"),
+        "ratified public source evidence",
+    )
+    _exact(
+        public_evidence,
+        {
+            "discovery_plan_file_sha256",
+            "thin_manifest_file_sha256",
+            "public_source_provenance",
+        },
+        "ratified public source evidence",
+    )
+    _digest(
+        public_evidence["discovery_plan_file_sha256"],
+        "ratified discovery plan file SHA-256",
+    )
+    _digest(
+        public_evidence["thin_manifest_file_sha256"],
+        "ratified thin manifest file SHA-256",
+    )
+    sources = _object(
+        public_evidence["public_source_provenance"],
+        "ratified public provenance bindings",
+    )
+    _exact(sources, {"K2", "K3", "K4"}, "ratified public provenance bindings")
+    for arm, raw_binding in sources.items():
+        binding = _object(raw_binding, f"ratified {arm} provenance binding")
+        _exact(
+            binding,
+            {"file_sha256", "manifest_sha256"},
+            f"ratified {arm} provenance binding",
+        )
+        _digest(binding["file_sha256"], f"ratified {arm} provenance file SHA-256")
+        _digest(
+            binding["manifest_sha256"],
+            f"ratified {arm} provenance semantic SHA-256",
+        )
+
+    amendment_custodian = _object(
+        amendment.get("sealed_custodian_actor"), "amendment sealed custodian"
+    )
+    _exact(
+        amendment_custodian,
+        {"file_sha256", "actor_sha256", "actor"},
+        "amendment sealed custodian",
+    )
+    custodian = krea_fixture._agent_actor(
+        custodian_actor, "source-review sealed custodian actor"
+    )
+    custodian_sha = krea_provenance.canonical_sha256(custodian)
+    portable_evidence = _object(
+        portable_draft.get("evidence_files"), "portable draft evidence files"
+    )
+    portable_custodian = _object(
+        portable_evidence.get("sealed_custodian_actor"),
+        "portable draft sealed custodian",
+    )
+    _exact(
+        portable_custodian,
+        {"file_sha256", "actor_sha256"},
+        "portable draft sealed custodian",
+    )
+    owner = krea_fixture.named_human(
+        ratification.get("owner_identity"), "source-review owner identity"
+    )
+    ratified_at = _strict_utc(
+        ratification.get("ratified_at_utc"), "source-review ratification time"
+    )
+    ratified_time = datetime.strptime(ratified_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    evidence_times = [
+        _strict_utc(
+            portable_draft.get("prepared_at_utc"), "portable draft preparation time"
+        ),
+        _strict_utc(amendment.get("amended_at_utc"), "amendment time"),
+    ]
+    if (
+        ratification.get("schema") != 1
+        or ratification.get("kind") != "forge-krea-sole-human-owner-ratification"
+        or portable_draft.get("schema") != 1
+        or portable_draft.get("kind") != "forge-krea-portable-owner-ratification-draft"
+        or amendment.get("schema") != 1
+        or amendment.get("kind") != "forge-krea-review-governance-amendment"
+        or ratification_draft
+        != {
+            "file_sha256": portable_draft_file_sha256,
+            "draft_sha256": draft_sha,
+        }
+        or ratification_amendment
+        != {
+            "file_sha256": amendment_file_sha256,
+            "amendment_sha256": amendment_sha,
+        }
+        or decision_bindings != draft_decisions
+        or decision_bindings.get("governance_amendment_sha256") != amendment_sha
+        or amendment.get("public_source_evidence") != public_evidence
+        or decision_bindings.get("sealed_custodian_actor_sha256") != custodian_sha
+        or amendment_custodian
+        != {
+            "file_sha256": custodian_actor_file_sha256,
+            "actor_sha256": custodian_sha,
+            "actor": custodian,
+        }
+        or portable_custodian
+        != {
+            "file_sha256": custodian_actor_file_sha256,
+            "actor_sha256": custodian_sha,
+        }
+        or portable_draft.get("owner_identity") != owner
+        or ratification.get("decision") != "ratified_for_fixture_admission_input"
+        or ratification.get("admission_authorized") is not False
+        or ratification.get("gpu_execution_authorized") is not False
+        or portable_draft.get("admission_authorized") is not False
+        or portable_draft.get("gpu_execution_authorized") is not False
+        or amendment.get("admission_authorized") is not False
+        or amendment.get("gpu_execution_authorized") is not False
+        or any(
+            ratified_time
+            < datetime.strptime(item, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            for item in evidence_times
+        )
+    ):
+        raise ValueError("portable source-review ratification chain is invalid")
+    return {
+        "owner_identity": owner,
+        "ratification_sha256": ratification_sha,
+        "ratification_file_sha256": ratification_file_sha256,
+        "ratified_at_utc": ratified_at,
+        "public_source_evidence": public_evidence,
+        "sealed_custodian_actor_sha256": custodian_sha,
+    }
+
+
+def _thin_evidence_rows(path: Path) -> dict[str, str]:
+    """Parse a sha256sum manifest without trusting paths or duplicate rows."""
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ValueError("thin evidence manifest is not UTF-8") from exc
+    if not lines:
+        raise ValueError("thin evidence manifest is empty")
+    rows: dict[str, str] = {}
+    for index, line in enumerate(lines):
+        match = re.fullmatch(r"([0-9a-f]{64})  ([^\x00\r\n]+)", line)
+        if match is None:
+            raise ValueError(f"thin evidence manifest row {index} is malformed")
+        digest, relative_text = match.groups()
+        relative = Path(relative_text)
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise ValueError("thin evidence manifest contains an unsafe path")
+        portable = relative.as_posix()
+        if portable in rows:
+            raise ValueError("thin evidence manifest contains a duplicate path")
+        artifact = _safe_file(path.parent / relative, "thin evidence artifact")
+        if krea_provenance.file_sha256(artifact) != digest:
+            raise ValueError(f"thin evidence artifact SHA-256 mismatch: {portable}")
+        rows[portable] = digest
+    return rows
+
+
+def _review_relative_file(review_path: Path, relative_value: Any, label: str) -> Path:
+    relative_text = _text(relative_value, f"{label}.relative_path")
+    relative = Path(relative_text)
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise ValueError(f"{label} relative path is unsafe")
+    root = review_path.parent.resolve()
+    path = _safe_file(root / relative, label)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} escaped the review bundle") from exc
+    return path
+
+
+def _portable_binding(
+    *, review_path: Path, artifact_path: Path, label: str
+) -> dict[str, str]:
+    artifact = _safe_file(artifact_path, label)
+    relative = Path(os.path.relpath(artifact, review_path.parent))
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise ValueError(f"{label} must be inside the review bundle")
+    return {
+        "relative_path": relative.as_posix(),
+        "file_sha256": krea_provenance.file_sha256(artifact),
+    }
+
+
+def _load_review_json(
+    *, review_path: Path, binding: Any, label: str, semantic_key: str
+) -> tuple[Path, dict[str, Any], str]:
+    binding = _object(binding, f"{label} binding")
+    _exact(
+        binding,
+        {"relative_path", "file_sha256", semantic_key},
+        f"{label} binding",
+    )
+    path = _review_relative_file(review_path, binding["relative_path"], label)
+    file_sha = _digest(binding["file_sha256"], f"{label} file SHA-256")
+    if krea_provenance.file_sha256(path) != file_sha:
+        raise ValueError(f"{label} file SHA-256 mismatch")
+    try:
+        raw = path.read_bytes()
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not JSON") from exc
+    if raw != krea_provenance.canonical_bytes(document) + b"\n":
+        raise ValueError(f"{label} must be canonical JSON plus one newline")
+    return path, _object(document, label), file_sha
+
+
+def build_agent_public_source_review(
+    *,
+    review_output_path: str | Path,
+    source_provenance: dict[str, str],
+    thin_evidence_manifest: dict[str, str],
+    owner_ratification: dict[str, str],
+    portable_ratification_draft: dict[str, str],
+    governance_amendment: dict[str, str],
+    sealed_custodian_actor: dict[str, str],
+    actor: dict[str, Any],
+    reviewed_at_utc: str,
+) -> dict[str, Any]:
+    """Build a non-authorizing agent review from exact bound public evidence."""
+
+    review_path = Path(os.path.abspath(os.path.expanduser(review_output_path)))
+    source_path, source, source_file_sha = _load_binding(
+        source_provenance, "agent-review source provenance"
+    )
+    krea_provenance.validate_manifest(source)
+    thin_path, thin_sha = _file_binding(
+        thin_evidence_manifest, "agent-review thin evidence manifest"
+    )
+    owner_path, owner, owner_file_sha = _load_binding(
+        owner_ratification, "agent-review owner ratification"
+    )
+    portable_path, portable, portable_file_sha = _load_binding(
+        portable_ratification_draft,
+        "agent-review portable ratification draft",
+    )
+    amendment_path, amendment, amendment_file_sha = _load_binding(
+        governance_amendment, "agent-review governance amendment"
+    )
+    custodian_path, custodian, custodian_file_sha = _load_binding(
+        sealed_custodian_actor, "agent-review sealed custodian actor"
+    )
+    owner_summary = _validate_source_review_owner_ratification(
+        owner,
+        ratification_file_sha256=owner_file_sha,
+        portable_draft=portable,
+        portable_draft_file_sha256=portable_file_sha,
+        amendment=amendment,
+        amendment_file_sha256=amendment_file_sha,
+        custodian_actor=custodian,
+        custodian_actor_file_sha256=custodian_file_sha,
+    )
+    source_binding = _portable_binding(
+        review_path=review_path,
+        artifact_path=source_path,
+        label="agent-review source provenance",
+    )
+    expected_source_relative = (
+        "public-source-provenance/"
+        f"{source['source_arm_id']}-public-source-provenance.json"
+    )
+    if source_binding["relative_path"] != expected_source_relative:
+        raise ValueError("source provenance is not at its canonical bundle path")
+    thin_binding = _portable_binding(
+        review_path=review_path,
+        artifact_path=thin_path,
+        label="agent-review thin evidence manifest",
+    )
+    if thin_binding["relative_path"] != "MANIFEST.sha256":
+        raise ValueError("thin evidence manifest is not at the bundle root")
+
+    def semantic_binding(
+        *, path: Path, label: str, semantic_key: str, semantic_sha: str
+    ) -> dict[str, str]:
+        binding = _portable_binding(
+            review_path=review_path, artifact_path=path, label=label
+        )
+        binding[semantic_key] = semantic_sha
+        return binding
+
+    body = {
+        "schema": 2,
+        "kind": _AGENT_PUBLIC_REVIEW_KIND,
+        "source_arm_id": source["source_arm_id"],
+        "source_provenance": {
+            **source_binding,
+            "manifest_sha256": source["manifest_sha256"],
+        },
+        "thin_evidence_manifest": {
+            **thin_binding,
+        },
+        "actor": krea_fixture._agent_actor(actor, "source-normalization review actor"),
+        "reviewed_at_utc": _strict_utc(
+            reviewed_at_utc, "source-normalization review time"
+        ),
+        "decision": "technical_pass",
+        "assertions": dict(_AGENT_PUBLIC_REVIEW_ASSERTIONS),
+        "owner_ratification": semantic_binding(
+            path=owner_path,
+            label="agent-review owner ratification",
+            semantic_key="ratification_sha256",
+            semantic_sha=owner_summary["ratification_sha256"],
+        ),
+        "portable_ratification_draft": semantic_binding(
+            path=portable_path,
+            label="agent-review portable ratification draft",
+            semantic_key="draft_sha256",
+            semantic_sha=portable["draft_sha256"],
+        ),
+        "governance_amendment": semantic_binding(
+            path=amendment_path,
+            label="agent-review governance amendment",
+            semantic_key="amendment_sha256",
+            semantic_sha=amendment["amendment_sha256"],
+        ),
+        "sealed_custodian_actor": semantic_binding(
+            path=custodian_path,
+            label="agent-review sealed custodian actor",
+            semantic_key="actor_sha256",
+            semantic_sha=owner_summary["sealed_custodian_actor_sha256"],
+        ),
+        "agent_review_is_not_human_review": True,
+        "admission_authorized": False,
+        "gpu_execution_authorized": False,
+        "claim_limit": _AGENT_PUBLIC_REVIEW_CLAIM_LIMIT,
+    }
+    review = {**body, "review_sha256": krea_provenance.canonical_sha256(body)}
+    _validate_agent_public_review(
+        review,
+        source_manifest=source,
+        source_manifest_file_sha256=source_file_sha,
+        review_path=review_path,
+    )
+    return review
+
+
+def _validate_agent_public_review(
+    value: dict[str, Any],
+    *,
+    source_manifest: dict[str, Any],
+    source_manifest_file_sha256: str,
+    review_path: Path,
+) -> dict[str, Any]:
+    label = "agent source-normalization review"
+    _exact(
+        value,
+        {
+            "schema",
+            "kind",
+            "source_arm_id",
+            "source_provenance",
+            "thin_evidence_manifest",
+            "actor",
+            "reviewed_at_utc",
+            "decision",
+            "assertions",
+            "owner_ratification",
+            "portable_ratification_draft",
+            "governance_amendment",
+            "sealed_custodian_actor",
+            "agent_review_is_not_human_review",
+            "admission_authorized",
+            "gpu_execution_authorized",
+            "claim_limit",
+            "review_sha256",
+        },
+        label,
+    )
+    source = _object(value["source_provenance"], "reviewed source provenance")
+    _exact(
+        source,
+        {"relative_path", "file_sha256", "manifest_sha256"},
+        "reviewed source provenance",
+    )
+    expected_relative = (
+        "public-source-provenance/"
+        f"{source_manifest['source_arm_id']}-public-source-provenance.json"
+    )
+    if source["relative_path"] != expected_relative:
+        raise ValueError("agent review source provenance path is not canonical")
+    source_file_sha = _digest(
+        source["file_sha256"], "agent review source provenance file SHA-256"
+    )
+    source_manifest_sha = _digest(
+        source["manifest_sha256"], "agent review source manifest SHA-256"
+    )
+    bundled_source_path = _review_relative_file(
+        review_path, source["relative_path"], "agent-review source provenance"
+    )
+    if krea_provenance.file_sha256(bundled_source_path) != source_file_sha:
+        raise ValueError("agent-review source provenance file SHA-256 mismatch")
+    try:
+        bundled_source_raw = bundled_source_path.read_bytes()
+        bundled_source = json.loads(bundled_source_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("agent-review source provenance is not JSON") from exc
+    if (
+        bundled_source_raw != krea_provenance.canonical_bytes(bundled_source) + b"\n"
+        or bundled_source != source_manifest
+    ):
+        raise ValueError("bundled source provenance differs from execution source")
+    thin_binding = _object(
+        value["thin_evidence_manifest"], "agent-review thin evidence binding"
+    )
+    _exact(
+        thin_binding,
+        {"relative_path", "file_sha256"},
+        "agent-review thin evidence binding",
+    )
+    if thin_binding["relative_path"] != "MANIFEST.sha256":
+        raise ValueError("agent-review thin manifest path is not canonical")
+    thin_path = _review_relative_file(
+        review_path,
+        thin_binding["relative_path"],
+        "agent-review thin evidence manifest",
+    )
+    thin_sha = _digest(
+        thin_binding["file_sha256"], "agent-review thin manifest file SHA-256"
+    )
+    if krea_provenance.file_sha256(thin_path) != thin_sha:
+        raise ValueError("agent-review thin evidence manifest SHA-256 mismatch")
+    rows = _thin_evidence_rows(thin_path)
+    _, owner, owner_file_sha = _load_review_json(
+        review_path=review_path,
+        binding=value["owner_ratification"],
+        label="agent-review owner ratification",
+        semantic_key="ratification_sha256",
+    )
+    _, portable, portable_file_sha = _load_review_json(
+        review_path=review_path,
+        binding=value["portable_ratification_draft"],
+        label="agent-review portable ratification draft",
+        semantic_key="draft_sha256",
+    )
+    _, amendment, amendment_file_sha = _load_review_json(
+        review_path=review_path,
+        binding=value["governance_amendment"],
+        label="agent-review governance amendment",
+        semantic_key="amendment_sha256",
+    )
+    _, custodian, custodian_file_sha = _load_review_json(
+        review_path=review_path,
+        binding=value["sealed_custodian_actor"],
+        label="agent-review sealed custodian actor",
+        semantic_key="actor_sha256",
+    )
+    owner_summary = _validate_source_review_owner_ratification(
+        owner,
+        ratification_file_sha256=owner_file_sha,
+        portable_draft=portable,
+        portable_draft_file_sha256=portable_file_sha,
+        amendment=amendment,
+        amendment_file_sha256=amendment_file_sha,
+        custodian_actor=custodian,
+        custodian_actor_file_sha256=custodian_file_sha,
+    )
+    public_evidence = owner_summary["public_source_evidence"]
+    ratified_source = public_evidence["public_source_provenance"].get(
+        source_manifest["source_arm_id"]
+    )
+    actor = krea_fixture._agent_actor(
+        value["actor"], "source-normalization review actor"
+    )
+    reviewed_at = datetime.strptime(
+        _strict_utc(value["reviewed_at_utc"], "source-normalization review time"),
+        "%Y-%m-%dT%H:%M:%SZ",
+    ).replace(tzinfo=timezone.utc)
+    ratified_at = datetime.strptime(
+        owner_summary["ratified_at_utc"], "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=timezone.utc)
+    body = {key: item for key, item in value.items() if key != "review_sha256"}
+    if (
+        value["schema"] != 2
+        or value["kind"] != _AGENT_PUBLIC_REVIEW_KIND
+        or value["source_arm_id"] != source_manifest["source_arm_id"]
+        or source_file_sha != source_manifest_file_sha256
+        or source_manifest_sha != source_manifest["manifest_sha256"]
+        or rows.get(expected_relative) != source_manifest_file_sha256
+        or public_evidence["thin_manifest_file_sha256"] != thin_sha
+        or ratified_source
+        != {
+            "file_sha256": source_manifest_file_sha256,
+            "manifest_sha256": source_manifest["manifest_sha256"],
+        }
+        or value["decision"] != "technical_pass"
+        or value["assertions"] != _AGENT_PUBLIC_REVIEW_ASSERTIONS
+        or value["owner_ratification"]["ratification_sha256"]
+        != owner_summary["ratification_sha256"]
+        or value["portable_ratification_draft"]["draft_sha256"]
+        != portable.get("draft_sha256")
+        or value["governance_amendment"]["amendment_sha256"]
+        != amendment.get("amendment_sha256")
+        or value["sealed_custodian_actor"]["actor_sha256"]
+        != owner_summary["sealed_custodian_actor_sha256"]
+        or reviewed_at < ratified_at
+        or value["agent_review_is_not_human_review"] is not True
+        or value["admission_authorized"] is not False
+        or value["gpu_execution_authorized"] is not False
+        or value["claim_limit"] != _AGENT_PUBLIC_REVIEW_CLAIM_LIMIT
+        or value["review_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("agent source-normalization review is invalid or unbound")
+    return {
+        "schema": 2,
+        "decision": "technical_pass",
+        "review_sha256": value["review_sha256"],
+        "actor": actor,
+        "owner_identity": owner_summary["owner_identity"],
+        "owner_ratification_sha256": owner_summary["ratification_sha256"],
+        "sealed_custodian_actor_sha256": owner_summary["sealed_custodian_actor_sha256"],
+        "public_source_evidence": public_evidence,
+        "claim_limit": _AGENT_PUBLIC_REVIEW_CLAIM_LIMIT,
+    }
+
+
 def _validate_public_approval(
-    value: dict[str, Any], *, source_manifest: dict[str, Any]
-) -> None:
+    value: dict[str, Any],
+    *,
+    source_manifest: dict[str, Any],
+    source_manifest_file_sha256: str,
+    approval_path: Path | None = None,
+) -> dict[str, Any]:
+    if value.get("schema") == 2:
+        if approval_path is None:
+            raise ValueError("schema-2 source review requires its bundle file path")
+        return _validate_agent_public_review(
+            value,
+            source_manifest=source_manifest,
+            source_manifest_file_sha256=source_manifest_file_sha256,
+            review_path=approval_path,
+        )
     _exact(
         value,
         {
@@ -269,6 +908,11 @@ def _validate_public_approval(
     )
     if any(item is not True for item in assertions.values()):
         raise ValueError("source-normalization approval assertions did not all pass")
+    return {
+        "schema": 1,
+        "decision": "approved",
+        "reviewer_identity": value["reviewer_identity"],
+    }
 
 
 def _arm_basis(
@@ -367,10 +1011,15 @@ def _arm_basis(
             )
         if source["source_arm_id"] != arm_id:
             raise ValueError("public source arm id differs from execution arm")
-        _, source_approval, source_approval_sha = _load_binding(
+        source_approval_path, source_approval, source_approval_sha = _load_binding(
             basis["source_normalization_approval"], "source approval"
         )
-        _validate_public_approval(source_approval, source_manifest=source)
+        source_approval_summary = _validate_public_approval(
+            source_approval,
+            source_manifest=source,
+            source_manifest_file_sha256=source_file_sha,
+            approval_path=source_approval_path,
+        )
         normalized = krea_provenance.normalize_execution_recipe(
             execution_recipe, source_recipe=source["normalized_recipe"]
         )
@@ -379,6 +1028,7 @@ def _arm_basis(
             "source_provenance_file_sha256": source_file_sha,
             "source_manifest_sha256": source["manifest_sha256"],
             "source_normalization_approval_sha256": source_approval_sha,
+            "source_normalization_approval": source_approval_summary,
             "rebound_source_files": {
                 name: {"path": str(path), "sha256": digest}
                 for name, (path, digest) in sorted(rebound.items())
@@ -449,6 +1099,7 @@ def validate_discovery_semantics(
     arm_id: str,
     fixture_id: str,
     fixture_manifest_sha256: str,
+    fixture_candidate_manifest_sha256: str | None = None,
     training_pair_count: int,
     seed_role: str,
     seed: int,
@@ -477,7 +1128,12 @@ def validate_discovery_semantics(
     if fixture_id not in {"D1", "D2"} or fixture_id not in tasks:
         raise ValueError("discovery fixture id must be D1 or D2")
     task = _object(tasks[fixture_id], f"discovery task {fixture_id}")
-    if task.get("fixture_split_manifest_sha256") != fixture_manifest_sha256:
+    frozen_fixture_identity = (
+        fixture_candidate_manifest_sha256
+        if fixture_candidate_manifest_sha256 is not None
+        else fixture_manifest_sha256
+    )
+    if task.get("fixture_split_manifest_sha256") != frozen_fixture_identity:
         raise ValueError("fixture manifest is not the one frozen in discovery plan")
     pair_range = task.get("required_training_pair_range")
     if (
@@ -493,6 +1149,13 @@ def validate_discovery_semantics(
         raise ValueError("fixture training-pair count escaped discovery range")
     if task.get("identity") is None:
         raise ValueError("discovery fixture identity is still unset")
+    if (
+        fixture_candidate_manifest_sha256 is not None
+        and task.get("identity") != fixture_candidate_manifest_sha256
+    ):
+        raise ValueError(
+            "schema-2 discovery identity must be its stable candidate manifest"
+        )
 
     expected_seed_key = {
         "A": "training_seed_a",
@@ -689,43 +1352,55 @@ def _schedule(
 
 def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     plan = _object(plan, "execution plan")
+    plan_schema = plan.get("schema")
+    plan_keys = {
+        "schema",
+        "kind",
+        "arm_id",
+        "task_id",
+        "expected_repo_name",
+        "discovery_plan",
+        "discovery_fixture_id",
+        "seed_role",
+        "fixture_manifest",
+        "fixture_approval",
+        "training_archive",
+        "evaluation_dataset",
+        "arm_basis",
+        "execution_recipe",
+        "throughput_profile",
+        "timing_evidence",
+        "host_execution_manifest",
+        "budget_plan",
+        "budget_plan_sha256",
+        "schedule",
+        "base_model",
+        "seed",
+        "runtime_identity_sha256",
+        "execution_envelope_sha256",
+        "throughput_equivalence_class",
+        "predeclared_recipe_axes",
+        "in_task_proxy_selection",
+        "runner_sha256",
+        "gpu_execution_authorized",
+        "plan_sha256",
+    }
+    if plan_schema == 3:
+        plan_keys.update(
+            {
+                "discovery_profile_index",
+                "discovery_execution_authorization",
+            }
+        )
     _exact(
         plan,
-        {
-            "schema",
-            "kind",
-            "arm_id",
-            "task_id",
-            "expected_repo_name",
-            "discovery_plan",
-            "discovery_fixture_id",
-            "seed_role",
-            "fixture_manifest",
-            "fixture_approval",
-            "training_archive",
-            "evaluation_dataset",
-            "arm_basis",
-            "execution_recipe",
-            "throughput_profile",
-            "timing_evidence",
-            "host_execution_manifest",
-            "budget_plan",
-            "budget_plan_sha256",
-            "schedule",
-            "base_model",
-            "seed",
-            "runtime_identity_sha256",
-            "execution_envelope_sha256",
-            "throughput_equivalence_class",
-            "predeclared_recipe_axes",
-            "in_task_proxy_selection",
-            "runner_sha256",
-            "gpu_execution_authorized",
-            "plan_sha256",
-        },
+        plan_keys,
         "execution plan",
     )
-    if plan["schema"] != 2 or plan["kind"] != "forge-krea-pretraining-execution-plan":
+    if (
+        plan_schema not in {2, 3}
+        or plan["kind"] != "forge-krea-pretraining-execution-plan"
+    ):
         raise ValueError("unsupported execution plan")
     for key in ("arm_id", "task_id", "expected_repo_name"):
         if not isinstance(plan[key], str) or not _SAFE_ID.fullmatch(plan[key]):
@@ -736,12 +1411,38 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if plan["plan_sha256"] != krea_provenance.canonical_sha256(body):
         raise ValueError("execution plan digest mismatch")
 
+    discovery_authorization = None
+    discovery_authorization_file_sha = None
+    probe_margin_policy = None
+    probe_margin_policy_file_sha = None
+    if plan_schema == 3:
+        _, discovery_authorization, discovery_authorization_file_sha = (
+            krea_discovery_authorization.load_binding(
+                plan["discovery_execution_authorization"]
+            )
+        )
+
     _, fixture, fixture_file_sha = _load_binding(
         plan["fixture_manifest"], "fixture manifest"
     )
     krea_fixture.validate_manifest(fixture)
-    _, fixture_approval, _ = _load_binding(plan["fixture_approval"], "fixture approval")
+    if fixture.get("schema") == 2 and plan_schema != 3:
+        raise ValueError(
+            "schema-2 discovery fixtures require a schema-3 profile-index-bound plan"
+        )
+    _, fixture_approval, fixture_approval_file_sha = _load_binding(
+        plan["fixture_approval"], "fixture approval"
+    )
     krea_fixture.validate_approval(fixture_approval, fixture_manifest=fixture)
+    if plan_schema == 3:
+        krea_discovery_authorization.assert_fixture_admitted(
+            discovery_authorization,
+            role=fixture["experimental_role"],
+            fixture=fixture,
+            fixture_file_sha256=fixture_file_sha,
+            fixture_approval=fixture_approval,
+            fixture_approval_file_sha256=fixture_approval_file_sha,
+        )
     archive_path, archive_sha = _file_binding(
         plan["training_archive"], "training archive"
     )
@@ -803,6 +1504,19 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     _, margin_policy, margin_policy_file_sha = _load_binding(
         timing_evidence["margin_policy"], "timing margin policy"
     )
+    normalized_margin_policy = krea_budget.load_margin_policy(margin_policy)
+    if plan_schema == 3 and (
+        normalized_margin_policy.get("schema") != 2
+        or normalized_margin_policy.get("kind")
+        != "forge-krea-agent-predeclared-timing-margin-policy"
+        or normalized_margin_policy["discovery_execution_authorization"].get(
+            "authorization_sha256"
+        )
+        != discovery_authorization["authorization_sha256"]
+    ):
+        raise ValueError(
+            "schema-3 execution requires its authorization-bound delegated margin"
+        )
     _, end_to_end, end_to_end_file_sha = _load_binding(
         timing_evidence["end_to_end_validation"], "end-to-end timing validation"
     )
@@ -836,6 +1550,25 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     recomputed_e2e = krea_timing_probe.end_to_end_from_records(
         [document for document, _ in heldout_capture_rows], heldout_run_rows
     )
+    timing_approval_actors: list[dict[str, Any]] = []
+    for capture, _ in measurement_capture_rows + heldout_capture_rows:
+        approval, _ = krea_timing_probe._load_canonical(
+            Path(capture["probe_approval"]["path"]), "timing probe approval"
+        )
+        if approval.get("schema") == 2:
+            timing_approval_actors.append(
+                krea_fixture._agent_actor(
+                    approval.get("technical_reviewer_actor"),
+                    "timing probe approval actor",
+                )
+            )
+    distinct_timing_actors = {
+        krea_provenance.canonical_sha256(actor) for actor in timing_approval_actors
+    }
+    if plan_schema == 3 and len(distinct_timing_actors) != 1:
+        raise ValueError(
+            "schema-3 final plan requires one common agent timing approval"
+        )
     if recomputed_raw != raw_samples or recomputed_e2e != end_to_end:
         raise ValueError("timing summaries differ from their bound producer records")
     recomputed_profile = krea_budget.seal_throughput_profile_from_evidence(
@@ -858,6 +1591,10 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         plan["host_execution_manifest"], "host execution manifest"
     )
     krea_host_identity.validate_manifest(host_manifest)
+    if plan_schema == 3 and host_manifest.get("schema") != 3:
+        raise ValueError(
+            "schema-3 execution plans require a bootstrap-receipt-bound host manifest"
+        )
     if profile_sha != plan["throughput_profile"]["sha256"]:
         raise ValueError("throughput profile binding mismatch")
     budget_plan = _object(plan["budget_plan"], "budget plan")
@@ -913,6 +1650,26 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         != host_manifest["host_execution_identity_sha256"]
     ):
         raise ValueError("profile/host execution identity mismatch")
+    bootstrap_runtime = None
+    bootstrap_execution_surface = None
+    if host_manifest.get("schema") == 3:
+        bootstrap_execution_surface = krea_host_identity.bootstrap_execution_surface(
+            host_manifest, recapture=False
+        )
+        bootstrap_runtime = bootstrap_execution_surface["runtime"]
+        if (
+            profile_envelope.get("execution_surface") != "staged_host_venv"
+            or profile_envelope.get("execution_scope") != "discovery_only"
+            or profile_envelope.get("venv_tree_manifest_sha256")
+            != bootstrap_execution_surface["venv_tree"]["manifest_sha256"]
+            or profile_envelope.get("reference_container_image_sha256")
+            != bootstrap_runtime["container_image_sha256"]
+            or profile_envelope.get("jit_enabled")
+            is not bootstrap_runtime["jit_enabled"]
+        ):
+            raise ValueError(
+                "Stage-1 profile surface/runtime identity differs from the bootstrap receipt"
+            )
     if float(profile.get("framework_stop_boundary_s", -1)) < 225.0:
         raise ValueError("profile does not cover Forge's 225-second stop boundary")
     _schedule(
@@ -1007,6 +1764,13 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         arm_id=plan["arm_id"],
         fixture_id=plan["discovery_fixture_id"],
         fixture_manifest_sha256=fixture["manifest_sha256"],
+        fixture_candidate_manifest_sha256=(
+            _object(fixture.get("governance"), "fixture governance").get(
+                "candidate_manifest_sha256"
+            )
+            if fixture.get("schema") == 2
+            else None
+        ),
         training_pair_count=len(fixture["training_rows"]),
         seed_role=plan["seed_role"],
         seed=seed,
@@ -1016,6 +1780,14 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         predeclared_recipe_axes=axes,
         basis_mode=basis_mode,
     )
+    if plan_schema == 3:
+        krea_discovery_authorization.assert_matches_discovery(
+            discovery_authorization,
+            discovery_path=discovery["path"],
+            discovery=discovery["document"],
+            discovery_file_sha256=discovery["file_sha256"],
+            action="profile_indexed_discovery_execution",
+        )
     if (
         plan["arm_id"] == "K5"
         and normalized_basis["K5_internal_evidence_anchor"]
@@ -1031,11 +1803,24 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         or probe_contract["discovery_fixture_id"] != plan["discovery_fixture_id"]
         or probe_contract["execution_envelope"]["execution_envelope_sha256"]
         != plan["execution_envelope_sha256"]
+        or (
+            plan_schema == 3
+            and probe_contract.get("margin_policy")
+            != plan["timing_evidence"]["margin_policy"]
+        )
     ):
         raise ValueError("final execution plan escaped its bootstrap timing probe")
+    profile_index = None
+    if plan_schema == 3:
+        profile_index = krea_profile_index.validate_plan_cell(
+            plan,
+            fixture=fixture,
+            throughput_profile=profile,
+        )
     return {
         "fixture": fixture,
         "fixture_manifest_file_sha256": fixture_file_sha,
+        "arm_basis": normalized_basis,
         "execution_recipe": recipe,
         "training_archive_path": archive_path,
         "evaluation_dataset_path": evaluation_path,
@@ -1043,7 +1828,23 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "throughput_profile": profile,
         "host_execution_manifest": host_manifest,
         "host_execution_manifest_file_sha256": host_manifest_file_sha,
+        "host_bootstrap_receipt": host_manifest.get("bootstrap_receipt"),
+        "bootstrap_runtime": bootstrap_runtime,
+        "bootstrap_execution_surface": bootstrap_execution_surface,
+        "discovery_profile_index": profile_index,
+        "discovery_execution_authorization": (
+            {
+                "document": discovery_authorization,
+                "file_sha256": discovery_authorization_file_sha,
+                "authorization_sha256": discovery_authorization["authorization_sha256"],
+            }
+            if discovery_authorization is not None
+            else None
+        ),
         "discovery": discovery,
+        "timing_probe_approval_actor": (
+            timing_approval_actors[0] if timing_approval_actors else None
+        ),
         "timing_evidence": {
             "raw_sample_manifest_file_sha256": raw_samples_file_sha,
             "margin_policy_file_sha256": margin_policy_file_sha,
@@ -1080,40 +1881,44 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
     """
 
     plan = _object(plan, "timing probe plan")
+    probe_schema = plan.get("schema")
+    probe_keys = {
+        "schema",
+        "kind",
+        "arm_id",
+        "task_id",
+        "expected_repo_name",
+        "discovery_plan",
+        "discovery_fixture_id",
+        "seed_role",
+        "seed",
+        "fixture_manifest",
+        "fixture_approval",
+        "training_archive",
+        "arm_basis",
+        "execution_recipe",
+        "host_execution_manifest",
+        "base_model",
+        "runtime_identity_sha256",
+        "execution_envelope",
+        "throughput_equivalence_class",
+        "predeclared_recipe_axes",
+        "probe_schedule",
+        "command_argv",
+        "runner_sha256",
+        "measurement_tool_sha256",
+        "gpu_execution_authorized",
+        "probe_contract_sha256",
+    }
+    if probe_schema == 2:
+        probe_keys.update({"discovery_execution_authorization", "margin_policy"})
     _exact(
         plan,
-        {
-            "schema",
-            "kind",
-            "arm_id",
-            "task_id",
-            "expected_repo_name",
-            "discovery_plan",
-            "discovery_fixture_id",
-            "seed_role",
-            "seed",
-            "fixture_manifest",
-            "fixture_approval",
-            "training_archive",
-            "arm_basis",
-            "execution_recipe",
-            "host_execution_manifest",
-            "base_model",
-            "runtime_identity_sha256",
-            "execution_envelope",
-            "throughput_equivalence_class",
-            "predeclared_recipe_axes",
-            "probe_schedule",
-            "command_argv",
-            "runner_sha256",
-            "measurement_tool_sha256",
-            "gpu_execution_authorized",
-            "probe_contract_sha256",
-        },
+        probe_keys,
         "timing probe plan",
     )
     if (
-        plan["schema"] != 1
+        probe_schema not in {1, 2}
         or plan["kind"] != _TIMING_PROBE_KIND
         or plan["gpu_execution_authorized"] is not False
     ):
@@ -1127,12 +1932,51 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
     seed = plan["seed"]
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
         raise ValueError("timing probe seed is invalid")
-    _, fixture, _ = _load_binding(plan["fixture_manifest"], "probe fixture manifest")
+    _, fixture, fixture_file_sha = _load_binding(
+        plan["fixture_manifest"], "probe fixture manifest"
+    )
     krea_fixture.validate_manifest(fixture)
-    _, fixture_approval, _ = _load_binding(
+    if fixture.get("schema") == 2 and probe_schema != 2:
+        raise ValueError(
+            "schema-2 timing fixtures require a discovery-authorization-bound probe"
+        )
+    discovery_authorization = None
+    discovery_authorization_file_sha = None
+    if probe_schema == 2:
+        _, discovery_authorization, discovery_authorization_file_sha = (
+            krea_discovery_authorization.load_binding(
+                plan["discovery_execution_authorization"]
+            )
+        )
+        _, probe_margin_policy, probe_margin_policy_file_sha = _load_binding(
+            plan["margin_policy"], "timing probe margin policy"
+        )
+        normalized_probe_margin = krea_budget.load_margin_policy(probe_margin_policy)
+        if (
+            normalized_probe_margin.get("schema") != 2
+            or normalized_probe_margin.get("kind")
+            != "forge-krea-agent-predeclared-timing-margin-policy"
+            or normalized_probe_margin["discovery_execution_authorization"].get(
+                "authorization_sha256"
+            )
+            != discovery_authorization["authorization_sha256"]
+        ):
+            raise ValueError(
+                "schema-2 timing probe requires its authorization-bound delegated margin"
+            )
+    _, fixture_approval, fixture_approval_file_sha = _load_binding(
         plan["fixture_approval"], "probe fixture approval"
     )
     krea_fixture.validate_approval(fixture_approval, fixture_manifest=fixture)
+    if probe_schema == 2:
+        krea_discovery_authorization.assert_fixture_admitted(
+            discovery_authorization,
+            role=fixture["experimental_role"],
+            fixture=fixture,
+            fixture_file_sha256=fixture_file_sha,
+            fixture_approval=fixture_approval,
+            fixture_approval_file_sha256=fixture_approval_file_sha,
+        )
     archive_path, archive_sha = _file_binding(
         plan["training_archive"], "probe training archive"
     )
@@ -1151,6 +1995,10 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
         plan["host_execution_manifest"], "probe host execution manifest"
     )
     krea_host_identity.validate_manifest(host)
+    if fixture.get("schema") == 2 and host.get("schema") != 3:
+        raise ValueError(
+            "schema-2 timing probes require a bootstrap-receipt-bound host manifest"
+        )
     envelope = krea_budget.load_execution_envelope(plan["execution_envelope"])
     if (
         envelope.equivalence_class != plan["throughput_equivalence_class"]
@@ -1161,6 +2009,33 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
         != plan["execution_envelope"]["execution_envelope_sha256"]
     ):
         raise ValueError("timing probe execution envelope is not host/runtime bound")
+    bootstrap_runtime = None
+    bootstrap_execution_surface = None
+    if host.get("schema") == 3:
+        bootstrap_execution_surface = krea_host_identity.bootstrap_execution_surface(
+            host, recapture=False
+        )
+        bootstrap_runtime = bootstrap_execution_surface["runtime"]
+        if (
+            envelope.execution_surface != "staged_host_venv"
+            or envelope.execution_scope != "discovery_only"
+            or envelope.venv_tree_manifest_sha256
+            != bootstrap_execution_surface["venv_tree"]["manifest_sha256"]
+            or envelope.reference_container_image_sha256
+            != bootstrap_runtime["container_image_sha256"]
+            or envelope.jit_enabled is not bootstrap_runtime["jit_enabled"]
+        ):
+            raise ValueError(
+                "timing probe Stage-1 surface/runtime differs from bootstrap receipt"
+            )
+    if (
+        envelope.training_pair_count != len(fixture["training_rows"])
+        or envelope.training_dataset_shape_sha256
+        != fixture["training_dataset_shape_sha256"]
+    ):
+        raise ValueError(
+            "timing probe execution envelope escaped the approved fixture shape"
+        )
     base = _object(plan["base_model"], "probe base model")
     _exact(
         base,
@@ -1235,6 +2110,13 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
         arm_id=plan["arm_id"],
         fixture_id=plan["discovery_fixture_id"],
         fixture_manifest_sha256=fixture["manifest_sha256"],
+        fixture_candidate_manifest_sha256=(
+            _object(fixture.get("governance"), "probe fixture governance").get(
+                "candidate_manifest_sha256"
+            )
+            if fixture.get("schema") == 2
+            else None
+        ),
         training_pair_count=len(fixture["training_rows"]),
         seed_role=plan["seed_role"],
         seed=seed,
@@ -1246,6 +2128,14 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
         predeclared_recipe_axes=axes,
         basis_mode=_object(plan["arm_basis"], "probe arm basis").get("mode"),
     )
+    if probe_schema == 2:
+        krea_discovery_authorization.assert_matches_discovery(
+            discovery_authorization,
+            discovery_path=discovery["path"],
+            discovery=discovery["document"],
+            discovery_file_sha256=discovery["file_sha256"],
+            action="bootstrap_timing_probe",
+        )
     if (
         plan["arm_id"] == "K5"
         and normalized_basis["K5_internal_evidence_anchor"]
@@ -1264,16 +2154,17 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
     runner_path = Path(__file__).with_name("run_krea_ladder.py").resolve(strict=True)
     tool_path = Path(__file__).with_name("krea_timing_probe.py").resolve(strict=True)
     if (
-        len(command) != 8
-        or Path(command[1]).expanduser().resolve(strict=True) != runner_path
-        or command[2] != "--timing-probe-plan"
-        or command[4] != "--timing-probe-approval"
-        or command[6] != "--campaign-dir"
-        or any(
-            not isinstance(command[index], str)
-            or not os.path.isabs(os.path.expanduser(command[index]))
-            for index in (0, 1, 3, 5, 7)
-        )
+        len(command) != 10
+        or command[0] != "/usr/bin/python3"
+        or command[1] != "-I"
+        or command[2] != "-c"
+        or command[3] != _TIMING_RUNNER_BOOTSTRAP
+        or command[4] != "--timing-probe-plan"
+        or command[6] != "--timing-probe-approval"
+        or command[8] != "--campaign-dir"
+        or not _lexical_child(command[5], _CONTROL_ROOT)
+        or not _lexical_child(command[7], _CONTROL_ROOT)
+        or not _lexical_child(command[9], _CAMPAIGN_ROOT)
     ):
         raise ValueError(
             "timing probe command must be the bounded run_krea_ladder bootstrap argv"
@@ -1288,10 +2179,30 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
         )
     return {
         "fixture": fixture,
+        "arm_basis": normalized_basis,
         "execution_recipe": recipe,
         "host_execution_manifest": host,
+        "bootstrap_runtime": bootstrap_runtime,
+        "bootstrap_execution_surface": bootstrap_execution_surface,
         "execution_envelope": envelope,
         "discovery": discovery,
+        "discovery_execution_authorization": (
+            {
+                "document": discovery_authorization,
+                "file_sha256": discovery_authorization_file_sha,
+                "authorization_sha256": discovery_authorization["authorization_sha256"],
+            }
+            if discovery_authorization is not None
+            else None
+        ),
+        "margin_policy": (
+            {
+                "document": probe_margin_policy,
+                "file_sha256": probe_margin_policy_file_sha,
+            }
+            if probe_margin_policy is not None
+            else None
+        ),
         "training_archive_path": archive_path,
     }
 
@@ -1308,9 +2219,75 @@ def seal_timing_probe_plan(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_timing_probe_approval(
-    plan: dict[str, Any], *, reviewer_identity: str, approved_at_utc: str
+    plan: dict[str, Any],
+    *,
+    reviewer_identity: str | None,
+    approved_at_utc: str,
+    technical_reviewer_actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved = validate_timing_probe_plan(plan)
+    if plan.get("schema") == 2:
+        if reviewer_identity is not None:
+            raise ValueError(
+                "agent-governed timing probes use a technical actor; "
+                "reviewer_identity must be omitted"
+            )
+        if technical_reviewer_actor is None:
+            raise ValueError("schema-2 timing probes require a fresh technical actor")
+        governance = _object(
+            resolved["fixture"].get("governance"), "probe fixture governance"
+        )
+        independent = _object(
+            governance.get("independent_agent_review"),
+            "probe independent agent review",
+        )
+        prior_actor = krea_fixture._agent_actor(
+            independent.get("actor"), "fixture independent reviewer actor"
+        )
+        authorization = resolved["discovery_execution_authorization"]
+        actor = krea_discovery_authorization.validate_technical_actor(
+            authorization["document"],
+            technical_reviewer_actor,
+            required_role="timing_probe_execution_reviewer",
+        )
+        if actor.get("actor_id") == prior_actor.get("actor_id") or actor.get(
+            "review_instance_id"
+        ) == prior_actor.get("review_instance_id"):
+            raise ValueError("timing approval requires a fresh technical review actor")
+        body = {
+            "schema": 2,
+            "kind": _TIMING_APPROVAL_KIND,
+            "probe_contract_sha256": plan["probe_contract_sha256"],
+            "host_execution_identity_sha256": resolved["host_execution_manifest"][
+                "host_execution_identity_sha256"
+            ],
+            "discovery_execution_authorization": {
+                "file_sha256": authorization["file_sha256"],
+                "authorization_sha256": authorization["authorization_sha256"],
+            },
+            "technical_reviewer_actor": actor,
+            "accountable_owner_identity": authorization["document"][
+                "accountable_owner_identity"
+            ],
+            "owner_ratification_sha256": authorization["document"][
+                "fixture_admission_envelope"
+            ]["owner_ratification_sha256"],
+            "approved_at_utc": _strict_utc(approved_at_utc, "approved_at_utc"),
+            "decision": "approved",
+            "gpu_execution_authorized": True,
+            "assertions": {
+                "host_capability_reviewed": True,
+                "fixture_and_recipe_reviewed": True,
+                "agent_review_evidence_bound": True,
+                "agents_are_not_humans": True,
+                "owner_ratification_bound": True,
+                "timing_only_no_production_mutation": True,
+                "natural_completion_will_be_certified_post_run": True,
+            },
+        }
+        return {**body, "approval_sha256": krea_provenance.canonical_sha256(body)}
+    if reviewer_identity is None:
+        raise ValueError("legacy timing probes require a named-human reviewer")
     body = {
         "schema": 1,
         "kind": _TIMING_APPROVAL_KIND,
@@ -1339,6 +2316,97 @@ def validate_timing_probe_approval(
 ) -> dict[str, Any]:
     resolved = validate_timing_probe_plan(plan)
     approval = _object(approval, "timing probe approval")
+    if approval.get("schema") == 2:
+        _exact(
+            approval,
+            {
+                "schema",
+                "kind",
+                "probe_contract_sha256",
+                "host_execution_identity_sha256",
+                "discovery_execution_authorization",
+                "technical_reviewer_actor",
+                "accountable_owner_identity",
+                "owner_ratification_sha256",
+                "approved_at_utc",
+                "decision",
+                "gpu_execution_authorized",
+                "assertions",
+                "approval_sha256",
+            },
+            "agent-governed timing probe approval",
+        )
+        authorization = resolved.get("discovery_execution_authorization")
+        if authorization is None:
+            raise ValueError("schema-2 timing approval requires bound authorization")
+        governance = _object(
+            resolved["fixture"].get("governance"), "probe fixture governance"
+        )
+        actor = krea_discovery_authorization.validate_technical_actor(
+            authorization["document"],
+            approval["technical_reviewer_actor"],
+            required_role="timing_probe_execution_reviewer",
+        )
+        prior_actor = krea_fixture._agent_actor(
+            _object(
+                governance.get("independent_agent_review"),
+                "probe independent agent review",
+            ).get("actor"),
+            "fixture independent reviewer actor",
+        )
+        expected_assertions = {
+            "host_capability_reviewed": True,
+            "fixture_and_recipe_reviewed": True,
+            "agent_review_evidence_bound": True,
+            "agents_are_not_humans": True,
+            "owner_ratification_bound": True,
+            "timing_only_no_production_mutation": True,
+            "natural_completion_will_be_certified_post_run": True,
+        }
+        body = {
+            key: value for key, value in approval.items() if key != "approval_sha256"
+        }
+        if (
+            approval["kind"] != _TIMING_APPROVAL_KIND
+            or approval["probe_contract_sha256"] != plan["probe_contract_sha256"]
+            or approval["host_execution_identity_sha256"]
+            != resolved["host_execution_manifest"]["host_execution_identity_sha256"]
+            or approval["discovery_execution_authorization"]
+            != {
+                "file_sha256": authorization["file_sha256"],
+                "authorization_sha256": authorization["authorization_sha256"],
+            }
+            or actor.get("actor_id") == prior_actor.get("actor_id")
+            or actor.get("review_instance_id") == prior_actor.get("review_instance_id")
+            or approval["accountable_owner_identity"]
+            != authorization["document"]["accountable_owner_identity"]
+            or approval["owner_ratification_sha256"]
+            != authorization["document"]["fixture_admission_envelope"][
+                "owner_ratification_sha256"
+            ]
+            or approval["decision"] != "approved"
+            or approval["gpu_execution_authorized"] is not True
+            or approval["assertions"] != expected_assertions
+            or approval["approval_sha256"] != krea_provenance.canonical_sha256(body)
+        ):
+            raise ValueError("agent-governed timing approval does not authorize probe")
+        krea_fixture.named_human(
+            approval["accountable_owner_identity"], "accountable_owner_identity"
+        )
+        approved_at = datetime.strptime(
+            _strict_utc(approval["approved_at_utc"], "approved_at_utc"),
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=timezone.utc)
+        authorized_at = datetime.strptime(
+            _strict_utc(
+                authorization["document"]["authorized_at_utc"],
+                "authorization authorized_at_utc",
+            ),
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=timezone.utc)
+        if approved_at < authorized_at:
+            raise ValueError("timing approval predates discovery authorization")
+        return approval
     _exact(
         approval,
         {
@@ -1410,11 +2478,51 @@ def build_approval(
             admission_envelope_path, "fixture admission envelope"
         )
         envelope_resolved = krea_fixture_admission.validate_envelope(envelope_path)
+        source_review = resolved.get("arm_basis", {}).get(
+            "source_normalization_approval"
+        )
+        if (
+            source_review is not None
+            and source_review.get("schema") == 2
+            and source_review.get("owner_ratification_sha256")
+            != envelope_resolved["ratification"]["ratification_sha256"]
+        ):
+            raise ValueError(
+                "source review owner ratification differs from fixture admission"
+            )
         if technical_reviewer_actor is None:
             raise ValueError("schema-2 fixtures require an explicit technical agent")
-        technical_actor = krea_fixture._agent_actor(
-            technical_reviewer_actor, "technical reviewer actor"
+        discovery_authorization = resolved.get("discovery_execution_authorization")
+        if discovery_authorization is None:
+            raise ValueError("schema-4 approval requires discovery authorization")
+        technical_actor = krea_discovery_authorization.validate_technical_actor(
+            discovery_authorization["document"],
+            technical_reviewer_actor,
+            required_role="execution_plan_reviewer",
         )
+        prior_actor = krea_fixture._agent_actor(
+            _object(
+                _object(
+                    resolved["fixture"].get("governance"),
+                    "fixture governance",
+                ).get("independent_agent_review"),
+                "fixture independent agent review",
+            ).get("actor"),
+            "fixture independent reviewer actor",
+        )
+        timing_actor = resolved.get("timing_probe_approval_actor")
+        if (
+            technical_actor.get("actor_id") == prior_actor.get("actor_id")
+            or technical_actor.get("review_instance_id")
+            == prior_actor.get("review_instance_id")
+            or timing_actor is None
+            or technical_actor.get("actor_id") == timing_actor.get("actor_id")
+            or technical_actor.get("review_instance_id")
+            == timing_actor.get("review_instance_id")
+        ):
+            raise ValueError(
+                "execution approval requires a fresh technical review actor"
+            )
         role = resolved["fixture"]["experimental_role"]
         if role not in {"D1", "D2"}:
             raise ValueError("discovery envelope authorizes only D1 or D2")
@@ -1436,8 +2544,19 @@ def build_approval(
             raise ValueError(
                 "admission envelope must be inside the approval output directory"
             )
+        profile_index = resolved.get("discovery_profile_index")
+        bootstrap_receipt = resolved.get("host_bootstrap_receipt")
+        if (
+            profile_index is None
+            or bootstrap_receipt is None
+            or discovery_authorization is None
+        ):
+            raise ValueError(
+                "discovery GPU approval requires authorization, profile-index, "
+                "and bootstrap bindings"
+            )
         body = {
-            "schema": 3,
+            "schema": 4,
             "kind": _EXECUTION_APPROVAL_KIND,
             "execution_plan_sha256": plan["plan_sha256"],
             "host_execution_identity_sha256": resolved["host_execution_manifest"][
@@ -1446,6 +2565,24 @@ def build_approval(
             "throughput_profile_sha256": resolved["throughput_profile"][
                 "profile_sha256"
             ],
+            "discovery_profile_index": {
+                "file_sha256": profile_index["file_sha256"],
+                "index_sha256": profile_index["index_sha256"],
+                "fixture_id": profile_index["fixture_id"],
+                "throughput_equivalence_class": profile_index[
+                    "throughput_equivalence_class"
+                ],
+                "profile_sha256": profile_index["profile_sha256"],
+            },
+            "host_bootstrap_receipt": {
+                "file_sha256": bootstrap_receipt["file_sha256"],
+                "receipt_sha256": bootstrap_receipt["receipt_sha256"],
+                "container_image_sha256": bootstrap_receipt["container_image_sha256"],
+            },
+            "discovery_execution_authorization": {
+                "file_sha256": discovery_authorization["file_sha256"],
+                "authorization_sha256": discovery_authorization["authorization_sha256"],
+            },
             "fixture_admission_envelope": {
                 "relative_path": relative.as_posix(),
                 "file_sha256": krea_provenance.file_sha256(envelope_path),
@@ -1469,6 +2606,9 @@ def build_approval(
                 "fixture_recipe_and_budget_reviewed": True,
                 "fixture_admission_envelope_revalidated": True,
                 "owner_authorized_mechanical_gpu_gate": True,
+                "profile_index_cell_reviewed": True,
+                "bootstrap_receipt_and_local_image_reviewed": True,
+                "discovery_execution_authorization_reviewed": True,
                 "natural_completion_is_post_run_evidence": True,
             },
         }
@@ -1617,30 +2757,43 @@ def validate_approval(
 ) -> dict[str, Any]:
     resolved = validate_plan(plan)
     approval = _object(approval, "execution approval")
-    if approval.get("schema") == 3:
+    if approval.get("schema") in {3, 4}:
         if resolved["fixture"].get("schema") != 2 or approval_path is None:
             raise ValueError(
                 "schema-3 execution approval requires a schema-2 fixture and its file path"
             )
+        if plan.get("schema") == 3 and approval.get("schema") != 4:
+            raise ValueError(
+                "schema-3 execution plans require schema-4 profile/bootstrap approval"
+            )
+        approval_keys = {
+            "schema",
+            "kind",
+            "execution_plan_sha256",
+            "host_execution_identity_sha256",
+            "throughput_profile_sha256",
+            "fixture_admission_envelope",
+            "fixture_role",
+            "technical_reviewer_actor",
+            "accountable_owner_identity",
+            "owner_ratification_sha256",
+            "approved_at_utc",
+            "decision",
+            "gpu_execution_authorized",
+            "assertions",
+            "approval_sha256",
+        }
+        if approval.get("schema") == 4:
+            approval_keys.update(
+                {
+                    "discovery_profile_index",
+                    "host_bootstrap_receipt",
+                    "discovery_execution_authorization",
+                }
+            )
         _exact(
             approval,
-            {
-                "schema",
-                "kind",
-                "execution_plan_sha256",
-                "host_execution_identity_sha256",
-                "throughput_profile_sha256",
-                "fixture_admission_envelope",
-                "fixture_role",
-                "technical_reviewer_actor",
-                "accountable_owner_identity",
-                "owner_ratification_sha256",
-                "approved_at_utc",
-                "decision",
-                "gpu_execution_authorized",
-                "assertions",
-                "approval_sha256",
-            },
+            approval_keys,
             "execution approval",
         )
         body = {
@@ -1673,9 +2826,102 @@ def validate_approval(
         envelope_resolved = krea_fixture_admission.validate_envelope(envelope_path)
         envelope = envelope_resolved["envelope"]
         ratification = envelope_resolved["ratification"]
-        technical_actor = krea_fixture._agent_actor(
-            approval["technical_reviewer_actor"], "technical reviewer actor"
+        source_review = resolved.get("arm_basis", {}).get(
+            "source_normalization_approval"
         )
+        if (
+            source_review is not None
+            and source_review.get("schema") == 2
+            and source_review.get("owner_ratification_sha256")
+            != ratification["ratification_sha256"]
+        ):
+            raise ValueError(
+                "source review owner ratification differs from fixture admission"
+            )
+        expected_authorization = resolved.get("discovery_execution_authorization")
+        if approval.get("schema") == 4 and expected_authorization is None:
+            raise ValueError("schema-4 approval lacks discovery authorization")
+        technical_actor = (
+            krea_discovery_authorization.validate_technical_actor(
+                expected_authorization["document"],
+                approval["technical_reviewer_actor"],
+                required_role="execution_plan_reviewer",
+            )
+            if approval.get("schema") == 4
+            else krea_fixture._agent_actor(
+                approval["technical_reviewer_actor"], "technical reviewer actor"
+            )
+        )
+        prior_actor = krea_fixture._agent_actor(
+            _object(
+                _object(
+                    resolved["fixture"].get("governance"),
+                    "fixture governance",
+                ).get("independent_agent_review"),
+                "fixture independent agent review",
+            ).get("actor"),
+            "fixture independent reviewer actor",
+        )
+        profile_index_approved = approval.get("discovery_profile_index")
+        bootstrap_approved = approval.get("host_bootstrap_receipt")
+        authorization_approved = approval.get("discovery_execution_authorization")
+        expected_profile_index = resolved.get("discovery_profile_index")
+        expected_bootstrap = resolved.get("host_bootstrap_receipt")
+        if approval.get("schema") == 4:
+            _exact(
+                _object(profile_index_approved, "approved profile index"),
+                {
+                    "file_sha256",
+                    "index_sha256",
+                    "fixture_id",
+                    "throughput_equivalence_class",
+                    "profile_sha256",
+                },
+                "approved profile index",
+            )
+            _exact(
+                _object(bootstrap_approved, "approved bootstrap receipt"),
+                {
+                    "file_sha256",
+                    "receipt_sha256",
+                    "container_image_sha256",
+                },
+                "approved bootstrap receipt",
+            )
+            _exact(
+                _object(
+                    authorization_approved,
+                    "approved discovery execution authorization",
+                ),
+                {"file_sha256", "authorization_sha256"},
+                "approved discovery execution authorization",
+            )
+            expected_profile_binding = {
+                key: expected_profile_index[key]
+                for key in (
+                    "file_sha256",
+                    "index_sha256",
+                    "fixture_id",
+                    "throughput_equivalence_class",
+                    "profile_sha256",
+                )
+            }
+            expected_bootstrap_binding = {
+                key: expected_bootstrap[key]
+                for key in (
+                    "file_sha256",
+                    "receipt_sha256",
+                    "container_image_sha256",
+                )
+            }
+            expected_authorization_binding = {
+                key: expected_authorization[key]
+                for key in ("file_sha256", "authorization_sha256")
+            }
+        else:
+            expected_profile_binding = None
+            expected_bootstrap_binding = None
+            expected_authorization_binding = None
         role = resolved["fixture"]["experimental_role"]
         fixture_binding = envelope["discovery_fixtures"].get(role)
         if (
@@ -1685,8 +2931,24 @@ def validate_approval(
             != resolved["host_execution_manifest"]["host_execution_identity_sha256"]
             or approval["throughput_profile_sha256"]
             != resolved["throughput_profile"]["profile_sha256"]
+            or profile_index_approved != expected_profile_binding
+            or bootstrap_approved != expected_bootstrap_binding
+            or authorization_approved != expected_authorization_binding
             or approval["fixture_role"] != role
             or technical_actor != approval["technical_reviewer_actor"]
+            or technical_actor.get("role") != "execution_plan_reviewer"
+            or technical_actor.get("review_instance_id")
+            == prior_actor.get("review_instance_id")
+            or (
+                approval.get("schema") == 4
+                and (
+                    resolved.get("timing_probe_approval_actor") is None
+                    or technical_actor.get("actor_id")
+                    == resolved["timing_probe_approval_actor"].get("actor_id")
+                    or technical_actor.get("review_instance_id")
+                    == resolved["timing_probe_approval_actor"].get("review_instance_id")
+                )
+            )
             or approval["accountable_owner_identity"] != ratification["owner_identity"]
             or approval["owner_ratification_sha256"]
             != ratification["ratification_sha256"]
@@ -1707,6 +2969,15 @@ def validate_approval(
                 "fixture_recipe_and_budget_reviewed": True,
                 "fixture_admission_envelope_revalidated": True,
                 "owner_authorized_mechanical_gpu_gate": True,
+                **(
+                    {
+                        "profile_index_cell_reviewed": True,
+                        "bootstrap_receipt_and_local_image_reviewed": True,
+                        "discovery_execution_authorization_reviewed": True,
+                    }
+                    if approval.get("schema") == 4
+                    else {}
+                ),
                 "natural_completion_is_post_run_evidence": True,
             }
             or approval["approval_sha256"] != krea_provenance.canonical_sha256(body)

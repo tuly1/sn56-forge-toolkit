@@ -743,7 +743,9 @@ def test_rehashed_wrong_score_plan_is_rejected_by_original_human_approval(
     forged = _reseal_aggregate(forged)
     _rewrite_canonical(output, forged)
 
-    with pytest.raises(ValueError, match="approval does not bind the exact score plan"):
+    with pytest.raises(
+        ValueError, match="exact-score approval does not bind the complete batch plan"
+    ):
         krea_decision._match_aggregates(
             policy=harness.boundary_policy(forged), aggregate_paths=[output]
         )

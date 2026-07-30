@@ -69,6 +69,13 @@ _AGENT_GOVERNANCE_MODE = "sole-human-owner-ratifies-agent-review-v1"
 _OWNER_IDENTITY_ASSURANCE = (
     "interactive-owner-self-attestation-not-cryptographic-or-legal-signature"
 )
+_AGENT_CROSS_REVIEW_KIND = "forge-krea-cross-fixture-agent-similarity-review"
+_AGENT_CROSS_BINDING_KIND = "forge-krea-cross-fixture-agent-review-binding"
+_SEALED_CUSTODIAN_ROLE = "sealed_confirmation_custodian"
+_AGENT_CROSS_CLAIM_LIMIT = (
+    "cross-fixture-nonoverlap-agent-technical-evidence-only-not-human-review-"
+    "content-disclosure-quality-proof-admission-or-gpu-authorization"
+)
 _ROLE_LABELS = frozenset(
     {
         "reviewer",
@@ -104,6 +111,12 @@ def _text(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-empty string")
     return " ".join(value.split())
+
+
+def _digest(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not _SHA256.fullmatch(value):
+        raise ValueError(f"{label} must be a lowercase SHA-256")
+    return value
 
 
 def named_human(value: Any, label: str) -> str:
@@ -1352,7 +1365,12 @@ def _validate_agent_governance(manifest: dict[str, Any]) -> dict[str, Any]:
         or governance["agent_review_is_not_human_review"] is not True
         or governance["independent_human_review_performed"] is not False
         or governance["claim_limit"]
-        != "owner-ratified-agent-evidence-not-independent-human-review-or-quality-proof"
+        != (
+            "owner-ratified-agent-evidence; Stage-1 is staged-host-venv "
+            "discovery-only, not production/release/tournament evidence; "
+            "Stage-2 requires a separate Forge commit and fresh named-owner "
+            "ratification"
+        )
     ):
         raise ValueError("fixture governance overstates its assurance")
     return {**governance, "accountable_owner_identity": owner}
@@ -1761,6 +1779,540 @@ def _latest_fixture_evidence(fixtures: list[dict[str, Any]]) -> datetime:
     if not evidence:  # pragma: no cover - callers require fixtures.
         raise ValueError("fixture evidence timestamps are absent")
     return max(evidence)
+
+
+def _cross_fixture_automated_nonoverlap(
+    fixtures: list[dict[str, Any]],
+) -> list[list[str]]:
+    """Recompute the complete machine-verifiable all-six nonoverlap surface."""
+
+    expected_roles = set(_CROSS_FIXTURE_ROLES)
+    if len(fixtures) != len(expected_roles):
+        raise ValueError("cross-fixture review requires exactly D1,D2,C1,C2,C3,C4")
+    for fixture in fixtures:
+        validate_manifest(fixture)
+    roles = {fixture["experimental_role"] for fixture in fixtures}
+    if roles != expected_roles:
+        raise ValueError("cross-fixture review requires exactly D1,D2,C1,C2,C3,C4")
+
+    seen_concepts: set[str] = set()
+    seen_triggers: set[str] = set()
+    seen: dict[str, tuple[str, str]] = {}
+    all_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for fixture in fixtures:
+        concept = fixture["concept_id"]
+        trigger = fixture["trigger_token"]
+        if concept in seen_concepts:
+            raise ValueError(f"duplicate fixture concept: {concept}")
+        if trigger in seen_triggers:
+            raise ValueError("fixtures must have unique roles and trigger tokens")
+        seen_concepts.add(concept)
+        seen_triggers.add(trigger)
+        for split in ("training_rows", "evaluation_rows"):
+            for row in fixture[split]:
+                for key in (
+                    "content_sha256",
+                    "image_sha256",
+                    "decoded_pixels_sha256",
+                    "normalized_caption_sha256",
+                ):
+                    token = f"{key}:{row[key]}"
+                    if token in seen:
+                        raise ValueError(
+                            f"fixtures overlap by {key}: {seen[token]} vs "
+                            f"{(concept, row['row_id'])}"
+                        )
+                    seen[token] = (concept, row["row_id"])
+                all_rows.append((fixture, row))
+    for index, (left_fixture, left) in enumerate(all_rows):
+        for right_fixture, right in all_rows[index + 1 :]:
+            if left_fixture["concept_id"] == right_fixture["concept_id"]:
+                continue
+            distance = (
+                int(left["perceptual_hash64"], 16) ^ int(right["perceptual_hash64"], 16)
+            ).bit_count()
+            threshold = max(
+                left_fixture["near_duplicate_policy"]["maximum_hamming_distance"],
+                right_fixture["near_duplicate_policy"]["maximum_hamming_distance"],
+            )
+            if distance <= threshold:
+                raise ValueError("fixtures overlap by perceptual near-duplicate")
+            shared_groups = sorted(
+                key
+                for key in set(
+                    left_fixture["near_duplicate_policy"]["group_disjoint_fields"]
+                )
+                | set(right_fixture["near_duplicate_policy"]["group_disjoint_fields"])
+                if key in left["group_identity"] and key in right["group_identity"]
+                if left["group_identity"][key] == right["group_identity"][key]
+            )
+            if shared_groups:
+                raise ValueError(
+                    f"fixtures overlap by grouped identity: {shared_groups}"
+                )
+    return _cross_fixture_pairs(fixtures)
+
+
+def _agent_cross_assertions() -> dict[str, bool]:
+    return {
+        "all_six_fixture_manifests_validated": True,
+        "automated_cross_fixture_nonoverlap_passed": True,
+        "agent_review_is_not_human_review": True,
+        "independent_human_review_performed": False,
+        "d2_selector_key_accessed": False,
+        "c1c4_content_or_paths_disclosed": False,
+        "c1c4_remain_in_sealed_custody": True,
+    }
+
+
+def _agent_cross_visual_scope(
+    visual_reviewed_pairs: list[list[str]], *, all_pairs: list[list[str]]
+) -> dict[str, Any]:
+    index = {tuple(pair): offset for offset, pair in enumerate(all_pairs)}
+    normalized: list[list[str]] = []
+    offsets: list[int] = []
+    for pair in visual_reviewed_pairs:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or any(not isinstance(item, str) for item in pair)
+            or tuple(pair) not in index
+        ):
+            raise ValueError("agent visual-review pair is outside the all-six universe")
+        normalized.append(list(pair))
+        offsets.append(index[tuple(pair)])
+    if offsets != sorted(set(offsets)):
+        raise ValueError(
+            "agent visual-review pairs must be unique and canonically ordered"
+        )
+    if not normalized:
+        method = "not-performed"
+        coverage = "none"
+    else:
+        method = "agent-visual-review-not-human-review"
+        coverage = "complete" if normalized == all_pairs else "targeted"
+    return {
+        "performed": bool(normalized),
+        "method": method,
+        "coverage": coverage,
+        "reviewed_pair_count": len(normalized),
+        "reviewed_pairs_sha256": krea_provenance.canonical_sha256(normalized),
+    }
+
+
+def _agent_cross_automated_scope(all_pairs: list[list[str]]) -> dict[str, Any]:
+    return {
+        "method": "exact-hash-group-identity-and-pinned-ahash",
+        "coverage": "all-cross-role-pairs",
+        "reviewed_pair_count": len(all_pairs),
+        "reviewed_pairs_sha256": krea_provenance.canonical_sha256(all_pairs),
+        "maximum_hamming_distance_policy": "max-of-paired-fixture-thresholds",
+    }
+
+
+def _validate_cross_agent_distinct(
+    actor: dict[str, str], parent_actor: dict[str, str]
+) -> None:
+    if actor["role"] != _SEALED_CUSTODIAN_ROLE:
+        raise ValueError("cross-fixture agent is not the sealed custodian")
+    if (
+        actor["actor_id"] == parent_actor["actor_id"]
+        or actor["review_instance_id"] == parent_actor["review_instance_id"]
+    ):
+        raise ValueError("sealed custodian must be distinct from the parent reviewer")
+
+
+def build_agent_cross_fixture_review(
+    fixtures: list[dict[str, Any]],
+    *,
+    actor: dict[str, Any],
+    parent_independent_review: dict[str, Any],
+    owner_ratification_sha256: str,
+    acceptance_request_sha256: str,
+    reviewed_at_utc: str,
+    visual_reviewed_pairs: list[list[str]],
+) -> dict[str, Any]:
+    """Build an all-six agent review inside sealed custody without a D2 key."""
+
+    actor = _agent_actor(actor, "sealed custodian actor")
+    parent = _object(parent_independent_review, "parent independent review")
+    _exact(parent, {"review_sha256", "actor"}, "parent independent review")
+    parent_actor = _agent_actor(parent["actor"], "parent independent review actor")
+    parent = {
+        "review_sha256": _digest(parent["review_sha256"], "parent review SHA-256"),
+        "actor": parent_actor,
+    }
+    _validate_cross_agent_distinct(actor, parent_actor)
+    owner_ratification_sha256 = _digest(
+        owner_ratification_sha256, "owner ratification SHA-256"
+    )
+    acceptance_request_sha256 = _digest(
+        acceptance_request_sha256, "acceptance request SHA-256"
+    )
+    all_pairs = _cross_fixture_automated_nonoverlap(fixtures)
+    manifests = {
+        fixture["experimental_role"]: fixture["manifest_sha256"]
+        for fixture in sorted(fixtures, key=lambda value: value["experimental_role"])
+    }
+    for fixture in fixtures:
+        if fixture.get("schema") != 2:
+            continue
+        governance = fixture["governance"]
+        if (
+            governance["owner_ratification"]["ratification_sha256"]
+            != owner_ratification_sha256
+            or governance["independent_agent_review"]["review_sha256"]
+            != parent["review_sha256"]
+            or governance["independent_agent_review"]["actor"] != parent_actor
+        ):
+            raise ValueError("agent fixture governance differs from the cross review")
+        for bound_actor in (
+            governance["preparer_actor"],
+            governance["surface_agent_review"]["actor"],
+            governance["independent_agent_review"]["actor"],
+        ):
+            bound_actor = _agent_actor(bound_actor, "fixture governance actor")
+            if (
+                actor["actor_id"] == bound_actor["actor_id"]
+                or actor["review_instance_id"] == bound_actor["review_instance_id"]
+            ):
+                raise ValueError("sealed custodian is not distinct from fixture actors")
+    visual_pairs = [list(pair) for pair in visual_reviewed_pairs]
+    visual_scope = _agent_cross_visual_scope(visual_pairs, all_pairs=all_pairs)
+    automated_scope = _agent_cross_automated_scope(all_pairs)
+    reviewed_at_utc = canonical_utc(reviewed_at_utc, "agent cross review time")
+    if _parse_canonical_utc(
+        reviewed_at_utc, "agent cross review time"
+    ) < _latest_fixture_evidence(fixtures):
+        raise ValueError("agent cross-fixture review predates fixture evidence")
+    body = {
+        "schema": 2,
+        "kind": _AGENT_CROSS_REVIEW_KIND,
+        "actor": actor,
+        "parent_independent_review": parent,
+        "owner_ratification_sha256": owner_ratification_sha256,
+        "acceptance_request_sha256": acceptance_request_sha256,
+        "fixture_manifest_sha256s": manifests,
+        "reviewed_at_utc": reviewed_at_utc,
+        "review_scope": {
+            "automated": automated_scope,
+            "visual": visual_scope,
+        },
+        "reviewed_pairs": all_pairs,
+        "reviewed_pair_count": len(all_pairs),
+        "reviewed_pairs_sha256": krea_provenance.canonical_sha256(all_pairs),
+        "visual_reviewed_pairs": visual_pairs,
+        "flagged_pairs": [],
+        "decision": "passed_agent_automated_cross_fixture_nonoverlap",
+        "assertions": _agent_cross_assertions(),
+        "admission_authorized": False,
+        "gpu_execution_authorized": False,
+        "claim_limit": _AGENT_CROSS_CLAIM_LIMIT,
+    }
+    review = {
+        **body,
+        "review_sha256": krea_provenance.canonical_sha256(body),
+    }
+    validate_agent_cross_fixture_review(review, fixtures=fixtures)
+    return review
+
+
+def validate_agent_cross_fixture_review(
+    record: dict[str, Any], *, fixtures: list[dict[str, Any]]
+) -> dict[str, Any]:
+    record = _object(record, "cross-fixture agent review")
+    _exact(
+        record,
+        {
+            "schema",
+            "kind",
+            "actor",
+            "parent_independent_review",
+            "owner_ratification_sha256",
+            "acceptance_request_sha256",
+            "fixture_manifest_sha256s",
+            "reviewed_at_utc",
+            "review_scope",
+            "reviewed_pairs",
+            "reviewed_pair_count",
+            "reviewed_pairs_sha256",
+            "visual_reviewed_pairs",
+            "flagged_pairs",
+            "decision",
+            "assertions",
+            "admission_authorized",
+            "gpu_execution_authorized",
+            "claim_limit",
+            "review_sha256",
+        },
+        "cross-fixture agent review",
+    )
+    body = {key: value for key, value in record.items() if key != "review_sha256"}
+    actor = _agent_actor(record["actor"], "sealed custodian actor")
+    parent = _object(record["parent_independent_review"], "parent independent review")
+    _exact(parent, {"review_sha256", "actor"}, "parent independent review")
+    parent_actor = _agent_actor(parent["actor"], "parent independent review actor")
+    _digest(parent["review_sha256"], "parent review SHA-256")
+    _digest(record["owner_ratification_sha256"], "owner ratification SHA-256")
+    _digest(record["acceptance_request_sha256"], "acceptance request SHA-256")
+    _validate_cross_agent_distinct(actor, parent_actor)
+    all_pairs = _cross_fixture_automated_nonoverlap(fixtures)
+    manifests = {
+        fixture["experimental_role"]: fixture["manifest_sha256"]
+        for fixture in sorted(fixtures, key=lambda value: value["experimental_role"])
+    }
+    visual_pairs = record["visual_reviewed_pairs"]
+    if not isinstance(visual_pairs, list):
+        raise ValueError("agent visual-review pairs must be a list")
+    expected_scope = {
+        "automated": _agent_cross_automated_scope(all_pairs),
+        "visual": _agent_cross_visual_scope(visual_pairs, all_pairs=all_pairs),
+    }
+    reviewed_at = _parse_canonical_utc(
+        canonical_utc(record["reviewed_at_utc"], "agent cross review time"),
+        "agent cross review time",
+    )
+    if reviewed_at < _latest_fixture_evidence(fixtures):
+        raise ValueError("agent cross-fixture review predates fixture evidence")
+    if (
+        record["schema"] != 2
+        or record["kind"] != _AGENT_CROSS_REVIEW_KIND
+        or record["fixture_manifest_sha256s"] != manifests
+        or record["review_scope"] != expected_scope
+        or record["reviewed_pairs"] != all_pairs
+        or record["reviewed_pair_count"] != len(all_pairs)
+        or record["reviewed_pairs_sha256"]
+        != krea_provenance.canonical_sha256(all_pairs)
+        or record["flagged_pairs"] != []
+        or record["decision"] != "passed_agent_automated_cross_fixture_nonoverlap"
+        or record["assertions"] != _agent_cross_assertions()
+        or record["admission_authorized"] is not False
+        or record["gpu_execution_authorized"] is not False
+        or record["claim_limit"] != _AGENT_CROSS_CLAIM_LIMIT
+        or record["review_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("cross-fixture agent review is invalid")
+    return record
+
+
+def _agent_cross_fixture_binding_body(
+    record: dict[str, Any], *, review_file_sha256: str
+) -> dict[str, Any]:
+    return {
+        "schema": 2,
+        "kind": _AGENT_CROSS_BINDING_KIND,
+        "review_file_sha256": review_file_sha256,
+        "review_sha256": record["review_sha256"],
+        "fixture_manifest_sha256s": record["fixture_manifest_sha256s"],
+        "fixture_manifest_set_sha256": krea_provenance.canonical_sha256(
+            record["fixture_manifest_sha256s"]
+        ),
+        "actor": record["actor"],
+        "parent_independent_review": record["parent_independent_review"],
+        "owner_ratification_sha256": record["owner_ratification_sha256"],
+        "acceptance_request_sha256": record["acceptance_request_sha256"],
+        "reviewed_at_utc": record["reviewed_at_utc"],
+        "reviewed_pair_count": record["reviewed_pair_count"],
+        "reviewed_pairs_sha256": record["reviewed_pairs_sha256"],
+        "review_scope": record["review_scope"],
+        "decision": record["decision"],
+        "assertions": record["assertions"],
+        "admission_authorized": False,
+        "gpu_execution_authorized": False,
+        "claim_limit": record["claim_limit"],
+    }
+
+
+def build_agent_cross_fixture_binding(
+    review_record: dict[str, Any],
+    *,
+    fixtures: list[dict[str, Any]],
+    review_file_sha256: str,
+) -> dict[str, Any]:
+    validate_agent_cross_fixture_review(review_record, fixtures=fixtures)
+    review_file_sha256 = _digest(review_file_sha256, "agent review file SHA-256")
+    body = _agent_cross_fixture_binding_body(
+        review_record, review_file_sha256=review_file_sha256
+    )
+    binding = {
+        **body,
+        "binding_sha256": krea_provenance.canonical_sha256(body),
+    }
+    validate_agent_cross_fixture_binding(
+        binding,
+        fixtures=fixtures,
+        review_record=review_record,
+        review_file_sha256=review_file_sha256,
+    )
+    return binding
+
+
+def validate_agent_cross_fixture_binding(
+    binding: dict[str, Any],
+    *,
+    fixtures: list[dict[str, Any]],
+    review_record: dict[str, Any],
+    review_file_sha256: str,
+) -> dict[str, Any]:
+    validate_agent_cross_fixture_review(review_record, fixtures=fixtures)
+    review_file_sha256 = _digest(review_file_sha256, "agent review file SHA-256")
+    expected = _agent_cross_fixture_binding_body(
+        review_record, review_file_sha256=review_file_sha256
+    )
+    binding = _object(binding, "cross-fixture agent review binding")
+    _exact(
+        binding,
+        set(expected) | {"binding_sha256"},
+        "cross-fixture agent review binding",
+    )
+    if {
+        key: value for key, value in binding.items() if key != "binding_sha256"
+    } != expected or binding["binding_sha256"] != krea_provenance.canonical_sha256(
+        expected
+    ):
+        raise ValueError("cross-fixture agent binding does not bind the exact review")
+    return binding
+
+
+def validate_agent_cross_fixture_binding_digest_only(
+    binding: dict[str, Any],
+    *,
+    fixture_manifest_sha256s: dict[str, str],
+    parent_independent_review: dict[str, Any],
+    owner_ratification_sha256: str,
+    acceptance_request_sha256: str,
+) -> dict[str, Any]:
+    """Validate the non-secret binding exported by a sealed custodian."""
+
+    binding = _object(binding, "cross-fixture agent review binding")
+    expected_keys = {
+        "schema",
+        "kind",
+        "review_file_sha256",
+        "review_sha256",
+        "fixture_manifest_sha256s",
+        "fixture_manifest_set_sha256",
+        "actor",
+        "parent_independent_review",
+        "owner_ratification_sha256",
+        "acceptance_request_sha256",
+        "reviewed_at_utc",
+        "reviewed_pair_count",
+        "reviewed_pairs_sha256",
+        "review_scope",
+        "decision",
+        "assertions",
+        "admission_authorized",
+        "gpu_execution_authorized",
+        "claim_limit",
+    }
+    _exact(binding, expected_keys | {"binding_sha256"}, "cross-fixture agent binding")
+    body = {key: value for key, value in binding.items() if key != "binding_sha256"}
+    actor = _agent_actor(binding["actor"], "sealed custodian actor")
+    parent = _object(parent_independent_review, "parent independent review")
+    _exact(parent, {"review_sha256", "actor"}, "parent independent review")
+    parent_actor = _agent_actor(parent["actor"], "parent independent review actor")
+    _digest(parent["review_sha256"], "parent review SHA-256")
+    _validate_cross_agent_distinct(actor, parent_actor)
+    if set(fixture_manifest_sha256s) != set(_CROSS_FIXTURE_ROLES):
+        raise ValueError("agent cross binding does not cover all six fixtures")
+    for role, digest in fixture_manifest_sha256s.items():
+        _digest(digest, f"{role} manifest SHA-256")
+    for key in (
+        "review_file_sha256",
+        "review_sha256",
+        "fixture_manifest_set_sha256",
+        "reviewed_pairs_sha256",
+        "binding_sha256",
+    ):
+        _digest(binding[key], f"agent cross binding {key}")
+    owner_ratification_sha256 = _digest(
+        owner_ratification_sha256, "owner ratification SHA-256"
+    )
+    acceptance_request_sha256 = _digest(
+        acceptance_request_sha256, "acceptance request SHA-256"
+    )
+    scope = _object(binding["review_scope"], "agent cross review scope")
+    _exact(scope, {"automated", "visual"}, "agent cross review scope")
+    automated = _object(scope["automated"], "automated cross review scope")
+    visual = _object(scope["visual"], "visual cross review scope")
+    _exact(
+        automated,
+        {
+            "method",
+            "coverage",
+            "reviewed_pair_count",
+            "reviewed_pairs_sha256",
+            "maximum_hamming_distance_policy",
+        },
+        "automated cross review scope",
+    )
+    _exact(
+        visual,
+        {
+            "performed",
+            "method",
+            "coverage",
+            "reviewed_pair_count",
+            "reviewed_pairs_sha256",
+        },
+        "visual cross review scope",
+    )
+    count = binding["reviewed_pair_count"]
+    visual_count = visual["reviewed_pair_count"]
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count <= 0
+        or automated
+        != {
+            "method": "exact-hash-group-identity-and-pinned-ahash",
+            "coverage": "all-cross-role-pairs",
+            "reviewed_pair_count": count,
+            "reviewed_pairs_sha256": binding["reviewed_pairs_sha256"],
+            "maximum_hamming_distance_policy": "max-of-paired-fixture-thresholds",
+        }
+        or isinstance(visual_count, bool)
+        or not isinstance(visual_count, int)
+        or visual_count < 0
+        or visual_count > count
+    ):
+        raise ValueError("cross-fixture agent review scope is invalid")
+    _digest(visual["reviewed_pairs_sha256"], "visual reviewed pairs SHA-256")
+    expected_visual = (
+        {
+            "performed": False,
+            "method": "not-performed",
+            "coverage": "none",
+        }
+        if visual_count == 0
+        else {
+            "performed": True,
+            "method": "agent-visual-review-not-human-review",
+            "coverage": "complete" if visual_count == count else "targeted",
+        }
+    )
+    if any(visual[key] != value for key, value in expected_visual.items()):
+        raise ValueError("cross-fixture visual scope overstates its coverage")
+    if (
+        binding["schema"] != 2
+        or binding["kind"] != _AGENT_CROSS_BINDING_KIND
+        or binding["fixture_manifest_sha256s"] != fixture_manifest_sha256s
+        or binding["fixture_manifest_set_sha256"]
+        != krea_provenance.canonical_sha256(fixture_manifest_sha256s)
+        or binding["parent_independent_review"] != parent
+        or binding["owner_ratification_sha256"] != owner_ratification_sha256
+        or binding["acceptance_request_sha256"] != acceptance_request_sha256
+        or binding["decision"] != "passed_agent_automated_cross_fixture_nonoverlap"
+        or binding["assertions"] != _agent_cross_assertions()
+        or binding["admission_authorized"] is not False
+        or binding["gpu_execution_authorized"] is not False
+        or binding["claim_limit"] != _AGENT_CROSS_CLAIM_LIMIT
+        or binding["binding_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("cross-fixture agent review binding is invalid")
+    canonical_utc(binding["reviewed_at_utc"], "agent cross binding time")
+    return binding
 
 
 def _cross_fixture_binding_body(

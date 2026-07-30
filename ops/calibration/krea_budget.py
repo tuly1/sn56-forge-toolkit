@@ -62,7 +62,10 @@ _EXECUTION_ENVELOPE_PAYLOAD_KEYS = frozenset(
         "base_model_identity_sha256",
         "runtime_identity_sha256",
         "host_execution_identity_sha256",
-        "container_image_sha256",
+        "execution_surface",
+        "execution_scope",
+        "venv_tree_manifest_sha256",
+        "reference_container_image_sha256",
         "gpu_identity_sha256",
         "trainer_identity_sha256",
         "measurement_tool_sha256",
@@ -258,7 +261,10 @@ class ExecutionEnvelope:
     base_model_identity_sha256: str
     runtime_identity_sha256: str
     host_execution_identity_sha256: str
-    container_image_sha256: str
+    execution_surface: str
+    execution_scope: str
+    venv_tree_manifest_sha256: str
+    reference_container_image_sha256: str
     gpu_identity_sha256: str
     trainer_identity_sha256: str
     measurement_tool_sha256: str
@@ -274,7 +280,7 @@ class ExecutionEnvelope:
 
     def to_record(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "model_type": _MODEL_TYPE,
             "equivalence_class": self.equivalence_class,
             "network_rank": self.network_rank,
@@ -299,7 +305,10 @@ class ExecutionEnvelope:
             "base_model_identity_sha256": self.base_model_identity_sha256,
             "runtime_identity_sha256": self.runtime_identity_sha256,
             "host_execution_identity_sha256": self.host_execution_identity_sha256,
-            "container_image_sha256": self.container_image_sha256,
+            "execution_surface": self.execution_surface,
+            "execution_scope": self.execution_scope,
+            "venv_tree_manifest_sha256": self.venv_tree_manifest_sha256,
+            "reference_container_image_sha256": self.reference_container_image_sha256,
             "gpu_identity_sha256": self.gpu_identity_sha256,
             "trainer_identity_sha256": self.trainer_identity_sha256,
             "measurement_tool_sha256": self.measurement_tool_sha256,
@@ -332,7 +341,10 @@ def seal_execution_envelope(
     base_model_identity_sha256: str,
     runtime_identity_sha256: str,
     host_execution_identity_sha256: str,
-    container_image_sha256: str,
+    execution_surface: str,
+    execution_scope: str,
+    venv_tree_manifest_sha256: str,
+    reference_container_image_sha256: str,
     gpu_identity_sha256: str,
     trainer_identity_sha256: str,
     measurement_tool_sha256: str,
@@ -353,7 +365,7 @@ def seal_execution_envelope(
             )
         normalized_guidance = None
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_type": _MODEL_TYPE,
         "equivalence_class": _require_safe_id(equivalence_class, "equivalence_class"),
         "network_rank": _require_count(network_rank, "network_rank", minimum=1),
@@ -399,12 +411,22 @@ def seal_execution_envelope(
         "dataloader_workers": _require_nonnegative_count(
             dataloader_workers, "dataloader_workers"
         ),
+        "execution_surface": _require_safe_id(execution_surface, "execution_surface"),
+        "execution_scope": _require_safe_id(execution_scope, "execution_scope"),
     }
+    if execution_surface != "staged_host_venv" or execution_scope != "discovery_only":
+        raise ProfileValidationError(
+            "Stage-1 profiles are limited to staged_host_venv discovery_only"
+        )
     for label, value in (
         ("base_model_identity_sha256", base_model_identity_sha256),
         ("runtime_identity_sha256", runtime_identity_sha256),
         ("host_execution_identity_sha256", host_execution_identity_sha256),
-        ("container_image_sha256", container_image_sha256),
+        ("venv_tree_manifest_sha256", venv_tree_manifest_sha256),
+        (
+            "reference_container_image_sha256",
+            reference_container_image_sha256,
+        ),
         ("gpu_identity_sha256", gpu_identity_sha256),
         ("trainer_identity_sha256", trainer_identity_sha256),
         ("measurement_tool_sha256", measurement_tool_sha256),
@@ -427,7 +449,7 @@ def load_execution_envelope(document: Mapping[str, Any]) -> ExecutionEnvelope:
             "execution envelope schema mismatch; "
             f"missing={missing!r}, extra={extra!r}"
         )
-    if document["schema_version"] != 1 or document["model_type"] != _MODEL_TYPE:
+    if document["schema_version"] != 2 or document["model_type"] != _MODEL_TYPE:
         raise ProfileValidationError("unsupported execution envelope schema/model")
     normalized = seal_execution_envelope(
         **{
@@ -1028,9 +1050,139 @@ def seal_margin_policy(
     return {**payload, "margin_policy_sha256": _payload_sha256(payload)}
 
 
+def seal_agent_margin_policy(
+    *,
+    technical_reviewer_actor: Mapping[str, Any],
+    discovery_execution_authorization: Mapping[str, Any],
+    approved_at_utc: str,
+    frozen_before_capture: bool,
+    multiplicative_margin: Mapping[str, Any],
+    additive_margin_s: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal the exact owner-ratified Stage-1 margin via a fresh agent review."""
+
+    try:
+        from . import krea_delegated_review_contract
+        from . import krea_discovery_authorization
+    except ImportError:  # pragma: no cover - direct script execution.
+        import krea_delegated_review_contract  # type: ignore[no-redef]
+        import krea_discovery_authorization  # type: ignore[no-redef]
+
+    _, authorization, _ = krea_discovery_authorization.load_binding(
+        discovery_execution_authorization
+    )
+    actor = krea_delegated_review_contract.validate_actor(
+        "timing_margin_reviewer",
+        technical_reviewer_actor,
+    )
+    authorization_actor = authorization["technical_reviewer_actor"]
+    if (
+        actor["actor_id"] == authorization_actor["actor_id"]
+        or actor["review_instance_id"] == authorization_actor["review_instance_id"]
+    ):
+        raise TimingEvidenceError("margin reviewer is not fresh from authorization")
+    if not isinstance(approved_at_utc, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", approved_at_utc
+    ):
+        raise TimingEvidenceError("approved_at_utc must be strict UTC seconds")
+    try:
+        approved = datetime.strptime(approved_at_utc, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        authorized = datetime.strptime(
+            authorization["authorized_at_utc"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise TimingEvidenceError("margin approval timestamp is invalid") from exc
+    if approved < authorized:
+        raise TimingEvidenceError("margin approval predates discovery authorization")
+    if frozen_before_capture is not True:
+        raise TimingEvidenceError("margin policy must be frozen before timing capture")
+    delegated_contract = krea_delegated_review_contract.load()
+    expected = delegated_contract["timing_margin_contract"]
+    if set(multiplicative_margin) != set(_TIMING_METRICS) or set(
+        additive_margin_s
+    ) != set(_TIMING_METRICS):
+        raise TimingEvidenceError("timing margin maps have the wrong metrics")
+    normalized_multiplier = {
+        name: _require_json_seconds(
+            multiplicative_margin[name], f"{name} multiplicative margin"
+        )
+        for name in _TIMING_METRICS
+    }
+    normalized_additive = {
+        name: _nonnegative_json_seconds(
+            additive_margin_s[name], f"{name} additive margin"
+        )
+        for name in _TIMING_METRICS
+    }
+    if {
+        "multiplicative_margin": normalized_multiplier,
+        "additive_margin_s": normalized_additive,
+    } != {
+        "multiplicative_margin": expected["multiplicative_margin"],
+        "additive_margin_s": expected["additive_margin_s"],
+    }:
+        raise TimingEvidenceError("timing margins differ from owner-ratified policy")
+    payload = {
+        "schema": 2,
+        "kind": "forge-krea-agent-predeclared-timing-margin-policy",
+        "technical_reviewer_actor": actor,
+        "accountable_owner_identity": authorization["accountable_owner_identity"],
+        "owner_ratification_sha256": authorization["fixture_admission_envelope"][
+            "owner_ratification_sha256"
+        ],
+        "discovery_execution_authorization": dict(discovery_execution_authorization),
+        "delegated_review_contract": krea_delegated_review_contract.binding(),
+        "agent_review_is_not_human_review": True,
+        "approved_at_utc": approved.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "frozen_before_capture": True,
+        "multiplicative_margin": normalized_multiplier,
+        "additive_margin_s": normalized_additive,
+    }
+    return {**payload, "margin_policy_sha256": _payload_sha256(payload)}
+
+
 def load_margin_policy(document: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(document, Mapping):
         raise TimingEvidenceError("timing margin policy must be a mapping")
+    if document.get("schema") == 2:
+        expected_agent = frozenset(
+            {
+                "schema",
+                "kind",
+                "technical_reviewer_actor",
+                "accountable_owner_identity",
+                "owner_ratification_sha256",
+                "discovery_execution_authorization",
+                "delegated_review_contract",
+                "agent_review_is_not_human_review",
+                "approved_at_utc",
+                "frozen_before_capture",
+                "multiplicative_margin",
+                "additive_margin_s",
+                "margin_policy_sha256",
+            }
+        )
+        _exact_mapping_keys(document, expected_agent, "timing margin policy")
+        normalized = seal_agent_margin_policy(
+            technical_reviewer_actor=document["technical_reviewer_actor"],
+            discovery_execution_authorization=document[
+                "discovery_execution_authorization"
+            ],
+            approved_at_utc=document["approved_at_utc"],
+            frozen_before_capture=document["frozen_before_capture"],
+            multiplicative_margin=document["multiplicative_margin"],
+            additive_margin_s=document["additive_margin_s"],
+        )
+        if document.get("agent_review_is_not_human_review") is not True:
+            raise TimingEvidenceError("agent margin is misattributed as human review")
+        claimed = _require_sha256(
+            document["margin_policy_sha256"], "margin_policy_sha256"
+        )
+        if not hmac.compare_digest(claimed, normalized["margin_policy_sha256"]):
+            raise TimingEvidenceError("timing margin policy digest mismatch")
+        return normalized
     expected = frozenset(
         {
             "schema",

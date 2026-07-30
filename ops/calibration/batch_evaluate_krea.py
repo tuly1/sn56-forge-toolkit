@@ -22,18 +22,25 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
 
 try:  # Direct script execution places this directory on sys.path.
     from . import krea_dataset_identity
+    from . import krea_delegated_review_contract
+    from . import krea_discovery_authorization
     from . import krea_execution_plan
+    from . import krea_execution_surface_policy
     from . import krea_fixture
     from . import krea_provenance
 except ImportError:  # pragma: no cover - exercised by CLI, not module tests.
     import krea_dataset_identity  # type: ignore[no-redef]
+    import krea_delegated_review_contract  # type: ignore[no-redef]
+    import krea_discovery_authorization  # type: ignore[no-redef]
     import krea_execution_plan  # type: ignore[no-redef]
+    import krea_execution_surface_policy  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
 
@@ -71,7 +78,8 @@ _CONFIRMATION_DECISION_BINDING = {
     "minimum_point_estimate_wins_or_ties": 3,
     "point_win_or_tie_cap": 0.01,
     "strongest_public_reference_rule": (
-        "minimum loss among exhaustive K2-K4 faithful replicas for the same "
+        "minimum loss among exhaustive approved K2-K4 local public-family "
+        "reproductions for the same "
         "concept and seed"
     ),
     "boundary_gate": "mechanics_only_natural_completion_upload_ready_clean",
@@ -97,6 +105,39 @@ class _EvaluatorCancellation(BaseException):
     def __init__(self, signum: int):
         super().__init__(f"batch received signal {signum}")
         self.signum = signum
+
+
+def _minimal_evaluator_environment(
+    *, driver_python: str, isolated_root: Path
+) -> dict[str, str]:
+    """Construct the exact outer evaluator environment from empty storage."""
+
+    root = isolated_root.resolve(strict=True)
+    python = _safe_file(driver_python, "evaluator driver Python", executable=True)
+    directories = {
+        "HOME": root / "home",
+        "XDG_CACHE_HOME": root / "xdg-cache",
+        "TORCH_HOME": root / "torch",
+        "HF_HOME": root / "huggingface",
+        "HF_HUB_CACHE": root / "huggingface" / "hub",
+        "TRANSFORMERS_CACHE": root / "transformers",
+    }
+    for directory in directories.values():
+        directory.mkdir(parents=True, exist_ok=True)
+    return {
+        "PATH": f"{python.parent}:/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "DIFFUSERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        **{name: str(path) for name, path in directories.items()},
+    }
 
 
 def _parse() -> argparse.Namespace:
@@ -1352,14 +1393,51 @@ def _load_candidate_binding(value: Any, label: str) -> tuple[Path, dict[str, Any
 
 
 def _validate_cross_fixture_review_surface(
-    value: dict[str, Any], *, fixture: dict[str, Any]
+    value: dict[str, Any], *, fixture: dict[str, Any], source_path: Path | None = None
 ) -> dict[str, Any]:
-    """Validate the sealed six-fixture review surface available to scoring.
+    """Validate the admitted six-fixture review surface available to scoring.
 
-    Exhaustive construction is enforced by ``krea_fixture.cross_fixture_disjoint``;
-    execution additionally binds the exact file through the approved discovery
-    freeze.  This consumer still fails closed on malformed or partial records.
+    Current schema-2 discovery binds the complete admission envelope whose
+    blinded acceptance validates the owner-ratified agent review. The legacy
+    named-human record remains readable only for older plans.
     """
+
+    if value.get("kind") == "forge-krea-fixture-admission-envelope":
+        if source_path is None:
+            raise ValueError("agent cross-fixture admission requires its bound path")
+        try:
+            from . import krea_fixture_admission
+        except ImportError:  # pragma: no cover - direct script execution.
+            import krea_fixture_admission  # type: ignore[no-redef]
+
+        resolved = krea_fixture_admission.validate_envelope(source_path)
+        role = fixture.get("experimental_role")
+        admitted = _object(resolved.get("fixtures"), "admitted fixtures").get(role)
+        acceptance = _object(resolved.get("blinded_acceptance"), "blinded acceptance")
+        assertions = _object(
+            acceptance.get("assertions"), "blinded acceptance assertions"
+        )
+        manifests = _object(
+            acceptance.get("fixture_manifest_sha256s"),
+            "accepted six-fixture manifest map",
+        )
+        if (
+            resolved.get("envelope") != value
+            or role not in {"D1", "D2"}
+            or admitted != fixture
+            or manifests.get(role) != fixture.get("manifest_sha256")
+            or assertions.get(
+                "all_six_cross_fixture_review_preexists_discovery_execution"
+            )
+            is not True
+            or assertions.get("agent_review_is_not_human_review") is not True
+            or acceptance.get("decision") != "accepted_for_d1_d2_discovery_admission"
+            or acceptance.get("c1c4_revealed") is not False
+        ):
+            raise ValueError(
+                "agent cross-fixture admission does not bind this discovery fixture"
+            )
+        return value
 
     _exact_keys(
         value,
@@ -1780,6 +1858,15 @@ def _validate_run_completion(
             "execution_envelope_sha256",
             "host_execution_identity_sha256",
             "throughput_profile_sha256",
+            "discovery_profile_index_sha256",
+            "discovery_profile_index_file_sha256",
+            "discovery_execution_authorization_sha256",
+            "discovery_execution_authorization_file_sha256",
+            "host_bootstrap_receipt_sha256",
+            "host_bootstrap_receipt_file_sha256",
+            "execution_surface_policy_sha256",
+            "execution_surface",
+            "execution_scope",
             "budget_plan_sha256",
             "schedule",
             "run_record_sha256",
@@ -1814,6 +1901,10 @@ def _validate_run_completion(
         != execution_plan["execution_envelope_sha256"]
         or completion["natural_completion"] is not True
         or completion["in_task_proxy_selection"] != {"enabled": False, "reserve_s": 0}
+        or completion["execution_surface_policy_sha256"]
+        != krea_execution_surface_policy.POLICY["policy_sha256"]
+        or completion["execution_surface"] != "staged_host_venv"
+        or completion["execution_scope"] != "discovery_only"
     ):
         raise ValueError("run completion does not bind the approved natural run")
     resolved = krea_execution_plan.validate_plan(execution_plan)
@@ -1824,6 +1915,18 @@ def _validate_run_completion(
         != resolved["throughput_profile"]["profile_sha256"]
         or completion["budget_plan_sha256"] != execution_plan["budget_plan_sha256"]
         or completion["schedule"] != execution_plan["schedule"]
+        or completion["discovery_profile_index_sha256"]
+        != resolved["discovery_profile_index"]["index_sha256"]
+        or completion["discovery_profile_index_file_sha256"]
+        != resolved["discovery_profile_index"]["file_sha256"]
+        or completion["discovery_execution_authorization_sha256"]
+        != resolved["discovery_execution_authorization"]["authorization_sha256"]
+        or completion["discovery_execution_authorization_file_sha256"]
+        != resolved["discovery_execution_authorization"]["file_sha256"]
+        or completion["host_bootstrap_receipt_sha256"]
+        != resolved["host_bootstrap_receipt"]["receipt_sha256"]
+        or completion["host_bootstrap_receipt_file_sha256"]
+        != resolved["host_bootstrap_receipt"]["file_sha256"]
     ):
         raise ValueError("run completion execution envelope is incomplete")
     rows = completion["candidates"]
@@ -1907,6 +2010,285 @@ def _v2_plan_approval_expected(
     }
 
 
+def _validate_stage1_exact_scorer(evaluator: dict[str, Any]) -> dict[str, Any]:
+    """Reject any schema-3 scorer surface not frozen by owner ratification."""
+
+    contract = krea_execution_surface_policy.POLICY["stage1_exact_scorer_contract"]
+    observed_assets = {
+        name: {
+            "basename": Path(row["canonical_path"]).name,
+            "relative_path": str(
+                Path(row["canonical_path"]).relative_to(Path(evaluator["comfy_root"]))
+            ),
+            "sha256": row["sha256"],
+            "bytes": row["bytes"],
+        }
+        for name, row in evaluator["expected_assets"].items()
+    }
+    observed = {
+        "god_commit": evaluator["expected_god_commit"],
+        "comfy_commit": evaluator["expected_comfy_commit"],
+        "tooling_commit": evaluator["expected_tooling_commit"],
+        "evaluator_script_sha256": evaluator["expected_evaluator_script_sha256"],
+        "dataset_identity_module_sha256": evaluator[
+            "expected_dataset_identity_module_sha256"
+        ],
+        "eval_defaults": evaluator["expected_eval_defaults"],
+        "assets": observed_assets,
+        "source_trees": contract["source_trees"],
+        "runtime_materialization": contract["runtime_materialization"],
+        "timeouts_s": {
+            "startup": _timeout_policy(evaluator)["startup_timeout_s"],
+            "evaluation": _timeout_policy(evaluator)["evaluation_timeout_s"],
+            "shutdown": _timeout_policy(evaluator)["shutdown_timeout_s"],
+            "containment_term_grace": evaluator["containment"]["term_grace_s"],
+        },
+        "estimated_seconds_per_candidate": 720,
+        "execution_scope": "offline_stage1_discovery_only",
+    }
+    if observed != contract:
+        raise ValueError("exact scorer differs from owner-ratified Stage-1 contract")
+    return observed
+
+
+def _stage1_exact_scorer_readiness(evaluator: dict[str, Any]) -> dict[str, Any]:
+    """Recompute the complete Stage-1 scorer surface before approval/execution."""
+
+    try:
+        from . import evaluate_krea_local as local_evaluator
+    except ImportError:  # pragma: no cover - direct script execution.
+        import evaluate_krea_local as local_evaluator  # type: ignore[no-redef]
+
+    contract = krea_execution_surface_policy.POLICY["stage1_exact_scorer_contract"]
+    _validate_stage1_exact_scorer(evaluator)
+    comfy_root = Path(evaluator["comfy_root"])
+    god_root = Path(evaluator["god_root"])
+    tooling_root = comfy_root / "custom_nodes" / "comfyui-tooling-nodes"
+    snapshots = {
+        "god": local_evaluator._git_snapshot(
+            god_root, expected_commit=evaluator["expected_god_commit"]
+        ),
+        "comfyui": local_evaluator._git_snapshot(
+            comfy_root, expected_commit=evaluator["expected_comfy_commit"]
+        ),
+        "tooling_nodes": local_evaluator._git_snapshot(
+            tooling_root, expected_commit=evaluator["expected_tooling_commit"]
+        ),
+    }
+    observed_trees = {name: row["tree"] for name, row in snapshots.items()}
+    if observed_trees != contract["source_trees"]:
+        raise ValueError("exact scorer source trees differ from owner contract")
+
+    requirements = {
+        "comfyui": comfy_root / "requirements.txt",
+        "tooling_nodes": tooling_root / "requirements.txt",
+        "god_validator": god_root / "ops/docker/requirements/validator.txt",
+    }
+    requirement_hashes = {
+        name: _sha256(_safe_file(path, f"{name} requirements"))
+        for name, path in requirements.items()
+    }
+    runtime_contract = contract["runtime_materialization"]
+    lock_contract = runtime_contract["exact_lock"]
+    lock_path = Path(__file__).parent / lock_contract["relative_path"]
+    lock_path = _safe_file(lock_path, "exact scorer dependency lock")
+    if (
+        _sha256(lock_path) != lock_contract["sha256"]
+        or len(lock_path.read_text(encoding="utf-8").splitlines())
+        != lock_contract["line_count"]
+    ):
+        raise ValueError("exact scorer dependency lock differs from owner contract")
+    locked_rows: list[tuple[str, str]] = []
+    vcs_versions = lock_contract["vcs_distribution_versions"]
+    for number, raw_line in enumerate(
+        lock_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            raise ValueError(f"exact scorer lock line {number} is not canonical")
+        if " @ " in line:
+            name, _url = line.split(" @ ", 1)
+            version = vcs_versions.get(re.sub(r"[-_.]+", "-", name).lower())
+            if version is None:
+                raise ValueError(
+                    f"exact scorer lock line {number} has an unbound VCS version"
+                )
+        else:
+            name, separator, version = line.partition("==")
+            if separator != "==" or not name or not version or "==" in version:
+                raise ValueError(f"exact scorer lock line {number} is not exact")
+        locked_rows.append((re.sub(r"[-_.]+", "-", name).lower(), version))
+    locked_rows.sort()
+    if (
+        len(locked_rows) != lock_contract["resolved_distribution_count"]
+        or krea_provenance.canonical_sha256(locked_rows)
+        != lock_contract["normalized_name_version_sha256"]
+    ):
+        raise ValueError(
+            "exact scorer lock does not resolve to its owner-bound distribution set"
+        )
+    if requirement_hashes != runtime_contract["requirements_sha256"]:
+        raise ValueError("exact scorer requirement inputs differ from owner contract")
+
+    expected_asset_paths = {
+        name: comfy_root / row["relative_path"]
+        for name, row in contract["assets"].items()
+    }
+    observed_assets = {}
+    for name, expected_path in expected_asset_paths.items():
+        configured = Path(evaluator["expected_assets"][name]["canonical_path"])
+        if configured != expected_path:
+            raise ValueError(f"exact scorer {name} is not at its canonical destination")
+        path = _safe_file(configured, f"exact scorer {name}")
+        observed_assets[name] = {
+            "canonical_path": str(path),
+            "sha256": _sha256(path),
+            "bytes": path.stat().st_size,
+        }
+        if observed_assets[name] != evaluator["expected_assets"][name]:
+            raise ValueError(f"exact scorer {name} bytes differ from owner contract")
+
+    if (comfy_root / "extra_model_paths.yaml").exists():
+        raise ValueError("exact scorer refuses Comfy extra_model_paths.yaml")
+    lora_root = comfy_root / "models" / "loras"
+    if lora_root.exists() and any(lora_root.iterdir()):
+        raise ValueError("exact scorer LoRA directory is not empty before scoring")
+
+    comfy_python = Path(evaluator["comfy_python"])
+    driver_python = Path(evaluator["driver_python"])
+    if not os.path.samefile(comfy_python, driver_python):
+        raise ValueError("Stage-1 scorer must use one Python for Comfy and driver")
+    python_environment = local_evaluator._python_environment(comfy_python)
+    driver_environment = {
+        key: python_environment[key]
+        for key in (
+            "executable",
+            "prefix",
+            "base_prefix",
+            "python",
+            "distribution_count",
+            "distributions_sha256",
+            "normalized_distributions_sha256",
+        )
+    }
+    if (
+        python_environment["python"] != runtime_contract["python_version"]
+        or python_environment["distribution_count"]
+        != runtime_contract["distribution_count"]
+        or python_environment["distributions_sha256"]
+        != runtime_contract["distributions_sha256"]
+        or python_environment["normalized_distributions_sha256"]
+        != lock_contract["normalized_name_version_sha256"]
+    ):
+        raise ValueError(
+            "exact scorer Python distribution set differs from owner contract"
+        )
+    critical_probe = (
+        "import importlib.metadata as m,json;"
+        "print(json.dumps({n:m.version(n) for n in "
+        "('torch','torchvision','torchaudio')},sort_keys=True))"
+    )
+    try:
+        critical = json.loads(
+            subprocess.check_output(
+                [str(comfy_python), "-I", "-c", critical_probe],
+                env=local_evaluator._inspection_environment(),
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+            )
+        )
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        raise RuntimeError("could not inspect exact scorer critical packages") from exc
+    if critical != runtime_contract["critical_distributions"]:
+        raise ValueError(
+            "exact scorer critical package versions differ from owner contract"
+        )
+    observed_runtime_identity = {
+        "comfy_python_identity_sha256": krea_provenance.canonical_sha256(
+            python_environment
+        ),
+        "driver_python_identity_sha256": krea_provenance.canonical_sha256(
+            driver_environment
+        ),
+    }
+    if observed_runtime_identity != evaluator["expected_runtime_identity"]:
+        raise ValueError("exact scorer runtime identity differs from live environment")
+    body = {
+        "schema": 1,
+        "kind": "forge-krea-stage1-exact-scorer-readiness",
+        "source_snapshots": snapshots,
+        "requirements_sha256": requirement_hashes,
+        "dependency_lock_sha256": lock_contract["sha256"],
+        "assets": observed_assets,
+        "runtime_identity": observed_runtime_identity,
+        "runtime_contract_sha256": krea_provenance.canonical_sha256(runtime_contract),
+        "timeouts_s": contract["timeouts_s"],
+        "ready": True,
+    }
+    return {**body, "readiness_sha256": krea_provenance.canonical_sha256(body)}
+
+
+def build_agent_sealed_plan_approval(
+    plan: dict[str, Any],
+    *,
+    technical_reviewer_actor: dict[str, Any],
+    discovery_execution_authorization: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the fixed Stage-1 agent approval; full plan validation follows."""
+
+    if (
+        plan.get("schema") != 2
+        or plan.get("decision_context", {}).get("phase") != "discovery"
+    ):
+        raise ValueError("agent exact-score approval is discovery-only")
+    evaluator = _validate_evaluator(plan["evaluator"])
+    _validate_stage1_exact_scorer(evaluator)
+    readiness = _stage1_exact_scorer_readiness(evaluator)
+    _, authorization, _ = krea_discovery_authorization.load_binding(
+        discovery_execution_authorization
+    )
+    if "offline_exact_scoring" not in authorization["authorized_actions"]:
+        raise ValueError("discovery authorization does not permit exact scoring")
+    actor = krea_delegated_review_contract.validate_actor(
+        "exact_score_plan_reviewer", technical_reviewer_actor
+    )
+    candidates = []
+    for raw in plan.get("candidates", []):
+        row = _object(raw, "plan candidate")
+        _, binding, binding_sha = _load_candidate_binding(
+            row.get("candidate_binding"), "candidate binding"
+        )
+        candidates.append(
+            {
+                "id": row.get("id"),
+                "candidate_binding": {
+                    "mode": binding.get("mode"),
+                    "binding_manifest_sha256": binding_sha,
+                },
+            }
+        )
+    candidates.sort(key=lambda item: item["id"])
+    expected = _v2_plan_approval_expected(
+        plan, candidates=candidates, evaluator=evaluator
+    )
+    return {
+        "schema": 3,
+        "kind": "forge-krea-agent-exact-score-plan-approval",
+        "decision": "approved",
+        "technical_reviewer_actor": actor,
+        "accountable_owner_identity": authorization["accountable_owner_identity"],
+        "owner_ratification_sha256": authorization["fixture_admission_envelope"][
+            "owner_ratification_sha256"
+        ],
+        "discovery_execution_authorization": dict(discovery_execution_authorization),
+        "delegated_review_contract": krea_delegated_review_contract.binding(),
+        "agent_review_is_not_human_review": True,
+        "scorer_readiness": readiness,
+        **expected,
+    }
+
+
 def _validate_v2_approval(
     value: dict[str, Any],
     raw: bytes,
@@ -1914,11 +2296,74 @@ def _validate_v2_approval(
     plan: dict[str, Any],
     candidates: list[dict[str, Any]],
     evaluator: dict[str, Any],
-) -> dict[str, str]:
+    common_authorization_sha256: str | None,
+) -> dict[str, Any]:
     _canonical_control_file(value, raw, "sealed exact-score approval")
     expected_fields = _v2_plan_approval_expected(
         plan, candidates=candidates, evaluator=evaluator
     )
+    if value.get("schema") == 3:
+        _exact_keys(
+            value,
+            {
+                "schema",
+                "kind",
+                "decision",
+                "technical_reviewer_actor",
+                "accountable_owner_identity",
+                "owner_ratification_sha256",
+                "discovery_execution_authorization",
+                "delegated_review_contract",
+                "agent_review_is_not_human_review",
+                "scorer_readiness",
+                *expected_fields,
+            },
+            "agent exact-score approval",
+        )
+        _validate_stage1_exact_scorer(evaluator)
+        readiness = _stage1_exact_scorer_readiness(evaluator)
+        _, authorization, _ = krea_discovery_authorization.load_binding(
+            value["discovery_execution_authorization"]
+        )
+        actor = krea_delegated_review_contract.validate_actor(
+            "exact_score_plan_reviewer", value["technical_reviewer_actor"]
+        )
+        expected = {
+            "schema": 3,
+            "kind": "forge-krea-agent-exact-score-plan-approval",
+            "decision": "approved",
+            "technical_reviewer_actor": actor,
+            "accountable_owner_identity": authorization["accountable_owner_identity"],
+            "owner_ratification_sha256": authorization["fixture_admission_envelope"][
+                "owner_ratification_sha256"
+            ],
+            "discovery_execution_authorization": dict(
+                value["discovery_execution_authorization"]
+            ),
+            "delegated_review_contract": krea_delegated_review_contract.binding(),
+            "agent_review_is_not_human_review": True,
+            "scorer_readiness": readiness,
+            **expected_fields,
+        }
+        if (
+            value != expected
+            or plan["decision_context"].get("phase") != "discovery"
+            or common_authorization_sha256 != authorization["authorization_sha256"]
+            or "offline_exact_scoring" not in authorization["authorized_actions"]
+        ):
+            raise ValueError(
+                "agent exact-score approval escaped owner-ratified discovery"
+            )
+        return {
+            "technical_reviewer_actor": actor,
+            "accountable_owner_identity": authorization["accountable_owner_identity"],
+            "decision": "approved",
+            "agent_review_is_not_human_review": True,
+        }
+    if common_authorization_sha256 is not None:
+        raise ValueError(
+            "authorization-bound Stage-1 scoring requires the delegated schema-3 approval"
+        )
     _exact_keys(
         value,
         {
@@ -1984,12 +2429,14 @@ def _validate_plan_v2(
     _canonical_control_file(fixture_approval, fixture_approval_raw, "fixture approval")
     krea_fixture.validate_approval(fixture_approval, fixture_manifest=fixture)
     cross_review_path, cross_review_file_sha, cross_review, cross_review_raw = (
-        _bound_file(plan["cross_fixture_review"], "cross-fixture human review")
+        _bound_file(plan["cross_fixture_review"], "cross-fixture admission surface")
     )
     _canonical_control_file(
-        cross_review, cross_review_raw, "cross-fixture human review"
+        cross_review, cross_review_raw, "cross-fixture admission surface"
     )
-    _validate_cross_fixture_review_surface(cross_review, fixture=fixture)
+    _validate_cross_fixture_review_surface(
+        cross_review, fixture=fixture, source_path=cross_review_path
+    )
     campaign_path, campaign_file_sha, campaign, campaign_raw = _bound_file(
         plan["campaign_manifest"], "exact-score campaign manifest"
     )
@@ -2187,6 +2634,9 @@ def _validate_plan_v2(
             envelope = {
                 "schema": 2,
                 "kind": "forge-krea-common-local-execution-envelope",
+                "discovery_execution_authorization_sha256": execution_resolved[
+                    "discovery_execution_authorization"
+                ]["authorization_sha256"],
                 "fixture_manifest_sha256": fixture["manifest_sha256"],
                 "training_dataset_sha256": fixture["training_dataset_identity"][
                     "sha256"
@@ -2200,7 +2650,14 @@ def _validate_plan_v2(
                 "host_execution_identity_sha256": measured_envelope[
                     "host_execution_identity_sha256"
                 ],
-                "container_image_sha256": measured_envelope["container_image_sha256"],
+                "execution_surface": measured_envelope["execution_surface"],
+                "execution_scope": measured_envelope["execution_scope"],
+                "venv_tree_manifest_sha256": measured_envelope[
+                    "venv_tree_manifest_sha256"
+                ],
+                "reference_container_image_sha256": measured_envelope[
+                    "reference_container_image_sha256"
+                ],
                 "gpu_identity_sha256": measured_envelope["gpu_identity_sha256"],
                 "trainer_identity_sha256": measured_envelope["trainer_identity_sha256"],
                 "measurement_tool_sha256": measured_envelope["measurement_tool_sha256"],
@@ -2416,6 +2873,11 @@ def _validate_plan_v2(
         plan=plan,
         candidates=candidates,
         evaluator=evaluator,
+        common_authorization_sha256=(
+            common_envelope.get("discovery_execution_authorization_sha256")
+            if common_envelope is not None
+            else None
+        ),
     )
     evaluator["_expected_dataset_identity"] = expected_identity
     evaluator["_common_training_envelope"] = common_envelope
@@ -3104,7 +3566,11 @@ def _run_contained(
             previous_handlers[stop_signal] = signal.getsignal(stop_signal)
             signal.signal(stop_signal, cancel)
     process: subprocess.Popen[str] | None = None
+    environment_root = tempfile.TemporaryDirectory(prefix="forge-krea-eval-env-")
     try:
+        evaluator_environment = _minimal_evaluator_environment(
+            driver_python=command[0], isolated_root=Path(environment_root.name)
+        )
         process = subprocess.Popen(
             wrapped,
             stdin=subprocess.DEVNULL,
@@ -3112,7 +3578,7 @@ def _run_contained(
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            env=evaluator_environment,
         )
         try:
             pgid = _validated_process_group(process)
@@ -3165,6 +3631,7 @@ def _run_contained(
     finally:
         for stop_signal, previous in previous_handlers.items():
             signal.signal(stop_signal, previous)
+        environment_root.cleanup()
     if process is None:  # pragma: no cover - defensive type narrowing.
         raise RuntimeError("evaluator process was never started")
     return subprocess.CompletedProcess(wrapped, process.returncode, stdout, stderr)
