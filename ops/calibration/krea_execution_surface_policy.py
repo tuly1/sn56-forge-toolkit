@@ -152,10 +152,11 @@ _BODY = {
         },
         "timeouts_s": {
             "startup": 300.0,
-            # D1 evaluates 240 prompts.  The first literal run took about
-            # 75 minutes, so the former one-hour ceiling was guaranteed to
-            # kill a healthy evaluator before it could publish evidence.
-            "evaluation": 5400.0,
+            # This is the owner-ratified training/scoring base contract.  A
+            # scorer-only extension may raise the effective evaluation limit,
+            # but must not mutate this policy (and thereby orphan valid
+            # training evidence produced under it).
+            "evaluation": 3600.0,
             "shutdown": 20.0,
             "containment_term_grace": 20.0,
         },

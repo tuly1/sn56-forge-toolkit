@@ -915,3 +915,189 @@ def test_explicit_boundary_context_blocks_phase_ambiguity_and_rule_drift(
     context["selected_candidate"] = wrong_candidate
     with pytest.raises(ValueError, match="does not map the frozen checkpoint rule"):
         batch._validate_score_decision_context(context, campaign=wrong_campaign)
+
+
+def _candidate_shards(
+    harness: ProducerHarness, root: Path
+) -> list[Path]:
+    # The legacy publication constructs the complete approved test plan.  The
+    # external evaluator remains mocked, so using it here costs no real scorer
+    # work and simultaneously proves the new mode does not break the old one.
+    harness.publish()
+    manifests = []
+    for candidate in harness.candidates:
+        directory = root / f"shard-{candidate['id']}"
+        manifest = directory / "shard.json"
+        batch.run_candidate_shard(
+            harness.plan,
+            candidate_id=candidate["id"],
+            results_dir=directory,
+            output=manifest,
+        )
+        manifests.append(manifest)
+    return manifests
+
+
+def test_candidate_shards_assemble_complete_set_and_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = ProducerHarness(tmp_path, monkeypatch)
+    shards = _candidate_shards(harness, tmp_path)
+    output = tmp_path / "assembled.json"
+    aggregate = batch.assemble_candidate_shards(
+        harness.plan, shard_paths=list(reversed(shards)), output=output
+    )
+
+    assert aggregate["coverage"] == {
+        "planned": 2,
+        "completed": 2,
+        "complete": True,
+    }
+    assert aggregate["staged_input_manifest"]["candidate_order"] == [
+        candidate["id"] for candidate in harness.candidates
+    ]
+    assert [row["candidate_id"] for row in aggregate["candidates"]] == [
+        candidate["id"] for candidate in harness.candidates
+    ]
+    harness.patch_match_context(monkeypatch)
+    observed, _ = krea_decision._match_aggregates(
+        policy=harness.boundary_policy(aggregate), aggregate_paths=[output]
+    )
+    assert list(observed) == ["B-0p5-small"]
+
+
+def test_candidate_shard_assembly_rejects_missing_duplicate_and_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = ProducerHarness(tmp_path, monkeypatch)
+    shards = _candidate_shards(harness, tmp_path)
+    with pytest.raises(ValueError, match="coverage is incomplete"):
+        batch.assemble_candidate_shards(
+            harness.plan,
+            shard_paths=shards[:1],
+            output=tmp_path / "missing.json",
+        )
+    assert not (tmp_path / "missing.json").exists()
+
+    with pytest.raises(ValueError, match="duplicate candidate shard"):
+        batch.assemble_candidate_shards(
+            harness.plan,
+            shard_paths=[shards[0], shards[0]],
+            output=tmp_path / "duplicate.json",
+        )
+    assert not (tmp_path / "duplicate.json").exists()
+
+    forged_dir = tmp_path / "extra-shard"
+    shutil.copytree(shards[0].parent, forged_dir)
+    forged_path = forged_dir / "shard.json"
+    forged = json.loads(forged_path.read_text(encoding="utf-8"))
+    forged["candidate"]["id"] = "not-in-approved-plan"
+    forged_body = {
+        key: value for key, value in forged.items() if key != "shard_sha256"
+    }
+    forged["shard_sha256"] = krea_provenance.canonical_sha256(forged_body)
+    forged_path.write_bytes(krea_provenance.canonical_bytes(forged) + b"\n")
+    with pytest.raises(ValueError, match="extra or not present"):
+        batch.assemble_candidate_shards(
+            harness.plan,
+            shard_paths=[*shards, forged_path],
+            output=tmp_path / "extra.json",
+        )
+    assert not (tmp_path / "extra.json").exists()
+
+
+def test_candidate_shard_assembly_rejects_tampered_result_and_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result_case = tmp_path / "result-case"
+    result_case.mkdir()
+    harness = ProducerHarness(result_case, monkeypatch)
+    shards = _candidate_shards(harness, result_case)
+    shard = json.loads(shards[0].read_text(encoding="utf-8"))
+    raw_result = shards[0].parent / shard["result"]["path"]
+    raw_result.write_bytes(raw_result.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="raw result or log changed"):
+        batch.assemble_candidate_shards(
+            harness.plan,
+            shard_paths=shards,
+            output=result_case / "tampered-result.json",
+        )
+
+    manifest_case = tmp_path / "manifest-case"
+    manifest_case.mkdir()
+    other = ProducerHarness(manifest_case, monkeypatch)
+    other_shards = _candidate_shards(other, manifest_case)
+    other_shards[0].write_bytes(other_shards[0].read_bytes() + b" ")
+    with pytest.raises(ValueError, match="canonical JSON"):
+        batch.assemble_candidate_shards(
+            other.plan,
+            shard_paths=other_shards,
+            output=manifest_case / "tampered-manifest.json",
+        )
+
+
+def test_candidate_shards_are_create_only_and_portable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    harness = ProducerHarness(source, monkeypatch)
+    shards = _candidate_shards(harness, source)
+    first_candidate = harness.candidates[0]
+    with pytest.raises(FileExistsError, match="exclusively new"):
+        batch.run_candidate_shard(
+            harness.plan,
+            candidate_id=first_candidate["id"],
+            results_dir=shards[0].parent,
+            output=shards[0],
+        )
+
+    relocated = tmp_path / "relocated"
+    relocated.mkdir()
+    moved = []
+    for shard in shards:
+        destination = relocated / shard.parent.name
+        shutil.copytree(shard.parent, destination)
+        moved.append(destination / "shard.json")
+    for shard in shards:
+        shard.parent.rename(source / f"retired-{shard.parent.name}")
+    output = tmp_path / "portable-aggregate.json"
+    aggregate = batch.assemble_candidate_shards(
+        harness.plan, shard_paths=moved, output=output
+    )
+    assert aggregate["coverage"]["complete"] is True
+
+
+def test_candidate_shards_exclusively_lease_shared_comfy_surface(
+    tmp_path: Path,
+) -> None:
+    comfy = tmp_path / "ComfyUI"
+    lora_root = comfy / "models" / "loras"
+    lora_root.mkdir(parents=True)
+    (lora_root / "put_loras_here").write_bytes(b"")
+    first = tmp_path / "first.safetensors"
+    second = tmp_path / "second.safetensors"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first_sha = krea_provenance.file_sha256(first)
+    second_sha = krea_provenance.file_sha256(second)
+
+    first_binding = batch._stage_comfy_lora(
+        comfy_root=comfy,
+        candidate=first,
+        candidate_sha256=first_sha,
+    )
+    with pytest.raises(RuntimeError, match="already leased"):
+        batch._stage_comfy_lora(
+            comfy_root=comfy,
+            candidate=second,
+            candidate_sha256=second_sha,
+        )
+    batch._remove_comfy_lora(first_binding, comfy_root=comfy)
+
+    second_binding = batch._stage_comfy_lora(
+        comfy_root=comfy,
+        candidate=second,
+        candidate_sha256=second_sha,
+    )
+    batch._remove_comfy_lora(second_binding, comfy_root=comfy)

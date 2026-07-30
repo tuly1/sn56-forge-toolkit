@@ -127,12 +127,11 @@ def test_agent_admission_envelope_is_the_score_plan_cross_fixture_surface(
     monkeypatch.setattr(
         krea_fixture_admission, "validate_envelope", lambda _path: resolved
     )
-    assert (
-        batch._validate_cross_fixture_review_surface(
-            envelope, fixture=fixture, source_path=envelope_path
-        )
-        == envelope
-    )
+    assert batch._validate_cross_fixture_review_surface(
+        envelope,
+        fixture=fixture,
+        source_path=envelope_path,
+    ) == envelope
     resolved["blinded_acceptance"]["assertions"][
         "agent_review_is_not_human_review"
     ] = False
@@ -140,6 +139,35 @@ def test_agent_admission_envelope_is_the_score_plan_cross_fixture_surface(
         batch._validate_cross_fixture_review_surface(
             envelope, fixture=fixture, source_path=envelope_path
         )
+
+
+def test_historical_fixture_admission_validator_is_explicitly_dispatched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = {
+        "experimental_role": "D1",
+        "manifest_sha256": "d" * 64,
+    }
+    envelope = {
+        "schema": 1,
+        "kind": "forge-krea-fixture-admission-envelope",
+        "envelope_sha256": "e" * 64,
+    }
+    envelope_path = tmp_path / "historical-admission-envelope.json"
+    _canonical_file(envelope_path, envelope)
+    resolved = _agent_admission_result(envelope, fixture)
+    historical = SimpleNamespace(validate_envelope=lambda _path: resolved)
+    monkeypatch.setattr(
+        krea_fixture_admission,
+        "validate_envelope",
+        lambda _path: pytest.fail("current admission validator was used"),
+    )
+    assert batch._validate_cross_fixture_review_surface(
+        envelope,
+        fixture=fixture,
+        source_path=envelope_path,
+        fixture_admission_validator=historical,
+    ) == envelope
 
 
 def test_d1_score_plan_builder_binds_agent_admission_not_fictional_human_review(
@@ -246,6 +274,119 @@ def _schema3_approval_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         ),
     )
     return plan, evaluator, actor, authorization, authorization_binding, readiness
+
+
+def _historical_campaign_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    modules: dict,
+) -> dict[str, str]:
+    identity = {
+        "schema": 1,
+        "kind": "forge-krea-historical-training-evidence-validator",
+        "root": "/admitted/forge-58822b4",
+    }
+    monkeypatch.setattr(
+        batch.krea_historical_training_evidence,
+        "validate_identity",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        batch.krea_historical_training_evidence,
+        "load_modules",
+        lambda value: modules if value == identity else pytest.fail("wrong identity"),
+    )
+    payload = {
+        "schema": 2,
+        "kind": "forge-krea-exact-score-campaign",
+        "fixture_manifest_sha256": "1" * 64,
+        "discovery_plan_sha256": "2" * 64,
+        "runs": [
+            {
+                "arm_id": "K1",
+                "execution_plan_sha256": "3" * 64,
+                "run_completion_sha256": "4" * 64,
+                "candidates": [
+                    {
+                        "candidate_id": "K1-step-1",
+                        "sha256": "5" * 64,
+                        "bytes": 1,
+                        "step": 1,
+                        "fraction": {"numerator": 1, "denominator": 1},
+                    }
+                ],
+            }
+        ],
+        "zero_control_manifest_sha256": "6" * 64,
+        "decision_contract": batch._DISCOVERY_DECISION_BINDING,
+        "confirmation_contract": batch._CONFIRMATION_DECISION_BINDING,
+        "historical_training_evidence_validator": identity,
+    }
+    campaign = batch.seal_campaign_manifest(payload)
+    path = tmp_path / "historical-campaign.json"
+    digest = _canonical_file(path, campaign)
+    return {"path": str(path), "sha256": digest}
+
+
+def test_schema3_score_approval_uses_historical_authority_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, evaluator, actor, authorization, binding, readiness = _schema3_approval_case(
+        tmp_path, monkeypatch
+    )
+    calls = []
+    historical_authorization = SimpleNamespace(
+        load_binding=lambda value: (
+            calls.append(("authorization", value))
+            or (Path(binding["path"]), authorization, binding["file_sha256"])
+        )
+    )
+    historical_delegated = SimpleNamespace(
+        validate_actor=lambda role, value: (
+            calls.append(("actor", role)) or value
+        ),
+        binding=lambda: {"historical_contract": "58822b4"},
+    )
+    modules = {
+        "discovery_authorization": historical_authorization,
+        "delegated_review_contract": historical_delegated,
+    }
+    plan["campaign_manifest"] = _historical_campaign_binding(
+        tmp_path, monkeypatch, modules
+    )
+    approval = batch.build_agent_sealed_plan_approval(
+        plan,
+        technical_reviewer_actor=actor,
+        discovery_execution_authorization=binding,
+    )
+    assert approval["delegated_review_contract"] == {
+        "historical_contract": "58822b4"
+    }
+    candidate = {
+        "id": "K1-step-50",
+        "candidate_binding": {
+            "mode": "local_run_candidate",
+            "binding_manifest_sha256": plan["candidates"][0][
+                "candidate_binding"
+            ]["sha256"],
+        },
+    }
+    result = batch._validate_v2_approval(
+        approval,
+        krea_provenance.canonical_bytes(approval) + b"\n",
+        plan=plan,
+        candidates=[candidate],
+        evaluator=evaluator,
+        common_authorization_sha256=authorization["authorization_sha256"],
+    )
+    assert result["accountable_owner_identity"] == "Atulya Shetty"
+    assert [row[0] for row in calls] == [
+        "authorization",
+        "actor",
+        "authorization",
+        "actor",
+    ]
+    assert approval["scorer_readiness"] == readiness
 
 
 def test_schema3_agent_score_approval_builds_and_revalidates(
@@ -498,7 +639,12 @@ def _readiness_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "startup_timeout_s": contract["timeouts_s"]["startup"],
         "evaluation_timeout_s": contract["timeouts_s"]["evaluation"],
         "shutdown_timeout_s": contract["timeouts_s"]["shutdown"],
+        "scorer_extension_policy": deepcopy(
+            batch.krea_scorer_extension_policy.POLICY
+        ),
+        "scorer_timeout_profile": "D1",
     }
+    evaluator["evaluation_timeout_s"] = 5400.0
     snapshots = {
         "god": {
             "commit": contract["god_commit"],
@@ -573,16 +719,60 @@ def test_stage1_d1_timeout_covers_measured_runtime_and_rejects_old_ceiling(
     )
     for name, row in evaluator["expected_assets"].items():
         row["bytes"] = contract["assets"][name]["bytes"]
-    assert contract["timeouts_s"]["evaluation"] == 5400.0
-    assert contract["timeouts_s"]["evaluation"] >= 75 * 60
-    assert validator(evaluator)["timeouts_s"]["evaluation"] == 5400.0
+    assert contract["timeouts_s"]["evaluation"] == 3600.0
+    assert (
+        batch.krea_scorer_extension_policy.POLICY[
+            "changes"
+        ]["evaluation_timeout_profiles"]["D1"]["evaluation_timeout_s"]
+        == 5400.0
+    )
+    assert validator(evaluator)["timeouts_s"]["evaluation"] == 3600.0
     assert batch._timeout_policy(evaluator)["total_candidate_timeout_s"] == 5780.0
 
     evaluator["evaluation_timeout_s"] = 3600.0
     with pytest.raises(
-        ValueError, match="exact scorer differs from owner-ratified Stage-1 contract"
+        ValueError, match="effective timeouts differ from its extension"
     ):
         validator(evaluator)
+
+    evaluator["evaluation_timeout_s"] = 5400.0
+    evaluator["scorer_extension_policy"] = {
+        **evaluator["scorer_extension_policy"],
+        "policy_sha256": "0" * 64,
+    }
+    with pytest.raises(ValueError, match="extension policy drifted"):
+        validator(evaluator)
+
+
+def test_stage1_d2_timeout_is_shape_bound_and_has_explicit_headroom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validator = batch._validate_stage1_exact_scorer
+    evaluator, contract, _snapshots, _hashes, _python = _readiness_case(
+        tmp_path, monkeypatch
+    )
+    for name, row in evaluator["expected_assets"].items():
+        row["bytes"] = contract["assets"][name]["bytes"]
+    evaluator["scorer_timeout_profile"] = "D2"
+    evaluator["evaluation_timeout_s"] = 9000.0
+    fixture = {
+        "experimental_role": "D2",
+        "evaluation_rows": [{"row_id": f"row-{index:03d}"} for index in range(40)],
+    }
+    profile = batch._validate_scorer_fixture_timeout(evaluator, fixture)
+    assert profile["prompt_count"] == 400
+    assert profile["evaluation_timeout_s"] == 9000.0
+    assert profile["evaluation_timeout_s"] - profile["measured_runtime_s"] == 1500.0
+    assert validator(evaluator)["timeouts_s"] == contract["timeouts_s"]
+    assert batch._timeout_policy(evaluator)["total_candidate_timeout_s"] == 9380.0
+
+    fixture["evaluation_rows"] = fixture["evaluation_rows"][:24]
+    with pytest.raises(ValueError, match="differs from fixture shape"):
+        batch._validate_scorer_fixture_timeout(evaluator, fixture)
+
+    fixture["experimental_role"] = "D1"
+    with pytest.raises(ValueError, match="differs from fixture role"):
+        batch._validate_scorer_fixture_timeout(evaluator, fixture)
 
 
 @pytest.mark.parametrize(
@@ -637,6 +827,22 @@ def test_stage1_policy_binds_live_evaluator_and_exact_krea_lock() -> None:
     assert len(lock.read_text(encoding="utf-8").splitlines()) == 229
 
 
+def test_stage1_policy_binds_split_scorer_support_module_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert (
+        batch._validate_scorer_support_modules()
+        == batch._SCORER_SUPPORT_MODULE_SHA256
+    )
+    monkeypatch.setitem(
+        batch._SCORER_SUPPORT_MODULE_SHA256,
+        "krea_scorer_extension_policy.py",
+        "0" * 64,
+    )
+    with pytest.raises(ValueError, match="support module bytes drifted"):
+        batch._validate_scorer_support_modules()
+
+
 def test_stage1_evaluator_config_builder_emits_complete_live_containment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -679,6 +885,7 @@ def test_stage1_evaluator_config_builder_emits_complete_live_containment(
         god_root=god,
         python_path=python_path,
         cache_provenance_sha256="b" * 64,
+        fixture_role="D1",
         systemd_run_path=systemd_run,
         systemctl_path=systemctl,
     )
@@ -988,6 +1195,56 @@ class BuilderHarness:
             output_dir=self.output_dir, campaign=campaign, draft=draft
         )
         return campaign, draft, campaign_path, draft_path
+
+
+def test_588_training_bundle_routes_through_historical_validator_and_rejects_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = BuilderHarness(tmp_path, monkeypatch)
+    identity = {
+        "schema": 1,
+        "kind": "forge-krea-historical-training-evidence-validator",
+        "root": "/admitted/forge-58822b4",
+        "commit_sha1": "58822b496019177a02fa6196247ac30e788331bb",
+        "tree_sha1": "ba569913ceeddab6c425efd97b3dfb39a290a9c5",
+        "execution_surface_policy_sha256": (
+            "98b59fd90dbf4ea213c860f873bc472cadc66714c7b9118672de2474f020f5f3"
+        ),
+        "module_sha256": {},
+    }
+    calls = []
+
+    def validate(path, supplied_identity):
+        calls.append((Path(path), supplied_identity))
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(
+        score_plan.krea_historical_training_evidence,
+        "validate_run_evidence",
+        validate,
+    )
+    run, rows, *_ = score_plan._bundle_candidates(
+        harness.bundle_path,
+        historical_validator_identity=identity,
+    )
+    assert run["arm_id"] == harness.base.arm
+    assert rows
+    assert calls == [(harness.bundle_path, identity)]
+
+    incompatible = json.loads(harness.bundle_path.read_text(encoding="utf-8"))
+    incompatible["execution_surface_policy_sha256"] = (
+        "8a45666ea1555600de79f657055c5d540a9a87e8a6807640059011f3ee540b3f"
+    )
+    body = {
+        key: value for key, value in incompatible.items() if key != "bundle_sha256"
+    }
+    incompatible["bundle_sha256"] = krea_provenance.canonical_sha256(body)
+    _canonical_file(harness.bundle_path, incompatible)
+    with pytest.raises(ValueError, match="invalid run-evidence bundle"):
+        score_plan._bundle_candidates(
+            harness.bundle_path,
+            historical_validator_identity=identity,
+        )
 
 
 def test_build_is_unapproved_and_dry_run_performs_no_writes(

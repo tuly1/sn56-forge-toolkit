@@ -24,12 +24,16 @@ try:
     from . import krea_fixture
     from . import krea_execution_surface_policy
     from . import krea_provenance
+    from . import krea_historical_training_evidence
+    from . import krea_scorer_extension_policy
     from . import krea_training_evidence
 except ImportError:  # pragma: no cover - direct script execution.
     import batch_evaluate_krea as batch  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
     import krea_execution_surface_policy  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
+    import krea_historical_training_evidence  # type: ignore[no-redef]
+    import krea_scorer_extension_policy  # type: ignore[no-redef]
     import krea_training_evidence  # type: ignore[no-redef]
 
 
@@ -85,9 +89,16 @@ def _bound_document(value: Any, label: str) -> tuple[Path, dict[str, Any], str]:
 
 def _bundle_candidates(
     bundle_path: Path,
+    *,
+    historical_validator_identity: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any], str, str]:
     path, bundle, _ = _load(bundle_path, "stage-three run-evidence bundle")
-    validated_bundle = krea_training_evidence.validate_run_evidence(path)
+    if historical_validator_identity is None:
+        validated_bundle = krea_training_evidence.validate_run_evidence(path)
+    else:
+        validated_bundle = krea_historical_training_evidence.validate_run_evidence(
+            path, historical_validator_identity
+        )
     if validated_bundle != bundle:
         raise ValueError(
             "stage-three validator result differs from the consumed bundle"
@@ -443,6 +454,7 @@ def build_documents(
     campaign_output_path: Path,
     frozen_discovery_decision: Path | None = None,
     candidate_family: str | None = None,
+    historical_training_validator_root: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Construct a sealed campaign and unapproved exact-score plan draft."""
 
@@ -453,26 +465,48 @@ def build_documents(
     campaign_output_path = Path(
         os.path.abspath(os.path.expanduser(campaign_output_path))
     )
+    historical_validator_identity = (
+        None
+        if historical_training_validator_root is None
+        else krea_historical_training_evidence.capture_identity(
+            historical_training_validator_root
+        )
+    )
+    historical_modules = (
+        None
+        if historical_validator_identity is None
+        else krea_historical_training_evidence.load_modules(
+            historical_validator_identity
+        )
+    )
+    fixture_validator = (
+        krea_fixture if historical_modules is None else historical_modules["fixture"]
+    )
+    cross_validator = (
+        batch
+        if historical_modules is None
+        else historical_modules["batch_evaluate"]
+    )
     fixture_path, fixture, fixture_file_sha = _load(
         fixture_manifest_path, "fixture manifest"
     )
-    krea_fixture.validate_manifest(fixture)
+    fixture_validator.validate_manifest(fixture)
     approval_path, approval, approval_file_sha = _load(
         fixture_approval_path, "fixture approval"
     )
-    krea_fixture.validate_approval(approval, fixture_manifest=fixture)
+    fixture_validator.validate_approval(approval, fixture_manifest=fixture)
     cross_path, cross_review, cross_file_sha = _load(
         cross_fixture_review_path, "cross-fixture review"
     )
-    batch._validate_cross_fixture_review_surface(
+    cross_validator._validate_cross_fixture_review_surface(
         cross_review, fixture=fixture, source_path=cross_path
     )
     evaluator_path, evaluator, _ = _load(evaluator_config_path, "evaluator config")
     del evaluator_path
     evaluator = batch._validate_evaluator(evaluator)
+    batch._validate_scorer_fixture_timeout(evaluator, fixture)
     dataset = batch._safe_directory(dataset_path, "evaluation dataset")
     expected_dataset_sha = fixture["evaluation_dataset_identity"]["sha256"]
-
     runs: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
     discovery_shas: set[str] = set()
@@ -481,11 +515,13 @@ def build_documents(
     candidate_hashes: set[str] = set()
     for raw_bundle in bundle_paths:
         run, rows, _completion, discovery_sha, evaluation_sha = _bundle_candidates(
-            raw_bundle
+            raw_bundle,
+            historical_validator_identity=historical_validator_identity,
         )
         if evaluation_sha != expected_dataset_sha:
             raise ValueError(
-                f"run bundle for arm {run['arm_id']} belongs to another evaluation fixture"
+                f"run bundle for arm {run['arm_id']} belongs to another "
+                "evaluation fixture"
             )
         if run["arm_id"] in arms:
             raise ValueError(f"duplicate run bundle for arm {run['arm_id']}")
@@ -521,6 +557,10 @@ def build_documents(
         "decision_contract": batch._DISCOVERY_DECISION_BINDING,
         "confirmation_contract": batch._CONFIRMATION_DECISION_BINDING,
     }
+    if historical_validator_identity is not None:
+        campaign_payload["historical_training_evidence_validator"] = (
+            historical_validator_identity
+        )
     campaign = batch.seal_campaign_manifest(campaign_payload)
     context = _decision_context(
         phase=phase,
@@ -560,24 +600,6 @@ def validate_draft(
         dataset_spec["sha256"]
     ):
         raise ValueError("draft evaluation-dataset SHA-256 is invalid")
-    _fixture_path, fixture, _fixture_file_sha = _bound_document(
-        draft["fixture_manifest"], "fixture manifest"
-    )
-    krea_fixture.validate_manifest(fixture)
-    _approval_path, approval, _approval_file_sha = _bound_document(
-        draft["fixture_approval"], "fixture approval"
-    )
-    krea_fixture.validate_approval(approval, fixture_manifest=fixture)
-    _cross_path, cross_review, _cross_file_sha = _bound_document(
-        draft["cross_fixture_review"], "cross-fixture review"
-    )
-    batch._validate_cross_fixture_review_surface(
-        cross_review, fixture=fixture, source_path=_cross_path
-    )
-    if dataset_spec["sha256"] != fixture["evaluation_dataset_identity"]["sha256"]:
-        raise ValueError("draft dataset differs from the approved fixture identity")
-    evaluator = batch._validate_evaluator(draft["evaluator"])
-    del evaluator
     campaign_binding = batch._object(
         draft["campaign_manifest"], "draft campaign binding"
     )
@@ -599,6 +621,38 @@ def validate_draft(
     if campaign_binding != expected_campaign_binding:
         raise ValueError("draft campaign file binding is not exact")
     batch._validate_campaign_manifest(campaign)
+    historical_identity = campaign.get("historical_training_evidence_validator")
+    historical_modules = (
+        None
+        if historical_identity is None
+        else krea_historical_training_evidence.load_modules(historical_identity)
+    )
+    fixture_validator = (
+        krea_fixture if historical_modules is None else historical_modules["fixture"]
+    )
+    cross_validator = (
+        batch
+        if historical_modules is None
+        else historical_modules["batch_evaluate"]
+    )
+    _fixture_path, fixture, _fixture_file_sha = _bound_document(
+        draft["fixture_manifest"], "fixture manifest"
+    )
+    fixture_validator.validate_manifest(fixture)
+    _approval_path, approval, _approval_file_sha = _bound_document(
+        draft["fixture_approval"], "fixture approval"
+    )
+    fixture_validator.validate_approval(approval, fixture_manifest=fixture)
+    _cross_path, cross_review, _cross_file_sha = _bound_document(
+        draft["cross_fixture_review"], "cross-fixture review"
+    )
+    cross_validator._validate_cross_fixture_review_surface(
+        cross_review, fixture=fixture, source_path=_cross_path
+    )
+    if dataset_spec["sha256"] != fixture["evaluation_dataset_identity"]["sha256"]:
+        raise ValueError("draft dataset differs from the approved fixture identity")
+    evaluator = batch._validate_evaluator(draft["evaluator"])
+    batch._validate_scorer_fixture_timeout(evaluator, fixture)
     if campaign["fixture_manifest_sha256"] != fixture["manifest_sha256"]:
         raise ValueError("draft campaign belongs to another approved fixture")
     batch._validate_score_decision_context(draft["decision_context"], campaign=campaign)
@@ -840,6 +894,7 @@ def build_stage1_evaluator_config(
     god_root: Path,
     python_path: Path,
     cache_provenance_sha256: str,
+    fixture_role: str,
     systemd_run_path: Path = Path("/usr/bin/systemd-run"),
     systemctl_path: Path = Path("/usr/bin/systemctl"),
 ) -> dict[str, Any]:
@@ -858,6 +913,9 @@ def build_stage1_evaluator_config(
     god_root = god_root.resolve(strict=True)
     python_path = python_path.resolve(strict=True)
     contract = krea_execution_surface_policy.POLICY["stage1_exact_scorer_contract"]
+    effective_timeouts = krea_scorer_extension_policy.effective_timeouts(
+        contract["timeouts_s"], fixture_role
+    )
     python_environment = local_evaluator._python_environment(python_path)
     driver_environment = {
         key: python_environment[key]
@@ -923,7 +981,10 @@ def build_stage1_evaluator_config(
         "startup_timeout_s": contract["timeouts_s"]["startup"],
         "evaluation_timeout_s": contract["timeouts_s"]["evaluation"],
         "shutdown_timeout_s": contract["timeouts_s"]["shutdown"],
+        "scorer_extension_policy": krea_scorer_extension_policy.POLICY,
+        "scorer_timeout_profile": fixture_role,
     }
+    config["evaluation_timeout_s"] = effective_timeouts["evaluation"]
     normalized = batch._validate_evaluator(config)
     batch._validate_stage1_exact_scorer(normalized)
     return normalized
@@ -943,6 +1004,14 @@ def _add_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--frozen-discovery-decision", type=Path)
     parser.add_argument("--candidate-family")
+    parser.add_argument(
+        "--historical-training-validator-root",
+        type=Path,
+        help=(
+            "exact clean 58822b4 worktree used only to validate training "
+            "evidence; scorer code remains current"
+        ),
+    )
 
 
 def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -967,6 +1036,7 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     evaluator.add_argument("--god-root", required=True, type=Path)
     evaluator.add_argument("--python", required=True, type=Path)
     evaluator.add_argument("--cache-provenance-sha256", required=True)
+    evaluator.add_argument("--fixture-role", required=True, choices=("D1", "D2"))
     evaluator.add_argument("--output", required=True, type=Path)
     assets = commands.add_parser("stage-stage1-assets")
     assets.add_argument("--comfy-root", required=True, type=Path)
@@ -988,6 +1058,7 @@ def _build_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str
         campaign_output_path=output / "campaign.json",
         frozen_discovery_decision=args.frozen_discovery_decision,
         candidate_family=args.candidate_family,
+        historical_training_validator_root=args.historical_training_validator_root,
     )
 
 
@@ -1009,6 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             god_root=args.god_root,
             python_path=args.python,
             cache_provenance_sha256=args.cache_provenance_sha256,
+            fixture_role=args.fixture_role,
         )
         _canonical_file(args.output, evaluator)
         result = {
