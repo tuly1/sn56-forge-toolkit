@@ -1024,7 +1024,7 @@ def _add_build_arguments(parser: argparse.ArgumentParser) -> None:
         "--historical-training-validator-root",
         type=Path,
         help=(
-            "exact clean fc70e616 worktree used only to validate training "
+            "exact clean daf9a252 worktree used only to validate training "
             "evidence; scorer code remains current"
         ),
     )

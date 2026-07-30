@@ -66,7 +66,7 @@ _SCORER_SUPPORT_MODULE_SHA256 = {
         "597e5047e419a5007e5dd7e9c80c3d771ac21995028899edaac38ba47bf02722"
     ),
     "krea_historical_training_evidence.py": (
-        "090ab7dd06a6738ac00089a0f818de8366a14b2fead76ef32d85154fa7c32d23"
+        "76c365c82de409385e7e277592aa891f3c41ab4aef39e5cb7bb1a1be30a38563"
     ),
     "krea_scorer_extension_policy.py": (
         "b0c033025dc35f0cdc3e348234507c24f17ac636f522eaff3a392cd3e74a062b"
@@ -2465,7 +2465,7 @@ def _plan_authority_modules(plan: dict[str, Any]) -> dict[str, Any]:
     """Resolve the authority graph that emitted a schema-2 campaign.
 
     The scorer may evolve without forcing already-admitted training evidence to
-    be rewritten.  When the campaign explicitly binds the one admitted fc70e616
+    be rewritten.  When the campaign explicitly binds the one admitted daf9a252
     validator, every authority-sensitive read must use that isolated graph.
     """
 
