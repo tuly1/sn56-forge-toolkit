@@ -63,13 +63,13 @@ _FORBIDDEN_OUTPUT = "forge_holdout_scores.json"
 _COMFY_LORA_PLACEHOLDER = "put_loras_here"
 _SCORER_SUPPORT_MODULE_SHA256 = {
     "krea_execution_surface_policy.py": (
-        "6d3b2098893d31dd109a497d138f7360831174829a767f8a013b53f98fadc130"
+        "597e5047e419a5007e5dd7e9c80c3d771ac21995028899edaac38ba47bf02722"
     ),
     "krea_historical_training_evidence.py": (
         "717a1448eafcbc832e9dacf978181fc7a337de3fbc29eda6721c111cc767e0a2"
     ),
     "krea_scorer_extension_policy.py": (
-        "66113901140c8c61a42607b13b2f2e3d8fc5554865ad75eccef04bce935502a4"
+        "b0c033025dc35f0cdc3e348234507c24f17ac636f522eaff3a392cd3e74a062b"
     ),
 }
 _FIXTURE_KIND = "forge-krea-fixture-split"
@@ -2335,15 +2335,83 @@ def _stage1_exact_scorer_readiness(evaluator: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "exact scorer critical package versions differ from owner contract"
         )
-    cuda_probe = (
-        "import json,torch;"
-        "x=torch.randn(1,4,4,32,32,device='cuda',dtype=torch.bfloat16);"
-        "layer=torch.nn.Conv3d(4,8,3,padding=1,device='cuda',dtype=torch.bfloat16);"
-        "result=layer(x);torch.cuda.synchronize();"
-        "print(json.dumps({'torch':torch.__version__,'torch_cuda':torch.version.cuda,"
-        "'cudnn_version':torch.backends.cudnn.version(),"
-        "'bf16_conv3d':tuple(result.shape)==(1,8,4,32,32)},sort_keys=True))"
+    cuda_probe = """
+import base64
+import csv
+import hashlib
+import importlib.metadata
+import io
+import json
+
+import torch
+
+
+def active_owner(cu12_name, cu13_name, relative_path):
+    distributions = [
+        importlib.metadata.distribution(cu12_name),
+        importlib.metadata.distribution(cu13_name),
+    ]
+    path = distributions[0].locate_file(relative_path)
+    actual = hashlib.sha256(path.read_bytes()).digest()
+    matches = []
+    for distribution in distributions:
+        records = {
+            row[0]: row[1]
+            for row in csv.reader(io.StringIO(distribution.read_text("RECORD")))
+        }
+        encoded = records.get(relative_path, "")
+        if not encoded.startswith("sha256="):
+            raise RuntimeError(f"missing wheel RECORD hash: {relative_path}")
+        digest = encoded.split("=", 1)[1]
+        expected = base64.urlsafe_b64decode(digest + "=" * (-len(digest) % 4))
+        if actual == expected:
+            matches.append(
+                f"{distribution.metadata['Name']}=={distribution.version}"
+            )
+    if len(matches) != 1:
+        raise RuntimeError(f"ambiguous CUDA namespace owner: {relative_path}")
+    return matches[0]
+
+
+owners = {
+    "cudnn": active_owner(
+        "nvidia-cudnn-cu12",
+        "nvidia-cudnn-cu13",
+        "nvidia/cudnn/lib/libcudnn.so.9",
+    ),
+    "cusparselt": active_owner(
+        "nvidia-cusparselt-cu12",
+        "nvidia-cusparselt-cu13",
+        "nvidia/cusparselt/lib/libcusparseLt.so.0",
+    ),
+    "nccl": active_owner(
+        "nvidia-nccl-cu12",
+        "nvidia-nccl-cu13",
+        "nvidia/nccl/lib/libnccl.so.2",
+    ),
+    "nvshmem": active_owner(
+        "nvidia-nvshmem-cu12",
+        "nvidia-nvshmem-cu13",
+        "nvidia/nvshmem/lib/libnvshmem_host.so.3",
+    ),
+}
+x = torch.randn(1, 4, 4, 32, 32, device="cuda", dtype=torch.bfloat16)
+layer = torch.nn.Conv3d(4, 8, 3, padding=1, device="cuda", dtype=torch.bfloat16)
+result = layer(x)
+torch.cuda.synchronize()
+print(
+    json.dumps(
+        {
+            "torch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "cudnn_version": torch.backends.cudnn.version(),
+            "bf16_conv3d": tuple(result.shape) == (1, 8, 4, 32, 32),
+            "overlapping_namespace_owners": owners,
+        },
+        sort_keys=True,
     )
+)
+""".strip()
     try:
         cuda_runtime = json.loads(
             subprocess.check_output(
@@ -2351,7 +2419,7 @@ def _stage1_exact_scorer_readiness(evaluator: dict[str, Any]) -> dict[str, Any]:
                 env=local_evaluator._inspection_environment(),
                 stderr=subprocess.STDOUT,
                 text=True,
-                timeout=30,
+                timeout=60,
             )
         )
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:

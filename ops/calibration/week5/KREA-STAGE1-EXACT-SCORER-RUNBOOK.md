@@ -26,14 +26,17 @@ uv pip install --python "$PY" --no-deps \
   --index-strategy unsafe-best-match \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
   -r "$LOCK"
-# The lock intentionally contains CUDA-12 and CUDA-13 support distributions,
-# and both cuDNN wheels own the same ``nvidia/cudnn`` paths.  Reinstall the
-# torch-cu128-compatible wheel last so concurrent installer extraction order
-# cannot choose the CUDA-13 payload nondeterministically.
+# The lock intentionally contains CUDA-12 and CUDA-13 support distributions.
+# Four wheel pairs own the same runtime paths.  Reinstall every torch-cu128
+# namespace owner last so concurrent installer extraction order cannot choose
+# any CUDA-13 payload nondeterministically.
 uv pip install --python "$PY" --no-deps --reinstall \
   --index-strategy unsafe-best-match \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
-  nvidia-cudnn-cu12==9.10.2.21
+  nvidia-cudnn-cu12==9.10.2.21 \
+  nvidia-cusparselt-cu12==0.7.1 \
+  nvidia-nccl-cu12==2.27.5 \
+  nvidia-nvshmem-cu12==3.3.20
 uv pip check --python "$PY"
 
 "$PY" -I - <<'PY'

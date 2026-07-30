@@ -147,6 +147,12 @@ _BODY = {
                 "torch_cuda": "12.8",
                 "cudnn_version": 91002,
                 "bf16_conv3d": True,
+                "overlapping_namespace_owners": {
+                    "cudnn": "nvidia-cudnn-cu12==9.10.2.21",
+                    "cusparselt": "nvidia-cusparselt-cu12==0.7.1",
+                    "nccl": "nvidia-nccl-cu12==2.27.5",
+                    "nvshmem": "nvidia-nvshmem-cu12==3.3.20",
+                },
             },
             "install_order": [
                 "comfyui_requirements",
@@ -154,7 +160,7 @@ _BODY = {
                 "tooling_requirements",
                 "diffusers_and_huggingface_hub",
                 "god_validator_requirements",
-                "force_nvidia_cudnn_cu12_9_10_2_21_last",
+                "force_all_overlapping_cuda12_namespace_wheels_last",
             ],
         },
         "timeouts_s": {
