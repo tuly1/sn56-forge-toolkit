@@ -304,6 +304,32 @@ def _agent_actor(
     return krea_fixture._agent_actor(actor, "agent actor")
 
 
+def _admission_implementation_actor(
+    amendment: Mapping[str, Any], *, role: str
+) -> dict[str, str]:
+    """Derive a producer from the implementation the owner actually ratified.
+
+    Successor validation must not relabel immutable manifests or envelopes with
+    the live module hash.  The canonical actor is therefore derived from the
+    admission tool SHA stored in the fully validated amendment, whether that
+    amendment names the current implementation or the hash-proven 588 ancestor.
+    """
+
+    implementation = _object(
+        amendment.get("implementation"), "governance implementation binding"
+    )
+    source_sha256 = _digest(
+        implementation.get("admission_tool_file_sha256"),
+        "bound admission tool file SHA-256",
+    )
+    return _agent_actor(
+        actor_id="codex-fixture-admission-implementer",
+        display_name="Codex (fixture admission implementation agent)",
+        role=role,
+        source_file_sha256=source_sha256,
+    )
+
+
 def load_sealed_custodian_actor(
     path: Path, *, parent_independent_actor: dict[str, Any]
 ) -> tuple[dict[str, str], str]:
@@ -2310,11 +2336,8 @@ def build_agent_governed_manifest(
     independent = resolved["independent_review"]
     surface_actor = surface["actor"]
     independent_actor = independent["actor"]
-    preparer_actor = _agent_actor(
-        actor_id="codex-fixture-admission-implementer",
-        display_name="Codex (fixture admission implementation agent)",
-        role="fixture_implementer",
-        source_file_sha256=_file_sha256(Path(__file__).resolve(strict=True)),
+    preparer_actor = _admission_implementation_actor(
+        resolved["amendment"], role="fixture_implementer"
     )
     materialization, _ = _json(
         inputs["root"]
@@ -3745,11 +3768,8 @@ def finalize_discovery_envelope(
             }
             fixtures[role] = fixture
         files = _inventory(temporary)
-        admission_producer = _agent_actor(
-            actor_id="codex-fixture-admission-implementer",
-            display_name="Codex (fixture admission implementation agent)",
-            role="admission_envelope_producer",
-            source_file_sha256=_file_sha256(Path(__file__)),
+        admission_producer = _admission_implementation_actor(
+            resolved["amendment"], role="admission_envelope_producer"
         )
         body = {
             "schema": 1,
@@ -3983,14 +4003,6 @@ def validate_envelope(root_or_path: Path) -> dict[str, Any]:
     admission_producer = krea_fixture._agent_actor(
         envelope["admission_producer_actor"], "admission producer actor"
     )
-    expected_admission_producer = _agent_actor(
-        actor_id="codex-fixture-admission-implementer",
-        display_name="Codex (fixture admission implementation agent)",
-        role="admission_envelope_producer",
-        source_file_sha256=_file_sha256(Path(__file__)),
-    )
-    if admission_producer != expected_admission_producer:
-        raise ValueError("admission producer differs from the bound implementation")
     krea_fixture.named_human(
         envelope["accountable_owner_identity"], "accountable owner identity"
     )
@@ -4002,6 +4014,11 @@ def validate_envelope(root_or_path: Path) -> dict[str, Any]:
             "confirmation/blinded-acceptance.json",
         },
     )
+    expected_admission_producer = _admission_implementation_actor(
+        materialized["amendment"], role="admission_envelope_producer"
+    )
+    if admission_producer != expected_admission_producer:
+        raise ValueError("admission producer differs from the bound implementation")
     expected_live_paths = _expected_materialized_paths(root / "fixture-package-v2") | {
         "input-bundle.json",
         "confirmation/blinded-acceptance.json",
