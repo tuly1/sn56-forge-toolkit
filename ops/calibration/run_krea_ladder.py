@@ -323,9 +323,16 @@ def _preimport_executable_identity(path: Path) -> dict[str, Any]:
     requested_stat = requested.lstat()
     resolved = requested.resolve(strict=True)
     resolved_stat = resolved.stat()
+    requested_is_symlink = stat.S_ISLNK(requested_stat.st_mode)
     if (
         requested_stat.st_uid != 0
-        or requested_stat.st_mode & 0o022
+        # Linux does not consult symlink permission bits and normally reports
+        # them as 0777.  Bootstrap already accepts a root-owned /usr symlink
+        # whose resolved executable is independently pinned below; applying
+        # the regular-file write-bit rule to the link itself makes the two
+        # trust checks contradictory on stock Ubuntu (/usr/bin/python3).
+        or (not requested_is_symlink and requested_stat.st_mode & 0o022)
+        or not (requested_is_symlink or stat.S_ISREG(requested_stat.st_mode))
         or not stat.S_ISREG(resolved_stat.st_mode)
         or resolved_stat.st_uid != 0
         or resolved_stat.st_mode & 0o022

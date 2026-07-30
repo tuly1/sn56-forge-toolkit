@@ -365,9 +365,7 @@ def test_trusted_root_owned_system_symlink_ignores_symlink_mode_bits(monkeypatch
     symlink_stat = type(
         "SymlinkStat", (), {"st_uid": 0, "st_mode": stat.S_IFLNK | 0o777}
     )()
-    file_stat = type(
-        "FileStat", (), {"st_uid": 0, "st_mode": stat.S_IFREG | 0o755}
-    )()
+    file_stat = type("FileStat", (), {"st_uid": 0, "st_mode": stat.S_IFREG | 0o755})()
     directory_stat = type(
         "DirectoryStat", (), {"st_uid": 0, "st_mode": stat.S_IFDIR | 0o755}
     )()
@@ -392,6 +390,34 @@ def test_trusted_root_owned_system_symlink_ignores_symlink_mode_bits(monkeypatch
 
     assert path == str(requested)
     assert identity["resolved_path"] == str(resolved)
+
+
+def test_stage1_preimport_accepts_same_root_owned_system_symlink(monkeypatch):
+    requested = Path("/usr/bin/python3")
+    resolved = Path("/usr/bin/python3.10")
+    symlink_stat = type(
+        "SymlinkStat", (), {"st_uid": 0, "st_mode": stat.S_IFLNK | 0o777}
+    )()
+    file_stat = type("FileStat", (), {"st_uid": 0, "st_mode": stat.S_IFREG | 0o755})()
+    monkeypatch.setattr(runner.Path, "lstat", lambda path: symlink_stat)
+    monkeypatch.setattr(
+        runner.Path,
+        "resolve",
+        lambda path, strict=True: resolved if path == requested else path,
+    )
+    monkeypatch.setattr(runner.Path, "stat", lambda path: file_stat)
+    monkeypatch.setattr(runner.os, "access", lambda *_args: True)
+    monkeypatch.setattr(runner, "_sha256_file", lambda _path: "a" * 64)
+
+    identity = runner._preimport_executable_identity(requested)
+
+    assert identity == {
+        "requested_path": str(requested),
+        "resolved_path": str(resolved),
+        "sha256": "a" * 64,
+        "mode": 0o755,
+        "uid": 0,
+    }
 
 
 def test_preimport_venv_drift_rejects_before_any_child_exec(tmp_path, monkeypatch):
