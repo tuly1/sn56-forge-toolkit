@@ -26,6 +26,7 @@ try:
     from . import krea_c1c4_amendment
     from . import krea_delegated_review_contract
     from . import krea_fixture
+    from . import krea_profile_index
     from . import krea_provenance
     from . import krea_discovery_authorization
 except ImportError:  # pragma: no cover - direct script execution.
@@ -33,6 +34,7 @@ except ImportError:  # pragma: no cover - direct script execution.
     import krea_c1c4_amendment  # type: ignore[no-redef]
     import krea_delegated_review_contract  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
+    import krea_profile_index  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_discovery_authorization  # type: ignore[no-redef]
 
@@ -170,6 +172,28 @@ _BOUNDARY_FIXTURE_COUNTS = {
     "small": (18, 24, 24),
     "large": (36, 48, 40),
 }
+_CAMPAIGN_RUNTIME_IDENTITY_FIELDS = (
+    "micro_batch_size",
+    "gradient_accumulation_steps",
+    "data_parallel_replicas",
+    "resolution_policy_sha256",
+    "precision_policy_sha256",
+    "cache_latents_to_disk",
+    "cache_text_embeddings",
+    "compile_enabled",
+    "jit_enabled",
+    "dataloader_workers",
+    "base_model_identity_sha256",
+    "runtime_identity_sha256",
+    "host_execution_identity_sha256",
+    "execution_surface",
+    "execution_scope",
+    "venv_tree_manifest_sha256",
+    "reference_container_image_sha256",
+    "gpu_identity_sha256",
+    "trainer_identity_sha256",
+    "measurement_tool_sha256",
+)
 _LOSS_KEYS = frozenset({"text_guided_loss", "blank_prompt_loss"})
 _OUTPUT_NAME = re.compile(
     r"krea-(?:discovery|confirmation)-decision(?:-[A-Za-z0-9_.-]+)?\.json"
@@ -669,9 +693,27 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arms, list) or not arms:
         raise ValueError("discovery plan arms are absent")
     arm_ids = []
+    arm_classes: dict[str, str] = {}
     for raw in arms:
         arm = _object(raw, "discovery arm")
-        arm_ids.append(_identifier(arm.get("id"), "discovery arm id"))
+        arm_id = _identifier(arm.get("id"), "discovery arm id")
+        arm_ids.append(arm_id)
+        arm_classes[arm_id] = _identifier(
+            arm.get("throughput_equivalence_class"),
+            f"discovery arm {arm_id} throughput class",
+        )
+        if any(
+            arm.get(key) is not None
+            for key in (
+                "throughput_profile_sha256",
+                "fixture_manifest_sha256",
+                "fixture_approval_sha256",
+            )
+        ):
+            raise ValueError(
+                f"discovery arm {arm_id} rewrites a legacy flat hash; "
+                "post-timing identities belong only in the profile index"
+            )
     if arm_ids != sorted(set(arm_ids)):
         raise ValueError("discovery arms must be unique and sorted")
     if _CONTROL_FAMILY not in arm_ids or not set(_PUBLIC_FAMILIES).issubset(arm_ids):
@@ -689,6 +731,10 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 f"throughput profile {name} must remain the deferred index sentinel"
             )
+    if set(arm_classes.values()) != set(profiles):
+        raise ValueError(
+            "discovery arm classes differ from the deferred profile-index classes"
+        )
     profile_index_contract = _object(
         _object(value["budget_contract"], "budget_contract").get(
             "profile_index_contract"
@@ -868,6 +914,7 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
     return {
         "document": value,
         "arm_ids": arm_ids,
+        "arm_classes": arm_classes,
         "seed_a": seed_a,
         "seed_b": seed_b,
         "report_targets": [Decimal(str(item)) for item in report_targets],
@@ -1092,6 +1139,189 @@ def _bound_plan_and_seal(
     return plan_state, plan, seal
 
 
+def _bound_discovery_profile_index(
+    policy: Mapping[str, Any], *, plan_state: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Load the post-timing six-cell index without rewriting the freeze.
+
+    The discovery freeze intentionally remains blocked and carries only null
+    legacy arm hashes plus deferred profile sentinels.  Executable fixture,
+    approval, throughput-class, and host identities therefore come exclusively
+    from this separately sealed, non-authorizing index.
+    """
+
+    index_path, index, index_file_sha = krea_profile_index.load_binding(
+        policy["discovery_profile_index"]
+    )
+    plan_path = _safe_file(policy["discovery_plan"]["path"], "discovery plan")
+    authorization_path, authorization, authorization_file_sha = _binding(
+        policy["discovery_execution_authorization"],
+        "discovery execution authorization",
+    )
+    indexed_plan = _object(index["discovery_plan"], "indexed discovery plan")
+    indexed_authorization = _object(
+        index["discovery_execution_authorization"],
+        "indexed discovery execution authorization",
+    )
+    if (
+        str(plan_path) != indexed_plan.get("path")
+        or policy["discovery_plan"]["sha256"]
+        != indexed_plan.get("file_sha256")
+        or str(authorization_path) != indexed_authorization.get("path")
+        or authorization_file_sha != indexed_authorization.get("file_sha256")
+        or authorization.get("authorization_sha256")
+        != indexed_authorization.get("authorization_sha256")
+    ):
+        raise ValueError(
+            "discovery policy, authorization, and profile index bind different freezes"
+        )
+    expected_classes = sorted(set(plan_state["arm_classes"].values()))
+    if (
+        index.get("throughput_equivalence_classes") != expected_classes
+        or index.get("required_profile_count") != 6
+        or index.get("cross_fixture_profile_reuse_forbidden") is not True
+        or index.get("gpu_execution_authorized") is not False
+    ):
+        raise ValueError("discovery profile index weakens the frozen six-cell contract")
+    return {
+        "document": index,
+        "path": index_path,
+        "file_sha256": index_file_sha,
+        "index_sha256": index["index_sha256"],
+    }
+
+
+def _validate_indexed_discovery_batches(
+    batches: Sequence[Mapping[str, Any]], *, index: Mapping[str, Any]
+) -> None:
+    fixtures = _object(index["fixtures"], "indexed discovery fixtures")
+    for row in batches:
+        fixture_id = row["fixture_id"]
+        slot = _object(fixtures[fixture_id], f"indexed fixture {fixture_id}")
+        manifest = _object(slot["manifest"], f"indexed {fixture_id} manifest")
+        approval = _object(slot["approval"], f"indexed {fixture_id} approval")
+        if (
+            row["fixture_manifest_sha256"] != manifest["file_sha256"]
+            or row["fixture_approval_sha256"] != approval["file_sha256"]
+        ):
+            raise ValueError(
+                f"discovery batch {row['batch_id']} escaped its indexed exact "
+                "fixture approval"
+            )
+
+
+def _indexed_profile_document(
+    index: Mapping[str, Any], *, fixture_id: str, class_name: str
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    fixture = _object(index["fixtures"][fixture_id], f"indexed fixture {fixture_id}")
+    slot = _object(
+        _object(fixture["profiles"], f"indexed {fixture_id} profiles")[class_name],
+        f"indexed profile {fixture_id}/{class_name}",
+    )
+    document, file_sha = _load_canonical(
+        slot["path"], f"indexed profile {fixture_id}/{class_name}"
+    )
+    envelope = _object(
+        document.get("execution_envelope"),
+        f"indexed profile {fixture_id}/{class_name} execution envelope",
+    )
+    if (
+        file_sha != slot["file_sha256"]
+        or document.get("profile_sha256") != slot["profile_sha256"]
+        or envelope.get("execution_envelope_sha256")
+        != slot["execution_envelope_sha256"]
+    ):
+        raise ValueError(f"indexed profile {fixture_id}/{class_name} bytes drifted")
+    return envelope, slot
+
+
+def _validate_indexed_discovery_aggregate(
+    aggregate: Mapping[str, Any],
+    *,
+    fixture_id: str,
+    plan_state: Mapping[str, Any],
+    profile_index: Mapping[str, Any],
+) -> None:
+    """Prove every discovery run occupies its admitted fixture/class/host cell."""
+
+    index = profile_index["document"]
+    fixture = _object(index["fixtures"][fixture_id], f"indexed fixture {fixture_id}")
+    manifest = _object(fixture["manifest"], f"indexed {fixture_id} manifest")
+    approval = _object(fixture["approval"], f"indexed {fixture_id} approval")
+    adapter = aggregate["fixture"]
+    if (
+        aggregate["fixture_manifest_sha256"] != manifest["file_sha256"]
+        or adapter["manifest_sha256"] != manifest["manifest_sha256"]
+        or adapter["file_sha256"] != manifest["file_sha256"]
+        or aggregate["fixture_approval_sha256"] != approval["file_sha256"]
+        or aggregate["fixture_contract"]["training_pair_count"]
+        != fixture["training_pair_count"]
+    ):
+        raise ValueError(
+            f"discovery aggregate {fixture_id} escaped its indexed admitted fixture"
+        )
+
+    runs = {row["arm_id"]: row for row in aggregate["campaign"]["runs"]}
+    raw_envelopes = aggregate["training_run_envelopes"]
+    if not isinstance(raw_envelopes, list):
+        raise ValueError("discovery training-run envelopes must be a list")
+    envelopes: dict[str, Mapping[str, Any]] = {}
+    observed_runtime_identities: set[str] = set()
+    for raw in raw_envelopes:
+        row = _object(raw, "indexed discovery training-run envelope")
+        _exact(
+            row,
+            {
+                "arm_id",
+                "execution_plan_sha256",
+                "execution_envelope",
+                "throughput_profile_sha256",
+                "budget_plan",
+                "budget_plan_sha256",
+                "schedule",
+            },
+            "indexed discovery training-run envelope",
+        )
+        arm_id = _identifier(row["arm_id"], "indexed discovery envelope arm")
+        if arm_id in envelopes or arm_id not in runs:
+            raise ValueError("indexed discovery envelopes are duplicate or unexpected")
+        if row["execution_plan_sha256"] != runs[arm_id]["execution_plan_sha256"]:
+            raise ValueError("indexed discovery envelope binds another execution plan")
+        class_name = plan_state["arm_classes"][arm_id]
+        indexed_envelope, profile_slot = _indexed_profile_document(
+            index, fixture_id=fixture_id, class_name=class_name
+        )
+        measured_envelope = _object(
+            row["execution_envelope"], "discovery measured execution envelope"
+        )
+        runtime_identity = {
+            key: measured_envelope.get(key)
+            for key in _CAMPAIGN_RUNTIME_IDENTITY_FIELDS
+        }
+        runtime_identity_sha = krea_provenance.canonical_sha256(runtime_identity)
+        if (
+            measured_envelope != indexed_envelope
+            or measured_envelope.get("equivalence_class") != class_name
+            or row["throughput_profile_sha256"]
+            != profile_slot["profile_sha256"]
+            or runtime_identity_sha
+            != profile_slot["campaign_runtime_identity_sha256"]
+        ):
+            raise ValueError(
+                f"discovery run {arm_id} escaped indexed {fixture_id}/{class_name}"
+            )
+        observed_runtime_identities.add(runtime_identity_sha)
+        envelopes[arm_id] = row
+    if set(envelopes) != set(runs):
+        raise ValueError("indexed discovery envelopes do not cover every arm")
+    if observed_runtime_identities != {
+        index["campaign_runtime_identity_sha256"]
+    }:
+        raise ValueError(
+            "discovery aggregates do not share the indexed one-host runtime"
+        )
+
+
 def _validate_score_batch(value: Any, *, confirmation: bool) -> dict[str, Any]:
     row = _object(value, "score batch")
     base_keys = {
@@ -1169,6 +1399,7 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "prepared_by",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "score_batches",
             "bootstrap",
@@ -1183,6 +1414,7 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("unsupported discovery decision policy")
     prepared_by = _named_human(payload["prepared_by"], "policy preparer")
     plan_state, _, seal = _bound_plan_and_seal(payload)
+    profile_index = _bound_discovery_profile_index(payload, plan_state=plan_state)
     _, authorization, _ = _binding(
         payload["discovery_execution_authorization"],
         "discovery execution authorization",
@@ -1224,6 +1456,9 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("discovery batch fixture must be D1 or D2")
         if row["hours"] is not None or row["dataset_boundary"] is not None:
             raise ValueError("discovery batch must not masquerade as a boundary cell")
+    _validate_indexed_discovery_batches(
+        batches, index=profile_index["document"]
+    )
     return {
         "schema": 2,
         "kind": "forge-krea-discovery-decision-policy",
@@ -1233,6 +1468,7 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "discovery_execution_authorization": dict(
             payload["discovery_execution_authorization"]
         ),
+        "discovery_profile_index": dict(payload["discovery_profile_index"]),
         "confirmation_fixture_seal": dict(payload["confirmation_fixture_seal"]),
         "score_batches": batches,
         "bootstrap": bootstrap,
@@ -1254,6 +1490,7 @@ def _validate_agent_discovery_policy_payload(
             "fixture_admission_envelope",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "score_batches",
             "bootstrap",
@@ -1274,6 +1511,7 @@ def _validate_agent_discovery_policy_payload(
         delegated_actor_name="discovery_decision_policy_preparer",
     )
     plan_state, plan, seal = _bound_plan_and_seal(payload)
+    profile_index = _bound_discovery_profile_index(payload, plan_state=plan_state)
     if (
         context["authorization"]["discovery_plan"]["file_sha256"]
         != payload["discovery_plan"]["sha256"]
@@ -1331,6 +1569,9 @@ def _validate_agent_discovery_policy_payload(
             raise ValueError("discovery batch fixture must be D1 or D2")
         if row["hours"] is not None or row["dataset_boundary"] is not None:
             raise ValueError("discovery batch must not masquerade as a boundary cell")
+    _validate_indexed_discovery_batches(
+        batches, index=profile_index["document"]
+    )
     return {
         "schema": 3,
         "kind": "forge-krea-agent-discovery-decision-policy",
@@ -1345,6 +1586,7 @@ def _validate_agent_discovery_policy_payload(
         "discovery_execution_authorization": dict(
             payload["discovery_execution_authorization"]
         ),
+        "discovery_profile_index": dict(payload["discovery_profile_index"]),
         "confirmation_fixture_seal": dict(payload["confirmation_fixture_seal"]),
         "score_batches": batches,
         "bootstrap": bootstrap,
@@ -1379,6 +1621,7 @@ def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
             "fixture_admission_envelope",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "score_batches",
             "bootstrap",
@@ -1394,6 +1637,7 @@ def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
             "prepared_by",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "score_batches",
             "bootstrap",
@@ -1422,6 +1666,7 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
             "prepared_by",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "discovery_decision",
             "candidate_family_id",
@@ -1440,6 +1685,7 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
         raise ValueError("unsupported confirmation decision policy")
     prepared_by = _named_human(payload["prepared_by"], "policy preparer")
     plan_state, _, seal = _bound_plan_and_seal(payload)
+    profile_index = _bound_discovery_profile_index(payload, plan_state=plan_state)
     if seal.get("schema") == 1 and prepared_by == seal["reviewer_identity"]:
         raise ValueError("fixture sealer must be independent from policy preparer")
     _, discovery, _ = _binding(payload["discovery_decision"], "discovery decision")
@@ -1448,6 +1694,10 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
         discovery["outcome"] != "finalists_frozen"
         or discovery["discovery_plan_file_sha256"]
         != payload["discovery_plan"]["sha256"]
+        or discovery["discovery_profile_index_sha256"]
+        != profile_index["index_sha256"]
+        or discovery["discovery_profile_index_file_sha256"]
+        != profile_index["file_sha256"]
         or discovery["confirmation_fixture_seal_sha256"] != seal["seal_sha256"]
     ):
         raise ValueError("confirmation policy lacks a matching frozen discovery")
@@ -1538,6 +1788,7 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
         "discovery_execution_authorization": dict(
             payload["discovery_execution_authorization"]
         ),
+        "discovery_profile_index": dict(payload["discovery_profile_index"]),
         "confirmation_fixture_seal": dict(payload["confirmation_fixture_seal"]),
         "discovery_decision": dict(payload["discovery_decision"]),
         "candidate_family_id": candidate_family_id,
@@ -1569,6 +1820,7 @@ def validate_confirmation_policy(value: dict[str, Any]) -> dict[str, Any]:
         "prepared_by",
         "discovery_plan",
         "discovery_execution_authorization",
+        "discovery_profile_index",
         "confirmation_fixture_seal",
         "discovery_decision",
         "candidate_family_id",
@@ -1639,6 +1891,7 @@ def build_approval(
             "discovery_execution_authorization": dict(
                 policy["discovery_execution_authorization"]
             ),
+            "discovery_profile_index": dict(policy["discovery_profile_index"]),
             "delegated_review_contract": krea_delegated_review_contract.binding(),
             "agent_review_is_not_human_review": True,
             "approved_at_utc": _timestamp(approved_at_utc, "approved_at_utc"),
@@ -1748,6 +2001,7 @@ def _validate_agent_discovery_approval(
             "owner_ratification_sha256",
             "fixture_admission_envelope",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "delegated_review_contract",
             "agent_review_is_not_human_review",
             "approved_at_utc",
@@ -1765,6 +2019,7 @@ def _validate_agent_discovery_approval(
         or value["decision"] != "approved"
         or value["discovery_execution_authorization"]
         != policy["discovery_execution_authorization"]
+        or value["discovery_profile_index"] != policy["discovery_profile_index"]
         or value["approval_sha256"] != krea_provenance.canonical_sha256(body)
     ):
         raise ValueError("agent decision approval does not bind this policy")
@@ -2052,6 +2307,8 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
         "policy_approval_sha256",
         "policy_approval_file_sha256",
         "discovery_plan_file_sha256",
+        "discovery_profile_index_sha256",
+        "discovery_profile_index_file_sha256",
         "confirmation_fixture_seal_sha256",
         "aggregate_bindings",
         "bootstrap",
@@ -2111,6 +2368,8 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
         "policy_approval_sha256",
         "policy_approval_file_sha256",
         "discovery_plan_file_sha256",
+        "discovery_profile_index_sha256",
+        "discovery_profile_index_file_sha256",
         "confirmation_fixture_seal_sha256",
     ):
         _digest(value[key], key)
@@ -2819,6 +3078,16 @@ def _validate_score_plan_evidence(
         raise ValueError("decision-evidence score plan identity is invalid")
     if krea_provenance.canonical_sha256(plan) != aggregate["plan_canonical_sha256"]:
         raise ValueError("decision-evidence score plan differs from the aggregate")
+    for binding_name, aggregate_key in (
+        ("fixture_manifest", "fixture_manifest_sha256"),
+        ("fixture_approval", "fixture_approval_sha256"),
+    ):
+        bound = _object(plan[binding_name], f"score plan {binding_name}")
+        _exact(bound, {"path", "sha256"}, f"score plan {binding_name}")
+        if bound["sha256"] != aggregate[aggregate_key]:
+            raise ValueError(
+                f"decision-evidence {binding_name} differs from the aggregate"
+            )
 
     sealed = _object(plan["sealed_plan_approval"], "plan approval binding")
     _exact(sealed, {"path", "sha256"}, "plan approval binding")
@@ -3371,6 +3640,11 @@ def _match_aggregates(
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     plan_state, _, seal = _bound_plan_and_seal(policy)
     confirmation_policy = policy["phase"] == "confirmation"
+    profile_index = (
+        None
+        if confirmation_policy
+        else _bound_discovery_profile_index(policy, plan_state=plan_state)
+    )
     discovery: dict[str, Any] | None = None
     if confirmation_policy:
         _, discovery, _ = _binding(policy["discovery_decision"], "discovery decision")
@@ -3406,6 +3680,14 @@ def _match_aggregates(
         fixture_adapter = aggregate["fixture"]
         if fixture_adapter["experimental_role"] != expected["fixture_id"]:
             raise ValueError("aggregate fixture role differs from the decision batch")
+        if not confirmation_policy:
+            assert profile_index is not None
+            _validate_indexed_discovery_aggregate(
+                aggregate,
+                fixture_id=expected["fixture_id"],
+                plan_state=plan_state,
+                profile_index=profile_index,
+            )
         campaign_arms = [row["arm_id"] for row in campaign["runs"]]
         if not confirmation_policy:
             expected_arms = list(plan_state["arm_ids"])
@@ -3492,11 +3774,12 @@ def _match_aggregates(
                 f"aggregate {expected['batch_id']} violates frozen fixture counts"
             )
         if fixture_id in _DISCOVERY_FIXTURES:
-            expected_identity = plan_state["document"]["discovery_tasks"][fixture_id][
-                "fixture_split_manifest_sha256"
-            ]
+            assert profile_index is not None
+            expected_identity = profile_index["document"]["fixtures"][fixture_id][
+                "manifest"
+            ]["manifest_sha256"]
             if contract["fixture_manifest_identity_sha256"] != expected_identity:
-                raise ValueError("discovery aggregate fixture identity drifted")
+                raise ValueError("discovery aggregate escaped its indexed fixture")
         elif fixture_id in _CONFIRMATION_FIXTURES:
             if (
                 contract["fixture_manifest_identity_sha256"]
@@ -3897,6 +4180,12 @@ def _base_discovery_body(
         "policy_approval_file_sha256": approval_file_sha,
         **governance,
         "discovery_plan_file_sha256": policy["discovery_plan"]["sha256"],
+        "discovery_profile_index_sha256": policy["discovery_profile_index"][
+            "index_sha256"
+        ],
+        "discovery_profile_index_file_sha256": policy["discovery_profile_index"][
+            "file_sha256"
+        ],
         "confirmation_fixture_seal_sha256": state["seal"]["seal_sha256"],
         "aggregate_bindings": aggregate_bindings,
         "bootstrap": policy["bootstrap"],
@@ -4247,6 +4536,8 @@ def _validate_confirmation_record(value: dict[str, Any]) -> dict[str, Any]:
         "policy_approval_file_sha256",
         "decision_reviewer_identity",
         "discovery_plan_file_sha256",
+        "discovery_profile_index_sha256",
+        "discovery_profile_index_file_sha256",
         "discovery_decision_sha256",
         "confirmation_fixture_seal_sha256",
         "aggregate_bindings",
@@ -4283,6 +4574,8 @@ def _validate_confirmation_record(value: dict[str, Any]) -> dict[str, Any]:
         "policy_approval_sha256",
         "policy_approval_file_sha256",
         "discovery_plan_file_sha256",
+        "discovery_profile_index_sha256",
+        "discovery_profile_index_file_sha256",
         "discovery_decision_sha256",
         "confirmation_fixture_seal_sha256",
     ):
@@ -4656,6 +4949,12 @@ def _base_confirmation_body(
         "policy_approval_file_sha256": approval_file_sha,
         "decision_reviewer_identity": approval["reviewer_identity"],
         "discovery_plan_file_sha256": policy["discovery_plan"]["sha256"],
+        "discovery_profile_index_sha256": policy["discovery_profile_index"][
+            "index_sha256"
+        ],
+        "discovery_profile_index_file_sha256": policy["discovery_profile_index"][
+            "file_sha256"
+        ],
         "discovery_decision_sha256": discovery_file_sha,
         "confirmation_fixture_seal_sha256": state["seal"]["seal_sha256"],
         "aggregate_bindings": aggregate_bindings,
