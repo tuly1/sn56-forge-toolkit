@@ -11,6 +11,7 @@ cadence derived from depth) the only scientific differences between conditions.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import ctypes
 import hashlib
@@ -133,6 +134,34 @@ def _verify_host_post_run(
     host_identity, manifest: dict[str, Any], checkpoint_root: Path
 ):
     return host_identity.verify_static(manifest, checkpoint_path=checkpoint_root)
+
+
+@contextlib.contextmanager
+def _calibration_exact_final_selection(checkpoints_module):
+    """Keep calibration selection offline without changing production policy.
+
+    The tournament trainer's raw-loss divergence guard is intentionally useful
+    in production, but it is an in-task proxy.  Calibration must retain the
+    exact natural final as ``last.safetensors`` and exact-score the complete
+    predeclared checkpoint grid afterward.  Install that stricter selector only
+    inside this calibration process and always restore the production selector.
+    """
+
+    production_select = checkpoints_module.select
+
+    def select_exact_final(valid, repo, save_root, state):
+        selection = checkpoints_module._default_selection(valid, repo, state)
+        if selection.source != "exact_final":
+            raise RuntimeError(
+                "calibration reached finalization without an exact natural final"
+            )
+        return selection
+
+    checkpoints_module.select = select_exact_final
+    try:
+        yield
+    finally:
+        checkpoints_module.select = production_select
 
 
 def _minimal_runtime_environment(
@@ -2024,20 +2053,21 @@ def main() -> int:
         aitoolkit._finalize = _timed_finalize
     launch_not_before = time.time()
     try:
-        return_code = forge_main(
-            [
-                "--task-id",
-                args.task_id,
-                "--model",
-                args.model,
-                "--model-type",
-                "krea2",
-                "--expected-repo-name",
-                args.expected_repo_name,
-                "--hours-to-complete",
-                str(args.hours),
-            ]
-        )
+        with _calibration_exact_final_selection(checkpoints):
+            return_code = forge_main(
+                [
+                    "--task-id",
+                    args.task_id,
+                    "--model",
+                    args.model,
+                    "--model-type",
+                    "krea2",
+                    "--expected-repo-name",
+                    args.expected_repo_name,
+                    "--hours-to-complete",
+                    str(args.hours),
+                ]
+            )
     finally:
         aitoolkit.build_config = original_build_config
         aitoolkit._run_toolkit = original_run_toolkit

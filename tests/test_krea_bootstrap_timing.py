@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import signal
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -835,6 +836,39 @@ def test_bootstrap_runner_derives_isolated_names_without_a_profile():
         "landmark_policy": "none",
     }
     assert first["budget_plan"] == {"hard_budget_s": "2700"}
+
+
+def test_calibration_forces_exact_final_and_restores_production_selector():
+    production_selection = SimpleNamespace(source="training_loss_divergence")
+    exact_final = SimpleNamespace(source="exact_final")
+
+    def production_select(*_args):
+        return production_selection
+
+    module = SimpleNamespace(
+        select=production_select,
+        _default_selection=lambda *_args: exact_final,
+    )
+    with pytest.raises(RuntimeError, match="forced test unwind"):
+        with run_krea_ladder._calibration_exact_final_selection(module):
+            assert module.select([], "repo", "/checkpoints", {}) is exact_final
+            raise RuntimeError("forced test unwind")
+    assert module.select is production_select
+    assert module.select([], "repo", "/checkpoints", {}) is production_selection
+
+
+def test_calibration_exact_final_selection_fails_closed_without_natural_final():
+    production_select = lambda *_args: SimpleNamespace(source="production")
+    module = SimpleNamespace(
+        select=production_select,
+        _default_selection=lambda *_args: SimpleNamespace(
+            source="highest_valid_periodic"
+        ),
+    )
+    with run_krea_ladder._calibration_exact_final_selection(module):
+        with pytest.raises(RuntimeError, match="without an exact natural final"):
+            module.select([], "repo", "/checkpoints", {})
+    assert module.select is production_select
 
 
 class _FakeScopeClient:
