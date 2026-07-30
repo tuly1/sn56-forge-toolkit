@@ -26,6 +26,11 @@ from typing import Any, Mapping, Sequence
 # lets it consume the immutable admission sealed by its 588 ancestor.  Later
 # external controller commits must not broaden or move this runtime pin.
 FC70_COMMIT = "f6ce1ad044ff2aa920f2c63074dedd9c32035922"
+_RUNNER_INITIAL_PYTHON = "/usr/bin/python3"
+_RUNNER_BOOTSTRAP = (
+    "import runpy,sys;sys.path.insert(0,'/app/forge');"
+    "runpy.run_module('ops.calibration.run_krea_ladder',run_name='__main__')"
+)
 _KIND = "forge-krea-fc70-cell-assembly-spec"
 _QUEUE_KIND = "forge-krea-fc70-sequential-cell-queue"
 _CELLS = tuple(f"{fixture}-K{arm}" for fixture in ("D1", "D2") for arm in range(6))
@@ -413,7 +418,14 @@ def assemble(
     _, technical_actor, _ = _load(technical_actor_path, "execution reviewer actor")
     output_dir = Path(os.path.abspath(os.path.expanduser(output_dir)))
     campaign_root = Path(os.path.abspath(os.path.expanduser(campaign_root)))
-    if not output_dir.is_dir() or not campaign_root.is_dir():
+    queue_output = Path(os.path.abspath(os.path.expanduser(queue_output)))
+    controls_root = admission_envelope_path.parent.parent
+    if (
+        not output_dir.is_dir()
+        or output_dir != controls_root
+        or not campaign_root.is_dir()
+        or queue_output.parent != controls_root
+    ):
         raise ValueError("output and campaign roots must already exist")
     if len(cells) != len(set(cells)) or any(cell not in _CELLS for cell in cells):
         raise ValueError("requested cells are invalid or duplicated")
@@ -424,6 +436,7 @@ def assemble(
     except ValueError as exc:
         raise ValueError("approved-at-utc must be whole-second UTC") from exc
     queue_rows = []
+    runtime_tag = FC70_COMMIT[:8]
     for cell_id in cells:
         fixture_id, arm_id = cell_id.split("-", 1)
         controls = modules["accelerated"].derive_cell_controls(
@@ -433,10 +446,10 @@ def assemble(
             fixture_id=fixture_id,
             arm_id=arm_id,
         )
-        controls_path = output_dir / f"{cell_id}.controls.fc70e616.json"
-        payload_path = output_dir / f"{cell_id}.plan.payload.fc70e616.json"
-        plan_path = output_dir / f"{cell_id}.plan.fc70e616.json"
-        approval_path = output_dir / f"{cell_id}.approval.fc70e616.json"
+        controls_path = output_dir / f"{cell_id}.controls.{runtime_tag}.json"
+        payload_path = output_dir / f"{cell_id}.plan.payload.{runtime_tag}.json"
+        plan_path = output_dir / f"{cell_id}.plan.{runtime_tag}.json"
+        approval_path = output_dir / f"{cell_id}.approval.{runtime_tag}.json"
         _publish(controls_path, controls)
         payload = _cell_payload(
             cell_id=cell_id,
@@ -470,13 +483,10 @@ def assemble(
         _publish(approval_path, approval)
         run_dir = campaign_root / cell_id
         argv = [
-            "/app/venv/bin/python",
+            _RUNNER_INITIAL_PYTHON,
             "-I",
             "-c",
-            (
-                "import runpy,sys;sys.path.insert(0,'/app/forge');"
-                "runpy.run_module('ops.calibration.run_krea_ladder',run_name='__main__')"
-            ),
+            _RUNNER_BOOTSTRAP,
             "--execution-plan",
             str(plan_path),
             "--execution-approval",
@@ -575,13 +585,10 @@ def validate_queue(path: Path) -> dict[str, Any]:
                 raise ValueError(f"queue {cell_id} {label} drifted")
         campaign_dir = Path(row["campaign_dir"])
         expected_prefix = [
-            "/app/venv/bin/python",
+            _RUNNER_INITIAL_PYTHON,
             "-I",
             "-c",
-            (
-                "import runpy,sys;sys.path.insert(0,'/app/forge');"
-                "runpy.run_module('ops.calibration.run_krea_ladder',run_name='__main__')"
-            ),
+            _RUNNER_BOOTSTRAP,
             "--execution-plan",
             row["plan"]["path"],
             "--execution-approval",

@@ -93,6 +93,13 @@ _INDEPENDENT_SOURCE_FILE_SHA256 = (
 _SUCCESSOR_ADMISSION_COMMIT = "58822b496019177a02fa6196247ac30e788331bb"
 _SUCCESSOR_ADMISSION_TREE = "ba569913ceeddab6c425efd97b3dfb39a290a9c5"
 _SUCCESSOR_RUNTIME_BASE_COMMIT = "fc70e616b7b9b5ffbd590cf0433609cd4d3528e6"
+_SUCCESSOR_ALLOWED_RUNTIME_PATHS = frozenset(
+    {
+        "ops/calibration/krea_fixture_admission.py",
+        "ops/calibration/krea_runtime_binding.py",
+        "ops/calibration/run_krea_ladder.py",
+    }
+)
 _GPU_GATE_IMPLEMENTATION_PATHS = {
     "fixture_validator_file_sha256": "ops/calibration/krea_fixture.py",
     "admission_tool_file_sha256": "ops/calibration/krea_fixture_admission.py",
@@ -1093,13 +1100,9 @@ def _require_fc70_successor(repository: Path, current_commit: str) -> None:
         changed = [item.decode("utf-8") for item in changed_raw.split(b"\0") if item]
     except UnicodeDecodeError as exc:
         raise ValueError("successor Forge path is not UTF-8") from exc
-    allowed_runtime_paths = {
-        "ops/calibration/krea_fixture_admission.py",
-        "ops/calibration/krea_runtime_binding.py",
-    }
     if any(
         not (
-            path in allowed_runtime_paths
+            path in _SUCCESSOR_ALLOWED_RUNTIME_PATHS
             or path.startswith("campaign_tools/")
             or path.startswith("tests/")
         )

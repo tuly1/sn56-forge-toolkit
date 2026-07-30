@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from types import SimpleNamespace
-
 import pytest
 
 from ops.calibration import krea_accelerated_discovery as accelerated
+from ops.calibration import krea_budget
 from ops.calibration import krea_provenance
 from ops.calibration import krea_execution_plan
 from ops.calibration import krea_runtime_binding as runtime_binding
@@ -399,16 +398,68 @@ def _budget(planned: int, cadence: int, hard: int) -> dict:
     }
 
 
-def _profile() -> SimpleNamespace:
-    return SimpleNamespace(
+def _profile() -> krea_budget.ThroughputProfile:
+    envelope = krea_budget.seal_execution_envelope(
+        equivalence_class="a-rank32-adamw8bit-mse-guidance2",
+        network_rank=32,
+        network_alpha=32,
+        optimizer="adamw8bit",
+        optimizer_config_sha256=_sha("optimizer"),
+        loss="mse",
+        differential_guidance_enabled=True,
+        guidance_scale=2.0,
+        training_pair_count=24,
+        training_dataset_shape_sha256=_sha("dataset-shape"),
+        micro_batch_size=1,
+        gradient_accumulation_steps=1,
+        data_parallel_replicas=1,
+        resolution_policy_sha256=_sha("resolution"),
+        precision_policy_sha256=_sha("precision"),
+        cache_latents_to_disk=False,
+        cache_text_embeddings=True,
+        compile_enabled=False,
+        jit_enabled=True,
+        dataloader_workers=2,
+        base_model_identity_sha256=_sha("base"),
+        runtime_identity_sha256=_sha("runtime"),
+        host_execution_identity_sha256=_sha("host"),
+        execution_surface="staged_host_venv",
+        execution_scope="discovery_only",
+        venv_tree_manifest_sha256=_sha("venv"),
+        reference_container_image_sha256=_sha("container"),
+        gpu_identity_sha256=_sha("gpu"),
+        trainer_identity_sha256=_sha("trainer"),
+        measurement_tool_sha256=_sha("measurement"),
+    )
+    document = krea_budget.seal_throughput_profile(
+        execution_envelope=envelope,
+        raw_sample_manifest_sha256=_sha("raw"),
+        startup_sample_count=3,
+        update_sample_count=100,
+        save_sample_count=8,
         startup_upper_bound_s=1.0,
-        selection_scoring_reserve_s=0.0,
-        framework_stop_boundary_s=225.0,
-        finalization_reserve_s=1.0,
-        upload_reserve_s=1.0,
         update_upper_bound_s=1.0,
         save_upper_bound_s=1.0,
+        bound_method="observed-max-plus-predeclared-margin",
+        margin_policy_sha256=_sha("margin"),
+        end_to_end_validation_count=1,
+        end_to_end_validation_sha256=_sha("heldout"),
+        framework_stop_boundary_s=225.0,
+        framework_stop_boundary_source_sha256=_sha("boundary"),
+        selection_mode="offline_post_training",
+        selection_scorer_identity_sha256=None,
+        selection_scoring_reserve_s=0.0,
+        finalization_reserve_s=1.0,
+        upload_reserve_s=1.0,
     )
+    return krea_budget.load_throughput_profile(document)
+
+
+def test_real_profile_exposes_runtime_identity_only_through_envelope() -> None:
+    profile = _profile()
+    assert not hasattr(profile, "runtime_identity_sha256")
+    assert profile.execution_envelope.runtime_identity_sha256 == _sha("runtime")
+    assert "profile.runtime_identity_sha256" not in Path(runner.__file__).read_text()
 
 
 def test_every_other_checkpoint_requires_slip_bound_campaign_cadence() -> None:
@@ -477,15 +528,7 @@ def test_source_transition_allows_only_the_control_patch(
             }
         }
     }
-    changed = [
-        "ops/calibration/krea_accelerated_discovery.py",
-        "ops/calibration/krea_execution_plan.py",
-        "ops/calibration/krea_profile_index.py",
-        "ops/calibration/krea_runtime_binding.py",
-        "ops/calibration/run_krea_ladder.py",
-        "ops/calibration/week5/krea-accelerated-discovery-policy.json",
-        "tests/test_krea_accelerated_discovery.py",
-    ]
+    changed = sorted(runner._ACCELERATED_TRANSITION_ALLOWED_PATHS)
     unsafe = {"deletion": False}
 
     def fake_run_text(command: list[str], *, cwd=None) -> str:
@@ -508,6 +551,17 @@ def test_source_transition_allows_only_the_control_patch(
     unsafe["deletion"] = True
     with pytest.raises(RuntimeError, match="unsafe Git change"):
         runner._validate_control_only_source_transition(compatibility)
+
+
+def test_real_successor_git_transition_is_control_only() -> None:
+    compatibility = {
+        "document": {
+            "historical_compatibility": {
+                "source_commit": "58822b496019177a02fa6196247ac30e788331bb"
+            }
+        }
+    }
+    runner._validate_control_only_source_transition(compatibility)
 
 
 def test_runner_allows_only_the_plan_derived_proxy_mismatch_set(

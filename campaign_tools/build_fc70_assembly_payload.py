@@ -21,6 +21,7 @@ from typing import Any, Mapping
 
 
 CONTROLS = Path("/campaign/controls")
+ADMISSION_ENVELOPE = CONTROLS / "admission.58822b4/admission-envelope.json"
 ARM_INPUTS = CONTROLS / "fc70-arm-inputs.json"
 PROBE_PLAN = CONTROLS / "timing-probe-D1-A-58822b4-r2.json"
 MARGIN_POLICY = CONTROLS / "timing-margin.58822b4.json"
@@ -33,28 +34,16 @@ HELDOUT_RUN_RECORDS = (
     Path("/campaign/krea-timing-D1-A-58822b4-r2/conditions")
     / "wk5-d1-k1-a-timing-70aac7899e94.json",
 )
-DEFAULT_OUTPUT = CONTROLS / "fc70e616.assembly-spec.payload.json"
+DEFAULT_OUTPUT = CONTROLS / "admitted-fixtures.assembly-spec.payload.json"
 
-FIXTURES = {
+FIXTURE_PATHS = {
     "D1": {
-        "training_archive": {
-            "path": "/campaign/controls/admission/fixture-package-v2/D1/training.zip",
-            "sha256": "30601eceed1fa5590013aa9eee877b055a8e75986231edbd5045e421c083a201",
-        },
-        "evaluation_dataset": {
-            "path": "/campaign/controls/admission/fixture-package-v2/D1/evaluation",
-            "sha256": "f47d3c792a25eb982ffd578ff5cc9a20924aeaf14c3205586920bee4571a902e",
-        },
+        "training_archive": "/campaign/controls/admission/fixture-package-v2/D1/training.zip",
+        "evaluation_dataset": "/campaign/controls/admission/fixture-package-v2/D1/evaluation",
     },
     "D2": {
-        "training_archive": {
-            "path": "/campaign/controls/admission/fixture-package-v2/D2/training.zip",
-            "sha256": "da5a647e318a1d1904635df8631458fccb680165fb3378aba2e25fa2b8e30f5e",
-        },
-        "evaluation_dataset": {
-            "path": "/campaign/controls/admission/fixture-package-v2/D2/evaluation",
-            "sha256": "841db949263117579c431b382178b9c582b58fbd36be67b63d4ed00f4fa48be1",
-        },
+        "training_archive": "/campaign/controls/admission/fixture-package-v2/D2/training.zip",
+        "evaluation_dataset": "/campaign/controls/admission/fixture-package-v2/D2/evaluation",
     },
 }
 
@@ -203,8 +192,77 @@ def validate_arm_inputs(path: Path) -> dict[str, Any]:
     return arms
 
 
+def admitted_fixtures(admission_envelope: Path) -> dict[str, Any]:
+    """Bind paths to the identities in the already sealed admission artifacts."""
+
+    envelope_path, envelope, _ = load_canonical(
+        admission_envelope, "fixture admission envelope"
+    )
+    envelope_body = {
+        key: value for key, value in envelope.items() if key != "envelope_sha256"
+    }
+    slots = envelope.get("discovery_fixtures")
+    if (
+        envelope.get("schema") != 1
+        or envelope.get("kind") != "forge-krea-fixture-admission-envelope"
+        or envelope.get("admission_authorized") is not True
+        or envelope.get("gpu_execution_authorized") is not False
+        or envelope.get("envelope_sha256") != semantic_sha(envelope_body)
+        or not isinstance(slots, dict)
+        or set(slots) != {"D1", "D2"}
+    ):
+        raise ValueError("fixture admission envelope is invalid")
+    fixtures: dict[str, Any] = {}
+    for role in ("D1", "D2"):
+        slot = slots[role]
+        binding_row = slot.get("manifest") if isinstance(slot, dict) else None
+        if not isinstance(binding_row, dict):
+            raise ValueError(f"{role} admission manifest binding is invalid")
+        relative = binding_row.get("relative_path")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+        ):
+            raise ValueError(f"{role} admission manifest path is unsafe")
+        manifest_path, manifest, manifest_file_sha = load_canonical(
+            envelope_path.parent / relative, f"{role} admitted fixture manifest"
+        )
+        manifest_body = {
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        }
+        archive = manifest.get("training_archive")
+        evaluation = manifest.get("evaluation_dataset_identity")
+        if (
+            binding_row.get("file_sha256") != manifest_file_sha
+            or binding_row.get("manifest_sha256") != manifest.get("manifest_sha256")
+            or manifest.get("manifest_sha256") != semantic_sha(manifest_body)
+            or manifest.get("schema") != 2
+            or manifest.get("kind") != "forge-krea-curated-fixture"
+            or manifest.get("experimental_role") != role
+            or not isinstance(archive, dict)
+            or not _SHA256.fullmatch(str(archive.get("sha256", "")))
+            or not isinstance(evaluation, dict)
+            or not _SHA256.fullmatch(str(evaluation.get("sha256", "")))
+        ):
+            raise ValueError(f"{role} admitted fixture identity is invalid")
+        fixtures[role] = {
+            "training_archive": {
+                "path": FIXTURE_PATHS[role]["training_archive"],
+                "sha256": archive["sha256"],
+            },
+            "evaluation_dataset": {
+                "path": FIXTURE_PATHS[role]["evaluation_dataset"],
+                "sha256": evaluation["sha256"],
+            },
+        }
+    return fixtures
+
+
 def build_payload(
     *,
+    admission_envelope: Path = ADMISSION_ENVELOPE,
     arm_inputs: Path = ARM_INPUTS,
     probe_plan: Path = PROBE_PLAN,
     margin_policy: Path = MARGIN_POLICY,
@@ -248,7 +306,7 @@ def build_payload(
         "expected_repo_prefix": "week5-krea",
         "timing_evidence": timing_evidence,
         "base_model": base_model,
-        "fixtures": FIXTURES,
+        "fixtures": admitted_fixtures(admission_envelope),
         "arms": arms,
     }
 

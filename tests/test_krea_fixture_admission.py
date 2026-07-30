@@ -880,6 +880,14 @@ def test_successor_rederives_exact_588_repository_and_implementation() -> None:
         assert bindings[key] == tracked[relative]["sha256"]
 
 
+def test_successor_runtime_allowlist_is_the_exact_bridge_surface() -> None:
+    assert admission._SUCCESSOR_ALLOWED_RUNTIME_PATHS == {
+        "ops/calibration/krea_fixture_admission.py",
+        "ops/calibration/krea_runtime_binding.py",
+        "ops/calibration/run_krea_ladder.py",
+    }
+
+
 def test_successor_bridge_preserves_only_historical_bindings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -10,6 +10,7 @@ import pytest
 
 from campaign_tools import krea_fc70_cell_queue as queue
 from ops.calibration import krea_budget
+from ops.calibration import run_krea_ladder as runner
 
 
 def _sha(label: str) -> str:
@@ -267,6 +268,13 @@ def test_tracked_discovery_plan_rejects_malformed_json(tmp_path: Path) -> None:
 def test_initial_queue_excludes_correction_gated_d2_k4() -> None:
     assert queue._INITIAL_CELLS[0] == "D1-K1"
     assert set(queue._INITIAL_CELLS) == set(queue._CELLS) - {"D2-K4"}
+
+
+def test_queue_uses_the_runners_required_system_python_entry() -> None:
+    assert queue._RUNNER_INITIAL_PYTHON == "/usr/bin/python3"
+    source = Path(runner.__file__).read_text()
+    assert 'os.path.samefile(sys.executable, "/usr/bin/python3")' in source
+    assert "/app/venv/bin/python" not in queue._RUNNER_INITIAL_PYTHON
 
 
 def test_controller_is_sequential_and_stops_on_first_failure(

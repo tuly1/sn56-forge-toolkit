@@ -982,6 +982,26 @@ def _training_seed_support(ai_toolkit_dir: Path) -> dict[str, Any]:
     }
 
 
+_ACCELERATED_TRANSITION_ALLOWED_PATHS = frozenset(
+    {
+        "campaign_tools/build_fc70_arm_inputs.py",
+        "campaign_tools/build_fc70_assembly_payload.py",
+        "campaign_tools/krea_fc70_cell_queue.py",
+        "ops/calibration/krea_accelerated_discovery.py",
+        "ops/calibration/krea_execution_plan.py",
+        "ops/calibration/krea_fixture_admission.py",
+        "ops/calibration/krea_profile_index.py",
+        "ops/calibration/krea_runtime_binding.py",
+        "ops/calibration/run_krea_ladder.py",
+        "ops/calibration/week5/krea-accelerated-discovery-policy.json",
+        "tests/test_build_fc70_assembly_payload.py",
+        "tests/test_krea_accelerated_discovery.py",
+        "tests/test_krea_fc70_cell_queue.py",
+        "tests/test_krea_fixture_admission.py",
+    }
+)
+
+
 def _validate_control_only_source_transition(compatibility: dict[str, Any]) -> None:
     """Prove the historical profile crossed only this control-plane patch."""
 
@@ -1015,19 +1035,10 @@ def _validate_control_only_source_transition(compatibility: dict[str, Any]) -> N
         if len(fields) != 2 or fields[0] not in {"A", "M"}:
             raise RuntimeError(f"accelerated transition has unsafe Git change: {row}")
         changed.add(fields[1])
-    allowed = {
-        "ops/calibration/krea_accelerated_discovery.py",
-        "ops/calibration/krea_execution_plan.py",
-        "ops/calibration/krea_profile_index.py",
-        "ops/calibration/krea_runtime_binding.py",
-        "ops/calibration/krea_training_evidence.py",
-        "ops/calibration/run_krea_ladder.py",
-        "ops/calibration/week5/krea-accelerated-discovery-policy.json",
-        "tests/test_krea_accelerated_discovery.py",
-    }
-    if not changed or not changed <= allowed:
+    if not changed or not changed <= _ACCELERATED_TRANSITION_ALLOWED_PATHS:
         raise RuntimeError(
-            f"accelerated transition changed non-control files: {sorted(changed - allowed)}"
+            "accelerated transition changed non-control files: "
+            f"{sorted(changed - _ACCELERATED_TRANSITION_ALLOWED_PATHS)}"
         )
 
 
@@ -1943,7 +1954,10 @@ def main() -> int:
                 raise RuntimeError("budget-fill depth does not fill the measured plan")
         elif args.steps > budget_plan.max_affordable_steps:
             raise RuntimeError("release-control depth does not fit the measured plan")
-    if profile.runtime_identity_sha256 != pre["runtime"]["sha256"]:
+    if (
+        profile.execution_envelope.runtime_identity_sha256
+        != pre["runtime"]["sha256"]
+    ):
         raise RuntimeError("throughput profile runtime does not match this process")
     allowed_differences = {
         "scientific_axes": list(_SCIENTIFIC_AXIS_POINTERS),
