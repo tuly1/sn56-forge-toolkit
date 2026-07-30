@@ -855,6 +855,45 @@ def test_effective_cgroup_constraints_include_all_ancestors(tmp_path, monkeypatc
     assert constraints["memory_available_bytes"] == 5 * 1024**3
 
 
+def test_effective_cgroup_constraints_allow_controllerless_v2_root(
+    tmp_path, monkeypatch
+):
+    base = tmp_path / "cgroup"
+    current = base / "system.slice" / "worker.scope"
+    current.mkdir(parents=True)
+    (current / "cpuset.cpus.effective").write_text("0-7\n", encoding="ascii")
+    for path in (current, current.parent):
+        (path / "cpu.max").write_text("max 100000\n", encoding="ascii")
+        (path / "memory.max").write_text("max\n", encoding="ascii")
+        (path / "memory.current").write_text("0\n", encoding="ascii")
+    monkeypatch.setattr(host, "_cgroup_base", lambda: base)
+    monkeypatch.setattr(host, "_cgroup_root", lambda: current)
+
+    constraints = host._cgroup_constraints()
+
+    assert constraints["cpuset_logical_cpus"] == 8
+    assert constraints["cpu_quota_cores"] is None
+    assert constraints["memory_limit_bytes"] is None
+
+
+def test_effective_cgroup_constraints_reject_partial_root_controls(
+    tmp_path, monkeypatch
+):
+    base = tmp_path / "cgroup"
+    current = base / "worker.scope"
+    current.mkdir(parents=True)
+    (current / "cpuset.cpus.effective").write_text("0-3\n", encoding="ascii")
+    for path in (current, base):
+        (path / "cpu.max").write_text("max 100000\n", encoding="ascii")
+    (current / "memory.max").write_text("max\n", encoding="ascii")
+    (current / "memory.current").write_text("0\n", encoding="ascii")
+    monkeypatch.setattr(host, "_cgroup_base", lambda: base)
+    monkeypatch.setattr(host, "_cgroup_root", lambda: current)
+
+    with pytest.raises(RuntimeError, match="controller files are incomplete"):
+        host._cgroup_constraints()
+
+
 def test_checkpoint_path_rejects_relative_file_and_symlink_ancestors(tmp_path):
     directory = tmp_path / "real"
     directory.mkdir()

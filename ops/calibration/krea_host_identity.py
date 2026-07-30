@@ -658,12 +658,25 @@ def _cgroup_constraints() -> dict[str, Any]:
     """Resolve effective cpuset/quota/headroom across every cgroup ancestor."""
 
     root = _cgroup_root()
+    base = _cgroup_base()
     cpuset = _parse_cpuset((root / "cpuset.cpus.effective").read_text(encoding="ascii"))
     quota_capacities: list[float] = []
     memory_limits: list[int] = []
     memory_headrooms: list[int] = []
     for ancestor in _cgroup_ancestors(root):
-        cpu_fields = (ancestor / "cpu.max").read_text(encoding="ascii").split()
+        control_paths = tuple(
+            ancestor / name for name in ("cpu.max", "memory.max", "memory.current")
+        )
+        present = tuple(path.is_file() for path in control_paths)
+        # The cgroup-v2 filesystem root is not a child cgroup and Linux normally
+        # omits controller limit/current files there. Every actual ancestor
+        # cgroup remains mandatory and a partial root surface is rejected.
+        if ancestor == base and not any(present):
+            continue
+        if not all(present):
+            raise RuntimeError(f"cgroup controller files are incomplete: {ancestor}")
+
+        cpu_fields = control_paths[0].read_text(encoding="ascii").split()
         if len(cpu_fields) != 2:
             raise RuntimeError(f"cgroup cpu.max is malformed: {ancestor}")
         try:
@@ -676,8 +689,8 @@ def _cgroup_constraints() -> dict[str, Any]:
         if quota is not None:
             quota_capacities.append(quota / period)
 
-        memory_raw = (ancestor / "memory.max").read_text(encoding="ascii").strip()
-        current_raw = (ancestor / "memory.current").read_text(encoding="ascii").strip()
+        memory_raw = control_paths[1].read_text(encoding="ascii").strip()
+        current_raw = control_paths[2].read_text(encoding="ascii").strip()
         try:
             memory_limit = None if memory_raw == "max" else int(memory_raw)
             memory_current = int(current_raw)
