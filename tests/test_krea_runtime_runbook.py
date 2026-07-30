@@ -78,6 +78,7 @@ def test_exact_scorer_runbook_is_literal_and_matches_owner_contract():
     for token in (
         "5473a9da95cc729cac65ae0309b1044224a40eb1e8961b77cd0e39eab846bb08",
         "uv venv --python 3.10.20",
+        "--index-strategy unsafe-best-match",
         'uv pip check --python "$PY"',
         "stage-stage1-assets",
         "unset HF_TOKEN",
@@ -97,3 +98,22 @@ def test_exact_scorer_runbook_is_literal_and_matches_owner_contract():
     assert '"$PY" -m pip check' not in text
     assert "fresh `exact_score_plan_reviewer`" not in text
     assert "2026-07-29T00:00:00Z" not in text
+
+    install = text[text.index('uv pip install --python "$PY"') :]
+    install = install[: install.index('uv pip check --python "$PY"')]
+    assert "--no-deps" in install
+    assert "--index-strategy unsafe-best-match" in install
+    assert "--extra-index-url https://download.pytorch.org/whl/cu128" in install
+    assert "registry distribution pinned with exact `==`" in text
+    assert "sole VCS distribution pinned to a full commit" in text
+    assert "normalized name/version set plus the lock file identity" in text
+    assert "wheel-byte verification" in text
+
+    lock = SCORER_RUNBOOK.with_name("krea-stage1-exact-scorer-lock.txt")
+    lines = lock.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 229
+    vcs = [line for line in lines if " @ git+" in line]
+    registry = [line for line in lines if line not in vcs]
+    assert all(re.fullmatch(r"[A-Za-z0-9_.-]+==[^=\s]+", line) for line in registry)
+    assert len(vcs) == 1
+    assert re.fullmatch(r"[A-Za-z0-9_.-]+ @ git\+https://[^@]+@[0-9a-f]{40}", vcs[0])

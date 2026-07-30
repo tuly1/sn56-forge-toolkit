@@ -23,6 +23,7 @@ test "$(wc -l < "$LOCK" | tr -d ' ')" = 229
 uv python install 3.10.20
 uv venv --python 3.10.20 "$ROOT/venv"
 uv pip install --python "$PY" --no-deps \
+  --index-strategy unsafe-best-match \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
   -r "$LOCK"
 uv pip check --python "$PY"
@@ -30,6 +31,16 @@ uv pip check --python "$PY"
 
 `uv venv` deliberately omits `--seed`: the attested 229-distribution lock does
 not contain pip. `uv pip` performs the installation from outside the venv.
+The explicit `unsafe-best-match` name is uv terminology, not a relaxation of
+the dependency contract: uv's default first-index policy can stop at a package
+name present on the PyTorch index (for example `certifi`) even when that index
+does not carry the owner-pinned version. This command is safe only in this
+bounded form: `--no-deps`, every registry distribution pinned with exact `==`,
+the sole VCS distribution pinned to a full commit, and the complete installed
+normalized name/version set plus the lock file identity verified against the
+owner-bound 229-line contract before any score plan can be approved. This does
+not claim wheel-byte verification. Do not reuse this index strategy for an
+unpinned requirements file.
 
 Stage exact source trees and reject local mutation:
 

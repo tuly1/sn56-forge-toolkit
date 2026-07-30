@@ -142,6 +142,7 @@ def test_plan_reproduces_exact_production_phase_order_and_indexes(
 
     assert [item.command_id for item in specs if item.phase == "materialize"] == [
         "venv-create",
+        "bootstrap-build-wheel",
         "phase1-ai-toolkit-requirements",
         "phase1-torch-cu124",
         "phase1-torchcodec-support",
@@ -152,6 +153,21 @@ def test_plan_reproduces_exact_production_phase_order_and_indexes(
         "-m",
         "venv",
         "--copies",
+    )
+    bootstrap_wheel = by_id["bootstrap-build-wheel"]
+    assert bootstrap_wheel.argv == (
+        str(paths.venv_python),
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--constraint",
+        str(paths.constraints),
+        "wheel==0.37.1",
+    )
+    assert bootstrap_wheel.attempts == 5
+    assert specs.index(bootstrap_wheel) < specs.index(
+        by_id["phase1-ai-toolkit-requirements"]
     )
     torch = by_id["phase1-torch-cu124"].argv
     assert ("torch==2.6.0", "torchvision==0.21.0", "torchaudio==2.6.0") == (
@@ -389,6 +405,14 @@ def test_materialization_receipt_is_canonical_create_only_and_detects_tree_drift
     assert result["tree_manifest"]["entry_count"] > 1
     assert result["verification"]["runtime_verifier_pass"] is True
     assert result["transient_materialization_cache"]["removed"] is True
+    command_results = {row["command_id"]: row for row in result["command_results"]}
+    bootstrap_result = command_results["bootstrap-build-wheel"]
+    assert bootstrap_result["status"] == "executed"
+    assert len(bootstrap_result["attempts"]) == 1
+    bootstrap_contract = {
+        row["command_id"]: row for row in result["contract"]["command_plan"]
+    }["bootstrap-build-wheel"]
+    assert bootstrap_contract["argv"][-1] == runtime.BUILD_BOOTSTRAP_WHEEL
     assert not runtime._transient_cache_root(paths).exists()
     assert runtime.validate_receipt(result) == result
     assert (
@@ -725,6 +749,37 @@ def test_failed_materialization_cleans_only_its_transient_cache(tmp_path, monkey
             paths.receipt,
             runner=fail_phase1,
         )
+    assert not runtime._transient_cache_root(paths).exists()
+    assert not paths.receipt.exists()
+
+
+def test_failed_build_wheel_bootstrap_retries_and_publishes_no_receipt(
+    tmp_path, monkeypatch
+):
+    paths, system_python = _copy_sources(tmp_path, monkeypatch)
+    successful = _fake_runner(paths, system_python)
+    attempts = 0
+
+    def fail_bootstrap(command, **kwargs):
+        nonlocal attempts
+        argv = [str(item) for item in command]
+        if argv[-1:] == [runtime.BUILD_BOOTSTRAP_WHEEL]:
+            attempts += 1
+            return subprocess.CompletedProcess(
+                argv, 2, stdout="", stderr="wheel bootstrap failed\n"
+            )
+        return successful(command, **kwargs)
+
+    with pytest.raises(runtime.Stage1RuntimeError, match="failed after 5"):
+        runtime.materialize(
+            paths.forge_repo,
+            paths.ai_toolkit_repo,
+            paths.destination,
+            paths.receipt,
+            runner=fail_bootstrap,
+        )
+
+    assert attempts == 5
     assert not runtime._transient_cache_root(paths).exists()
     assert not paths.receipt.exists()
 

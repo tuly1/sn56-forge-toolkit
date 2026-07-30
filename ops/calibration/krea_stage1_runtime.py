@@ -46,6 +46,7 @@ AI_TOOLKIT_REQUIREMENTS_SHA256 = (
 BASE_IMAGE_SHA256 = "c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8"
 BASE_IMAGE_REFERENCE = "diagonalge/ai-toolkit:latest@sha256:" + BASE_IMAGE_SHA256
 PYTORCH_INDEX = "https://download.pytorch.org/whl/cu124"
+BUILD_BOOTSTRAP_WHEEL = "wheel==0.37.1"
 
 # A Dockerfile edit is a production-contract edit, not an input to improvise
 # around.  Update this constant only alongside an intentional review of the
@@ -508,6 +509,22 @@ def command_plan(paths: RuntimePaths) -> tuple[CommandSpec, ...]:
                 str(paths.destination),
             ),
             str(paths.destination.parent),
+        ),
+        CommandSpec(
+            "bootstrap-build-wheel",
+            "materialize",
+            (
+                python,
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--constraint",
+                str(paths.constraints),
+                BUILD_BOOTSTRAP_WHEEL,
+            ),
+            str(paths.ai_toolkit_repo),
+            attempts=5,
         ),
         CommandSpec(
             "phase1-ai-toolkit-requirements",
