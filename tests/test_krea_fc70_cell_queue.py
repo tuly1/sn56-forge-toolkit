@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from campaign_tools import krea_fc70_cell_queue as queue
+from forge.data.schema import ImageSpec
 from ops.calibration import krea_budget
 from ops.calibration import run_krea_ladder as runner
 
@@ -277,6 +278,64 @@ def test_queue_uses_the_runners_required_system_python_entry() -> None:
     assert "/app/venv/bin/python" not in queue._RUNNER_INITIAL_PYTHON
 
 
+def test_training_archive_is_atomically_staged_at_real_imagespec_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "training.zip"
+    source.write_bytes(b"admitted training archive")
+    source_sha = queue._file_sha(source)
+    fixture = tmp_path / "fixture.json"
+    _canonical(
+        fixture,
+        {"training_archive": {"sha256": source_sha, "bytes": source.stat().st_size}},
+    )
+    plan = tmp_path / "plan.json"
+    _canonical(
+        plan,
+        {
+            "task_id": "week5-krea-D1-K1",
+            "expected_repo_name": "week5-krea-D1-K1",
+            "base_model": {"model_id": "krea/Krea-2-Raw"},
+            "training_archive": {"path": str(source), "sha256": source_sha},
+            "fixture_manifest": {
+                "path": str(fixture),
+                "sha256": queue._file_sha(fixture),
+            },
+        },
+    )
+    cache = tmp_path / "cache/datasets"
+    cache.mkdir(parents=True)
+    monkeypatch.setattr(queue, "_DATASET_CACHE_ROOT", cache)
+    target = queue._stage_training_archive(
+        {"plan": {"path": str(plan), "sha256": queue._file_sha(plan)}},
+        ImageSpec,
+    )
+    assert target == cache / "week5-krea-D1-K1_tourn.zip"
+    assert target.read_bytes() == source.read_bytes()
+    with pytest.raises(FileExistsError, match="refusing to replace"):
+        queue._stage_training_archive(
+            {"plan": {"path": str(plan), "sha256": queue._file_sha(plan)}},
+            ImageSpec,
+        )
+
+
+def test_dataset_cleanup_removes_only_exact_transient_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    preserved = dataset / "configs"
+    preserved.mkdir()
+    for name in queue._DATASET_WORK_NAMES:
+        work = dataset / name
+        work.mkdir()
+        (work / "data").write_text("x")
+    monkeypatch.setattr(queue, "_DATASET_ROOT", dataset)
+    queue._clean_dataset_work_paths()
+    assert preserved.is_dir()
+    assert all(not (dataset / name).exists() for name in queue._DATASET_WORK_NAMES)
+
+
 def test_controller_is_sequential_and_stops_on_first_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -286,7 +345,16 @@ def test_controller_is_sequential_and_stops_on_first_failure(
         {"cell_id": "D1-K1", "campaign_dir": str(runs / "D1-K1"), "argv": ["b"]},
     ]
     monkeypatch.setattr(queue, "validate_queue", lambda _path: {"cells": rows})
-    monkeypatch.setattr(queue, "_modules", lambda _path: {})
+    monkeypatch.setattr(queue, "_modules", lambda _path: {"image_spec": ImageSpec})
+    monkeypatch.setattr(queue, "_stage_training_archive", lambda *_args: None)
+    monkeypatch.setattr(queue, "_verify_completed_condition", lambda _row: None)
+    cleanup_called = False
+
+    def cleanup():
+        nonlocal cleanup_called
+        cleanup_called = True
+
+    monkeypatch.setattr(queue, "_clean_dataset_work_paths", cleanup)
     observed = []
 
     def fail_first(argv, *, check):
@@ -298,5 +366,48 @@ def test_controller_is_sequential_and_stops_on_first_failure(
     with pytest.raises(RuntimeError, match="stop"):
         queue.run_queue(tmp_path / "queue.json")
     assert observed == [["a"]]
+    assert cleanup_called is False
     assert (runs / "D1-K0").is_dir()
     assert not (runs / "D1-K1").exists()
+
+
+def test_two_rows_stage_run_verify_and_clean_before_next_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs = tmp_path / "runs"
+    rows = [
+        {"cell_id": cell, "campaign_dir": str(runs / cell), "argv": [cell]}
+        for cell in ("D1-K0", "D1-K1")
+    ]
+    events: list[str] = []
+    monkeypatch.setattr(queue, "validate_queue", lambda _path: {"cells": rows})
+    monkeypatch.setattr(queue, "_modules", lambda _path: {"image_spec": ImageSpec})
+    monkeypatch.setattr(
+        queue,
+        "_stage_training_archive",
+        lambda row, _spec: events.append(f"stage:{row['cell_id']}"),
+    )
+    monkeypatch.setattr(
+        queue.subprocess,
+        "run",
+        lambda argv, *, check: events.append(f"run:{argv[0]}") if check else None,
+    )
+    monkeypatch.setattr(
+        queue,
+        "_verify_completed_condition",
+        lambda row: events.append(f"verify:{row['cell_id']}"),
+    )
+    monkeypatch.setattr(
+        queue, "_clean_dataset_work_paths", lambda: events.append("clean")
+    )
+    queue.run_queue(tmp_path / "queue.json")
+    assert events == [
+        "stage:D1-K0",
+        "run:D1-K0",
+        "verify:D1-K0",
+        "clean",
+        "stage:D1-K1",
+        "run:D1-K1",
+        "verify:D1-K1",
+        "clean",
+    ]

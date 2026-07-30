@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any, Mapping, Sequence
@@ -25,7 +26,7 @@ from typing import Any, Mapping, Sequence
 # Runtime source is the exact fc70 tree plus the native, hash-proven bridge that
 # lets it consume the immutable admission sealed by its 588 ancestor.  Later
 # external controller commits must not broaden or move this runtime pin.
-FC70_COMMIT = "c9f30b1a30d33ee2121a3fb3afe64608aa2b3ae7"
+FC70_COMMIT = "c9f30b14de5358a5fd8e3c2e23a8e6427c2fdb1d"
 _RUNNER_INITIAL_PYTHON = "/usr/bin/python3"
 _RUNNER_BOOTSTRAP = (
     "import runpy,sys;sys.path.insert(0,'/app/forge');"
@@ -49,6 +50,9 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _TRACKED_DISCOVERY_PLAN = Path(
     "ops/calibration/week5/krea-discovery-plan.json"
 )
+_DATASET_CACHE_ROOT = Path("/cache/datasets")
+_DATASET_ROOT = Path("/dataset")
+_DATASET_WORK_NAMES = ("images", "images__extract", "images__flat")
 
 
 def _object(value: Any, label: str) -> dict[str, Any]:
@@ -203,6 +207,7 @@ def _modules(forge_root: Path) -> dict[str, Any]:
     from ops.calibration import krea_execution_plan
     from ops.calibration import krea_provenance
     from ops.calibration import krea_runtime_binding
+    from forge.data.schema import ImageSpec
 
     return {
         "accelerated": krea_accelerated_discovery,
@@ -210,7 +215,113 @@ def _modules(forge_root: Path) -> dict[str, Any]:
         "execution": krea_execution_plan,
         "provenance": krea_provenance,
         "runtime": krea_runtime_binding,
+        "image_spec": ImageSpec,
     }
+
+
+def _stage_training_archive(row: dict[str, Any], image_spec_type: Any) -> Path:
+    """Atomically stage the plan-bound archive at ImageSpec's exact cache path."""
+
+    _, plan, plan_file_sha = _load(row["plan"]["path"], "queued execution plan")
+    if plan_file_sha != row["plan"]["sha256"]:
+        raise ValueError("queued execution plan drifted before dataset staging")
+    training = _object(plan.get("training_archive"), "plan training archive")
+    fixture_binding = _object(plan.get("fixture_manifest"), "plan fixture manifest")
+    _, fixture, fixture_file_sha = _load(
+        fixture_binding["path"], "queued fixture manifest"
+    )
+    if fixture_file_sha != fixture_binding["sha256"]:
+        raise ValueError("queued fixture manifest drifted before dataset staging")
+    fixture_training = _object(
+        fixture.get("training_archive"), "fixture training archive"
+    )
+    source = _safe_file(training["path"], "plan training archive")
+    expected_sha = _sha(training.get("sha256"), "plan training archive SHA-256")
+    expected_bytes = fixture_training.get("bytes")
+    if (
+        fixture_training.get("sha256") != expected_sha
+        or isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes <= 0
+        or source.stat().st_size != expected_bytes
+        or _file_sha(source) != expected_sha
+    ):
+        raise ValueError("plan training archive differs from the admitted fixture")
+    spec = image_spec_type.build(
+        task_id=plan["task_id"],
+        model=plan["base_model"]["model_id"],
+        model_type="krea2",
+        expected_repo_name=plan["expected_repo_name"],
+        trigger_word=None,
+        dataset_zip=None,
+    )
+    canonical_target = Path(spec.cached_zip_path)
+    if canonical_target.parent != Path("/cache/datasets"):
+        raise ValueError("ImageSpec dataset cache path escaped /cache/datasets")
+    cache_root = _DATASET_CACHE_ROOT
+    if cache_root.is_symlink() or not cache_root.is_dir():
+        raise ValueError("dataset cache root must be an existing regular directory")
+    target = cache_root / canonical_target.name
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"refusing to replace staged dataset: {target}")
+    descriptor = os.open(
+        target,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    digest = hashlib.sha256()
+    copied = 0
+    try:
+        with source.open("rb") as reader, os.fdopen(descriptor, "wb") as writer:
+            for block in iter(lambda: reader.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+                copied += len(block)
+                writer.write(block)
+            writer.flush()
+            os.fsync(writer.fileno())
+        if digest.hexdigest() != expected_sha or copied != expected_bytes:
+            raise ValueError("staged dataset identity differs from the plan")
+        directory = os.open(cache_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def _verify_completed_condition(row: dict[str, Any]) -> None:
+    _, plan, _ = _load(row["plan"]["path"], "completed execution plan")
+    condition_path = (
+        Path(row["campaign_dir"]) / "conditions" / f"{plan['task_id']}.json"
+    )
+    _, condition, _ = _load(condition_path, "completed condition record")
+    if (
+        condition.get("schema") != 2
+        or condition.get("kind") != "forge-krea2-calibration-run"
+        or condition.get("complete") is not True
+        or condition.get("task_id") != plan["task_id"]
+        or condition.get("execution_plan_sha256") != plan["plan_sha256"]
+    ):
+        raise ValueError("runner did not publish the expected completed condition")
+
+
+def _clean_dataset_work_paths() -> None:
+    dataset_root = _DATASET_ROOT
+    if dataset_root.is_symlink() or not dataset_root.is_dir():
+        raise ValueError("dataset root must be an existing regular directory")
+    resolved_root = dataset_root.resolve(strict=True)
+    for name in _DATASET_WORK_NAMES:
+        path = dataset_root / name
+        if path.parent != dataset_root or path.is_symlink():
+            raise ValueError(f"unsafe dataset cleanup target: {path}")
+        if not path.exists():
+            continue
+        if not path.is_dir() or path.resolve(strict=True).parent != resolved_root:
+            raise ValueError(f"dataset cleanup target escaped its root: {path}")
+        shutil.rmtree(path)
 
 
 def _validate_spec(value: dict[str, Any]) -> dict[str, Any]:
@@ -606,11 +717,14 @@ def validate_queue(path: Path) -> dict[str, Any]:
 
 def run_queue(path: Path) -> None:
     queue = validate_queue(path)
-    _modules(Path("/app/forge"))
+    modules = _modules(Path("/app/forge"))
     for row in queue["cells"]:
+        _stage_training_archive(row, modules["image_spec"])
         campaign_dir = Path(row["campaign_dir"])
         campaign_dir.mkdir(parents=True, exist_ok=False)
         subprocess.run(row["argv"], check=True)
+        _verify_completed_condition(row)
+        _clean_dataset_work_paths()
 
 
 def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
