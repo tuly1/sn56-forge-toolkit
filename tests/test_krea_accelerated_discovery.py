@@ -239,7 +239,10 @@ def test_accelerated_index_contains_one_real_profile_and_six_proxy_slots(
     campaign = accelerated.build_campaign(campaign_payload)
     authorization = {
         "authorization_sha256": _sha("authorization-semantic"),
-        "fixture_admission_envelope": campaign["fixture_admission_envelope"],
+        "fixture_admission_envelope": {
+            **campaign["fixture_admission_envelope"],
+            "owner_ratification_sha256": _sha("owner-ratification"),
+        },
     }
     profile_record = {
         "path": "/sealed/d1-a-profile.json",

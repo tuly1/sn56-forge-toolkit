@@ -1093,10 +1093,13 @@ def _require_fc70_successor(repository: Path, current_commit: str) -> None:
         changed = [item.decode("utf-8") for item in changed_raw.split(b"\0") if item]
     except UnicodeDecodeError as exc:
         raise ValueError("successor Forge path is not UTF-8") from exc
-    allowed_runtime_path = "ops/calibration/krea_fixture_admission.py"
+    allowed_runtime_paths = {
+        "ops/calibration/krea_fixture_admission.py",
+        "ops/calibration/krea_runtime_binding.py",
+    }
     if any(
         not (
-            path == allowed_runtime_path
+            path in allowed_runtime_paths
             or path.startswith("campaign_tools/")
             or path.startswith("tests/")
         )

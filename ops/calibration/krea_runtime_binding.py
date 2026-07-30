@@ -641,7 +641,10 @@ def _build_accelerated_profile_index(payload: dict[str, Any]) -> dict[str, Any]:
         or campaign["discovery_execution_authorization"]["authorization_sha256"]
         != authorization["authorization_sha256"]
         or campaign["fixture_admission_envelope"]
-        != authorization["fixture_admission_envelope"]
+        != {
+            key: authorization["fixture_admission_envelope"][key]
+            for key in ("path", "file_sha256", "envelope_sha256")
+        }
     ):
         raise ValueError("accelerated campaign escaped discovery authority")
     fixture_inputs = _object(payload["fixtures"], "accelerated profile fixtures")
@@ -969,7 +972,10 @@ def _validate_accelerated_profile_index(value: dict[str, Any]) -> dict[str, Any]
         or campaign["discovery_execution_authorization"]["authorization_sha256"]
         != authorization["authorization_sha256"]
         or campaign["fixture_admission_envelope"]
-        != authorization["fixture_admission_envelope"]
+        != {
+            key: authorization["fixture_admission_envelope"][key]
+            for key in ("path", "file_sha256", "envelope_sha256")
+        }
         or value["accelerated_discovery_campaign"]
         != {
             "path": str(campaign_path),
