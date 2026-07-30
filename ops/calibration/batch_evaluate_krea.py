@@ -4862,6 +4862,15 @@ def run_batch(
                     "decision_contract": campaign["decision_contract"],
                     "confirmation_contract": campaign["confirmation_contract"],
                     "runs": campaign["runs"],
+                    **(
+                        {
+                            "historical_training_evidence_validator": campaign[
+                                "historical_training_evidence_validator"
+                            ]
+                        }
+                        if "historical_training_evidence_validator" in campaign
+                        else {}
+                    ),
                 },
                 "fixture": {
                     "manifest_sha256": fixture["manifest_sha256"],
@@ -5667,6 +5676,15 @@ def assemble_candidate_shards(
             "decision_contract": campaign["decision_contract"],
             "confirmation_contract": campaign["confirmation_contract"],
             "runs": campaign["runs"],
+            **(
+                {
+                    "historical_training_evidence_validator": campaign[
+                        "historical_training_evidence_validator"
+                    ]
+                }
+                if "historical_training_evidence_validator" in campaign
+                else {}
+            ),
         },
         "fixture": {
             "manifest_sha256": fixture["manifest_sha256"],
