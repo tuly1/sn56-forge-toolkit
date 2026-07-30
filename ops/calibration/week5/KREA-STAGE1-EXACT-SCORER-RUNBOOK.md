@@ -26,7 +26,29 @@ uv pip install --python "$PY" --no-deps \
   --index-strategy unsafe-best-match \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
   -r "$LOCK"
+# The lock intentionally contains CUDA-12 and CUDA-13 support distributions,
+# and both cuDNN wheels own the same ``nvidia/cudnn`` paths.  Reinstall the
+# torch-cu128-compatible wheel last so concurrent installer extraction order
+# cannot choose the CUDA-13 payload nondeterministically.
+uv pip install --python "$PY" --no-deps --reinstall \
+  --index-strategy unsafe-best-match \
+  --extra-index-url https://download.pytorch.org/whl/cu128 \
+  nvidia-cudnn-cu12==9.10.2.21
 uv pip check --python "$PY"
+
+"$PY" -I - <<'PY'
+import torch
+
+assert torch.__version__ == "2.9.1+cu128"
+assert torch.version.cuda == "12.8"
+assert torch.backends.cudnn.version() == 91002
+x = torch.randn(1, 4, 4, 32, 32, device="cuda", dtype=torch.bfloat16)
+layer = torch.nn.Conv3d(4, 8, 3, padding=1, device="cuda", dtype=torch.bfloat16)
+result = layer(x)
+torch.cuda.synchronize()
+assert tuple(result.shape) == (1, 8, 4, 32, 32)
+print("SN56_KREA_SCORER_CUDNN_CONV3D=PASS")
+PY
 ```
 
 `uv venv` deliberately omits `--seed`: the attested 229-distribution lock does

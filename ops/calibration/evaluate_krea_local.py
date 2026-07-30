@@ -98,6 +98,29 @@ def _port(value: str) -> int:
     return parsed
 
 
+def _ordered_image_enumerator(
+    native_enumerator: Any,
+    approved_order: list[str],
+) -> Any:
+    """Return an enumerator whose order is fixture-bound, not filesystem-bound."""
+
+    def enumerate_images(root: str, extensions: tuple[str, ...]) -> list[str]:
+        native_order = native_enumerator(root, extensions)
+        if not approved_order:
+            return native_order
+        if (
+            not isinstance(native_order, list)
+            or len(native_order) != len(approved_order)
+            or set(native_order) != set(approved_order)
+        ):
+            raise RuntimeError(
+                "live evaluator image set differs from the approved fixture"
+            )
+        return list(approved_order)
+
+    return enumerate_images
+
+
 def _parse() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
@@ -137,6 +160,16 @@ def _parse() -> argparse.Namespace:
     parser.add_argument("--expected-god-commit")
     parser.add_argument("--expected-comfy-commit")
     parser.add_argument("--expected-tooling-commit")
+    parser.add_argument(
+        "--expected-image",
+        action="append",
+        default=[],
+        help=(
+            "Approved evaluator image basename, repeated in the exact sealed "
+            "fixture order. When supplied, filesystem enumeration order is "
+            "ignored while the complete file set is still validated."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -568,12 +601,14 @@ def _run_exact_eval(
     dataset: Path,
     params: Any,
     generations: int,
+    list_supported_images: Any | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     captured_orders: list[list[str]] = []
     original = diffusion.list_supported_images
+    enumerator = list_supported_images or original
 
     def _capture_order(dataset_path: str, extensions: tuple[str, ...]) -> list[str]:
-        names = original(dataset_path, extensions)
+        names = enumerator(dataset_path, extensions)
         captured_orders.append(list(names))
         return names
 
@@ -713,9 +748,27 @@ def main() -> int:
         dataset_constants = modules["dataset_constants"]
 
         extensions = tuple(dataset_constants.SUPPORTED_IMAGE_FILE_EXTENSIONS)
+        approved_order = list(args.expected_image)
+        if approved_order and (
+            len(approved_order) != len(set(approved_order))
+            or any(
+                not isinstance(name, str)
+                or not name
+                or Path(name).name != name
+                or Path(name).suffix.lower() not in extensions
+                for name in approved_order
+            )
+        ):
+            raise ValueError("approved evaluator image order is invalid")
+
+        list_scoring_images = _ordered_image_enumerator(
+            image_io.list_supported_images,
+            approved_order,
+        )
+
         dataset_before = _capture_dataset(
             dataset,
-            list_supported_images=image_io.list_supported_images,
+            list_supported_images=list_scoring_images,
             extensions=extensions,
         )
         model_type = image_models.ImageModelType.KREA2.value
@@ -859,6 +912,7 @@ def main() -> int:
                             dataset=dataset,
                             params=params,
                             generations=generations,
+                            list_supported_images=list_scoring_images,
                         )
                     if actual_order != dataset_before["evaluator_order"]:
                         raise RuntimeError(
@@ -915,7 +969,7 @@ def main() -> int:
 
         dataset_after = _capture_dataset(
             dataset,
-            list_supported_images=image_io.list_supported_images,
+            list_supported_images=list_scoring_images,
             extensions=extensions,
         )
         if dataset_after != dataset_before:

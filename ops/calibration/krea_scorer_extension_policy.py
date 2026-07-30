@@ -1,7 +1,10 @@
 """Exact scorer-only extension to the immutable Stage-1 execution policy.
 
-The Week-5 training evidence is bound to execution-surface policy
-``98b59f...``.  Scoring D1 takes about 75 minutes, so the scorer needs a
+The historical training evidence remains validated against its exact
+execution-surface policy ``98b59f...`` through the historical-validator
+adapter.  The live
+scorer extension binds the current scorer surface separately.  Scoring D1
+takes about 75 minutes, so the scorer needs a
 90-minute process limit.  Keeping this as a separate, exact policy preserves
 the training claim boundary while making the effective scorer surface
 explicit and downgrade-resistant.
@@ -30,7 +33,7 @@ _BODY = {
     "schema": 1,
     "kind": "forge-krea-stage1-scorer-extension-policy",
     "base_execution_surface_policy_sha256": (
-        "98b59fd90dbf4ea213c860f873bc472cadc66714c7b9118672de2474f020f5f3"
+        "15eacab07996cb3d4678fd512b66c3d6cbf71f221b3fd26ff7d619fc73f0ea8e"
     ),
     "scope": "offline_stage1_exact_scoring_only",
     "changes": {

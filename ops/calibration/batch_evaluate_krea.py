@@ -63,13 +63,13 @@ _FORBIDDEN_OUTPUT = "forge_holdout_scores.json"
 _COMFY_LORA_PLACEHOLDER = "put_loras_here"
 _SCORER_SUPPORT_MODULE_SHA256 = {
     "krea_execution_surface_policy.py": (
-        "952cb63e6efc693d06de534e842f3c6feb9d49b638ebc85ad3592325c428f9d9"
+        "6d3b2098893d31dd109a497d138f7360831174829a767f8a013b53f98fadc130"
     ),
     "krea_historical_training_evidence.py": (
         "717a1448eafcbc832e9dacf978181fc7a337de3fbc29eda6721c111cc767e0a2"
     ),
     "krea_scorer_extension_policy.py": (
-        "8a0d7066545f7b94dacb791cda77d6d646901572a944649ddb646dfd45b0fec8"
+        "66113901140c8c61a42607b13b2f2e3d8fc5554865ad75eccef04bce935502a4"
     ),
 }
 _FIXTURE_KIND = "forge-krea-fixture-split"
@@ -2335,6 +2335,29 @@ def _stage1_exact_scorer_readiness(evaluator: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "exact scorer critical package versions differ from owner contract"
         )
+    cuda_probe = (
+        "import json,torch;"
+        "x=torch.randn(1,4,4,32,32,device='cuda',dtype=torch.bfloat16);"
+        "layer=torch.nn.Conv3d(4,8,3,padding=1,device='cuda',dtype=torch.bfloat16);"
+        "result=layer(x);torch.cuda.synchronize();"
+        "print(json.dumps({'torch':torch.__version__,'torch_cuda':torch.version.cuda,"
+        "'cudnn_version':torch.backends.cudnn.version(),"
+        "'bf16_conv3d':tuple(result.shape)==(1,8,4,32,32)},sort_keys=True))"
+    )
+    try:
+        cuda_runtime = json.loads(
+            subprocess.check_output(
+                [str(comfy_python), "-I", "-c", cuda_probe],
+                env=local_evaluator._inspection_environment(),
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+            )
+        )
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise RuntimeError("exact scorer CUDA/cuDNN probe failed") from exc
+    if cuda_runtime != runtime_contract["cuda_runtime_probe"]:
+        raise ValueError("exact scorer CUDA/cuDNN runtime differs from owner contract")
     observed_runtime_identity = {
         "comfy_python_identity_sha256": krea_provenance.canonical_sha256(
             python_environment
@@ -2353,6 +2376,7 @@ def _stage1_exact_scorer_readiness(evaluator: dict[str, Any]) -> dict[str, Any]:
         "dependency_lock_sha256": lock_contract["sha256"],
         "assets": observed_assets,
         "runtime_identity": observed_runtime_identity,
+        "cuda_runtime_probe": cuda_runtime,
         "runtime_contract_sha256": krea_provenance.canonical_sha256(runtime_contract),
         "base_timeouts_s": contract["timeouts_s"],
         "effective_timeouts_s": krea_scorer_extension_policy.effective_timeouts(
@@ -3455,6 +3479,15 @@ def _evaluator_command(
     for key, flag in flags.items():
         if key in evaluator:
             command.extend((flag, str(evaluator[key])))
+    expected_identity = evaluator.get("_expected_dataset_identity")
+    if expected_identity is not None:
+        order = expected_identity.get("evaluator_order")
+        if not isinstance(order, list) or not order:
+            raise ValueError("sealed evaluator image order is missing")
+        for image_name in order:
+            if not isinstance(image_name, str) or not image_name:
+                raise ValueError("sealed evaluator image order is invalid")
+            command.extend(("--expected-image", image_name))
     return command
 
 

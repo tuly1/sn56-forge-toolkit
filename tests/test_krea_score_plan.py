@@ -79,6 +79,73 @@ def test_exact_scorer_environments_do_not_inherit_operator_controls(
     assert inspection["GIT_CONFIG_VALUE_0"] == "false"
 
 
+def test_exact_scorer_binds_approved_order_across_filesystem_enumeration(
+    tmp_path: Path,
+) -> None:
+    # APFS and ext4 can enumerate the same immutable file set differently.
+    # The approved fixture order must win on both the evaluator side and the
+    # batch command side; native order remains only a set-integrity check.
+    approved = ["fontana.jpg", "no-print.jpg"]
+    native_ext4 = ["no-print.jpg", "fontana.jpg"]
+    enumerate_images = evaluate_krea_local._ordered_image_enumerator(
+        lambda _root, _extensions: list(native_ext4),
+        approved,
+    )
+    assert enumerate_images(str(tmp_path), (".jpg",)) == approved
+
+    original = lambda _root, _extensions: list(native_ext4)
+    diffusion = SimpleNamespace(list_supported_images=original)
+
+    def eval_loop(dataset, params, *, generations):
+        assert dataset == str(tmp_path)
+        assert params == "params"
+        assert generations == 5
+        return {
+            "observed_order": diffusion.list_supported_images(dataset, (".jpg",))
+        }
+
+    diffusion.eval_loop = eval_loop
+    raw, scored_order = evaluate_krea_local._run_exact_eval(
+        diffusion,
+        dataset=tmp_path,
+        params="params",
+        generations=5,
+        list_supported_images=enumerate_images,
+    )
+    assert raw["observed_order"] == approved
+    assert scored_order == approved
+    assert diffusion.list_supported_images is original
+
+    evaluator = {
+        "driver_python": sys.executable,
+        "comfy_root": str(tmp_path / "comfy"),
+        "comfy_python": sys.executable,
+        "god_root": str(tmp_path / "god"),
+        "expected_god_commit": "a" * 40,
+        "_expected_dataset_identity": {"evaluator_order": approved},
+    }
+    command = batch._evaluator_command(
+        evaluator_script=_CALIBRATION / "evaluate_krea_local.py",
+        dataset=tmp_path / "dataset",
+        candidate={"path": tmp_path / "candidate.safetensors"},
+        result_path=tmp_path / "result.json",
+        evaluator=evaluator,
+    )
+    observed = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "--expected-image"
+    ]
+    assert observed == approved
+
+    mismatched = evaluate_krea_local._ordered_image_enumerator(
+        lambda _root, _extensions: ["other.jpg"],
+        approved,
+    )
+    with pytest.raises(RuntimeError, match="image set differs"):
+        mismatched(str(tmp_path), (".jpg",))
+
+
 def _canonical_file(path: Path, value: dict) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(krea_provenance.canonical_bytes(value) + b"\n")
@@ -685,13 +752,15 @@ def _readiness_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         evaluate_krea_local, "_python_environment", lambda _path: python_environment
     )
     monkeypatch.setattr(batch, "_sha256", fake_sha256)
-    monkeypatch.setattr(
-        batch.subprocess,
-        "check_output",
-        lambda *_args, **_kwargs: json.dumps(
-            contract["runtime_materialization"]["critical_distributions"]
-        ),
-    )
+    def fake_runtime_probe(argv, **_kwargs):
+        key = (
+            "cuda_runtime_probe"
+            if "Conv3d" in " ".join(str(item) for item in argv)
+            else "critical_distributions"
+        )
+        return json.dumps(contract["runtime_materialization"][key])
+
+    monkeypatch.setattr(batch.subprocess, "check_output", fake_runtime_probe)
     return evaluator, contract, snapshots, live_hashes, python_environment
 
 
@@ -776,7 +845,7 @@ def test_stage1_d2_timeout_is_shape_bound_and_has_explicit_headroom(
 
 
 @pytest.mark.parametrize(
-    "drift", ("source", "requirements", "asset", "runtime", "torch")
+    "drift", ("source", "requirements", "asset", "runtime", "torch", "cudnn")
 )
 def test_stage1_exact_scorer_readiness_fails_closed_on_dependency_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
@@ -794,7 +863,7 @@ def test_stage1_exact_scorer_readiness_fails_closed_on_dependency_drift(
         live_hashes[asset["canonical_path"]] = "f" * 64
     elif drift == "runtime":
         python_environment["normalized_distributions_sha256"] = "f" * 64
-    else:
+    elif drift == "torch":
         monkeypatch.setattr(
             batch.subprocess,
             "check_output",
@@ -805,6 +874,20 @@ def test_stage1_exact_scorer_readiness_fails_closed_on_dependency_drift(
                 }
             ),
         )
+    else:
+        def mismatched_cudnn(argv, **_kwargs):
+            if "Conv3d" in " ".join(str(item) for item in argv):
+                return json.dumps(
+                    {
+                        **contract["runtime_materialization"]["cuda_runtime_probe"],
+                        "cudnn_version": 92000,
+                    }
+                )
+            return json.dumps(
+                contract["runtime_materialization"]["critical_distributions"]
+            )
+
+        monkeypatch.setattr(batch.subprocess, "check_output", mismatched_cudnn)
     with pytest.raises(ValueError):
         batch._stage1_exact_scorer_readiness(evaluator)
 
