@@ -77,13 +77,18 @@ def test_all_twelve_cells_are_assembled_from_exact_controls(
     tmp_path: Path, cell_id: str
 ) -> None:
     fixture_id, arm_id = cell_id.split("-", 1)
-    discovery_path = tmp_path / "discovery.json"
-    _canonical(discovery_path, {"training_seed_a": 42565431})
+    discovery_path = tmp_path / queue._TRACKED_DISCOVERY_PLAN
+    discovery_path.parent.mkdir(parents=True)
+    discovery_path.write_text(
+        json.dumps({"training_seed_a": 42565431}, indent=2) + "\n"
+    )
     runner_path = tmp_path / "ops/calibration/run_krea_ladder.py"
-    runner_path.parent.mkdir(parents=True)
     runner_path.write_text("# frozen fc70 runner\n")
     profile_index = {
-        "discovery_plan": {"path": str(discovery_path)},
+        "discovery_plan": {
+            "path": str(discovery_path),
+            "file_sha256": queue._file_sha(discovery_path),
+        },
         "discovery_execution_authorization": {"bound": True},
         "fixtures": {
             fixture: {
@@ -164,6 +169,42 @@ def test_all_twelve_cells_are_assembled_from_exact_controls(
         f"/{fixture_id}/manifest.json"
     )
     assert payload["runner_sha256"] == queue._file_sha(runner_path)
+
+
+def test_tracked_discovery_plan_rejects_wrong_path_and_digest(
+    tmp_path: Path,
+) -> None:
+    tracked_path = tmp_path / queue._TRACKED_DISCOVERY_PLAN
+    tracked_path.parent.mkdir(parents=True)
+    tracked_path.write_text('{\n  "training_seed_a": 42565431\n}\n')
+    wrong_path = tmp_path / "discovery.json"
+    wrong_path.write_bytes(tracked_path.read_bytes())
+
+    with pytest.raises(ValueError, match="not the tracked Forge plan"):
+        queue._load_tracked_discovery_plan(
+            wrong_path,
+            forge_root=tmp_path,
+            expected_file_sha256=queue._file_sha(wrong_path),
+        )
+    with pytest.raises(ValueError, match="differs from the profile index"):
+        queue._load_tracked_discovery_plan(
+            tracked_path,
+            forge_root=tmp_path,
+            expected_file_sha256=_sha("wrong discovery plan"),
+        )
+
+
+def test_tracked_discovery_plan_rejects_malformed_json(tmp_path: Path) -> None:
+    tracked_path = tmp_path / queue._TRACKED_DISCOVERY_PLAN
+    tracked_path.parent.mkdir(parents=True)
+    tracked_path.write_text("{not-json}\n")
+
+    with pytest.raises(ValueError, match="is not JSON"):
+        queue._load_tracked_discovery_plan(
+            tracked_path,
+            forge_root=tmp_path,
+            expected_file_sha256=queue._file_sha(tracked_path),
+        )
 
 
 def test_initial_queue_excludes_correction_gated_d2_k4() -> None:

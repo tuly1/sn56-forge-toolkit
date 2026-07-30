@@ -41,6 +41,9 @@ _AXES = {
     "K5": ["learning_rate"],
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_TRACKED_DISCOVERY_PLAN = Path(
+    "ops/calibration/week5/krea-discovery-plan.json"
+)
 
 
 def _object(value: Any, label: str) -> dict[str, Any]:
@@ -119,6 +122,34 @@ def _load(path: str | Path, label: str) -> tuple[Path, dict[str, Any], str]:
     if raw != _canonical_bytes(value) + b"\n":
         raise ValueError(f"{label} must be canonical JSON plus one newline")
     return path, value, hashlib.sha256(raw).hexdigest()
+
+
+def _load_tracked_discovery_plan(
+    path: str | Path,
+    *,
+    forge_root: Path,
+    expected_file_sha256: str,
+) -> tuple[Path, dict[str, Any], str]:
+    """Load the one tracked source JSON whose repository bytes are pretty-printed."""
+
+    path = _safe_file(path, "tracked discovery plan")
+    expected_path = _safe_file(
+        forge_root / _TRACKED_DISCOVERY_PLAN,
+        "tracked discovery plan",
+    )
+    if path != expected_path:
+        raise ValueError("discovery plan is not the tracked Forge plan")
+    raw = path.read_bytes()
+    try:
+        value = _object(json.loads(raw), "tracked discovery plan")
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("tracked discovery plan is not JSON") from exc
+    file_sha = hashlib.sha256(raw).hexdigest()
+    if file_sha != _sha(
+        expected_file_sha256, "indexed discovery-plan file SHA-256"
+    ):
+        raise ValueError("tracked discovery plan differs from the profile index")
+    return path, value, file_sha
 
 
 def _publish(path: Path, value: dict[str, Any]) -> None:
@@ -269,8 +300,19 @@ def _cell_payload(
     cell = controls["cell"]
     if cell["cell_id"] != cell_id:
         raise ValueError("derived controls bind another cell")
-    discovery_path = Path(profile_index["discovery_plan"]["path"])
-    _, discovery, discovery_file_sha = _load(discovery_path, "discovery plan")
+    discovery_binding = _object(
+        profile_index["discovery_plan"], "indexed discovery plan"
+    )
+    _exact(
+        discovery_binding,
+        {"path", "file_sha256"},
+        "indexed discovery plan",
+    )
+    discovery_path, discovery, discovery_file_sha = _load_tracked_discovery_plan(
+        discovery_binding["path"],
+        forge_root=forge_root,
+        expected_file_sha256=discovery_binding["file_sha256"],
+    )
     fixture_slot = profile_index["fixtures"][fixture_id]
     fixture_spec = spec["fixtures"][fixture_id]
     recipe = copy.deepcopy(spec["arms"][arm_id]["execution_recipe"])
