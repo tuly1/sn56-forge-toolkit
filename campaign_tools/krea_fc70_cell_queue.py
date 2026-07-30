@@ -25,7 +25,7 @@ from typing import Any, Mapping, Sequence
 # Runtime source is the exact fc70 tree plus the native, hash-proven bridge that
 # lets it consume the immutable admission sealed by its 588 ancestor.  Later
 # external controller commits must not broaden or move this runtime pin.
-FC70_COMMIT = "f6ce1ad044ff2aa920f2c63074dedd9c32035922"
+FC70_COMMIT = "c9f30b1a30d33ee2121a3fb3afe64608aa2b3ae7"
 _RUNNER_INITIAL_PYTHON = "/usr/bin/python3"
 _RUNNER_BOOTSTRAP = (
     "import runpy,sys;sys.path.insert(0,'/app/forge');"
