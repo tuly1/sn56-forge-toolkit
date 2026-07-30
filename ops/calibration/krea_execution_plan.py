@@ -1382,12 +1382,100 @@ def validate_timing_probe_approval(
 def build_approval(
     plan: dict[str, Any],
     *,
-    reviewer_identity: str,
+    reviewer_identity: str | None,
     approved_at_utc: str,
+    admission_envelope_path: str | Path | None = None,
+    approval_output_path: str | Path | None = None,
+    technical_reviewer_actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a pre-run approval without demanding evidence from the future."""
 
     resolved = validate_plan(plan)
+    if resolved.get("fixture", {"schema": 1}).get("schema") == 2:
+        if reviewer_identity is not None:
+            raise ValueError(
+                "schema-2 fixtures use an explicit technical agent; "
+                "reviewer_identity must be omitted"
+            )
+        if admission_envelope_path is None or approval_output_path is None:
+            raise ValueError(
+                "schema-2 fixtures require an admission envelope and approval output path"
+            )
+        try:
+            from . import krea_fixture_admission
+        except ImportError:  # pragma: no cover - direct script execution.
+            import krea_fixture_admission  # type: ignore[no-redef]
+
+        envelope_path = _safe_file(
+            admission_envelope_path, "fixture admission envelope"
+        )
+        envelope_resolved = krea_fixture_admission.validate_envelope(envelope_path)
+        if technical_reviewer_actor is None:
+            raise ValueError("schema-2 fixtures require an explicit technical agent")
+        technical_actor = krea_fixture._agent_actor(
+            technical_reviewer_actor, "technical reviewer actor"
+        )
+        role = resolved["fixture"]["experimental_role"]
+        if role not in {"D1", "D2"}:
+            raise ValueError("discovery envelope authorizes only D1 or D2")
+        fixture_binding = envelope_resolved["envelope"]["discovery_fixtures"][role][
+            "manifest"
+        ]
+        if (
+            fixture_binding["file_sha256"]
+            != _file_binding(plan["fixture_manifest"], "fixture manifest")[1]
+            or fixture_binding["manifest_sha256"]
+            != resolved["fixture"]["manifest_sha256"]
+        ):
+            raise ValueError("admission envelope does not authorize the plan fixture")
+        output_path = Path(os.path.abspath(os.path.expanduser(approval_output_path)))
+        relative = Path(os.path.relpath(envelope_path, output_path.parent))
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise ValueError(
+                "admission envelope must be inside the approval output directory"
+            )
+        body = {
+            "schema": 3,
+            "kind": _EXECUTION_APPROVAL_KIND,
+            "execution_plan_sha256": plan["plan_sha256"],
+            "host_execution_identity_sha256": resolved["host_execution_manifest"][
+                "host_execution_identity_sha256"
+            ],
+            "throughput_profile_sha256": resolved["throughput_profile"][
+                "profile_sha256"
+            ],
+            "fixture_admission_envelope": {
+                "relative_path": relative.as_posix(),
+                "file_sha256": krea_provenance.file_sha256(envelope_path),
+                "envelope_sha256": envelope_resolved["envelope"]["envelope_sha256"],
+                "phase": "discovery",
+            },
+            "fixture_role": role,
+            "technical_reviewer_actor": technical_actor,
+            "accountable_owner_identity": envelope_resolved["ratification"][
+                "owner_identity"
+            ],
+            "owner_ratification_sha256": envelope_resolved["ratification"][
+                "ratification_sha256"
+            ],
+            "approved_at_utc": _strict_utc(approved_at_utc, "approved_at_utc"),
+            "decision": "approved",
+            "gpu_execution_authorized": True,
+            "assertions": {
+                "host_capability_reviewed": True,
+                "raw_timing_evidence_reviewed": True,
+                "fixture_recipe_and_budget_reviewed": True,
+                "fixture_admission_envelope_revalidated": True,
+                "owner_authorized_mechanical_gpu_gate": True,
+                "natural_completion_is_post_run_evidence": True,
+            },
+        }
+        return {
+            **body,
+            "approval_sha256": krea_provenance.canonical_sha256(body),
+        }
     body = {
         "schema": 2,
         "kind": _EXECUTION_APPROVAL_KIND,
@@ -1522,10 +1610,123 @@ def validate_postrun_certificate(
 
 
 def validate_approval(
-    approval: dict[str, Any], *, plan: dict[str, Any]
+    approval: dict[str, Any],
+    *,
+    plan: dict[str, Any],
+    approval_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    validate_plan(plan)
+    resolved = validate_plan(plan)
     approval = _object(approval, "execution approval")
+    if approval.get("schema") == 3:
+        if resolved["fixture"].get("schema") != 2 or approval_path is None:
+            raise ValueError(
+                "schema-3 execution approval requires a schema-2 fixture and its file path"
+            )
+        _exact(
+            approval,
+            {
+                "schema",
+                "kind",
+                "execution_plan_sha256",
+                "host_execution_identity_sha256",
+                "throughput_profile_sha256",
+                "fixture_admission_envelope",
+                "fixture_role",
+                "technical_reviewer_actor",
+                "accountable_owner_identity",
+                "owner_ratification_sha256",
+                "approved_at_utc",
+                "decision",
+                "gpu_execution_authorized",
+                "assertions",
+                "approval_sha256",
+            },
+            "execution approval",
+        )
+        body = {
+            key: value for key, value in approval.items() if key != "approval_sha256"
+        }
+        binding = _object(
+            approval["fixture_admission_envelope"], "fixture admission envelope"
+        )
+        _exact(
+            binding,
+            {"relative_path", "file_sha256", "envelope_sha256", "phase"},
+            "fixture admission envelope",
+        )
+        relative = Path(binding["relative_path"])
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise ValueError("fixture admission envelope path is not portable")
+        approval_file = Path(os.path.abspath(os.path.expanduser(approval_path)))
+        envelope_path = _safe_file(
+            approval_file.parent / relative, "fixture admission envelope"
+        )
+        if krea_provenance.file_sha256(envelope_path) != binding["file_sha256"]:
+            raise ValueError("fixture admission envelope file SHA-256 mismatch")
+        try:
+            from . import krea_fixture_admission
+        except ImportError:  # pragma: no cover - direct script execution.
+            import krea_fixture_admission  # type: ignore[no-redef]
+
+        envelope_resolved = krea_fixture_admission.validate_envelope(envelope_path)
+        envelope = envelope_resolved["envelope"]
+        ratification = envelope_resolved["ratification"]
+        technical_actor = krea_fixture._agent_actor(
+            approval["technical_reviewer_actor"], "technical reviewer actor"
+        )
+        role = resolved["fixture"]["experimental_role"]
+        fixture_binding = envelope["discovery_fixtures"].get(role)
+        if (
+            approval["kind"] != _EXECUTION_APPROVAL_KIND
+            or approval["execution_plan_sha256"] != plan["plan_sha256"]
+            or approval["host_execution_identity_sha256"]
+            != resolved["host_execution_manifest"]["host_execution_identity_sha256"]
+            or approval["throughput_profile_sha256"]
+            != resolved["throughput_profile"]["profile_sha256"]
+            or approval["fixture_role"] != role
+            or technical_actor != approval["technical_reviewer_actor"]
+            or approval["accountable_owner_identity"] != ratification["owner_identity"]
+            or approval["owner_ratification_sha256"]
+            != ratification["ratification_sha256"]
+            or role not in {"D1", "D2"}
+            or binding["phase"] != "discovery"
+            or binding["envelope_sha256"] != envelope["envelope_sha256"]
+            or fixture_binding is None
+            or fixture_binding["manifest"]["file_sha256"]
+            != _file_binding(plan["fixture_manifest"], "fixture manifest")[1]
+            or fixture_binding["manifest"]["manifest_sha256"]
+            != resolved["fixture"]["manifest_sha256"]
+            or approval["decision"] != "approved"
+            or approval["gpu_execution_authorized"] is not True
+            or approval["assertions"]
+            != {
+                "host_capability_reviewed": True,
+                "raw_timing_evidence_reviewed": True,
+                "fixture_recipe_and_budget_reviewed": True,
+                "fixture_admission_envelope_revalidated": True,
+                "owner_authorized_mechanical_gpu_gate": True,
+                "natural_completion_is_post_run_evidence": True,
+            }
+            or approval["approval_sha256"] != krea_provenance.canonical_sha256(body)
+        ):
+            raise ValueError("schema-3 execution approval does not authorize this plan")
+        krea_fixture.named_human(
+            approval["accountable_owner_identity"], "accountable_owner_identity"
+        )
+        approved_at = datetime.strptime(
+            _strict_utc(approval["approved_at_utc"], "approved_at_utc"),
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=timezone.utc)
+        admitted_at = datetime.strptime(
+            envelope["admitted_at_utc"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+        if approved_at < admitted_at:
+            raise ValueError("GPU approval predates fixture admission")
+        return approval
+    if resolved["fixture"].get("schema") != 1:
+        raise ValueError("schema-2 fixtures require schema-3 envelope-bound approval")
     _exact(
         approval,
         {

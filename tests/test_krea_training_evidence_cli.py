@@ -143,9 +143,10 @@ def approved_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         assert value == plan
         return copy.deepcopy(resolved)
 
-    def validate_approval(value, *, plan):
+    def validate_approval(value, *, plan, approval_path=None):
         assert value == approval
         assert plan == approved_plan
+        assert approval_path is not None
         return value
 
     approved_plan = copy.deepcopy(plan)

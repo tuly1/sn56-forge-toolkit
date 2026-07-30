@@ -2135,7 +2135,9 @@ def _validate_plan_v2(
                 binding["execution_approval"], "execution approval"
             )
             krea_execution_plan.validate_approval(
-                approval_value, plan=execution_plan_value
+                approval_value,
+                plan=execution_plan_value,
+                approval_path=approval_path,
             )
             completion_path, completion, completion_sha = _load_candidate_binding(
                 binding["run_completion"], "run completion"

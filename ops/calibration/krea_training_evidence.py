@@ -122,7 +122,9 @@ def load_execution_controls(
     approval, approval_file_sha = _load_canonical(
         execution_approval_path, "execution approval"
     )
-    krea_execution_plan.validate_approval(approval, plan=plan)
+    krea_execution_plan.validate_approval(
+        approval, plan=plan, approval_path=execution_approval_path
+    )
     return plan, plan_file_sha, approval, approval_file_sha, resolved
 
 

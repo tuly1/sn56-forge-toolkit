@@ -10,6 +10,7 @@ approved bytes before use.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import inspect
 import json
@@ -60,6 +61,13 @@ _BASE_GROUP_DISJOINT_FIELDS = frozenset(
 )
 _HUMAN_IDENTITY_ASSURANCE = (
     "named-human-string-self-assertion-not-cryptographic-authentication"
+)
+_AGENT_IDENTITY_ASSURANCE = (
+    "self-declared-agent-identity-not-human-or-cryptographic-authentication"
+)
+_AGENT_GOVERNANCE_MODE = "sole-human-owner-ratifies-agent-review-v1"
+_OWNER_IDENTITY_ASSURANCE = (
+    "interactive-owner-self-attestation-not-cryptographic-or-legal-signature"
 )
 _ROLE_LABELS = frozenset(
     {
@@ -818,7 +826,7 @@ def build_manifest(
     return manifest
 
 
-def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+def _validate_legacy_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     manifest = _object(manifest, "fixture manifest")
     expected = {
         "schema",
@@ -1230,6 +1238,257 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     return manifest
 
 
+def _agent_actor(value: Any, label: str) -> dict[str, str]:
+    """Validate an explicitly non-human review actor.
+
+    Agent identities are deliberately separate from :func:`named_human`.
+    They establish stable record linkage and review-instance separation, not
+    human identity, legal agency, or cryptographic authentication.
+    """
+
+    actor = _object(value, label)
+    _exact(
+        actor,
+        {
+            "actor_class",
+            "actor_id",
+            "display_name",
+            "role",
+            "review_instance_id",
+            "identity_assurance",
+        },
+        label,
+    )
+    if (
+        actor["actor_class"] != "agent"
+        or not isinstance(actor["actor_id"], str)
+        or not _SAFE_ID.fullmatch(actor["actor_id"])
+        or not isinstance(actor["review_instance_id"], str)
+        or not _SAFE_ID.fullmatch(actor["review_instance_id"])
+        or actor["identity_assurance"] != _AGENT_IDENTITY_ASSURANCE
+    ):
+        raise ValueError(f"{label} is not an explicit agent identity")
+    _text(actor["display_name"], f"{label}.display_name")
+    _text(actor["role"], f"{label}.role")
+    return dict(actor)
+
+
+def _validate_agent_governance(manifest: dict[str, Any]) -> dict[str, Any]:
+    governance = _object(manifest.get("governance"), "fixture governance")
+    _exact(
+        governance,
+        {
+            "mode",
+            "policy_sha256",
+            "governance_amendment",
+            "owner_ratification",
+            "source_package",
+            "candidate_manifest_sha256",
+            "surface_agent_review",
+            "independent_agent_review",
+            "preparer_actor",
+            "accountable_owner_identity",
+            "owner_identity_assurance",
+            "agent_review_is_not_human_review",
+            "independent_human_review_performed",
+            "claim_limit",
+        },
+        "fixture governance",
+    )
+    if governance["mode"] != _AGENT_GOVERNANCE_MODE:
+        raise ValueError("unsupported fixture governance mode")
+    for key in (
+        "policy_sha256",
+        "candidate_manifest_sha256",
+    ):
+        if not isinstance(governance[key], str) or not _SHA256.fullmatch(
+            governance[key]
+        ):
+            raise ValueError(f"fixture governance {key} is invalid")
+    for key, semantic_key in (
+        ("governance_amendment", "amendment_sha256"),
+        ("owner_ratification", "ratification_sha256"),
+        ("source_package", "package_sha256"),
+    ):
+        binding = _object(governance[key], f"fixture governance {key}")
+        _exact(binding, {"file_sha256", semantic_key}, f"fixture governance {key}")
+        for digest_key in ("file_sha256", semantic_key):
+            if not isinstance(binding[digest_key], str) or not _SHA256.fullmatch(
+                binding[digest_key]
+            ):
+                raise ValueError(f"fixture governance {key}.{digest_key} is invalid")
+    for key in ("surface_agent_review", "independent_agent_review"):
+        binding = _object(governance[key], f"fixture governance {key}")
+        _exact(
+            binding,
+            {"file_sha256", "review_sha256", "actor"},
+            f"fixture governance {key}",
+        )
+        for digest_key in ("file_sha256", "review_sha256"):
+            if not isinstance(binding[digest_key], str) or not _SHA256.fullmatch(
+                binding[digest_key]
+            ):
+                raise ValueError(f"fixture governance {key}.{digest_key} is invalid")
+    preparer = _agent_actor(governance["preparer_actor"], "fixture preparer actor")
+    surface_actor = _agent_actor(
+        governance["surface_agent_review"]["actor"], "surface review actor"
+    )
+    independent_actor = _agent_actor(
+        governance["independent_agent_review"]["actor"],
+        "independent review actor",
+    )
+    if (
+        preparer["review_instance_id"] == surface_actor["review_instance_id"]
+        or preparer["review_instance_id"] == independent_actor["review_instance_id"]
+        or surface_actor["review_instance_id"]
+        == independent_actor["review_instance_id"]
+    ):
+        raise ValueError("agent review instances are not distinct")
+    owner = named_human(
+        governance["accountable_owner_identity"], "accountable_owner_identity"
+    )
+    if (
+        governance["owner_identity_assurance"] != _OWNER_IDENTITY_ASSURANCE
+        or governance["agent_review_is_not_human_review"] is not True
+        or governance["independent_human_review_performed"] is not False
+        or governance["claim_limit"]
+        != "owner-ratified-agent-evidence-not-independent-human-review-or-quality-proof"
+    ):
+        raise ValueError("fixture governance overstates its assurance")
+    return {**governance, "accountable_owner_identity": owner}
+
+
+def _schema2_legacy_projection(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Project schema 2 onto schema 1 solely for byte-integrity validation.
+
+    The placeholder names exist only inside this in-memory projection.  They
+    are never evidence and never written to an artifact.  This lets schema 2
+    reuse the mature dataset/archive/leakage validator without laundering an
+    agent identity through ``named_human()``.
+    """
+
+    projected = deepcopy(manifest)
+    projected.pop("governance")
+    projected["schema"] = 1
+    projected["preparer_identity"] = "Governance Projection Preparer"
+    projected["source_rights"]["reviewer_identity"] = "Governance Projection Rights"
+    projected["caption_policy"]["reviewer_identity"] = "Governance Projection Caption"
+    projected["near_duplicate_policy"]["human_similarity_review"][
+        "reviewer_identity"
+    ] = "Governance Projection Similarity"
+    projected["near_duplicate_policy"]["human_similarity_review"][
+        "method"
+    ] = "named-human-exhaustive-pair-review-plus-pinned-ahash"
+    # Schema 2 preserves threshold-8 machine flags that were explicitly
+    # adjudicated by the bound agent surface review.  Schema 1 cannot express
+    # adjudicated flags and requires the raw list to be empty, so this
+    # in-memory compatibility projection uses the strict exact-pHash threshold
+    # after schema-2 validation has already recomputed and checked the real
+    # threshold-8 report.
+    projected["near_duplicate_policy"]["maximum_hamming_distance"] = 0
+    projected["near_duplicate_policy"]["report"] = _duplicates(
+        projected["training_rows"],
+        projected["evaluation_rows"],
+        threshold=0,
+        group_disjoint_fields=tuple(
+            projected["near_duplicate_policy"]["group_disjoint_fields"]
+        ),
+    )
+    projected["near_duplicate_policy"]["report_sha256"] = (
+        krea_provenance.canonical_sha256(projected["near_duplicate_policy"]["report"])
+    )
+    body = {key: value for key, value in projected.items() if key != "manifest_sha256"}
+    projected["manifest_sha256"] = krea_provenance.canonical_sha256(body)
+    return projected
+
+
+def _validate_agent_governed_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    expected = {
+        "schema",
+        "kind",
+        "concept_id",
+        "experimental_role",
+        "trigger_token",
+        "caption_policy",
+        "source_rights",
+        "preparer_identity",
+        "training_archive",
+        "training_archive_identity",
+        "training_dataset_identity",
+        "evaluation_dataset_identity",
+        "training_dataset_shape_sha256",
+        "evaluation_dataset_shape_sha256",
+        "training_rows",
+        "evaluation_rows",
+        "tool_identity",
+        "near_duplicate_policy",
+        "governance",
+        "manifest_sha256",
+    }
+    _exact(manifest, expected, "agent-governed fixture manifest")
+    body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    if (
+        manifest["schema"] != 2
+        or manifest["kind"] != "forge-krea-curated-fixture"
+        or manifest["manifest_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("agent-governed fixture manifest digest mismatch")
+    governance = _validate_agent_governance(manifest)
+    surface_binding = governance["surface_agent_review"]
+    independent_binding = governance["independent_agent_review"]
+    surface_actor = _agent_actor(surface_binding["actor"], "surface review actor")
+    independent_actor = _agent_actor(
+        independent_binding["actor"], "independent review actor"
+    )
+    preparer_actor = _agent_actor(
+        governance["preparer_actor"], "fixture preparer actor"
+    )
+    if (
+        manifest["preparer_identity"] != preparer_actor["display_name"]
+        or manifest["source_rights"]["reviewer_identity"]
+        != surface_actor["display_name"]
+        or manifest["caption_policy"]["reviewer_identity"]
+        != surface_actor["display_name"]
+        or manifest["near_duplicate_policy"]["human_similarity_review"][
+            "reviewer_identity"
+        ]
+        != surface_actor["display_name"]
+        or manifest["near_duplicate_policy"]["human_similarity_review"]["method"]
+        != "owner-ratified-agent-review-plus-pinned-ahash"
+        or independent_actor["actor_id"] == surface_actor["actor_id"]
+    ):
+        raise ValueError("fixture actors differ from the explicit governance record")
+    near = _object(manifest["near_duplicate_policy"], "near_duplicate_policy")
+    if near.get("maximum_hamming_distance") != 8:
+        raise ValueError("agent-governed fixture must preserve threshold-8 screening")
+    actual_report = _duplicates(
+        manifest["training_rows"],
+        manifest["evaluation_rows"],
+        threshold=8,
+        group_disjoint_fields=tuple(near.get("group_disjoint_fields", [])),
+    )
+    if (
+        near.get("report") != actual_report
+        or near.get("report_sha256") != krea_provenance.canonical_sha256(actual_report)
+        or actual_report["exact_matches"]
+        or actual_report["cross_split_group_matches"]
+    ):
+        raise ValueError("agent-governed fixture duplicate report is invalid")
+    _validate_legacy_manifest(_schema2_legacy_projection(manifest))
+    return manifest
+
+
+def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch without weakening the legacy named-human contract."""
+
+    manifest = _object(manifest, "fixture manifest")
+    if manifest.get("schema") == 1:
+        return _validate_legacy_manifest(manifest)
+    if manifest.get("schema") == 2:
+        return _validate_agent_governed_manifest(manifest)
+    raise ValueError("unsupported fixture manifest")
+
+
 def build_approval(
     manifest: dict[str, Any],
     *,
@@ -1262,10 +1521,10 @@ def build_approval(
     return {**body, "approval_sha256": krea_provenance.canonical_sha256(body)}
 
 
-def validate_approval(
+def _validate_legacy_approval(
     approval: dict[str, Any], *, fixture_manifest: dict[str, Any]
 ) -> dict[str, Any]:
-    validate_manifest(fixture_manifest)
+    _validate_legacy_manifest(fixture_manifest)
     approval = _object(approval, "fixture approval")
     _exact(
         approval,
@@ -1308,6 +1567,134 @@ def validate_approval(
     if approved_at < _latest_fixture_evidence([fixture_manifest]):
         raise ValueError("fixture approval predates fixture preparation evidence")
     return approval
+
+
+def build_agent_governed_approval(
+    manifest: dict[str, Any],
+    *,
+    technical_reviewer_actor: dict[str, Any],
+    accountable_owner_identity: str,
+    approved_at_utc: str,
+) -> dict[str, Any]:
+    """Build an admission input; only the later envelope admits a fixture."""
+
+    _validate_agent_governed_manifest(manifest)
+    governance = manifest["governance"]
+    actor = _agent_actor(technical_reviewer_actor, "technical reviewer actor")
+    if actor != governance["independent_agent_review"]["actor"]:
+        raise ValueError("fixture approval actor differs from governance")
+    owner = named_human(accountable_owner_identity, "accountable_owner_identity")
+    if owner != governance["accountable_owner_identity"]:
+        raise ValueError("fixture approval owner differs from ratified governance")
+    approved_at = canonical_utc(approved_at_utc, "approved_at_utc")
+    body = {
+        "schema": 2,
+        "kind": "forge-krea-owner-ratified-fixture-approval",
+        "fixture_manifest_sha256": manifest["manifest_sha256"],
+        "governance_policy_sha256": governance["policy_sha256"],
+        "owner_ratification_sha256": governance["owner_ratification"][
+            "ratification_sha256"
+        ],
+        "accountable_owner_identity": owner,
+        "owner_identity_assurance": _OWNER_IDENTITY_ASSURANCE,
+        "technical_reviewer_actor": actor,
+        "approved_at_utc": approved_at,
+        "decision": "approved_as_discovery_admission_input",
+        "assertions": {
+            "package_and_fixture_bytes_rederived": True,
+            "agent_review_evidence_bound": True,
+            "agents_are_not_humans": True,
+            "independent_human_review_performed": False,
+            "owner_ratification_bound": True,
+        },
+        "admission_authorized": False,
+        "gpu_execution_authorized": False,
+        "claim_limit": (
+            "fixture-integrity-and-governance-input-only-not-independent-human-"
+            "review-competitiveness-or-gpu-authorization"
+        ),
+    }
+    return {**body, "approval_sha256": krea_provenance.canonical_sha256(body)}
+
+
+def _validate_agent_governed_approval(
+    approval: dict[str, Any], *, fixture_manifest: dict[str, Any]
+) -> dict[str, Any]:
+    _validate_agent_governed_manifest(fixture_manifest)
+    approval = _object(approval, "agent-governed fixture approval")
+    _exact(
+        approval,
+        {
+            "schema",
+            "kind",
+            "fixture_manifest_sha256",
+            "governance_policy_sha256",
+            "owner_ratification_sha256",
+            "accountable_owner_identity",
+            "owner_identity_assurance",
+            "technical_reviewer_actor",
+            "approved_at_utc",
+            "decision",
+            "assertions",
+            "admission_authorized",
+            "gpu_execution_authorized",
+            "claim_limit",
+            "approval_sha256",
+        },
+        "agent-governed fixture approval",
+    )
+    body = {key: value for key, value in approval.items() if key != "approval_sha256"}
+    governance = fixture_manifest["governance"]
+    if (
+        approval["schema"] != 2
+        or approval["kind"] != "forge-krea-owner-ratified-fixture-approval"
+        or approval["fixture_manifest_sha256"] != fixture_manifest["manifest_sha256"]
+        or approval["governance_policy_sha256"] != governance["policy_sha256"]
+        or approval["owner_ratification_sha256"]
+        != governance["owner_ratification"]["ratification_sha256"]
+        or approval["accountable_owner_identity"]
+        != governance["accountable_owner_identity"]
+        or approval["owner_identity_assurance"] != _OWNER_IDENTITY_ASSURANCE
+        or approval["decision"] != "approved_as_discovery_admission_input"
+        or approval["assertions"]
+        != {
+            "package_and_fixture_bytes_rederived": True,
+            "agent_review_evidence_bound": True,
+            "agents_are_not_humans": True,
+            "independent_human_review_performed": False,
+            "owner_ratification_bound": True,
+        }
+        or approval["admission_authorized"] is not False
+        or approval["gpu_execution_authorized"] is not False
+        or approval["claim_limit"]
+        != (
+            "fixture-integrity-and-governance-input-only-not-independent-human-"
+            "review-competitiveness-or-gpu-authorization"
+        )
+        or approval["approval_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("agent-governed fixture approval is invalid")
+    actor = _agent_actor(
+        approval["technical_reviewer_actor"], "technical reviewer actor"
+    )
+    if actor != governance["independent_agent_review"]["actor"]:
+        raise ValueError("agent-governed approval reviewer differs from governance")
+    named_human(approval["accountable_owner_identity"], "accountable_owner_identity")
+    _parse_canonical_utc(approval["approved_at_utc"], "approved_at_utc")
+    return approval
+
+
+def validate_approval(
+    approval: dict[str, Any], *, fixture_manifest: dict[str, Any]
+) -> dict[str, Any]:
+    approval = _object(approval, "fixture approval")
+    if approval.get("schema") == 1:
+        return _validate_legacy_approval(approval, fixture_manifest=fixture_manifest)
+    if approval.get("schema") == 2:
+        return _validate_agent_governed_approval(
+            approval, fixture_manifest=fixture_manifest
+        )
+    raise ValueError("unsupported fixture approval")
 
 
 def _cross_fixture_pairs(fixtures: list[dict[str, Any]]) -> list[list[str]]:
