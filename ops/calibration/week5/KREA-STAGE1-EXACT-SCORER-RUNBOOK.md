@@ -219,6 +219,41 @@ source, dependency-lock, requirements, asset, runtime, empty-LoRA, containment,
 and timeout readiness before it publishes either approval or executable plan.
 The batch recomputes readiness again immediately before execution.
 
+### Streaming per-arm score batches
+
+Scoring may begin as soon as one arm completion is sealed. Build and approve a
+separate exhaustive score plan for that arm (all of its checkpoints plus the
+same zero-LoRA control), then run its candidate shards and ordinary
+`assemble-shards` publication. Do not amend that plan when later arms arrive.
+
+After all arms exist, seal one complete campaign manifest containing the exact
+union of the per-arm run completions and compose the already-finished batches:
+
+```bash
+ADDITIVE_MODULE='import runpy,sys; sys.path.insert(0,"/app/forge/ops/calibration"); runpy.run_module("krea_additive_score",run_name="__main__")'
+
+"$PY" -I -c "$ADDITIVE_MODULE" \
+  --campaign /campaign/controls/D1-A-complete-campaign.json \
+  --member /campaign/scoring/D1-A/K0/aggregate.json \
+  --member /campaign/scoring/D1-A/K1/aggregate.json \
+  --member /campaign/scoring/D1-A/K2/aggregate.json \
+  --member /campaign/scoring/D1-A/K3/aggregate.json \
+  --member /campaign/scoring/D1-A/K4/aggregate.json \
+  --member /campaign/scoring/D1-A/K5/aggregate.json \
+  --output /campaign/scoring/D1-A/additive.json
+```
+
+Every member must be below the additive output directory so the result remains
+portable with its member evidence trees. Composition reopens every raw plan,
+approval, shard result, and evidence bundle; requires exactly one exhaustive
+arm per member; verifies disjoint candidate identities and exact full-campaign
+coverage; and requires one fixture, evaluation dataset, zero score, evaluator,
+runtime, provenance, and approval authority. Input order does not affect the
+composite identity. Any missing/duplicate arm, candidate collision, or surface
+drift fails before publication. The policy binds `plan.canonical_sha256`,
+`sealed_plan_approval_sha256`, and `campaign_manifest_sha256` from
+`additive.json`; the ordinary all-arms single-plan path remains supported.
+
 ## 4. Agent-bound discovery decision
 
 Prepare the canonical schema-3 policy payload binding the owner ratification,

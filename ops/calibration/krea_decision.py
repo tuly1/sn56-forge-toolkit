@@ -195,6 +195,13 @@ _CAMPAIGN_RUNTIME_IDENTITY_FIELDS = (
     "measurement_tool_sha256",
 )
 _LOSS_KEYS = frozenset({"text_guided_loss", "blank_prompt_loss"})
+_ADDITIVE_AGGREGATE_KIND = "forge-krea-additive-exact-score-aggregate"
+_ADDITIVE_EVIDENCE_KIND = "forge-krea-additive-decision-evidence"
+_ADDITIVE_PLAN_SET_KIND = "forge-krea-additive-exact-score-plan-set"
+_ADDITIVE_APPROVAL_SET_KIND = "forge-krea-additive-exact-score-approval-set"
+_ARM_VARIANT_TRAINING_ENVELOPE_KEYS = frozenset(
+    {"hard_budget_s", "predeclared_recipe_axes", "fixed_execution_fields"}
+)
 _OUTPUT_NAME = re.compile(
     r"krea-(?:discovery|confirmation)-decision(?:-[A-Za-z0-9_.-]+)?\.json"
 )
@@ -234,9 +241,16 @@ def _object(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
-def _exact(value: Mapping[str, Any], keys: set[str], label: str) -> None:
+def _exact(
+    value: Mapping[str, Any],
+    keys: set[str],
+    label: str,
+    *,
+    optional: set[str] | None = None,
+) -> None:
+    optional = optional or set()
     missing = keys - set(value)
-    extra = set(value) - keys
+    extra = set(value) - keys - optional
     if missing or extra:
         raise ValueError(
             f"{label} keys mismatch: missing={sorted(missing)}, "
@@ -424,6 +438,68 @@ def _manifest_file_entry(value: Any, label: str) -> dict[str, str]:
 
 def _validate_decision_evidence_binding(value: Any) -> dict[str, Any]:
     binding = _object(value, "decision evidence binding")
+    if binding.get("kind") == _ADDITIVE_EVIDENCE_KIND:
+        _exact(binding, {"schema", "kind", "members"}, "additive decision evidence")
+        if binding["schema"] != 1:
+            raise ValueError("additive decision evidence schema is invalid")
+        raw_members = binding["members"]
+        if not isinstance(raw_members, list) or not raw_members:
+            raise ValueError("additive decision evidence must contain members")
+        members = []
+        previous = None
+        for index, raw in enumerate(raw_members):
+            label = f"additive decision evidence member[{index}]"
+            row = _object(raw, label)
+            _exact(
+                row,
+                {
+                    "arm_id",
+                    "aggregate_path",
+                    "file_sha256",
+                    "aggregate_sha256",
+                    "plan_canonical_sha256",
+                    "sealed_plan_approval_sha256",
+                    "decision_evidence",
+                },
+                label,
+            )
+            arm_id = _identifier(row["arm_id"], f"{label}.arm_id")
+            if previous is not None and arm_id <= previous:
+                raise ValueError(
+                    "additive decision evidence members must be unique and sorted"
+                )
+            previous = arm_id
+            aggregate_path = _portable_relative_path(
+                row["aggregate_path"], f"{label}.aggregate_path"
+            )
+            members.append(
+                {
+                    "arm_id": arm_id,
+                    "aggregate_path": aggregate_path.as_posix(),
+                    "file_sha256": _digest(
+                        row["file_sha256"], f"{label}.file_sha256"
+                    ),
+                    "aggregate_sha256": _digest(
+                        row["aggregate_sha256"], f"{label}.aggregate_sha256"
+                    ),
+                    "plan_canonical_sha256": _digest(
+                        row["plan_canonical_sha256"],
+                        f"{label}.plan_canonical_sha256",
+                    ),
+                    "sealed_plan_approval_sha256": _digest(
+                        row["sealed_plan_approval_sha256"],
+                        f"{label}.sealed_plan_approval_sha256",
+                    ),
+                    "decision_evidence": _validate_decision_evidence_binding(
+                        row["decision_evidence"]
+                    ),
+                }
+            )
+        return {
+            "schema": 1,
+            "kind": _ADDITIVE_EVIDENCE_KIND,
+            "members": members,
+        }
     _exact(
         binding,
         {
@@ -2860,6 +2936,7 @@ def _validate_campaign_adapter(value: Any) -> dict[str, Any]:
             "runs",
         },
         "aggregate campaign adapter",
+        optional={"historical_training_evidence_validator"},
     )
     for key in (
         "manifest_sha256",
@@ -2973,6 +3050,15 @@ def _validate_campaign_adapter(value: Any) -> dict[str, Any]:
         "zero_control_manifest_sha256": campaign["zero_control_manifest_sha256"],
         "decision_contract": campaign["decision_contract"],
         "confirmation_contract": campaign["confirmation_contract"],
+        **(
+            {
+                "historical_training_evidence_validator": campaign[
+                    "historical_training_evidence_validator"
+                ]
+            }
+            if "historical_training_evidence_validator" in campaign
+            else {}
+        ),
     }
     manifest_sha = krea_provenance.canonical_sha256(manifest_body)
     manifest = {**manifest_body, "manifest_sha256": manifest_sha}
@@ -3238,10 +3324,665 @@ def _validate_raw_evaluator_result(
         raise ValueError("raw evaluator result text weight differs from aggregate")
 
 
+def _campaign_adapter_from_manifest(
+    manifest: Mapping[str, Any], *, file_sha256: str
+) -> dict[str, Any]:
+    """Build the consumer adapter for one already-validated campaign manifest."""
+
+    return {
+        "manifest_sha256": manifest["manifest_sha256"],
+        "file_sha256": file_sha256,
+        "fixture_manifest_sha256": manifest["fixture_manifest_sha256"],
+        "discovery_plan_sha256": manifest["discovery_plan_sha256"],
+        "zero_control_manifest_sha256": manifest["zero_control_manifest_sha256"],
+        "decision_contract": manifest["decision_contract"],
+        "confirmation_contract": manifest["confirmation_contract"],
+        "runs": manifest["runs"],
+        **(
+            {
+                "historical_training_evidence_validator": manifest[
+                    "historical_training_evidence_validator"
+                ]
+            }
+            if "historical_training_evidence_validator" in manifest
+            else {}
+        ),
+    }
+
+
+def _additive_member_path(root: Path, path: Path | str, label: str) -> tuple[Path, str]:
+    root = root.resolve(strict=True)
+    member = _safe_file(path, label)
+    try:
+        relative = member.resolve(strict=True).relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"{label} must be beneath the additive aggregate directory"
+        ) from exc
+    portable = _portable_relative_path(relative.as_posix(), f"{label}.path")
+    if member.stat().st_nlink != 1:
+        raise ValueError(f"{label} has an unexpected hardlink")
+    return member, portable.as_posix()
+
+
+def _shared_training_runtime(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove only the fields that are predeclared to differ between arms."""
+
+    return {
+        key: value
+        for key, value in envelope.items()
+        if key not in _ARM_VARIANT_TRAINING_ENVELOPE_KEYS
+    }
+
+
+def _shared_evaluation_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop only the per-batch immutable staging path, never dataset identity."""
+
+    return {key: value for key, value in envelope.items() if key != "dataset"}
+
+
+def _zero_score_semantics(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The base score must agree even when result filenames/timestamps differ."""
+
+    ignored = {"result_file", "result_file_sha256", "result_canonical_sha256"}
+    return {key: value for key, value in row.items() if key not in ignored}
+
+
+def _load_additive_members(
+    *, root: Path, member_paths: Iterable[Path | str]
+) -> list[dict[str, Any]]:
+    members = []
+    seen_paths: set[str] = set()
+    seen_arms: set[str] = set()
+    for index, raw_path in enumerate(member_paths):
+        path, relative = _additive_member_path(
+            root, raw_path, f"additive aggregate member[{index}]"
+        )
+        if relative in seen_paths:
+            raise ValueError("additive aggregate repeats a member path")
+        seen_paths.add(relative)
+        aggregate, file_sha = _aggregate(path)
+        document = aggregate["document"]
+        if (
+            document.get("schema") != 2
+            or document.get("kind") != "forge-krea-exact-score-batch"
+        ):
+            raise ValueError("additive members must be ordinary schema-2 score batches")
+        evidence = _reload_decision_evidence(
+            aggregate_path=path, aggregate=aggregate
+        )
+        runs = aggregate["campaign"]["runs"]
+        if len(runs) != 1:
+            raise ValueError("each additive score member must exhaust exactly one arm")
+        arm_id = runs[0]["arm_id"]
+        if arm_id in seen_arms:
+            raise ValueError(f"additive aggregate repeats arm {arm_id}")
+        seen_arms.add(arm_id)
+        members.append(
+            {
+                "arm_id": arm_id,
+                "path": path,
+                "relative_path": relative,
+                "file_sha256": file_sha,
+                "aggregate": aggregate,
+                "decision_evidence": evidence,
+            }
+        )
+    if not members:
+        raise ValueError("additive aggregate requires at least one score member")
+    return sorted(members, key=lambda item: item["arm_id"])
+
+
+def _additive_body(
+    *,
+    campaign_manifest: dict[str, Any],
+    campaign_file_sha256: str,
+    members: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Recompute an additive aggregate only from validated member evidence."""
+
+    krea_batch._validate_campaign_manifest(campaign_manifest)
+    expected_campaign = _validate_campaign_adapter(
+        _campaign_adapter_from_manifest(
+            campaign_manifest, file_sha256=campaign_file_sha256
+        )
+    )
+    expected_by_arm = {row["arm_id"]: row for row in expected_campaign["runs"]}
+    if len(expected_by_arm) != len(expected_campaign["runs"]):
+        raise ValueError("expected campaign repeats an arm")
+
+    first_document = members[0]["aggregate"]["document"]
+    required_member_fields = {
+        "batch_runner_sha256",
+        "common_training_envelope",
+        "common_training_envelope_sha256",
+        "evaluator_script_sha256",
+        "evaluation_envelope_sha256",
+    }
+    for member in members:
+        missing = required_member_fields - set(member["aggregate"]["document"])
+        if missing:
+            raise ValueError(
+                f"additive member {member['arm_id']} lacks scorer bindings: "
+                f"{sorted(missing)}"
+            )
+
+    first_training = _object(
+        first_document["common_training_envelope"],
+        "additive common training envelope",
+    )
+    if (
+        first_document["common_training_envelope_sha256"]
+        != krea_provenance.canonical_sha256(first_training)
+    ):
+        raise ValueError("additive member common training envelope digest is invalid")
+    first_evaluation = _object(
+        first_document["evaluation_envelope"], "additive evaluation envelope"
+    )
+    if (
+        first_document["evaluation_envelope_sha256"]
+        != krea_provenance.canonical_sha256(first_evaluation)
+    ):
+        raise ValueError("additive member evaluation envelope digest is invalid")
+    shared_evaluation = _shared_evaluation_envelope(first_evaluation)
+    common_surface = {
+        "batch_runner_sha256": _digest(
+            first_document["batch_runner_sha256"], "additive batch runner"
+        ),
+        "evaluator_script_sha256": _digest(
+            first_document["evaluator_script_sha256"], "additive evaluator script"
+        ),
+        "evaluation_envelope": shared_evaluation,
+        "shared_training_runtime": _shared_training_runtime(first_training),
+        "fixture_manifest_sha256": first_document["fixture_manifest_sha256"],
+        "fixture_approval_sha256": first_document["fixture_approval_sha256"],
+        "fixture_contract": first_document["fixture_contract"],
+        "fixture": first_document["fixture"],
+        "sealed_plan_approval": first_document["sealed_plan_approval"],
+    }
+    campaign_common_keys = {
+        "fixture_manifest_sha256",
+        "discovery_plan_sha256",
+        "zero_control_manifest_sha256",
+        "decision_contract",
+        "confirmation_contract",
+        "historical_training_evidence_validator",
+    }
+    expected_campaign_common = {
+        key: expected_campaign[key]
+        for key in campaign_common_keys
+        if key in expected_campaign
+    }
+
+    public_members = []
+    plan_members = []
+    local_public: list[dict[str, Any]] = []
+    local_normalized: list[dict[str, Any]] = []
+    training_envelopes: list[dict[str, Any]] = []
+    training_members = []
+    zero_public: dict[str, Any] | None = None
+    zero_normalized: dict[str, Any] | None = None
+    zero_semantics: dict[str, Any] | None = None
+    seen_candidate_ids: set[str] = set()
+    seen_candidate_shas: set[str] = set()
+    seen_binding_shas: set[str] = set()
+    observed_runs = []
+    reviewer = members[0]["aggregate"]["score_plan_reviewer"]
+
+    for member in members:
+        arm_id = member["arm_id"]
+        aggregate = member["aggregate"]
+        document = aggregate["document"]
+        campaign = aggregate["campaign"]
+        campaign_common = {
+            key: campaign[key] for key in campaign_common_keys if key in campaign
+        }
+        if campaign_common != expected_campaign_common:
+            raise ValueError(f"additive member {arm_id} escaped the expected campaign")
+        if (
+            arm_id not in expected_by_arm
+            or campaign["runs"][0] != expected_by_arm[arm_id]
+        ):
+            raise ValueError(f"additive member {arm_id} differs from the expected run")
+        observed_runs.append(campaign["runs"][0])
+
+        training = _object(
+            document["common_training_envelope"],
+            f"additive member {arm_id} training envelope",
+        )
+        training_sha = document["common_training_envelope_sha256"]
+        if training_sha != krea_provenance.canonical_sha256(training):
+            raise ValueError(f"additive member {arm_id} training envelope drifted")
+        evaluation = _object(
+            document["evaluation_envelope"],
+            f"additive member {arm_id} evaluation envelope",
+        )
+        if document["evaluation_envelope_sha256"] != krea_provenance.canonical_sha256(
+            evaluation
+        ):
+            raise ValueError(f"additive member {arm_id} evaluation envelope drifted")
+        surface = {
+            "batch_runner_sha256": document["batch_runner_sha256"],
+            "evaluator_script_sha256": document["evaluator_script_sha256"],
+            "evaluation_envelope": _shared_evaluation_envelope(evaluation),
+            "shared_training_runtime": _shared_training_runtime(training),
+            "fixture_manifest_sha256": document["fixture_manifest_sha256"],
+            "fixture_approval_sha256": document["fixture_approval_sha256"],
+            "fixture_contract": document["fixture_contract"],
+            "fixture": document["fixture"],
+            "sealed_plan_approval": document["sealed_plan_approval"],
+        }
+        if surface != common_surface:
+            raise ValueError(
+                f"additive member {arm_id} differs in "
+                "fixture/evaluator/runtime/authority"
+            )
+        if aggregate["score_plan_reviewer"] != reviewer:
+            raise ValueError("additive members use different score-plan authorities")
+
+        raw_rows = document["candidates"]
+        member_zero = [row for row in raw_rows if row["mode"] == "zero_lora_control"]
+        member_local = [row for row in raw_rows if row["mode"] == "local_run_candidate"]
+        normalized_zero = [
+            row
+            for row in aggregate["candidates"]
+            if row["mode"] == "zero_lora_control"
+        ]
+        normalized_local = [
+            row
+            for row in aggregate["candidates"]
+            if row["mode"] == "local_run_candidate"
+        ]
+        if len(member_zero) != 1 or len(normalized_zero) != 1 or not member_local:
+            raise ValueError(
+                f"additive member {arm_id} lacks exact zero/local coverage"
+            )
+        semantics = _zero_score_semantics(member_zero[0])
+        if zero_semantics is None:
+            zero_semantics = semantics
+            zero_public = member_zero[0]
+            zero_normalized = normalized_zero[0]
+        elif semantics != zero_semantics:
+            raise ValueError("additive members do not share one exact zero-LoRA score")
+
+        for public, normalized in zip(
+            sorted(member_local, key=lambda row: row["candidate_id"]),
+            sorted(normalized_local, key=lambda row: row["candidate_id"]),
+            strict=True,
+        ):
+            if public["candidate_id"] != normalized["candidate_id"]:
+                raise RuntimeError("additive candidate normalization order diverged")
+            candidate_id = public["candidate_id"]
+            candidate_sha = public["candidate_sha256"]
+            binding_sha = public["binding_manifest_sha256"]
+            if (
+                candidate_id in seen_candidate_ids
+                or candidate_sha in seen_candidate_shas
+                or binding_sha in seen_binding_shas
+            ):
+                raise ValueError("additive candidates repeat an id, bytes, or binding")
+            seen_candidate_ids.add(candidate_id)
+            seen_candidate_shas.add(candidate_sha)
+            seen_binding_shas.add(binding_sha)
+            local_public.append(public)
+            local_normalized.append(normalized)
+
+        member_envelopes = document["training_run_envelopes"]
+        if not isinstance(member_envelopes, list) or len(member_envelopes) != 1:
+            raise ValueError(f"additive member {arm_id} has ambiguous run envelopes")
+        if member_envelopes[0].get("arm_id") != arm_id:
+            raise ValueError(f"additive member {arm_id} run envelope is misbound")
+        training_envelopes.append(member_envelopes[0])
+        training_members.append(
+            {
+                "arm_id": arm_id,
+                "envelope_sha256": training_sha,
+                "arm_variant": {
+                    key: training[key]
+                    for key in sorted(_ARM_VARIANT_TRAINING_ENVELOPE_KEYS)
+                    if key in training
+                },
+            }
+        )
+        local_ids = sorted(row["candidate_id"] for row in member_local)
+        public_members.append(
+            {
+                "arm_id": arm_id,
+                "path": member["relative_path"],
+                "file_sha256": member["file_sha256"],
+                "aggregate_sha256": aggregate["aggregate_sha256"],
+                "plan": document["plan"],
+                "sealed_plan_approval_sha256": document[
+                    "sealed_plan_approval_sha256"
+                ],
+                "candidate_ids": local_ids,
+            }
+        )
+        plan_members.append(
+            {
+                "arm_id": arm_id,
+                "aggregate_sha256": aggregate["aggregate_sha256"],
+                "plan": document["plan"],
+                "sealed_plan_approval_sha256": document[
+                    "sealed_plan_approval_sha256"
+                ],
+                "candidate_ids": local_ids,
+                "candidate_sha256s": sorted(
+                    row["candidate_sha256"] for row in member_local
+                ),
+            }
+        )
+
+    if observed_runs != expected_campaign["runs"]:
+        missing = sorted(
+            set(expected_by_arm) - {row["arm_id"] for row in observed_runs}
+        )
+        extra = sorted({row["arm_id"] for row in observed_runs} - set(expected_by_arm))
+        raise ValueError(
+            "additive campaign coverage is incomplete: "
+            f"missing={missing}, extra={extra}"
+        )
+    assert zero_public is not None and zero_normalized is not None
+    if zero_public["candidate_id"] in seen_candidate_ids or zero_public[
+        "candidate_sha256"
+    ] in seen_candidate_shas:
+        raise ValueError("additive zero control collides with a local candidate")
+
+    local_public.sort(
+        key=lambda row: (row["arm_id"], row["step"], row["candidate_sha256"])
+    )
+    local_normalized.sort(
+        key=lambda row: (row["arm_id"], row["step"], row["candidate_sha256"])
+    )
+    training_envelopes.sort(key=lambda row: row["arm_id"])
+    training_members.sort(key=lambda row: row["arm_id"])
+    public_candidates = sorted(
+        [zero_public, *local_public], key=lambda row: row["candidate_id"]
+    )
+    normalized_candidates = sorted(
+        [zero_normalized, *local_normalized], key=lambda row: row["candidate_id"]
+    )
+
+    plan_set = {
+        "schema": 1,
+        "kind": _ADDITIVE_PLAN_SET_KIND,
+        "campaign_manifest_sha256": campaign_file_sha256,
+        "members": plan_members,
+    }
+    plan_set_sha = krea_provenance.canonical_sha256(plan_set)
+    approved_payload = {
+        "plan_set_sha256": plan_set_sha,
+        "member_approved_payload_sha256s": [
+            {
+                "arm_id": row["arm_id"],
+                "approved_payload_sha256": row["plan"]["approved_payload_sha256"],
+            }
+            for row in public_members
+        ],
+    }
+    approval_set = {
+        "schema": 1,
+        "kind": _ADDITIVE_APPROVAL_SET_KIND,
+        "plan_set_sha256": plan_set_sha,
+        "score_plan_reviewer": first_document["sealed_plan_approval"],
+        "members": [
+            {
+                "arm_id": row["arm_id"],
+                "sealed_plan_approval_sha256": row[
+                    "sealed_plan_approval_sha256"
+                ],
+            }
+            for row in public_members
+        ],
+    }
+    additive_training = {
+        "schema": 1,
+        "kind": "forge-krea-additive-shared-training-runtime",
+        "shared": common_surface["shared_training_runtime"],
+        "members": training_members,
+    }
+    decision_evidence = {
+        "schema": 1,
+        "kind": _ADDITIVE_EVIDENCE_KIND,
+        "members": [
+            {
+                "arm_id": row["arm_id"],
+                "aggregate_path": row["path"],
+                "file_sha256": row["file_sha256"],
+                "aggregate_sha256": row["aggregate_sha256"],
+                "plan_canonical_sha256": row["plan"]["canonical_sha256"],
+                "sealed_plan_approval_sha256": row[
+                    "sealed_plan_approval_sha256"
+                ],
+            }
+            for row in public_members
+        ],
+    }
+    body = {
+        "schema": 1,
+        "kind": _ADDITIVE_AGGREGATE_KIND,
+        "coverage": {
+            "expected_arms": sorted(expected_by_arm),
+            "completed_arms": [row["arm_id"] for row in public_members],
+            "expected_candidates": 1
+            + sum(len(row["candidates"]) for row in expected_campaign["runs"]),
+            "completed_candidates": len(public_candidates),
+            "complete": True,
+        },
+        "direction": "min",
+        "plan": {
+            "raw_sha256": hashlib.sha256(
+                krea_provenance.canonical_bytes(plan_set) + b"\n"
+            ).hexdigest(),
+            "canonical_sha256": plan_set_sha,
+            "approved_payload_sha256": krea_provenance.canonical_sha256(
+                approved_payload
+            ),
+        },
+        "sealed_plan_approval_sha256": krea_provenance.canonical_sha256(
+            approval_set
+        ),
+        "sealed_plan_approval": first_document["sealed_plan_approval"],
+        "batch_runner_sha256": common_surface["batch_runner_sha256"],
+        "common_training_envelope": additive_training,
+        "common_training_envelope_sha256": krea_provenance.canonical_sha256(
+            additive_training
+        ),
+        "evaluator_script_sha256": common_surface["evaluator_script_sha256"],
+        "evaluation_envelope": common_surface["evaluation_envelope"],
+        "evaluation_envelope_sha256": krea_provenance.canonical_sha256(
+            common_surface["evaluation_envelope"]
+        ),
+        "candidates": public_candidates,
+        "campaign_manifest_sha256": campaign_file_sha256,
+        "fixture_manifest_sha256": common_surface["fixture_manifest_sha256"],
+        "fixture_approval_sha256": common_surface["fixture_approval_sha256"],
+        "fixture_contract": common_surface["fixture_contract"],
+        "campaign": expected_campaign,
+        "fixture": common_surface["fixture"],
+        "training_run_envelopes": training_envelopes,
+        "campaign_source": {
+            "file_sha256": campaign_file_sha256,
+            "manifest": campaign_manifest,
+        },
+        "members": public_members,
+        "decision_evidence": decision_evidence,
+    }
+    internal = {
+        "campaign": expected_campaign,
+        "candidates": normalized_candidates,
+        "zero": zero_normalized,
+        "text_weight": members[0]["aggregate"]["text_weight"],
+        "fixture_contract": members[0]["aggregate"]["fixture_contract"],
+        "fixture": members[0]["aggregate"]["fixture"],
+        "training_run_envelopes": training_envelopes,
+        "score_plan_reviewer": reviewer,
+        "members": members,
+    }
+    return body, internal
+
+
+def _aggregate_additive(
+    *, path: Path, value: dict[str, Any], file_sha: str
+) -> tuple[dict[str, Any], str]:
+    body = {key: item for key, item in value.items() if key != "aggregate_sha256"}
+    if (
+        value.get("schema") != 1
+        or value.get("kind") != _ADDITIVE_AGGREGATE_KIND
+        or value.get("direction") != "min"
+        or value.get("aggregate_sha256")
+        != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("additive exact-score aggregate identity is invalid")
+    source = _object(value.get("campaign_source"), "additive campaign source")
+    _exact(source, {"file_sha256", "manifest"}, "additive campaign source")
+    campaign = _object(source["manifest"], "additive campaign manifest")
+    campaign_file_sha = hashlib.sha256(
+        krea_provenance.canonical_bytes(campaign) + b"\n"
+    ).hexdigest()
+    if campaign_file_sha != source["file_sha256"]:
+        raise ValueError("additive campaign source file identity is invalid")
+    raw_members = value.get("members")
+    if not isinstance(raw_members, list) or not raw_members:
+        raise ValueError("additive aggregate has no members")
+    member_paths = []
+    for index, raw in enumerate(raw_members):
+        row = _object(raw, f"additive member[{index}]")
+        if "path" not in row:
+            raise ValueError("additive member lacks a path")
+        relative = _portable_relative_path(
+            row["path"], f"additive member[{index}].path"
+        )
+        member_paths.append(path.parent / relative)
+    members = _load_additive_members(root=path.parent, member_paths=member_paths)
+    expected_body, internal = _additive_body(
+        campaign_manifest=campaign,
+        campaign_file_sha256=campaign_file_sha,
+        members=members,
+    )
+    if body != expected_body:
+        raise ValueError(
+            "additive aggregate does not canonically recompute from members"
+        )
+    return {
+        "document": value,
+        "file_sha256": file_sha,
+        "plan_canonical_sha256": value["plan"]["canonical_sha256"],
+        "campaign_manifest_sha256": value["campaign_manifest_sha256"],
+        "fixture_manifest_sha256": value["fixture_manifest_sha256"],
+        "fixture_approval_sha256": value["fixture_approval_sha256"],
+        "sealed_plan_approval_sha256": value[
+            "sealed_plan_approval_sha256"
+        ],
+        "score_plan_reviewer": internal["score_plan_reviewer"],
+        "aggregate_sha256": value["aggregate_sha256"],
+        "candidates": internal["candidates"],
+        "zero": internal["zero"],
+        "text_weight": internal["text_weight"],
+        "fixture_contract": internal["fixture_contract"],
+        "campaign": internal["campaign"],
+        "fixture": internal["fixture"],
+        "training_run_envelopes": internal["training_run_envelopes"],
+        "additive_members": internal["members"],
+    }, file_sha
+
+
+def assemble_additive_score_aggregates(
+    *, campaign_path: Path, aggregate_paths: Iterable[Path], output: Path
+) -> dict[str, Any]:
+    """Publish one decision-valid aggregate from sealed per-arm score batches."""
+
+    output = Path(os.path.abspath(os.path.expanduser(output)))
+    if output.name in _FORBIDDEN_OUTPUTS or output.suffix != ".json":
+        raise ValueError("additive aggregate output must be a non-production JSON file")
+    current = output.parent
+    while current != current.parent:
+        if current.is_symlink():
+            raise ValueError(
+                f"additive aggregate output has symlink ancestor: {current}"
+            )
+        current = current.parent
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(f"{output}.tmp")
+    if os.path.lexists(output) or os.path.lexists(temporary):
+        raise FileExistsError(f"refusing existing additive aggregate output: {output}")
+    campaign, campaign_file_sha = _load_canonical(
+        campaign_path, "additive expected campaign"
+    )
+    krea_batch._validate_campaign_manifest(campaign)
+    members = _load_additive_members(
+        root=output.parent, member_paths=list(aggregate_paths)
+    )
+    body, _ = _additive_body(
+        campaign_manifest=campaign,
+        campaign_file_sha256=campaign_file_sha,
+        members=members,
+    )
+    document = {
+        **body,
+        "aggregate_sha256": krea_provenance.canonical_sha256(body),
+    }
+    payload = krea_provenance.canonical_bytes(document) + b"\n"
+    with temporary.open("xb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        loaded, _ = _aggregate(temporary)
+        _reload_decision_evidence(aggregate_path=temporary, aggregate=loaded)
+        os.link(temporary, output)
+        temporary.unlink()
+        directory_fd = os.open(
+            output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+    return document
+
+
+def _reload_additive_decision_evidence(
+    *, aggregate: Mapping[str, Any]
+) -> dict[str, Any]:
+    members = aggregate.get("additive_members")
+    if not isinstance(members, list) or not members:
+        raise ValueError("additive aggregate lost its validated member set")
+    rows = []
+    for member in members:
+        nested = member["aggregate"]
+        evidence = _reload_decision_evidence(
+            aggregate_path=member["path"], aggregate=nested
+        )
+        rows.append(
+            {
+                "arm_id": member["arm_id"],
+                "aggregate_path": member["relative_path"],
+                "file_sha256": member["file_sha256"],
+                "aggregate_sha256": nested["aggregate_sha256"],
+                "plan_canonical_sha256": nested["plan_canonical_sha256"],
+                "sealed_plan_approval_sha256": nested[
+                    "sealed_plan_approval_sha256"
+                ],
+                "decision_evidence": evidence,
+            }
+        )
+    return _validate_decision_evidence_binding(
+        {"schema": 1, "kind": _ADDITIVE_EVIDENCE_KIND, "members": rows}
+    )
+
+
 def _reload_decision_evidence(
     *, aggregate_path: Path, aggregate: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Reload the portable raw evidence bundle and prove every aggregate row."""
+
+    if aggregate["document"].get("kind") == _ADDITIVE_AGGREGATE_KIND:
+        return _reload_additive_decision_evidence(aggregate=aggregate)
 
     reference = _object(
         aggregate["document"].get("decision_evidence"),
@@ -3387,6 +4128,12 @@ def _reload_decision_evidence(
 
 def _aggregate(path: Path) -> tuple[dict[str, Any], str]:
     value, file_sha = _load_canonical(path, "exact-score aggregate")
+    if value.get("kind") == _ADDITIVE_AGGREGATE_KIND:
+        return _aggregate_additive(
+            path=Path(os.path.abspath(os.path.expanduser(path))),
+            value=value,
+            file_sha=file_sha,
+        )
     required = {
         "schema",
         "kind",
