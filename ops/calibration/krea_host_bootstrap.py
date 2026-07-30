@@ -835,8 +835,9 @@ def _docker_identity(
         required_runtime,
         "--gpus",
         "all",
-        expected_image_id,
+        "--entrypoint",
         _trusted_executable("nvidia_smi")[0],
+        expected_image_id,
         "--query-gpu=uuid",
         "--format=csv,noheader,nounits",
     )

@@ -552,7 +552,9 @@ def test_docker_identity_binds_actual_image_id(monkeypatch):
                 }
             )
         if command[:2] == ["/usr/bin/docker", "run"]:
-            if "--entrypoint" in command:
+            if "/usr/bin/nvidia-smi" in command:
+                return "GPU-1"
+            if "/usr/bin/python3" in command:
                 return json.dumps(
                     {
                         "cuda": True,
@@ -563,7 +565,7 @@ def test_docker_identity_binds_actual_image_id(monkeypatch):
                     sort_keys=True,
                     separators=(",", ":"),
                 )
-            return "GPU-1"
+            raise AssertionError(command)
         if (
             command[:2] == ["/usr/bin/docker", "info"]
             and "SecurityOptions" in command[-1]
@@ -589,8 +591,12 @@ def test_docker_identity_binds_actual_image_id(monkeypatch):
     assert identity["container_image"]["image_id"] == "sha256:" + "c" * 64
     assert identity["container_image"]["cuda_jit_smoke"]["result"] == "PASS"
     assert any(
-        "--entrypoint" in command and timeout == 300
+        "/usr/bin/python3" in command and timeout == 300
         for command, timeout in observed_timeouts
+    )
+    assert any(
+        "/usr/bin/nvidia-smi" in command and "--entrypoint" in command
+        for command, _timeout in observed_timeouts
     )
 
     with pytest.raises(RuntimeError, match="actual Docker image ID differs"):
@@ -619,7 +625,9 @@ def test_docker_identity_rejects_failed_real_cuda_jit_compile(monkeypatch):
                 {"Id": "sha256:" + "c" * 64, "RepoDigests": [], "Config": {"Env": []}}
             )
         if command[:2] == ["/usr/bin/docker", "run"]:
-            if "--entrypoint" in command:
+            if "/usr/bin/nvidia-smi" in command:
+                return "GPU-1"
+            if "/usr/bin/python3" in command:
                 return json.dumps(
                     {
                         "cuda": True,
@@ -628,7 +636,7 @@ def test_docker_identity_rejects_failed_real_cuda_jit_compile(monkeypatch):
                         "torch_cuda": "12.4",
                     }
                 )
-            return "GPU-1"
+            raise AssertionError(command)
         if (
             command[:2] == ["/usr/bin/docker", "info"]
             and "SecurityOptions" in command[-1]
