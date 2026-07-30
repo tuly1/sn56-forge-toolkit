@@ -774,8 +774,12 @@ def stage_stage1_evaluator_assets(
     if (comfy_root / "extra_model_paths.yaml").exists():
         raise ValueError("asset staging refuses Comfy extra_model_paths.yaml")
     lora_root = comfy_root / "models" / "loras"
-    if lora_root.exists() and any(lora_root.iterdir()):
-        raise ValueError("asset staging requires an empty Comfy LoRA directory")
+    if os.path.lexists(lora_root):
+        batch._empty_real_directory(
+            lora_root,
+            "asset-staging ComfyUI LoRA directory",
+            allowed_zero_byte_placeholder=batch._COMFY_LORA_PLACEHOLDER,
+        )
     staged = []
     for name in sorted(contract["assets"]):
         expected = contract["assets"][name]

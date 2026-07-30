@@ -598,7 +598,15 @@ def test_schema2_publication_round_trips_into_decision_consumer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     harness = ProducerHarness(tmp_path, monkeypatch)
+    placeholder = harness.comfy_root / "models" / "loras" / "put_loras_here"
+    placeholder.write_bytes(b"")
     output, aggregate = harness.publish()
+
+    assert placeholder.is_file()
+    assert placeholder.stat().st_size == 0
+    assert sorted(path.name for path in placeholder.parent.iterdir()) == [
+        "put_loras_here"
+    ]
 
     assert aggregate["campaign"]["runs"] == [harness.run]
     assert [row["arm_id"] for row in aggregate["campaign"]["runs"]] == ["K1"]
@@ -647,6 +655,40 @@ def test_schema2_publication_round_trips_into_decision_consumer(
     )
     assert list(observed) == ["B-0p5-small"]
     assert bindings[0]["aggregate_sha256"] == aggregate["aggregate_sha256"]
+
+
+def test_batch_lora_directory_allows_only_exact_inert_placeholder(
+    tmp_path: Path,
+) -> None:
+    lora_root = tmp_path / "models" / "loras"
+    lora_root.mkdir(parents=True)
+    placeholder = lora_root / "put_loras_here"
+    placeholder.write_bytes(b"")
+    assert (
+        batch._empty_real_directory(
+            lora_root,
+            "test LoRA directory",
+            allowed_zero_byte_placeholder=batch._COMFY_LORA_PLACEHOLDER,
+        )
+        == lora_root
+    )
+
+    (lora_root / "foreign.safetensors").write_bytes(b"real-lora")
+    with pytest.raises(ValueError, match="must be empty"):
+        batch._empty_real_directory(
+            lora_root,
+            "test LoRA directory",
+            allowed_zero_byte_placeholder=batch._COMFY_LORA_PLACEHOLDER,
+        )
+
+    (lora_root / "foreign.safetensors").unlink()
+    placeholder.write_bytes(b"not-inert")
+    with pytest.raises(ValueError, match="placeholder must be one zero-byte"):
+        batch._empty_real_directory(
+            lora_root,
+            "test LoRA directory",
+            allowed_zero_byte_placeholder=batch._COMFY_LORA_PLACEHOLDER,
+        )
 
 
 def test_decision_consumer_reloads_every_raw_result_and_fails_when_one_is_missing(

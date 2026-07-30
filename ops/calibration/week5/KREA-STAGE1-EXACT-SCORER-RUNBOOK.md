@@ -118,7 +118,7 @@ test "$(sha256sum "$ROOT/src/ComfyUI/models/vae/qwen_image_vae.safetensors" | aw
 All JSON controls are canonical JSON plus one newline and are create-only. The
 evaluator config binds the commits, trees, three files, Python 3.10.20, the raw
 distribution identity `bbcd979cae4ca3cc3e8a35c16c3d1908512bec1b8b7e9a540582122e97648bed`,
-and timeouts `startup=300`, `evaluation=3600`, `shutdown=20`,
+and timeouts `startup=300`, `evaluation=5400`, `shutdown=20`,
 `term_grace=20`. `driver_python` and `comfy_python` are both `$PY`.
 
 ```bash

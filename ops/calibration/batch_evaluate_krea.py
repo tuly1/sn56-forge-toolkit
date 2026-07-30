@@ -51,6 +51,7 @@ _GIT_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SCHEMA = 1
 _KIND = "forge-krea-exact-score-batch"
 _FORBIDDEN_OUTPUT = "forge_holdout_scores.json"
+_COMFY_LORA_PLACEHOLDER = "put_loras_here"
 _FIXTURE_KIND = "forge-krea-fixture-split"
 _CONDITION_KIND = "forge-krea-training-condition"
 _COMPLETION_KIND = "forge-krea-training-completion"
@@ -2151,8 +2152,12 @@ def _stage1_exact_scorer_readiness(evaluator: dict[str, Any]) -> dict[str, Any]:
     if (comfy_root / "extra_model_paths.yaml").exists():
         raise ValueError("exact scorer refuses Comfy extra_model_paths.yaml")
     lora_root = comfy_root / "models" / "loras"
-    if lora_root.exists() and any(lora_root.iterdir()):
-        raise ValueError("exact scorer LoRA directory is not empty before scoring")
+    if os.path.lexists(lora_root):
+        _empty_real_directory(
+            lora_root,
+            "exact scorer LoRA directory before scoring",
+            allowed_zero_byte_placeholder=_COMFY_LORA_PLACEHOLDER,
+        )
 
     comfy_python = Path(evaluator["comfy_python"])
     driver_python = Path(evaluator["driver_python"])
@@ -3727,16 +3732,47 @@ def _copy_verified(
         os.close(source_fd)
 
 
-def _empty_real_directory(path: Path, label: str) -> Path:
+def _empty_real_directory(
+    path: Path,
+    label: str,
+    *,
+    allowed_zero_byte_placeholder: str | None = None,
+) -> Path:
+    """Require an empty real directory, optionally allowing one inert marker.
+
+    ComfyUI tracks ``models/loras/put_loras_here`` as a zero-byte regular file.
+    It is not a model and cannot be removed from a clean pinned checkout.  The
+    exception is deliberately exact: a different name, a symlink, a hardlink,
+    a directory, or any non-zero content still fails closed.
+    """
+
     path = _absolute_lexical(path)
     _reject_symlink_ancestors(path, label)
     if path.is_symlink() or not path.is_dir():
         raise ValueError(f"{label} must be a real directory: {path}")
-    with os.scandir(path) as entries:
-        names = sorted(entry.name for entry in entries)
-    if names:
-        raise ValueError(f"{label} must be empty; found {names}")
-    return path
+    with os.scandir(path) as scan:
+        entries = sorted(list(scan), key=lambda entry: entry.name)
+    if not entries:
+        return path
+    if (
+        allowed_zero_byte_placeholder is not None
+        and len(entries) == 1
+        and entries[0].name == allowed_zero_byte_placeholder
+    ):
+        placeholder = entries[0]
+        details = placeholder.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_size != 0
+            or details.st_nlink != 1
+        ):
+            raise ValueError(
+                f"{label} placeholder must be one zero-byte regular file "
+                "with no hardlinks"
+            )
+        return path
+    names = [entry.name for entry in entries]
+    raise ValueError(f"{label} must be empty; found {names}")
 
 
 def _publish_decision_evidence_bundle(
@@ -3893,7 +3929,9 @@ def _stage_comfy_lora(
     """Exclusively stage the exact bytes ComfyUI will resolve by LoRA name."""
 
     lora_dir = _empty_real_directory(
-        comfy_root / "models" / "loras", "ComfyUI LoRA staging directory"
+        comfy_root / "models" / "loras",
+        "ComfyUI LoRA staging directory",
+        allowed_zero_byte_placeholder=_COMFY_LORA_PLACEHOLDER,
     )
     lora_name = f"candidate-{candidate_sha256}.safetensors"
     target = lora_dir / lora_name
@@ -3931,7 +3969,11 @@ def _remove_comfy_lora(binding: dict[str, Any], *, comfy_root: Path) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-    _empty_real_directory(lora_dir, "ComfyUI LoRA staging directory after cleanup")
+    _empty_real_directory(
+        lora_dir,
+        "ComfyUI LoRA staging directory after cleanup",
+        allowed_zero_byte_placeholder=_COMFY_LORA_PLACEHOLDER,
+    )
 
 
 def _stage_inputs(
@@ -4089,7 +4131,9 @@ def run_batch(
     evaluator_script_sha = _sha256(staged_evaluator_script)
     comfy_root = _safe_directory(evaluator["comfy_root"], "comfy_root")
     _empty_real_directory(
-        comfy_root / "models" / "loras", "ComfyUI LoRA staging directory"
+        comfy_root / "models" / "loras",
+        "ComfyUI LoRA staging directory",
+        allowed_zero_byte_placeholder=_COMFY_LORA_PLACEHOLDER,
     )
     completed: list[dict[str, Any]] = []
     common_envelope: dict[str, Any] | None = None

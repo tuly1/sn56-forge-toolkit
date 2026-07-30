@@ -420,6 +420,7 @@ def _readiness_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     tooling = comfy / "custom_nodes" / "comfyui-tooling-nodes"
     for path in (comfy, god, tooling, comfy / "models" / "loras"):
         path.mkdir(parents=True, exist_ok=True)
+    (comfy / "models" / "loras" / "put_loras_here").write_bytes(b"")
     requirements = {
         "comfyui": comfy / "requirements.txt",
         "tooling_nodes": tooling / "requirements.txt",
@@ -563,6 +564,27 @@ def test_stage1_exact_scorer_readiness_recomputes_complete_bound_surface(
     assert result["source_snapshots"]["god"]["tree"] == contract["source_trees"]["god"]
 
 
+def test_stage1_d1_timeout_covers_measured_runtime_and_rejects_old_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validator = batch._validate_stage1_exact_scorer
+    evaluator, contract, _snapshots, _hashes, _python = _readiness_case(
+        tmp_path, monkeypatch
+    )
+    for name, row in evaluator["expected_assets"].items():
+        row["bytes"] = contract["assets"][name]["bytes"]
+    assert contract["timeouts_s"]["evaluation"] == 5400.0
+    assert contract["timeouts_s"]["evaluation"] >= 75 * 60
+    assert validator(evaluator)["timeouts_s"]["evaluation"] == 5400.0
+    assert batch._timeout_policy(evaluator)["total_candidate_timeout_s"] == 5780.0
+
+    evaluator["evaluation_timeout_s"] = 3600.0
+    with pytest.raises(
+        ValueError, match="exact scorer differs from owner-ratified Stage-1 contract"
+    ):
+        validator(evaluator)
+
+
 @pytest.mark.parametrize(
     "drift", ("source", "requirements", "asset", "runtime", "torch")
 )
@@ -678,6 +700,9 @@ def test_stage1_asset_stager_is_pinned_create_only_and_token_free(
 ) -> None:
     comfy = tmp_path / "ComfyUI"
     comfy.mkdir()
+    lora_root = comfy / "models" / "loras"
+    lora_root.mkdir(parents=True)
+    (lora_root / "put_loras_here").write_bytes(b"")
     sources = tmp_path / "sources"
     sources.mkdir()
     policy = deepcopy(score_plan.krea_execution_surface_policy.POLICY)
@@ -710,6 +735,46 @@ def test_stage1_asset_stager_is_pinned_create_only_and_token_free(
     with pytest.raises(FileExistsError):
         score_plan.stage_stage1_evaluator_assets(
             comfy_root=comfy, token="secret-token", receipt_output=receipt_path
+        )
+
+
+@pytest.mark.parametrize(
+    ("placeholder_contents", "foreign_name", "error"),
+    (
+        (b"not-empty", None, "placeholder must be one zero-byte regular file"),
+        (b"", "foreign.safetensors", "must be empty"),
+        (b"", "foreign-zero-byte", "must be empty"),
+    ),
+)
+def test_stage1_asset_stager_rejects_nonplaceholder_or_real_lora(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    placeholder_contents: bytes,
+    foreign_name: str | None,
+    error: str,
+) -> None:
+    comfy = tmp_path / "ComfyUI"
+    lora_root = comfy / "models" / "loras"
+    lora_root.mkdir(parents=True)
+    (lora_root / "put_loras_here").write_bytes(placeholder_contents)
+    if foreign_name is not None:
+        (lora_root / foreign_name).write_bytes(
+            b"foreign-model" if foreign_name.endswith(".safetensors") else b""
+        )
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(
+            hf_hub_download=lambda **_kwargs: pytest.fail(
+                "asset download started before LoRA staging validation"
+            )
+        ),
+    )
+    with pytest.raises(ValueError, match=error):
+        score_plan.stage_stage1_evaluator_assets(
+            comfy_root=comfy,
+            token="secret-token",
+            receipt_output=tmp_path / "receipt.json",
         )
 
 
