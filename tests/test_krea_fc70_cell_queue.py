@@ -167,9 +167,8 @@ def test_all_twelve_cells_are_assembled_from_exact_controls(
 
 
 def test_initial_queue_excludes_correction_gated_d2_k4() -> None:
-    assert queue._INITIAL_CELLS == tuple(
-        cell for cell in queue._CELLS if cell != "D2-K4"
-    )
+    assert queue._INITIAL_CELLS[0] == "D1-K1"
+    assert set(queue._INITIAL_CELLS) == set(queue._CELLS) - {"D2-K4"}
 
 
 def test_controller_is_sequential_and_stops_on_first_failure(

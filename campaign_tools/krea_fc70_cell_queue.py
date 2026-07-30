@@ -26,7 +26,9 @@ FC70_COMMIT = "fc70e616b7b9b5ffbd590cf0433609cd4d3528e6"
 _KIND = "forge-krea-fc70-cell-assembly-spec"
 _QUEUE_KIND = "forge-krea-fc70-sequential-cell-queue"
 _CELLS = tuple(f"{fixture}-K{arm}" for fixture in ("D1", "D2") for arm in range(6))
-_INITIAL_CELLS = tuple(cell for cell in _CELLS if cell != "D2-K4")
+_INITIAL_CELLS = ("D1-K1",) + tuple(
+    cell for cell in _CELLS if cell not in {"D1-K1", "D2-K4"}
+)
 _AXES = {
     "K0": [],
     "K1": ["planned_steps", "save_cadence"],
