@@ -25,7 +25,7 @@ from typing import Any, Mapping, Sequence
 # Runtime source is the exact fc70 tree plus the native, hash-proven bridge that
 # lets it consume the immutable admission sealed by its 588 ancestor.  Later
 # external controller commits must not broaden or move this runtime pin.
-FC70_COMMIT = "daf9a2528f4079ed06180c7e6d712a684a4170f0"
+FC70_COMMIT = "546985195687696cf10dff3e2c58f7f0d1dd12d5"
 _KIND = "forge-krea-fc70-cell-assembly-spec"
 _QUEUE_KIND = "forge-krea-fc70-sequential-cell-queue"
 _CELLS = tuple(f"{fixture}-K{arm}" for fixture in ("D1", "D2") for arm in range(6))
