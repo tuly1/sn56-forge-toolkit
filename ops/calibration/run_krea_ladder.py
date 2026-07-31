@@ -1000,21 +1000,42 @@ _ACCELERATED_TRANSITION_ALLOWED_PATHS = frozenset(
         "tests/test_krea_fixture_admission.py",
     }
 )
+_ACCELERATED_DISCOVERY_RUNTIME_COMMIT = "7f75549847fe5d078c755b672d45ecbb4d9b4f61"
 
 
-def _validate_control_only_source_transition(compatibility: dict[str, Any]) -> None:
+def _validate_control_only_source_transition(
+    compatibility: dict[str, Any],
+    *,
+    target_commit: str = "HEAD",
+    require_clean_worktree: bool = True,
+) -> None:
     """Prove the historical profile crossed only this control-plane patch."""
 
-    old_commit = compatibility["document"]["historical_compatibility"][
-        "source_commit"
-    ]
+    old_commit = compatibility["document"]["historical_compatibility"]["source_commit"]
     if old_commit != "58822b496019177a02fa6196247ac30e788331bb":
         raise RuntimeError("accelerated source transition has an unknown base")
+    if (
+        target_commit != "HEAD"
+        and target_commit != _ACCELERATED_DISCOVERY_RUNTIME_COMMIT
+    ):
+        raise RuntimeError(
+            "accelerated source transition target is not the pinned runtime"
+        )
     root = Path(__file__).resolve().parents[2]
-    if _run_text(["git", "-C", str(root), "status", "--porcelain"]):
+    if require_clean_worktree and _run_text(
+        ["git", "-C", str(root), "status", "--porcelain"]
+    ):
         raise RuntimeError("accelerated source transition requires a clean tree")
     subprocess.run(
-        ["git", "-C", str(root), "merge-base", "--is-ancestor", old_commit, "HEAD"],
+        [
+            "git",
+            "-C",
+            str(root),
+            "merge-base",
+            "--is-ancestor",
+            old_commit,
+            target_commit,
+        ],
         check=True,
         capture_output=True,
         timeout=60,
@@ -1026,7 +1047,7 @@ def _validate_control_only_source_transition(compatibility: dict[str, Any]) -> N
             str(root),
             "diff",
             "--name-status",
-            f"{old_commit}..HEAD",
+            f"{old_commit}..{target_commit}",
         ]
     ).splitlines()
     changed: set[str] = set()
@@ -1152,8 +1173,7 @@ def _validate_accelerated_proxy_transition(
         "trainer_identity_sha256",
     }
     if (
-        cell["timing_evidence_mode"]
-        != "conservative_proxy_not_measured_equivalence"
+        cell["timing_evidence_mode"] != "conservative_proxy_not_measured_equivalence"
         or cell["cadence_multiplier"] not in {1, 2}
         or historical_host_execution_identity_sha256
         != historical["host_execution_identity_sha256"]
@@ -1954,10 +1974,7 @@ def main() -> int:
                 raise RuntimeError("budget-fill depth does not fill the measured plan")
         elif args.steps > budget_plan.max_affordable_steps:
             raise RuntimeError("release-control depth does not fit the measured plan")
-    if (
-        profile.execution_envelope.runtime_identity_sha256
-        != pre["runtime"]["sha256"]
-    ):
+    if profile.execution_envelope.runtime_identity_sha256 != pre["runtime"]["sha256"]:
         raise RuntimeError("throughput profile runtime does not match this process")
     allowed_differences = {
         "scientific_axes": list(_SCIENTIFIC_AXIS_POINTERS),
@@ -2119,8 +2136,7 @@ def main() -> int:
                         "accelerated_proxy_mismatch_fields"
                     ],
                 }
-                if execution_controls.get("accelerated_discovery_campaign")
-                is not None
+                if execution_controls.get("accelerated_discovery_campaign") is not None
                 else None
             ),
         )

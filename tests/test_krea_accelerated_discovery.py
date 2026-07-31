@@ -63,28 +63,32 @@ def test_umbrella_seals_exact_twelve_cell_matrix() -> None:
 
     assert campaign["cell_count"] == 12
     assert [row["cell_id"] for row in campaign["cells"]] == [
-        f"{fixture}-K{arm}"
-        for fixture in ("D1", "D2")
-        for arm in range(6)
+        f"{fixture}-K{arm}" for fixture in ("D1", "D2") for arm in range(6)
     ]
-    assert accelerated.campaign_cell(campaign, "D1", "K1")[
-        "effective_hard_budget_s"
-    ] == 2700
-    assert accelerated.campaign_cell(campaign, "D1", "K3")[
-        "effective_hard_budget_s"
-    ] == 2454
-    assert accelerated.campaign_cell(campaign, "D1", "K4")[
-        "effective_hard_budget_s"
-    ] == 1350
-    assert accelerated.campaign_cell(campaign, "D2", "K1")[
-        "effective_hard_budget_s"
-    ] == 2160
-    assert accelerated.campaign_cell(campaign, "D2", "K3")[
-        "effective_hard_budget_s"
-    ] == 1963
-    assert accelerated.campaign_cell(campaign, "D2", "K4")[
-        "effective_hard_budget_s"
-    ] == 1080
+    assert (
+        accelerated.campaign_cell(campaign, "D1", "K1")["effective_hard_budget_s"]
+        == 2700
+    )
+    assert (
+        accelerated.campaign_cell(campaign, "D1", "K3")["effective_hard_budget_s"]
+        == 2454
+    )
+    assert (
+        accelerated.campaign_cell(campaign, "D1", "K4")["effective_hard_budget_s"]
+        == 1350
+    )
+    assert (
+        accelerated.campaign_cell(campaign, "D2", "K1")["effective_hard_budget_s"]
+        == 2160
+    )
+    assert (
+        accelerated.campaign_cell(campaign, "D2", "K3")["effective_hard_budget_s"]
+        == 1963
+    )
+    assert (
+        accelerated.campaign_cell(campaign, "D2", "K4")["effective_hard_budget_s"]
+        == 1080
+    )
 
 
 def test_campaign_tampering_cannot_be_self_rehashed() -> None:
@@ -119,7 +123,9 @@ def test_cadence_relief_requires_positive_bound_slip(tmp_path) -> None:
     }
     campaign = accelerated.build_campaign(payload)
     assert all(row["cadence_multiplier"] == 2 for row in campaign["cells"])
-    assert all(not row["depth_increase_from_cadence_relief"] for row in campaign["cells"])
+    assert all(
+        not row["depth_increase_from_cadence_relief"] for row in campaign["cells"]
+    )
 
 
 def test_k4_correction_is_one_way_and_capped(tmp_path: Path) -> None:
@@ -184,7 +190,11 @@ def test_k4_correction_source_is_same_campaign_uncorrected_d1_k4(
     def fake_load(path, _label, *, canonical):
         assert canonical is True
         if Path(path) == candidate_path:
-            return candidate_path, candidate, krea_provenance.file_sha256(candidate_path)
+            return (
+                candidate_path,
+                candidate,
+                krea_provenance.file_sha256(candidate_path),
+            )
         assert Path(path) == plan_path
         return plan_path, plan, krea_provenance.file_sha256(plan_path)
 
@@ -304,9 +314,7 @@ def test_accelerated_index_contains_one_real_profile_and_six_proxy_slots(
             },
             "concept_id": f"concept-{fixture_id}",
             "training_pair_count": len(fixture["training_rows"]),
-            "training_dataset_shape_sha256": fixture[
-                "training_dataset_shape_sha256"
-            ],
+            "training_dataset_shape_sha256": fixture["training_dataset_shape_sha256"],
         }
         return fixture, record
 
@@ -337,12 +345,14 @@ def test_accelerated_index_contains_one_real_profile_and_six_proxy_slots(
     assert index["schema"] == 3
     assert index["measured_profile_count"] == 1
     assert index["target_slot_count"] == 6
-    assert index["fixtures"]["D1"]["profiles"][classes[0]][
-        "source_profile"
-    ] == profile_record
-    assert index["fixtures"]["D2"]["profiles"][classes[2]][
-        "effective_hard_budget_s"
-    ] == 1080
+    assert (
+        index["fixtures"]["D1"]["profiles"][classes[0]]["source_profile"]
+        == profile_record
+    )
+    assert (
+        index["fixtures"]["D2"]["profiles"][classes[2]]["effective_hard_budget_s"]
+        == 1080
+    )
 
     correction = accelerated.build_k4_correction(
         campaign_sha256=campaign["campaign_sha256"],
@@ -365,9 +375,7 @@ def test_accelerated_index_contains_one_real_profile_and_six_proxy_slots(
     corrected_k4 = corrected["fixtures"]["D2"]["profiles"][classes[2]]
     assert corrected_k4["runtime_factor"] == "3.75"
     assert corrected_k4["effective_hard_budget_s"] == 720
-    assert corrected_k4["k4_correction_sha256"] == correction[
-        "correction_sha256"
-    ]
+    assert corrected_k4["k4_correction_sha256"] == correction["correction_sha256"]
 
     tampered = {**index, "target_slot_count": 5}
     tampered["index_sha256"] = krea_provenance.canonical_sha256(
@@ -473,13 +481,16 @@ def test_every_other_checkpoint_requires_slip_bound_campaign_cadence() -> None:
         "required_landmarks": [],
         "landmark_policy": "none",
     }
-    assert krea_execution_plan._schedule(
-        schedule,
-        recipe=_recipe(100, 26),
-        budget_plan=_budget(100, 13, 1000),
-        profile=_profile(),
-        accelerated_cell=cell,
-    ) == schedule
+    assert (
+        krea_execution_plan._schedule(
+            schedule,
+            recipe=_recipe(100, 26),
+            budget_plan=_budget(100, 13, 1000),
+            profile=_profile(),
+            accelerated_cell=cell,
+        )
+        == schedule
+    )
 
     with pytest.raises(ValueError, match="cadence multiplier"):
         krea_execution_plan._schedule(
@@ -500,13 +511,16 @@ def test_release_control_relief_keeps_depth_and_doubles_exact_cadence() -> None:
         "required_landmarks": [],
         "landmark_policy": "none",
     }
-    assert krea_execution_plan._schedule(
-        schedule,
-        recipe=_recipe(367, 148),
-        budget_plan=_budget(500, 63, 2160),
-        profile=_profile(),
-        accelerated_cell=cell,
-    ) == schedule
+    assert (
+        krea_execution_plan._schedule(
+            schedule,
+            recipe=_recipe(367, 148),
+            budget_plan=_budget(500, 63, 2160),
+            profile=_profile(),
+            accelerated_cell=cell,
+        )
+        == schedule
+    )
 
     wrong = {**schedule, "planned_steps": 368, "candidate_steps": [148, 296, 368]}
     with pytest.raises(ValueError, match="depth/cadence drifted"):
@@ -562,7 +576,27 @@ def test_real_successor_git_transition_is_control_only() -> None:
             }
         }
     }
-    runner._validate_control_only_source_transition(compatibility)
+    runner._validate_control_only_source_transition(
+        compatibility,
+        target_commit=runner._ACCELERATED_DISCOVERY_RUNTIME_COMMIT,
+        require_clean_worktree=False,
+    )
+
+
+def test_stage2_head_cannot_masquerade_as_the_discovery_runtime() -> None:
+    compatibility = {
+        "document": {
+            "historical_compatibility": {
+                "source_commit": "58822b496019177a02fa6196247ac30e788331bb"
+            }
+        }
+    }
+    with pytest.raises(RuntimeError, match="non-control files"):
+        runner._validate_control_only_source_transition(
+            compatibility,
+            target_commit="HEAD",
+            require_clean_worktree=False,
+        )
 
 
 def test_admitted_588_timing_probe_uses_exact_historical_git_blobs() -> None:
@@ -612,15 +646,16 @@ def test_archival_replay_propagates_exact_historical_source_through_all_layers(
         )
     assert seen == [source_commit, source_commit, None]
     assert krea_execution_plan._HISTORICAL_TIMING_REPLAY_SOURCE.get() is None
-    assert krea_execution_plan._replay_historical_timing(
-        source_commit,
-        lambda: krea_execution_plan._HISTORICAL_TIMING_REPLAY_SOURCE.get(),
-    ) == source_commit
+    assert (
+        krea_execution_plan._replay_historical_timing(
+            source_commit,
+            lambda: krea_execution_plan._HISTORICAL_TIMING_REPLAY_SOURCE.get(),
+        )
+        == source_commit
+    )
     assert krea_execution_plan._HISTORICAL_TIMING_REPLAY_SOURCE.get() is None
     with pytest.raises(ValueError, match="not authorized"):
-        krea_execution_plan._replay_historical_timing(
-            "0" * 40, lambda: None
-        )
+        krea_execution_plan._replay_historical_timing("0" * 40, lambda: None)
 
 
 def test_runner_allows_only_the_plan_derived_proxy_mismatch_set(
