@@ -75,7 +75,9 @@ def test_schema_paths():
     assert s.config_path == "/dataset/configs/t1.yaml"
 
 
-def test_toolkit_log_path_is_run_unique_and_not_under_upload_root(tmp_path, monkeypatch):
+def test_toolkit_log_path_is_run_unique_and_not_under_upload_root(
+    tmp_path, monkeypatch
+):
     s = _spec(expected_repo_name="repo")
     config_path = tmp_path / "configs" / "task.yaml"
     save_root = tmp_path / "checkpoints" / "repo"
@@ -200,9 +202,7 @@ def test_caption_byte_exact_no_trigger(tmp_path):
     zip_path = tmp_path / "t1_tourn.zip"
     imgs = tmp_path / "images"
     cap = "a red car, sunset"
-    _make_zip(
-        zip_path, [("img0", (200, 0, 0))], nested=True, captions={"img0": cap}
-    )
+    _make_zip(zip_path, [("img0", (200, 0, 0))], nested=True, captions={"img0": cap})
     dataset.prepare_aitoolkit_dataset(
         str(zip_path), images_dir=str(imgs), trigger_word="MYTRIGGER"
     )
@@ -437,6 +437,156 @@ def test_default_selection_prefers_current_exact_final(tmp_path):
     assert record["source"] == "exact_final"
     assert record["selected_step"] == 500
     assert record["sha256"]
+
+
+def _frozen_target(numerator: int, denominator: int) -> dict:
+    return {
+        "fraction_numerator": numerator,
+        "fraction_denominator": denominator,
+        "selection_rule": "nearest_current_candidate_ties_choose_earlier_step",
+    }
+
+
+def test_frozen_checkpoint_fraction_promotes_exact_mapped_periodic(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    state = checkpoints.set_planned_steps(
+        str(tmp_path),
+        state,
+        180,
+        model_type="krea2",
+        checkpoint_target=_frozen_target(1, 2),
+        checkpoint_selected_step=90,
+    )
+    paths = [
+        tmp_path / "repo_000000045.safetensors",
+        tmp_path / "repo_000000090.safetensors",
+        tmp_path / "repo_000000135.safetensors",
+        tmp_path / "repo.safetensors",
+    ]
+    for path, tag in zip(paths, ("45", "90", "135", "final")):
+        _write_st(path, tag=tag)
+
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert record["source"] == "frozen_checkpoint_fraction"
+    assert record["selected_step"] == 90
+    assert record["selected_file"] == "repo_000000090.safetensors"
+    assert record["output_file"] == "last.safetensors"
+    assert record["checkpoint_target"] == _frozen_target(1, 2)
+    assert record["planned_steps"] == 180
+    assert (tmp_path / "last.safetensors").read_bytes() == paths[1].read_bytes()
+
+
+def test_frozen_checkpoint_fraction_exact_tie_chooses_earlier(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    state = checkpoints.set_planned_steps(
+        str(tmp_path),
+        state,
+        100,
+        checkpoint_target=_frozen_target(1, 2),
+        checkpoint_selected_step=25,
+    )
+    early = tmp_path / "repo_000000025.safetensors"
+    late = tmp_path / "repo_000000075.safetensors"
+    _write_st(early, tag="early")
+    _write_st(late, tag="late")
+
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert record["selected_step"] == 25
+    assert (tmp_path / "last.safetensors").read_bytes() == early.read_bytes()
+
+
+def test_frozen_selected_checkpoint_must_exist_exactly(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    state = checkpoints.set_planned_steps(
+        str(tmp_path),
+        state,
+        100,
+        checkpoint_target=_frozen_target(1, 2),
+        checkpoint_selected_step=50,
+    )
+    _write_st(tmp_path / "repo_000000025.safetensors", tag="early")
+    _write_st(tmp_path / "repo_000000075.safetensors", tag="late")
+
+    with pytest.raises(ValueError, match="was not produced"):
+        checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert not (tmp_path / "last.safetensors").exists()
+
+
+def test_frozen_final_target_promotes_exact_final(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    state = checkpoints.set_planned_steps(
+        str(tmp_path),
+        state,
+        100,
+        checkpoint_target=_frozen_target(1, 1),
+        checkpoint_selected_step=100,
+    )
+    _write_st(tmp_path / "repo_000000075.safetensors", tag="periodic")
+    final = tmp_path / "repo.safetensors"
+    _write_st(final, tag="final")
+
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert record["source"] == "frozen_checkpoint_fraction"
+    assert record["selected_step"] == 100
+    assert record["selected_file"] == "repo.safetensors"
+    assert (tmp_path / "last.safetensors").read_bytes() == final.read_bytes()
+
+
+def test_frozen_checkpoint_target_overrides_training_loss_proxy(tmp_path):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    state = checkpoints.set_planned_steps(
+        str(tmp_path),
+        state,
+        180,
+        model_type="krea2",
+        checkpoint_target=_frozen_target(3, 4),
+        checkpoint_selected_step=135,
+    )
+    paths = [
+        tmp_path / "repo_000000045.safetensors",
+        tmp_path / "repo_000000090.safetensors",
+        tmp_path / "repo_000000135.safetensors",
+        tmp_path / "repo.safetensors",
+    ]
+    for path, tag in zip(paths, ("45", "90", "135", "final")):
+        _write_st(path, tag=tag)
+    # Without the frozen policy this late divergence deliberately selects 90.
+    losses = [0.16] * 45 + [0.10] * 45 + [0.18] * 45 + [0.60] * 45
+    _write_loss_db(tmp_path / "loss_log.db", state, losses)
+
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert record["source"] == "frozen_checkpoint_fraction"
+    assert record["selected_step"] == 135
+    assert (tmp_path / "last.safetensors").read_bytes() == paths[2].read_bytes()
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {},
+        _frozen_target(0, 1),
+        _frozen_target(2, 1),
+        _frozen_target(2, 4),
+        {**_frozen_target(1, 2), "selection_rule": "latest"},
+    ],
+)
+def test_invalid_frozen_checkpoint_target_fails_before_scope_persistence(
+    tmp_path, target
+):
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    scope_before = (tmp_path / ".forge_checkpoint_scope.json").read_bytes()
+
+    with pytest.raises(ValueError, match="checkpoint target"):
+        checkpoints.set_planned_steps(
+            str(tmp_path), state, 100, checkpoint_target=target
+        )
+
+    assert (tmp_path / ".forge_checkpoint_scope.json").read_bytes() == scope_before
 
 
 def test_default_selection_highest_valid_periodic(tmp_path):
@@ -740,9 +890,7 @@ def test_stale_holdout_manifest_is_ignored_on_retry(tmp_path):
             {
                 "source": "heldout",
                 "direction": "min",
-                "scores": [
-                    {"checkpoint": "repo_000000100.safetensors", "score": 0.01}
-                ],
+                "scores": [{"checkpoint": "repo_000000100.safetensors", "score": 0.01}],
             }
         )
     )
@@ -819,9 +967,7 @@ def test_invalid_calibrated_proxy_preserves_divergence_fallback(
     import json
 
     state = checkpoints.begin_run(str(tmp_path), "repo")
-    state = checkpoints.set_planned_steps(
-        str(tmp_path), state, 180, model_type="krea2"
-    )
+    state = checkpoints.set_planned_steps(str(tmp_path), state, 180, model_type="krea2")
     paths = [
         tmp_path / "repo_000000045.safetensors",
         tmp_path / "repo_000000090.safetensors",
@@ -942,9 +1088,7 @@ def test_loss_reader_accepts_current_uncheckpointed_sqlite_wal(tmp_path):
             "INSERT INTO steps VALUES (?, ?)",
             (1, state["started_unix"] + 0.1),
         )
-        conn.execute(
-            "INSERT INTO metrics VALUES (?, 'loss/loss', ?, NULL)", (1, 0.25)
-        )
+        conn.execute("INSERT INTO metrics VALUES (?, 'loss/loss', ?, NULL)", (1, 0.25))
         conn.commit()
         assert (tmp_path / "loss_log.db-wal").is_file()
         # Model the deadline state where only WAL freshness is observable.
@@ -1140,11 +1284,16 @@ def test_cli_never_crash_missing_cache():
 
     rc = cli.main(
         [
-            "--task-id", "nope",
-            "--model", "stabilityai/x",
-            "--model-type", "flux",
-            "--expected-repo-name", "repoZ",
-            "--hours-to-complete", "0.01",
+            "--task-id",
+            "nope",
+            "--model",
+            "stabilityai/x",
+            "--model-type",
+            "flux",
+            "--expected-repo-name",
+            "repoZ",
+            "--hours-to-complete",
+            "0.01",
         ]
     )
     assert rc == 0
@@ -1155,12 +1304,18 @@ def test_cli_unknown_type_fallback():
 
     rc = cli.main(
         [
-            "--task-id", "nope2",
-            "--model", "stabilityai/x",
-            "--model-type", "z-image",
-            "--expected-repo-name", "repoY",
-            "--hours-to-complete", "0.01",
-            "--extra-unknown-flag", "junk",
+            "--task-id",
+            "nope2",
+            "--model",
+            "stabilityai/x",
+            "--model-type",
+            "z-image",
+            "--expected-repo-name",
+            "repoY",
+            "--hours-to-complete",
+            "0.01",
+            "--extra-unknown-flag",
+            "junk",
         ]
     )
     assert rc == 0
@@ -1224,8 +1379,9 @@ def test_parse_never_raises_systemexit():
 # --------------------------------------------------------------------------- #
 # 13. z-image / qwen-image coverage (knockout types)
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("mt,tmpl_arch", [("z-image", "zimage:turbo"),
-                                          ("qwen-image", "qwen_image")])
+@pytest.mark.parametrize(
+    "mt,tmpl_arch", [("z-image", "zimage:turbo"), ("qwen-image", "qwen_image")]
+)
 def test_new_types_config(mt, tmpl_arch):
     s = _spec(model_type=mt, expected_repo_name="repoX")
     cfg = config.build_config(s, num_images=20, hours_to_complete=1.0)

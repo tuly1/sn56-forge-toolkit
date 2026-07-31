@@ -219,6 +219,23 @@ def test_execution_envelope_is_self_bound_and_rejects_tampering():
         _envelope(differential_guidance_enabled=False, guidance_scale=2.0)
 
 
+def test_execution_envelope_accepts_only_exact_stage1_or_stage2_surface_pairs():
+    production = _envelope(
+        execution_surface="immutable_production_docker_image",
+        execution_scope="stage2_throughput_timing_only",
+    )
+    assert production["execution_surface"] == "immutable_production_docker_image"
+    assert production["execution_scope"] == "stage2_throughput_timing_only"
+
+    for surface, scope in (
+        ("immutable_production_docker_image", "discovery_only"),
+        ("staged_host_venv", "stage2_throughput_timing_only"),
+        ("host", "stage2_throughput_timing_only"),
+    ):
+        with pytest.raises(krea_budget.ProfileValidationError, match="surface/scope"):
+            _envelope(execution_surface=surface, execution_scope=scope)
+
+
 def test_profile_requires_every_timing_input_instead_of_using_defaults():
     with pytest.raises(TypeError):
         krea_budget.seal_throughput_profile(

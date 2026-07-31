@@ -43,6 +43,18 @@ _CONFIRMATION_ROLE_COUNTS = {
     "C3": ((30, 30), (8, 8)),
     "C4": ((12, 12), (5, 5)),
 }
+# Stage-2's six boundary cells are deliberately enumerated instead of parsed as
+# general experiment labels.  Keeping them out of ``_ROLE_COUNTS`` preserves
+# the exact legacy D1/D2/C1-C4 namespace used by the Stage-1 cross-fixture
+# contracts while allowing the ordinary byte/leakage validators to be reused.
+_STAGE2_BOUNDARY_ROLE_COUNTS = {
+    "B-0p5-small": ((18, 24), (24, 24)),
+    "B-0p5-large": ((36, 48), (40, 40)),
+    "B-0p75-small": ((18, 24), (24, 24)),
+    "B-0p75-large": ((36, 48), (40, 40)),
+    "B-1-small": ((18, 24), (24, 24)),
+    "B-1-large": ((36, 48), (40, 40)),
+}
 _ROLE_COUNTS = {**_DISCOVERY_ROLE_COUNTS, **_CONFIRMATION_ROLE_COUNTS}
 _CROSS_FIXTURE_ROLES = ("D1", "D2", "C1", "C2", "C3", "C4")
 _BASE_GROUP_FIELDS = frozenset(
@@ -154,14 +166,20 @@ def _validate_role_counts(
 ) -> None:
     """Enforce discovery ranges and each published confirmation shape exactly."""
 
-    if role not in _ROLE_COUNTS:
-        raise ValueError("experimental_role must be D1, D2, or C1-C4")
+    counts = _ROLE_COUNTS.get(role)
+    if counts is None:
+        counts = _STAGE2_BOUNDARY_ROLE_COUNTS.get(role)
+    if counts is None:
+        raise ValueError(
+            "experimental_role must be D1, D2, C1-C4, or an exact Stage-2 "
+            "boundary role"
+        )
     if any(
         isinstance(item, bool) or not isinstance(item, int) or item < 0
         for item in (training_count, evaluation_count)
     ):
         raise ValueError("fixture counts must be non-negative integers")
-    train_range, eval_range = _ROLE_COUNTS[role]
+    train_range, eval_range = counts
     if not train_range[0] <= training_count <= train_range[1]:
         raise ValueError(f"{role} training count is outside {train_range}")
     if not eval_range[0] <= evaluation_count <= eval_range[1]:
@@ -169,8 +187,11 @@ def _validate_role_counts(
 
 
 def _group_fields(role: str) -> frozenset[str]:
-    if role not in _ROLE_COUNTS:
-        raise ValueError("experimental_role must be D1, D2, or C1-C4")
+    if role not in _ROLE_COUNTS and role not in _STAGE2_BOUNDARY_ROLE_COUNTS:
+        raise ValueError(
+            "experimental_role must be D1, D2, C1-C4, or an exact Stage-2 "
+            "boundary role"
+        )
     return _BASE_GROUP_FIELDS | (_D2_GROUP_FIELDS if role == "D2" else frozenset())
 
 
@@ -674,8 +695,11 @@ def build_manifest(
     if not _SAFE_ID.fullmatch(concept_id):
         raise ValueError("concept_id must be one conservative identifier")
     role = _text(metadata["experimental_role"], "experimental_role")
-    if role not in _ROLE_COUNTS:
-        raise ValueError("experimental_role must be D1, D2, or C1-C4")
+    if role not in _ROLE_COUNTS and role not in _STAGE2_BOUNDARY_ROLE_COUNTS:
+        raise ValueError(
+            "experimental_role must be D1, D2, C1-C4, or an exact Stage-2 "
+            "boundary role"
+        )
     threshold = metadata["near_duplicate_hamming_threshold"]
     if (
         isinstance(threshold, bool)
@@ -869,7 +893,7 @@ def _validate_legacy_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     if manifest["manifest_sha256"] != krea_provenance.canonical_sha256(body):
         raise ValueError("fixture manifest digest mismatch")
     role = manifest["experimental_role"]
-    if role not in _ROLE_COUNTS:
+    if role not in _ROLE_COUNTS and role not in _STAGE2_BOUNDARY_ROLE_COUNTS:
         raise ValueError("invalid fixture role")
     named_human(manifest["preparer_identity"], "preparer_identity")
     for identity_key in ("training_dataset_identity", "evaluation_dataset_identity"):

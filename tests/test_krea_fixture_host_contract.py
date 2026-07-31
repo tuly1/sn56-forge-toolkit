@@ -95,6 +95,57 @@ def test_discovery_fixture_ranges_remain_distinct_and_unchanged(
     fixture._validate_role_counts(role, training, evaluation)
 
 
+@pytest.mark.parametrize(
+    ("role", "training", "evaluation"),
+    [
+        ("B-0p5-small", 18, 24),
+        ("B-0p5-small", 24, 24),
+        ("B-0p5-large", 36, 40),
+        ("B-0p75-large", 48, 40),
+        ("B-1-small", 20, 24),
+        ("B-1-large", 40, 40),
+    ],
+)
+def test_stage2_boundary_fixture_roles_have_exact_predeclared_shapes(
+    role, training, evaluation
+):
+    fixture._validate_role_counts(role, training, evaluation)
+
+
+@pytest.mark.parametrize(
+    ("role", "training", "evaluation"),
+    [
+        ("B-0.5-small", 18, 24),
+        ("B-0p50-small", 18, 24),
+        ("B-1p0-large", 36, 40),
+        ("B-0p5-medium", 18, 24),
+        ("b-0p5-small", 18, 24),
+        ("B-0p5-small", 17, 24),
+        ("B-0p75-small", 24, 40),
+        ("B-1-large", 49, 40),
+        ("B-1-large", 40, 24),
+    ],
+)
+def test_stage2_boundary_fixture_roles_reject_aliases_and_wrong_shapes(
+    role, training, evaluation
+):
+    with pytest.raises(ValueError):
+        fixture._validate_role_counts(role, training, evaluation)
+
+
+def test_stage2_boundary_extension_does_not_change_legacy_role_sets() -> None:
+    assert fixture._ROLE_COUNTS == {
+        "D1": ((18, 24), (24, 24)),
+        "D2": ((36, 48), (40, 40)),
+        "C1": ((20, 20), (6, 6)),
+        "C2": ((45, 45), (6, 6)),
+        "C3": ((30, 30), (8, 8)),
+        "C4": ((12, 12), (5, 5)),
+    }
+    assert fixture._CROSS_FIXTURE_ROLES == ("D1", "D2", "C1", "C2", "C3", "C4")
+    assert fixture._group_fields("B-0p75-large") == fixture._BASE_GROUP_FIELDS
+
+
 def _row(role: str, index: int) -> dict:
     token = f"{role}-{index}"
     group = {
@@ -607,9 +658,9 @@ def test_host_manifest_and_live_preflight_accept_complete_bound_observation(
 def test_host_live_preflight_accepts_transient_systemd_scope_path(monkeypatch):
     manifest = _host_manifest()
     observed = deepcopy(_live(manifest))
-    observed["static"]["instance"]["cgroup_v2_path"] = (
-        "/system.slice/forge-krea-timing-example.scope"
-    )
+    observed["static"]["instance"][
+        "cgroup_v2_path"
+    ] = "/system.slice/forge-krea-timing-example.scope"
     monkeypatch.setattr(host, "observe", lambda *args, **kwargs: observed)
     normalized = host.verify_live(manifest, checkpoint_path=Path("/checkpoints"))
     assert normalized["static"] == manifest["static"]

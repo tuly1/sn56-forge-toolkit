@@ -157,8 +157,7 @@ class Harness:
             root / "discovery-authorization.json", self.authorization
         )
         self.arm_classes = {
-            row["id"]: row["throughput_equivalence_class"]
-            for row in self.plan["arms"]
+            row["id"]: row["throughput_equivalence_class"] for row in self.plan["arms"]
         }
         classes = sorted(set(self.arm_classes.values()))
         runtime_identity = {
@@ -225,9 +224,7 @@ class Harness:
                     "path": str(profile_path),
                     "file_sha256": profile_file_sha,
                     "profile_sha256": profile["profile_sha256"],
-                    "execution_envelope_sha256": envelope[
-                        "execution_envelope_sha256"
-                    ],
+                    "execution_envelope_sha256": envelope["execution_envelope_sha256"],
                     "campaign_runtime_identity_sha256": campaign_runtime_identity,
                 }
             indexed_fixtures[fixture_id] = {
@@ -239,15 +236,11 @@ class Harness:
                 "approval": {
                     "path": str(root / f"fixture-{fixture_id}.approval.json"),
                     "file_sha256": _sha(f"fixture-approval-{fixture_id}"),
-                    "approval_sha256": _sha(
-                        f"fixture-approval-semantic-{fixture_id}"
-                    ),
+                    "approval_sha256": _sha(f"fixture-approval-semantic-{fixture_id}"),
                 },
                 "concept_id": f"concept-{fixture_id}",
                 "training_pair_count": training_pairs,
-                "training_dataset_shape_sha256": _sha(
-                    f"training-shape-{fixture_id}"
-                ),
+                "training_dataset_shape_sha256": _sha(f"training-shape-{fixture_id}"),
                 "profiles": profiles,
             }
         index_body = {
@@ -454,9 +447,7 @@ class Harness:
                 }
             )
         fixture_internal = (
-            self.profile_index["fixtures"][fixture_id]["manifest"][
-                "manifest_sha256"
-            ]
+            self.profile_index["fixtures"][fixture_id]["manifest"]["manifest_sha256"]
             if fixture_id in {"D1", "D2"}
             else self.plan["confirmation_contract"]["identities"].get(
                 fixture_id, _sha(f"fixture-internal-{fixture_id}")
@@ -1138,20 +1129,15 @@ def test_decision_binds_index_without_rewriting_the_blocked_freeze(harness: Harn
         == harness.profile_index["index_sha256"]
     )
     assert (
-        record["discovery_profile_index_file_sha256"]
-        == harness.profile_index_file_sha
+        record["discovery_profile_index_file_sha256"] == harness.profile_index_file_sha
     )
 
 
 def test_discovery_policy_rejects_nonindexed_fixture_approval(harness: Harness):
-    _, _, policy_path, _ = harness.discovery_case(
-        losses_by_fixture=_agreement_losses()
-    )
+    _, _, policy_path, _ = harness.discovery_case(losses_by_fixture=_agreement_losses())
     body = json.loads(policy_path.read_text())
     body.pop("policy_sha256")
-    body["score_batches"][0]["fixture_approval_sha256"] = _sha(
-        "unindexed-approval"
-    )
+    body["score_batches"][0]["fixture_approval_sha256"] = _sha("unindexed-approval")
 
     with pytest.raises(ValueError, match="indexed exact fixture approval"):
         krea_decision.seal_discovery_policy(body)
@@ -1171,9 +1157,7 @@ def test_decision_rejects_profile_class_and_one_host_drift(
         envelope["equivalence_class"] = "B-rank32-adamw8bit-mae-guidance3"
     else:
         envelope["host_execution_identity_sha256"] = _sha("foreign-host")
-    body = {
-        key: value for key, value in aggregate.items() if key != "aggregate_sha256"
-    }
+    body = {key: value for key, value in aggregate.items() if key != "aggregate_sha256"}
     aggregate = {
         **body,
         "aggregate_sha256": krea_provenance.canonical_sha256(body),
@@ -1380,9 +1364,16 @@ def test_discovery_agreement_freezes_shared_winner_minimax_and_k0(harness: Harne
 
 def test_discovery_disagreement_freezes_two_winners_minimax_and_k0(harness: Harness):
     losses = _agreement_losses()
-    losses["D1"].update({"K1": 0.0700, "K2": 0.0705, "K3": 0.082})
-    losses["D2"].update({"K1": 0.0705, "K2": 0.0700, "K3": 0.082})
-    record, _, _, _ = harness.discovery_case(losses_by_fixture=losses)
+    # Keep the fixture reversal outside the 0.01 uncertainty band; inside it,
+    # the predeclared family tie-break intentionally resolves the apparent
+    # disagreement before finalist selection.
+    losses["D1"].update({"K1": 0.0680, "K2": 0.0710, "K3": 0.082})
+    losses["D2"].update({"K1": 0.0710, "K2": 0.0680, "K3": 0.082})
+    record, _, _, _ = harness.discovery_case(
+        losses_by_fixture=losses,
+        include_seed_b_policy=True,
+        include_seed_b_aggregates=True,
+    )
 
     assert record["outcome"] == "finalists_frozen"
     assert record["D1_winner_family_id"] == "K1"
@@ -1971,3 +1962,70 @@ def test_output_cannot_target_production_or_selector_names(
             output=tmp_path / "forge_holdout_scores.json",
             decided_at_utc="2026-07-28T00:03:00Z",
         )
+
+
+def _tie_analyses(exposures: dict[str, int]) -> dict:
+    return {
+        (fixture, "A"): {
+            "curves": {
+                family: {"selected": {"image_exposures": depth}}
+                for family, depth in exposures.items()
+            }
+        }
+        for fixture in ("D1", "D2")
+    }
+
+
+def test_family_tie_break_axes_are_depth_consistency_then_fixed_family() -> None:
+    families = ("K1", "K2", "K3")
+
+    depth_scores = {
+        "K1": {"D1": Decimal("0.205"), "D2": Decimal("0.205")},
+        "K2": {"D1": Decimal("0.200"), "D2": Decimal("0.200")},
+        "K3": {"D1": Decimal("0.199"), "D2": Decimal("0.199")},
+    }
+    assert (
+        krea_decision._pick_family_within_uncertainty(
+            families,
+            primary_values={family: depth_scores[family]["D1"] for family in families},
+            analyses=_tie_analyses({"K1": 800, "K2": 1000, "K3": 900}),
+            concept_scores=depth_scores,
+            fixtures=("D1", "D2"),
+            seed_roles=("A",),
+        )
+        == "K2"
+    )
+
+    consistency_scores = {
+        "K1": {"D1": Decimal("0.205"), "D2": Decimal("0.190")},
+        "K2": {"D1": Decimal("0.202"), "D2": Decimal("0.188")},
+        "K3": {"D1": Decimal("0.200"), "D2": Decimal("0.199")},
+    }
+    assert (
+        krea_decision._pick_family_within_uncertainty(
+            families,
+            primary_values={
+                family: consistency_scores[family]["D1"] for family in families
+            },
+            analyses=_tie_analyses({family: 1000 for family in families}),
+            concept_scores=consistency_scores,
+            fixtures=("D1", "D2"),
+            seed_roles=("A",),
+        )
+        == "K3"
+    )
+
+    family_scores = {
+        family: {"D1": Decimal("0.2"), "D2": Decimal("0.2")} for family in families
+    }
+    assert (
+        krea_decision._pick_family_within_uncertainty(
+            families,
+            primary_values={family: family_scores[family]["D1"] for family in families},
+            analyses=_tie_analyses({family: 1000 for family in families}),
+            concept_scores=family_scores,
+            fixtures=("D1", "D2"),
+            seed_roles=("A",),
+        )
+        == "K2"
+    )

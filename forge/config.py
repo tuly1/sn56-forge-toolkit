@@ -2,20 +2,23 @@
 
 Loads the bundled per-type template, overrides ONLY the contract keys
 (name==repo, paths, trigger, steps/save), and injects the text-encoder / VAE
-paths per type (exactly as the god_ref entrypoint does). Never raises out:
-``build_config`` degrades to the raw template with just the load-bearing
-name/paths patched so an override bug can't forfeit the task (INV-1). The single
+paths per type (exactly as the god_ref entrypoint does). On the normal production
+path, ``build_config`` degrades to the raw template with just the load-bearing
+name/paths patched so an override bug can't forfeit the task (INV-1). An explicit
+but invalid calibration profile is the sole fail-closed exception. The single
 non-negotiable is ``config.name == expected_repo_name`` — otherwise the validator
 uploader sees an empty folder ("Nothing to upload").
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 
 import yaml
 
-from forge import recipe
+from forge import krea_calibration_profiles, recipe
 
 # Templates are shipped INSIDE the package (forge/templates/*.yaml) so they are
 # present under any deployment (source COPY, `pip install .` wheel, or local test)
@@ -79,10 +82,33 @@ def resolve_base_model(cached_model_dir: str) -> str:
 
 
 def build_config(spec, num_images, hours_to_complete) -> dict:
+    # The selector is deliberately resolved before the never-forfeit override
+    # wrapper: an explicit but invalid calibration request must fail closed and
+    # must never silently fall through to the production recipe.
+    calibration_profile = krea_calibration_profiles.selected_profile(spec.model_type)
+    calibration_depth = krea_calibration_profiles.selected_stage2_depth(
+        spec.model_type, calibration_profile
+    )
+    stage2_control = krea_calibration_profiles.selected_stage2_run_control(
+        spec.model_type, calibration_profile
+    )
+    if (
+        stage2_control is not None
+        and calibration_profile is not None
+        and calibration_profile.profile_id != "K0"
+        and calibration_depth is None
+    ):
+        raise krea_calibration_profiles.KreaCalibrationProfileError(
+            "Stage-2 non-control run controls require measured depth binding"
+        )
     cfg = load_template(spec.model_type)  # may raise → caller wraps
     try:
-        return _apply_overrides(cfg, spec, num_images, hours_to_complete)
+        resolved = _apply_overrides(cfg, spec, num_images, hours_to_complete)
     except Exception:
+        if calibration_profile is not None:
+            # Experiment/Stage-2 evidence must never be generated from the
+            # never-forfeit degraded config while carrying a frozen arm label.
+            raise
         # Degrade to the template with only the load-bearing name/paths patched so
         # an override bug can't forfeit (INV-1). name==repo is non-negotiable.
         try:
@@ -115,7 +141,16 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
             )
         except Exception:
             pass
-        return cfg
+        resolved = cfg
+
+    # Environment-unset production returns the same object produced above with
+    # no extra metadata, event, or recipe mutation.  The calibration path stays
+    # dormant until the selector is explicitly present.
+    if calibration_profile is not None:
+        resolved = krea_calibration_profiles.apply_profile(
+            resolved, calibration_profile, depth_override=calibration_depth
+        )
+    return krea_calibration_profiles.apply_stage2_run_control(resolved, stage2_control)
 
 
 def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
@@ -163,5 +198,153 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
 
 def write_config(cfg: dict, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    rendered = yaml.safe_dump(cfg, sort_keys=False)
     with open(path, "w") as fh:
-        yaml.safe_dump(cfg, fh, sort_keys=False)
+        fh.write(rendered)
+    _write_stage2_control_receipt(cfg, rendered.encode("utf-8"))
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _write_stage2_control_receipt(cfg: dict, config_bytes: bytes) -> None:
+    """Emit the private, create-only proof that Stage-2 controls were consumed."""
+
+    raw_profile = os.environ.get(krea_calibration_profiles.PROFILE_SELECTOR_ENV)
+    if raw_profile is None and all(
+        os.environ.get(name) is None
+        for name in (
+            krea_calibration_profiles.STAGE2_SEED_ENV,
+            krea_calibration_profiles.STAGE2_PLAN_SHA_ENV,
+            krea_calibration_profiles.STAGE2_RECEIPT_PATH_ENV,
+            krea_calibration_profiles.STAGE2_TARGET_NUMERATOR_ENV,
+            krea_calibration_profiles.STAGE2_TARGET_DENOMINATOR_ENV,
+        )
+    ):
+        return
+    profile = krea_calibration_profiles.profile_for_id(raw_profile or "")
+    control = krea_calibration_profiles.selected_stage2_run_control("krea2", profile)
+    if (
+        control is None
+    ):  # pragma: no cover - explicit variables above make this impossible.
+        raise krea_calibration_profiles.KreaCalibrationProfileError(
+            "Stage-2 receipt lacks a validated run control"
+        )
+    process = cfg["config"]["process"][0]
+    train = process["train"]
+    network = process["network"]
+    dataset = process["datasets"][0]
+    save = process["save"]
+    model = process["model"]
+    checkpoint_selection = cfg.get("meta", {}).get("forge_krea_checkpoint_selection")
+    if not isinstance(checkpoint_selection, dict):
+        raise krea_calibration_profiles.KreaCalibrationProfileError(
+            "Stage-2 config lacks its checkpoint-selection binding"
+        )
+    raw_steps = os.environ.get(krea_calibration_profiles.STAGE2_STEPS_ENV)
+    raw_throughput = os.environ.get(krea_calibration_profiles.STAGE2_THROUGHPUT_SHA_ENV)
+    if process.get("training_seed") != control.seed:
+        raise krea_calibration_profiles.KreaCalibrationProfileError(
+            "Stage-2 process did not consume its training seed"
+        )
+    if profile.profile_id == "K0":
+        if raw_steps is not None or raw_throughput is not None:
+            raise krea_calibration_profiles.KreaCalibrationProfileError(
+                "K0 receipt cannot carry a Stage-2 depth override"
+            )
+        throughput_sha = None
+    else:
+        if raw_steps != str(train.get("steps")) or raw_throughput is None:
+            raise krea_calibration_profiles.KreaCalibrationProfileError(
+                "Stage-2 receipt depth differs from the effective config"
+            )
+        throughput_sha = raw_throughput
+    effective = {
+        "config_name": cfg["config"].get("name"),
+        "training_folder": process.get("training_folder"),
+        "trigger_word": process.get("trigger_word"),
+        "model_arch": model.get("arch"),
+        "model_name_or_path": model.get("name_or_path"),
+        "model_kwargs": model.get("model_kwargs"),
+        "dataset_folder_path": dataset.get("folder_path"),
+        "network_rank": network.get("linear"),
+        "network_alpha": network.get("linear_alpha"),
+        "optimizer": train.get("optimizer"),
+        "optimizer_params": train.get("optimizer_params"),
+        "loss": train.get("loss_type"),
+        "guidance_enabled": train.get("do_differential_guidance"),
+        "guidance_scale": train.get("differential_guidance_scale"),
+        "learning_rate": train.get("lr"),
+        "dropout": dataset.get("caption_dropout_rate"),
+        "ema": train.get("ema_config"),
+        "steps": train.get("steps"),
+        "save_every": save.get("save_every"),
+        "push_to_hub": save.get("push_to_hub"),
+        "batch_size": train.get("batch_size"),
+        "gradient_accumulation": train.get("gradient_accumulation"),
+        "resolution": dataset.get("resolution"),
+        "train_dtype": train.get("dtype"),
+        "save_dtype": save.get("dtype"),
+        "cache_latents_to_disk": dataset.get("cache_latents_to_disk"),
+        "cache_text_embeddings": train.get("cache_text_embeddings"),
+        "compile": model.get("compile"),
+        "dataloader_workers": dataset.get("num_workers", 0),
+    }
+    body = {
+        "schema": 1,
+        "kind": "forge-krea-stage2-config-control-receipt",
+        "execution_plan_sha256": control.execution_plan_sha256,
+        "profile_id": profile.profile_id,
+        "profile_sha256": profile.profile_sha256,
+        "training_seed": control.seed,
+        "throughput_profile_sha256": throughput_sha,
+        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "effective_config_file": {
+            "path": "effective-config.yaml",
+            "bytes": len(config_bytes),
+            "sha256": hashlib.sha256(config_bytes).hexdigest(),
+        },
+        "effective_recipe": effective,
+        "effective_recipe_sha256": hashlib.sha256(
+            _canonical_bytes(effective)
+        ).hexdigest(),
+        "checkpoint_selection": checkpoint_selection,
+        "release_authorized": False,
+    }
+    receipt = {
+        **body,
+        "receipt_sha256": hashlib.sha256(_canonical_bytes(body)).hexdigest(),
+    }
+    payload = _canonical_bytes(receipt) + b"\n"
+    parent = os.path.dirname(control.receipt_path)
+    if os.path.realpath(parent) != parent or not os.path.isdir(parent):
+        raise krea_calibration_profiles.KreaCalibrationProfileError(
+            "Stage-2 receipt parent is not the precreated real directory"
+        )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    config_copy_path = os.path.join(parent, "effective-config.yaml")
+    config_fd = os.open(config_copy_path, flags, 0o444)
+    try:
+        with os.fdopen(config_fd, "wb", closefd=False) as handle:
+            handle.write(config_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(config_fd)
+    fd = os.open(control.receipt_path, flags, 0o444)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)

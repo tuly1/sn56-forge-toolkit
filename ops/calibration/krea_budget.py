@@ -33,6 +33,10 @@ _MIN_SAVE_SAMPLES = 8
 _MIN_FRAMEWORK_STOP_BOUNDARY_S = 225.0
 _FROZEN_MINIMUM_UTILIZATION = Decimal("0.90")
 _FROZEN_MAXIMUM_SAVE_OVERHEAD = Decimal("0.10")
+_ALLOWED_EXECUTION_SURFACES = {
+    ("staged_host_venv", "discovery_only"),
+    ("immutable_production_docker_image", "stage2_throughput_timing_only"),
+}
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _EXECUTION_ENVELOPE_PAYLOAD_KEYS = frozenset(
@@ -414,9 +418,10 @@ def seal_execution_envelope(
         "execution_surface": _require_safe_id(execution_surface, "execution_surface"),
         "execution_scope": _require_safe_id(execution_scope, "execution_scope"),
     }
-    if execution_surface != "staged_host_venv" or execution_scope != "discovery_only":
+    if (execution_surface, execution_scope) not in _ALLOWED_EXECUTION_SURFACES:
         raise ProfileValidationError(
-            "Stage-1 profiles are limited to staged_host_venv discovery_only"
+            "throughput profiles require an exact admitted Stage-1 discovery "
+            "or Stage-2 production-timing surface/scope pair"
         )
     for label, value in (
         ("base_model_identity_sha256", base_model_identity_sha256),

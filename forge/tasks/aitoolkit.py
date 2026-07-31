@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 
-from forge import recipe, telemetry
+from forge import krea_calibration_profiles, recipe, telemetry
 from forge.clock import Deadline
 from forge.config import build_config, resolve_base_model, write_config
 from forge.tasks import checkpoints, holdout
@@ -104,11 +104,24 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     cfg = build_config(spec, num_images=pairs, hours_to_complete=hours)
     p = cfg["config"]["process"][0]
     steps = p["train"]["steps"]
+    stage2_profile = krea_calibration_profiles.selected_profile(spec.model_type)
+    stage2_control = krea_calibration_profiles.selected_stage2_run_control(
+        spec.model_type, stage2_profile
+    )
+    stage2_selection = cfg.get("meta", {}).get("forge_krea_checkpoint_selection")
     scope = checkpoints.set_planned_steps(
         spec.save_root,
         scope,
         steps,
         model_type=spec.model_type,
+        checkpoint_target=(
+            stage2_control.checkpoint_target if stage2_control is not None else None
+        ),
+        checkpoint_selected_step=(
+            stage2_selection["selected_step"]
+            if stage2_control is not None and isinstance(stage2_selection, dict)
+            else None
+        ),
     )
     telemetry.set_meta(
         steps=steps,
@@ -124,6 +137,7 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         spec,
         scope,
         scoring_reserve_s=scoring_reserve_s,
+        planned_steps=steps,
     )
     if scoring_budget_ready:
         holdout.produce(
@@ -152,14 +166,16 @@ def _recipe_hours(deadline: Deadline, scoring_reserve_s: float) -> float:
     """
     reserve_before_recipe_margin = 0.0
     if scoring_reserve_s > 0.0:
-        reserve_before_recipe_margin = (
-            (scoring_reserve_s + _STOP_MARGIN_S)
-            / max(0.01, float(recipe.MARGIN))
+        reserve_before_recipe_margin = (scoring_reserve_s + _STOP_MARGIN_S) / max(
+            0.01, float(recipe.MARGIN)
         )
-    return max(
-        0.0,
-        deadline.remaining_hard() - reserve_before_recipe_margin,
-    ) / 3600.0
+    return (
+        max(
+            0.0,
+            deadline.remaining_hard() - reserve_before_recipe_margin,
+        )
+        / 3600.0
+    )
 
 
 def _run_toolkit(
@@ -169,6 +185,7 @@ def _run_toolkit(
     scope: dict,
     *,
     scoring_reserve_s: float = 0.0,
+    planned_steps: int,
 ) -> bool:
     # Run ai-toolkit's run.py with the CURRENT interpreter, not a bare `python3`:
     # in the validator's Docker image sys.executable IS the env python with torch,
@@ -191,9 +208,14 @@ def _run_toolkit(
         while not gpu_stop.is_set():
             try:
                 out = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=memory.used",
-                     "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=5,
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
                 vals = [int(x) for x in out.stdout.split() if x.strip().isdigit()]
                 if vals:
@@ -215,7 +237,10 @@ def _run_toolkit(
         # DataLoader workers can't outlive the kill holding GPU memory while
         # _finalize runs.
         proc = subprocess.Popen(
-            cmd, cwd=_AI_TOOLKIT_DIR, stdout=log, stderr=subprocess.STDOUT,
+            cmd,
+            cwd=_AI_TOOLKIT_DIR,
+            stdout=log,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
         while proc.poll() is None:
@@ -264,17 +289,31 @@ def _run_toolkit(
         pass
 
     telemetry.event(
-        "toolkit_end", returncode=rc, stopped_by_deadline=stopped_by_deadline,
+        "toolkit_end",
+        returncode=rc,
+        stopped_by_deadline=stopped_by_deadline,
         elapsed_s=round(time.monotonic() - started, 1),
     )
+    last_step = None
     try:
         loss, step = _parse_toolkit_log(log_path)
+        last_step = step
         telemetry.event("toolkit_metrics", loss=loss, last_step=step)
         if loss is not None:
             telemetry.sample("final_loss", loss)
             telemetry.train_point(step or 0, loss, None)
     except Exception:
         pass
+
+    stage2_profile = os.environ.get(krea_calibration_profiles.PROFILE_SELECTOR_ENV)
+    if stage2_profile is not None:
+        krea_calibration_profiles.write_stage2_terminal_receipt(
+            profile_id=stage2_profile,
+            planned_steps=planned_steps,
+            last_step=last_step,
+            returncode=rc,
+            stopped_by_deadline=stopped_by_deadline,
+        )
 
     # A clean exit (0) or a deadline stop are both success: a checkpoint should be
     # on disk. A nonzero exit we did NOT trigger means ai-toolkit failed — but if
@@ -347,9 +386,7 @@ def _parse_toolkit_log(log_path: str):
             # ai-toolkit's tqdm counter is zero-based in the final visible loss
             # line (35/36 for the 36th update).  Its subsequent unnumbered
             # terminal save is the durable proof that all planned steps landed.
-            saves = re.findall(
-                r"Saved checkpoint to\s+([^\r\n]+\.safetensors)", text
-            )
+            saves = re.findall(r"Saved checkpoint to\s+([^\r\n]+\.safetensors)", text)
             if saves and not re.search(
                 r"_\d{9}\.safetensors$", os.path.basename(saves[-1].strip())
             ):
@@ -369,6 +406,13 @@ def _finalize(spec: ImageSpec, scope: dict | None = None) -> None:
     )
     if record is None:
         raise RuntimeError("ai-toolkit produced no valid current or prior LoRA")
+    stage2_profile = os.environ.get(krea_calibration_profiles.PROFILE_SELECTOR_ENV)
+    if stage2_profile is not None:
+        krea_calibration_profiles.preserve_stage2_checkpoint_selection(
+            profile_id=stage2_profile,
+            save_root=spec.save_root,
+            record=record,
+        )
     telemetry.event(
         "checkpoint_finalized",
         status=record["status"],

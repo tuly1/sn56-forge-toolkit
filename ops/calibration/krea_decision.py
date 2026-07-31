@@ -221,6 +221,26 @@ _DISCOVERY_CAMPAIGN_CONTRACT = {
         "earliest actual step among candidates within 0.01 of best"
     ),
 }
+
+# Frozen before the Week-5 score gate can close.  This is intentionally kept
+# separate from the already-sealed scorer campaign binding: it resolves only
+# family-level statistical ties and therefore cannot alter which score rows
+# are admissible.  Competitive depth wins first because the prior tournament
+# loss was an undertrained export; stable cross-fixture behavior wins second;
+# the last axis is a fixed family order rather than an observed-score choice.
+FAMILY_TIE_BREAK_POLICY = {
+    "uncertainty_band": 0.01,
+    "ordered_axes": [
+        "greater_selected_image_exposures",
+        "smaller_D1_D2_relative_improvement_spread",
+        "predeclared_family_preference",
+    ],
+    "family_preference": ["K2", "K3", "K4", "K5", "K1"],
+}
+_FAMILY_PREFERENCE = {
+    family: index
+    for index, family in enumerate(FAMILY_TIE_BREAK_POLICY["family_preference"])
+}
 _CONFIRMATION_CAMPAIGN_CONTRACT = {
     "field_parity_noninferiority_cap": 0.01,
     "concept_regression_cap": 0.03,
@@ -476,9 +496,7 @@ def _validate_decision_evidence_binding(value: Any) -> dict[str, Any]:
                 {
                     "arm_id": arm_id,
                     "aggregate_path": aggregate_path.as_posix(),
-                    "file_sha256": _digest(
-                        row["file_sha256"], f"{label}.file_sha256"
-                    ),
+                    "file_sha256": _digest(row["file_sha256"], f"{label}.file_sha256"),
                     "aggregate_sha256": _digest(
                         row["aggregate_sha256"], f"{label}.aggregate_sha256"
                     ),
@@ -1241,8 +1259,7 @@ def _bound_discovery_profile_index(
     )
     if (
         str(plan_path) != indexed_plan.get("path")
-        or policy["discovery_plan"]["sha256"]
-        != indexed_plan.get("file_sha256")
+        or policy["discovery_plan"]["sha256"] != indexed_plan.get("file_sha256")
         or str(authorization_path) != indexed_authorization.get("path")
         or authorization_file_sha != indexed_authorization.get("file_sha256")
         or authorization.get("authorization_sha256")
@@ -1371,17 +1388,14 @@ def _validate_indexed_discovery_aggregate(
             row["execution_envelope"], "discovery measured execution envelope"
         )
         runtime_identity = {
-            key: measured_envelope.get(key)
-            for key in _CAMPAIGN_RUNTIME_IDENTITY_FIELDS
+            key: measured_envelope.get(key) for key in _CAMPAIGN_RUNTIME_IDENTITY_FIELDS
         }
         runtime_identity_sha = krea_provenance.canonical_sha256(runtime_identity)
         if (
             measured_envelope != indexed_envelope
             or measured_envelope.get("equivalence_class") != class_name
-            or row["throughput_profile_sha256"]
-            != profile_slot["profile_sha256"]
-            or runtime_identity_sha
-            != profile_slot["campaign_runtime_identity_sha256"]
+            or row["throughput_profile_sha256"] != profile_slot["profile_sha256"]
+            or runtime_identity_sha != profile_slot["campaign_runtime_identity_sha256"]
         ):
             raise ValueError(
                 f"discovery run {arm_id} escaped indexed {fixture_id}/{class_name}"
@@ -1390,9 +1404,7 @@ def _validate_indexed_discovery_aggregate(
         envelopes[arm_id] = row
     if set(envelopes) != set(runs):
         raise ValueError("indexed discovery envelopes do not cover every arm")
-    if observed_runtime_identities != {
-        index["campaign_runtime_identity_sha256"]
-    }:
+    if observed_runtime_identities != {index["campaign_runtime_identity_sha256"]}:
         raise ValueError(
             "discovery aggregates do not share the indexed one-host runtime"
         )
@@ -1532,9 +1544,7 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("discovery batch fixture must be D1 or D2")
         if row["hours"] is not None or row["dataset_boundary"] is not None:
             raise ValueError("discovery batch must not masquerade as a boundary cell")
-    _validate_indexed_discovery_batches(
-        batches, index=profile_index["document"]
-    )
+    _validate_indexed_discovery_batches(batches, index=profile_index["document"])
     return {
         "schema": 2,
         "kind": "forge-krea-discovery-decision-policy",
@@ -1645,9 +1655,7 @@ def _validate_agent_discovery_policy_payload(
             raise ValueError("discovery batch fixture must be D1 or D2")
         if row["hours"] is not None or row["dataset_boundary"] is not None:
             raise ValueError("discovery batch must not masquerade as a boundary cell")
-    _validate_indexed_discovery_batches(
-        batches, index=profile_index["document"]
-    )
+    _validate_indexed_discovery_batches(batches, index=profile_index["document"])
     return {
         "schema": 3,
         "kind": "forge-krea-agent-discovery-decision-policy",
@@ -1770,8 +1778,7 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
         discovery["outcome"] != "finalists_frozen"
         or discovery["discovery_plan_file_sha256"]
         != payload["discovery_plan"]["sha256"]
-        or discovery["discovery_profile_index_sha256"]
-        != profile_index["index_sha256"]
+        or discovery["discovery_profile_index_sha256"] != profile_index["index_sha256"]
         or discovery["discovery_profile_index_file_sha256"]
         != profile_index["file_sha256"]
         or discovery["confirmation_fixture_seal_sha256"] != seal["seal_sha256"]
@@ -2552,6 +2559,7 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
         for batch_id, batch_curves in curves.items():
             implied_zeros = []
             selected_by_batch[batch_id] = {}
+            selected_rows: dict[str, dict[str, Any]] = {}
             pseudo_candidates = []
             for family_id, rows in batch_curves.items():
                 scored = []
@@ -2573,6 +2581,7 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
                     ),
                 )
                 selected_by_batch[batch_id][family_id] = selected[0]
+                selected_rows[family_id] = selected[1]
             zero = implied_zeros[0]
             if zero <= 0 or any(
                 abs(item - zero) > Decimal("1e-10") for item in implied_zeros[1:]
@@ -2581,6 +2590,9 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
             binding = bindings[batch_id]
             reconstructed_analyses[(binding["fixture_id"], binding["seed_role"])] = {
                 "batch_id": batch_id,
+                "curves": {
+                    family: {"selected": row} for family, row in selected_rows.items()
+                },
                 "aggregate": {
                     "candidates": pseudo_candidates,
                     "zero": {"weighted_loss": zero},
@@ -2620,9 +2632,15 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("family bootstrap does not recompute from concepts")
         noncontrols = sorted(set(families) - {_CONTROL_FAMILY})
         winners = {
-            fixture: min(
+            fixture: _pick_family_within_uncertainty(
                 noncontrols,
-                key=lambda family: (-concept_scores[family][fixture], family),
+                primary_values={
+                    family: concept_scores[family][fixture] for family in noncontrols
+                },
+                analyses=reconstructed_analyses,
+                concept_scores=concept_scores,
+                fixtures=_DISCOVERY_FIXTURES,
+                seed_roles=tuple(value["seeds_used"]),
             )
             for fixture in _DISCOVERY_FIXTURES
         }
@@ -2657,7 +2675,14 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
         ]
         if remaining:
             expected_finalists.append(
-                min(remaining, key=lambda family: (regret[family], family))
+                _pick_family_within_uncertainty(
+                    remaining,
+                    primary_values={family: -regret[family] for family in remaining},
+                    analyses=reconstructed_analyses,
+                    concept_scores=concept_scores,
+                    fixtures=_DISCOVERY_FIXTURES,
+                    seed_roles=tuple(value["seeds_used"]),
+                )
             )
         expected_finalists.append(_CONTROL_FAMILY)
         if finalists != expected_finalists:
@@ -3408,9 +3433,7 @@ def _load_additive_members(
             or document.get("kind") != "forge-krea-exact-score-batch"
         ):
             raise ValueError("additive members must be ordinary schema-2 score batches")
-        evidence = _reload_decision_evidence(
-            aggregate_path=path, aggregate=aggregate
-        )
+        evidence = _reload_decision_evidence(aggregate_path=path, aggregate=aggregate)
         runs = aggregate["campaign"]["runs"]
         if len(runs) != 1:
             raise ValueError("each additive score member must exhaust exactly one arm")
@@ -3471,17 +3494,15 @@ def _additive_body(
         first_document["common_training_envelope"],
         "additive common training envelope",
     )
-    if (
-        first_document["common_training_envelope_sha256"]
-        != krea_provenance.canonical_sha256(first_training)
-    ):
+    if first_document[
+        "common_training_envelope_sha256"
+    ] != krea_provenance.canonical_sha256(first_training):
         raise ValueError("additive member common training envelope digest is invalid")
     first_evaluation = _object(
         first_document["evaluation_envelope"], "additive evaluation envelope"
     )
-    if (
-        first_document["evaluation_envelope_sha256"]
-        != krea_provenance.canonical_sha256(first_evaluation)
+    if first_document["evaluation_envelope_sha256"] != krea_provenance.canonical_sha256(
+        first_evaluation
     ):
         raise ValueError("additive member evaluation envelope digest is invalid")
     shared_evaluation = _shared_evaluation_envelope(first_evaluation)
@@ -3584,9 +3605,7 @@ def _additive_body(
         member_zero = [row for row in raw_rows if row["mode"] == "zero_lora_control"]
         member_local = [row for row in raw_rows if row["mode"] == "local_run_candidate"]
         normalized_zero = [
-            row
-            for row in aggregate["candidates"]
-            if row["mode"] == "zero_lora_control"
+            row for row in aggregate["candidates"] if row["mode"] == "zero_lora_control"
         ]
         normalized_local = [
             row
@@ -3652,9 +3671,7 @@ def _additive_body(
                 "file_sha256": member["file_sha256"],
                 "aggregate_sha256": aggregate["aggregate_sha256"],
                 "plan": document["plan"],
-                "sealed_plan_approval_sha256": document[
-                    "sealed_plan_approval_sha256"
-                ],
+                "sealed_plan_approval_sha256": document["sealed_plan_approval_sha256"],
                 "candidate_ids": local_ids,
             }
         )
@@ -3663,9 +3680,7 @@ def _additive_body(
                 "arm_id": arm_id,
                 "aggregate_sha256": aggregate["aggregate_sha256"],
                 "plan": document["plan"],
-                "sealed_plan_approval_sha256": document[
-                    "sealed_plan_approval_sha256"
-                ],
+                "sealed_plan_approval_sha256": document["sealed_plan_approval_sha256"],
                 "candidate_ids": local_ids,
                 "candidate_sha256s": sorted(
                     row["candidate_sha256"] for row in member_local
@@ -3683,9 +3698,10 @@ def _additive_body(
             f"missing={missing}, extra={extra}"
         )
     assert zero_public is not None and zero_normalized is not None
-    if zero_public["candidate_id"] in seen_candidate_ids or zero_public[
-        "candidate_sha256"
-    ] in seen_candidate_shas:
+    if (
+        zero_public["candidate_id"] in seen_candidate_ids
+        or zero_public["candidate_sha256"] in seen_candidate_shas
+    ):
         raise ValueError("additive zero control collides with a local candidate")
 
     local_public.sort(
@@ -3728,9 +3744,7 @@ def _additive_body(
         "members": [
             {
                 "arm_id": row["arm_id"],
-                "sealed_plan_approval_sha256": row[
-                    "sealed_plan_approval_sha256"
-                ],
+                "sealed_plan_approval_sha256": row["sealed_plan_approval_sha256"],
             }
             for row in public_members
         ],
@@ -3751,9 +3765,7 @@ def _additive_body(
                 "file_sha256": row["file_sha256"],
                 "aggregate_sha256": row["aggregate_sha256"],
                 "plan_canonical_sha256": row["plan"]["canonical_sha256"],
-                "sealed_plan_approval_sha256": row[
-                    "sealed_plan_approval_sha256"
-                ],
+                "sealed_plan_approval_sha256": row["sealed_plan_approval_sha256"],
             }
             for row in public_members
         ],
@@ -3779,9 +3791,7 @@ def _additive_body(
                 approved_payload
             ),
         },
-        "sealed_plan_approval_sha256": krea_provenance.canonical_sha256(
-            approval_set
-        ),
+        "sealed_plan_approval_sha256": krea_provenance.canonical_sha256(approval_set),
         "sealed_plan_approval": first_document["sealed_plan_approval"],
         "batch_runner_sha256": common_surface["batch_runner_sha256"],
         "common_training_envelope": additive_training,
@@ -3830,8 +3840,7 @@ def _aggregate_additive(
         value.get("schema") != 1
         or value.get("kind") != _ADDITIVE_AGGREGATE_KIND
         or value.get("direction") != "min"
-        or value.get("aggregate_sha256")
-        != krea_provenance.canonical_sha256(body)
+        or value.get("aggregate_sha256") != krea_provenance.canonical_sha256(body)
     ):
         raise ValueError("additive exact-score aggregate identity is invalid")
     source = _object(value.get("campaign_source"), "additive campaign source")
@@ -3871,9 +3880,7 @@ def _aggregate_additive(
         "campaign_manifest_sha256": value["campaign_manifest_sha256"],
         "fixture_manifest_sha256": value["fixture_manifest_sha256"],
         "fixture_approval_sha256": value["fixture_approval_sha256"],
-        "sealed_plan_approval_sha256": value[
-            "sealed_plan_approval_sha256"
-        ],
+        "sealed_plan_approval_sha256": value["sealed_plan_approval_sha256"],
         "score_plan_reviewer": internal["score_plan_reviewer"],
         "aggregate_sha256": value["aggregate_sha256"],
         "candidates": internal["candidates"],
@@ -3965,9 +3972,7 @@ def _reload_additive_decision_evidence(
                 "file_sha256": member["file_sha256"],
                 "aggregate_sha256": nested["aggregate_sha256"],
                 "plan_canonical_sha256": nested["plan_canonical_sha256"],
-                "sealed_plan_approval_sha256": nested[
-                    "sealed_plan_approval_sha256"
-                ],
+                "sealed_plan_approval_sha256": nested["sealed_plan_approval_sha256"],
                 "decision_evidence": evidence,
             }
         )
@@ -4754,6 +4759,70 @@ def _concept_family_scores(
     return result
 
 
+def _family_tie_key(
+    family: str,
+    *,
+    analyses: Mapping[tuple[str, str], dict[str, Any]],
+    concept_scores: Mapping[str, Mapping[str, Decimal]],
+    fixtures: Sequence[str],
+    seed_roles: Sequence[str],
+) -> tuple[Decimal, Decimal, int, str]:
+    """Return the immutable competitive family tie-break key.
+
+    The caller must first restrict the field to families within the declared
+    uncertainty band.  Image exposures, rather than raw optimizer steps, are
+    used for depth because the frozen arms have different throughput classes.
+    """
+
+    exposures = [
+        Decimal(
+            analyses[(fixture, seed_role)]["curves"][family]["selected"][
+                "image_exposures"
+            ]
+        )
+        for fixture in fixtures
+        for seed_role in seed_roles
+    ]
+    mean_depth = sum(exposures) / Decimal(len(exposures))
+    values = [concept_scores[family][fixture] for fixture in fixtures]
+    cross_fixture_spread = max(values) - min(values)
+    return (
+        -mean_depth,
+        cross_fixture_spread,
+        _FAMILY_PREFERENCE.get(family, len(_FAMILY_PREFERENCE)),
+        family,
+    )
+
+
+def _pick_family_within_uncertainty(
+    families: Sequence[str],
+    *,
+    primary_values: Mapping[str, Decimal],
+    analyses: Mapping[tuple[str, str], dict[str, Any]],
+    concept_scores: Mapping[str, Mapping[str, Decimal]],
+    fixtures: Sequence[str],
+    seed_roles: Sequence[str],
+) -> str:
+    """Maximize the primary value, then apply the predeclared tie axes."""
+
+    if not families:
+        raise ValueError("family tie-break requires at least one family")
+    best = max(primary_values[family] for family in families)
+    near = [
+        family for family in families if best - primary_values[family] <= _DISCOVERY_TIE
+    ]
+    return min(
+        near,
+        key=lambda family: _family_tie_key(
+            family,
+            analyses=analyses,
+            concept_scores=concept_scores,
+            fixtures=fixtures,
+            seed_roles=seed_roles,
+        ),
+    )
+
+
 def _material_rank_reversal(
     concept_scores: Mapping[str, Mapping[str, Decimal]],
     *,
@@ -5093,9 +5162,15 @@ def decide(
             }
         )
     winners = {
-        fixture: min(
+        fixture: _pick_family_within_uncertainty(
             noncontrols,
-            key=lambda family: (-concept_scores[family][fixture], family),
+            primary_values={
+                family: concept_scores[family][fixture] for family in noncontrols
+            },
+            analyses=analyses,
+            concept_scores=concept_scores,
+            fixtures=_DISCOVERY_FIXTURES,
+            seed_roles=used_seed_roles,
         )
         for fixture in _DISCOVERY_FIXTURES
     }
@@ -5120,7 +5195,16 @@ def decide(
     add(winners["D2"])
     remaining = [family for family in noncontrols if family not in finalists]
     if remaining:
-        add(min(remaining, key=lambda family: (regret[family], family)))
+        add(
+            _pick_family_within_uncertainty(
+                remaining,
+                primary_values={family: -regret[family] for family in remaining},
+                analyses=analyses,
+                concept_scores=concept_scores,
+                fixtures=_DISCOVERY_FIXTURES,
+                seed_roles=used_seed_roles,
+            )
+        )
     add(_CONTROL_FAMILY)
     if len(finalists) > 4:
         raise RuntimeError("frozen finalist rule exceeded maximum_finalists=4")

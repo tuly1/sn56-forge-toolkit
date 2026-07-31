@@ -30,7 +30,7 @@ import re
 import sqlite3
 import statistics
 import time
-from typing import Any
+from typing import Any, Mapping
 import uuid
 
 from forge.tasks.integrity import valid_safetensors
@@ -55,6 +55,7 @@ _EXACT_HELDOUT_METRICS = frozenset({"validator_exact_combined"})
 # its own safety threshold. Entries are added only after exact Comfy evaluator
 # calibration, keyed by (metric, model_type); an empty map is telemetry-only.
 _HELDOUT_PROXY_POLICIES: dict[tuple[str, str], dict[str, Any]] = {}
+_FROZEN_FRACTION_RULE = "nearest_current_candidate_ties_choose_earlier_step"
 
 
 @dataclass(frozen=True)
@@ -140,9 +141,7 @@ def begin_run(save_root: str, repo: str) -> dict[str, Any]:
         candidates = sorted(
             name
             for name in os.listdir(save_root)
-            if (
-                name.startswith(repo) or name in _AUTO_RESUME_FIXED_NAMES
-            )
+            if (name.startswith(repo) or name in _AUTO_RESUME_FIXED_NAMES)
             and name != os.path.basename(scope_path)
         )
         if candidates:
@@ -227,18 +226,72 @@ def set_planned_steps(
     steps: int,
     *,
     model_type: str | None = None,
+    checkpoint_target: Mapping[str, Any] | None = None,
+    checkpoint_selected_step: int | None = None,
 ) -> dict[str, Any]:
     """Add the planned terminal step so an unnumbered exact final is traceable."""
     updated = dict(state)
+    target = _validate_checkpoint_target(checkpoint_target)
+    if (target is None) != (checkpoint_selected_step is None):
+        raise ValueError(
+            "checkpoint target and selected step must be supplied together"
+        )
+    if target is not None:
+        if (
+            isinstance(checkpoint_selected_step, bool)
+            or not isinstance(checkpoint_selected_step, int)
+            or checkpoint_selected_step <= 0
+            or checkpoint_selected_step > int(steps)
+        ):
+            raise ValueError("checkpoint selected step is invalid")
     try:
         updated["planned_steps"] = max(1, int(steps))
         if model_type:
             updated["model_type"] = str(model_type).strip().lower()
+        if target is not None:
+            updated["checkpoint_target"] = target
+            updated["checkpoint_selected_step"] = checkpoint_selected_step
         _ACTIVE_RUNS[os.path.abspath(save_root)] = updated
         _atomic_json(os.path.join(save_root, _SCOPE_FILE), updated)
     except Exception as exc:
         _event("checkpoint_scope_plan_failed", error=f"{type(exc).__name__}: {exc}")
     return updated
+
+
+def _validate_checkpoint_target(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Normalize the fixed checkpoint fraction used by a frozen policy."""
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+        "fraction_numerator",
+        "fraction_denominator",
+        "selection_rule",
+    }:
+        raise ValueError("checkpoint target has an invalid schema")
+    numerator = value["fraction_numerator"]
+    denominator = value["fraction_denominator"]
+    if (
+        isinstance(numerator, bool)
+        or not isinstance(numerator, int)
+        or isinstance(denominator, bool)
+        or not isinstance(denominator, int)
+        or numerator <= 0
+        or denominator <= 0
+        or numerator > denominator
+        or value["selection_rule"] != _FROZEN_FRACTION_RULE
+    ):
+        raise ValueError("checkpoint target fraction or rule is invalid")
+    divisor = math.gcd(numerator, denominator)
+    if divisor != 1:
+        raise ValueError("checkpoint target fraction must be reduced")
+    return {
+        "fraction_numerator": numerator,
+        "fraction_denominator": denominator,
+        "selection_rule": _FROZEN_FRACTION_RULE,
+    }
 
 
 def current_loras(save_root: str, state: dict[str, Any] | None) -> list[str]:
@@ -251,9 +304,7 @@ def current_loras(save_root: str, state: dict[str, Any] | None) -> list[str]:
     if not _scope_is_complete(state) or not os.path.isdir(save_root):
         return []
     repo = str(state.get("repo") or "")
-    periodic = re.compile(
-        rf"^{re.escape(repo)}(?:_\d+|-step\d+)\.safetensors$"
-    )
+    periodic = re.compile(rf"^{re.escape(repo)}(?:_\d+|-step\d+)\.safetensors$")
     out: list[str] = []
     for name in os.listdir(save_root):
         if name != f"{repo}.safetensors" and periodic.fullmatch(name) is None:
@@ -319,6 +370,13 @@ def finalize(
             discovered=len(candidates),
             valid=len(valid),
         )
+        if state is not None and state.get("checkpoint_target") is not None:
+            target = _validate_checkpoint_target(state["checkpoint_target"])
+            planned_steps = _planned_steps(state)
+            if target is None or planned_steps is None:
+                raise ValueError("frozen checkpoint selection lost its run binding")
+            record["checkpoint_target"] = target
+            record["planned_steps"] = planned_steps
         _write_selection(save_root, record)
         _event(
             "checkpoint_selected",
@@ -376,6 +434,10 @@ def select(
     """Choose among already integrity-checked current-run candidates."""
     default = _default_selection(valid, repo, state)
 
+    frozen = _select_from_frozen_fraction(valid, state)
+    if frozen is not None:
+        return frozen
+
     heldout = _select_from_holdout(valid, save_root, state, default)
     if heldout is not None:
         return heldout
@@ -384,6 +446,60 @@ def select(
     if divergence is not None:
         return divergence
     return default
+
+
+def _select_from_frozen_fraction(
+    valid: list[str], state: dict[str, Any] | None
+) -> Selection | None:
+    """Select the checkpoint nearest a predeclared training-curve fraction.
+
+    The comparison uses integer cross-products and chooses the earlier step on
+    an exact tie.  This is the same candidate-mapping rule used by the offline
+    discovery decision, without treating a training-loss or holdout proxy as
+    authoritative.
+    """
+
+    raw = (state or {}).get("checkpoint_target")
+    if raw is None:
+        return None
+    target = _validate_checkpoint_target(raw)
+    assert target is not None
+    planned = _planned_steps(state)
+    if planned is None:
+        raise ValueError("frozen checkpoint target requires planned steps")
+    rows: list[tuple[int, str]] = []
+    for path in valid:
+        step = _step_of(path)
+        if step < 0 and os.path.basename(path) == f"{state.get('repo')}.safetensors":
+            step = planned
+        if step <= 0 or step > planned:
+            raise ValueError("current checkpoint step escapes the frozen schedule")
+        rows.append((step, path))
+    if not rows:
+        raise ValueError("frozen checkpoint target has no valid candidate")
+    expected_step = (state or {}).get("checkpoint_selected_step")
+    if (
+        isinstance(expected_step, bool)
+        or not isinstance(expected_step, int)
+        or expected_step <= 0
+        or expected_step > planned
+    ):
+        raise ValueError("frozen checkpoint target lacks its selected step")
+    matching = [row for row in rows if row[0] == expected_step]
+    if not matching:
+        raise ValueError("the frozen selected checkpoint was not produced")
+    step, path = min(matching, key=lambda row: os.path.basename(row[1]))
+    numerator = target["fraction_numerator"]
+    denominator = target["fraction_denominator"]
+    return Selection(
+        path=path,
+        source="frozen_checkpoint_fraction",
+        reason=(
+            "selected the current-run checkpoint nearest the owner-frozen "
+            f"curve fraction {numerator}/{denominator}; exact ties choose earlier"
+        ),
+        step=step,
+    )
 
 
 def _default_selection(
@@ -519,9 +635,9 @@ def _select_from_holdout(
                     ),
                 )
                 return None
-            scoped_model_type = str(
-                (state or {}).get("model_type") or ""
-            ).strip().lower()
+            scoped_model_type = (
+                str((state or {}).get("model_type") or "").strip().lower()
+            )
             if not scoped_model_type or model_type != scoped_model_type:
                 _event(
                     "heldout_proxy_telemetry_only",
@@ -529,10 +645,9 @@ def _select_from_holdout(
                 )
                 return None
             allowed_sources = policy.get("reference_sources", ("exact_final",))
-            if (
-                not isinstance(allowed_sources, (list, tuple, set, frozenset))
-                or default.source not in {str(value) for value in allowed_sources}
-            ):
+            if not isinstance(
+                allowed_sources, (list, tuple, set, frozenset)
+            ) or default.source not in {str(value) for value in allowed_sources}:
                 _event(
                     "heldout_proxy_telemetry_only",
                     reason=f"policy does not cover reference source {default.source}",
@@ -684,7 +799,9 @@ def _validate_proxy_contract(
     expected_captioned = float(policy.get("captioned_weight"))
     expected_blank = float(policy.get("blank_caption_weight"))
     if (
-        not math.isclose(captioned_weight, expected_captioned, rel_tol=0.0, abs_tol=1e-12)
+        not math.isclose(
+            captioned_weight, expected_captioned, rel_tol=0.0, abs_tol=1e-12
+        )
         or not math.isclose(blank_weight, expected_blank, rel_tol=0.0, abs_tol=1e-12)
         or not math.isclose(captioned_weight + blank_weight, 1.0, abs_tol=1e-12)
         or manifest.get("strata_scored_separately") is not True
@@ -711,9 +828,7 @@ def _validate_proxy_contract(
             for value in (captioned_score, blank_score, combined)
         ):
             raise ValueError("proxy component score is invalid")
-        recomputed = (
-            captioned_weight * captioned_score + blank_weight * blank_score
-        )
+        recomputed = captioned_weight * captioned_score + blank_weight * blank_score
         if not math.isclose(combined, recomputed, rel_tol=1e-9, abs_tol=1e-12):
             raise ValueError("combined proxy score does not match its strata")
         if (
@@ -758,23 +873,22 @@ def _proxy_required_advantage(
         blank_n = min(holdout_pairs, blank_points)
         captioned_weight = float(policy.get("captioned_weight"))
         blank_weight = float(policy.get("blank_caption_weight"))
-        return (
-            (captioned_weight ** 2) * (captioned_sd ** 2) / captioned_n
-            + (blank_weight ** 2) * (blank_sd ** 2) / blank_n
-        )
+        return (captioned_weight**2) * (captioned_sd**2) / captioned_n + (
+            blank_weight**2
+        ) * (blank_sd**2) / blank_n
 
     absolute = float(policy.get("absolute_floor"))
     relative = float(policy.get("relative_floor"))
     multiplier = float(policy.get("dispersion_multiplier"))
     if (
-        any(not math.isfinite(value) or value < 0.0
-            for value in (absolute, relative, multiplier))
+        any(
+            not math.isfinite(value) or value < 0.0
+            for value in (absolute, relative, multiplier)
+        )
         or relative > 1.0
     ):
         raise ValueError("invalid frozen proxy policy")
-    dispersion = multiplier * math.sqrt(
-        _variance(best_row) + _variance(default_row)
-    )
+    dispersion = multiplier * math.sqrt(_variance(best_row) + _variance(default_row))
     return max(absolute, relative * abs(default_score), dispersion)
 
 
@@ -802,7 +916,9 @@ def _select_from_loss_divergence(
 
     scored: list[tuple[float, float, str, int]] = []
     for path, step in stepped:
-        values = [loss for point_step, loss in points if step - window < point_step <= step]
+        values = [
+            loss for point_step, loss in points if step - window < point_step <= step
+        ]
         if len(values) >= max(5, window // 2):
             scored.append((_trimmed_mean(values), _mad(values), path, step))
     if not scored:
@@ -848,9 +964,7 @@ def _loss_points(
 ) -> list[tuple[int, float]]:
     path = os.path.join(save_root, _LOSS_DB_FILE)
     wal_path = path + "-wal"
-    if state is None or not (
-        _is_current(path, state) or _is_current(wal_path, state)
-    ):
+    if state is None or not (_is_current(path, state) or _is_current(wal_path, state)):
         return []
     try:
         # ``mode=ro`` prevents selection from mutating or creating the recorder.
@@ -881,7 +995,11 @@ def _loss_points(
 def _trimmed_mean(values: list[float]) -> float:
     ordered = sorted(values)
     trim = int(len(ordered) * 0.1)
-    core = ordered[trim : len(ordered) - trim] if trim and len(ordered) > 2 * trim else ordered
+    core = (
+        ordered[trim : len(ordered) - trim]
+        if trim and len(ordered) > 2 * trim
+        else ordered
+    )
     return statistics.fmean(core)
 
 
@@ -1008,7 +1126,9 @@ def _cleanup_quarantine(state: dict[str, Any] | None) -> None:
     except FileNotFoundError:
         pass
     except Exception as exc:
-        _event("checkpoint_quarantine_cleanup_failed", error=f"{type(exc).__name__}: {exc}")
+        _event(
+            "checkpoint_quarantine_cleanup_failed", error=f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _prune_old_quarantines(save_root: str) -> None:
