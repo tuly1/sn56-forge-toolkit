@@ -96,6 +96,7 @@ _SUCCESSOR_RUNTIME_BASE_COMMIT = "fc70e616b7b9b5ffbd590cf0433609cd4d3528e6"
 _SUCCESSOR_ALLOWED_RUNTIME_PATHS = frozenset(
     {
         "ops/calibration/krea_fixture_admission.py",
+        "ops/calibration/krea_execution_plan.py",
         "ops/calibration/krea_runtime_binding.py",
         "ops/calibration/run_krea_ladder.py",
     }

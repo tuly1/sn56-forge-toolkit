@@ -564,6 +564,28 @@ def test_real_successor_git_transition_is_control_only() -> None:
     runner._validate_control_only_source_transition(compatibility)
 
 
+def test_admitted_588_timing_probe_uses_exact_historical_git_blobs() -> None:
+    admitted_probe = {
+        "probe_contract_sha256": (
+            "490914141eed9a0d083c870185e8cd832de8c1c47b5108250a260196416dd0d4"
+        ),
+        "runner_sha256": (
+            "b4ac3a6b475c3b59c3344baca103c7c03e5b0c14e9c25b24010906602b6a72df"
+        ),
+        "measurement_tool_sha256": (
+            "e8eaca8495885a94e49e7611c2f9ac26fea3ed07ef29611aa077bb4a0c76ac6c"
+        ),
+    }
+    assert admitted_probe["probe_contract_sha256"] == (
+        "490914141eed9a0d083c870185e8cd832de8c1c47b5108250a260196416dd0d4"
+    )
+    assert krea_execution_plan._historical_timing_source_identities(
+        "58822b496019177a02fa6196247ac30e788331bb"
+    ) == {key: admitted_probe[key] for key in krea_execution_plan._TIMING_SOURCE_PATHS}
+    with pytest.raises(ValueError, match="not authorized"):
+        krea_execution_plan._historical_timing_source_identities("0" * 40)
+
+
 def test_runner_allows_only_the_plan_derived_proxy_mismatch_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

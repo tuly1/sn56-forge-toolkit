@@ -882,6 +882,7 @@ def test_successor_rederives_exact_588_repository_and_implementation() -> None:
 
 def test_successor_runtime_allowlist_is_the_exact_bridge_surface() -> None:
     assert admission._SUCCESSOR_ALLOWED_RUNTIME_PATHS == {
+        "ops/calibration/krea_execution_plan.py",
         "ops/calibration/krea_fixture_admission.py",
         "ops/calibration/krea_runtime_binding.py",
         "ops/calibration/run_krea_ladder.py",

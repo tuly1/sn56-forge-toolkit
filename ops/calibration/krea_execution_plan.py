@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import re
+import subprocess
 from typing import Any
 
 try:
@@ -78,6 +79,45 @@ _EXECUTION_APPROVAL_KIND = "forge-krea-pre-run-execution-approval"
 _POSTRUN_CERTIFICATE_KIND = "forge-krea-post-run-natural-completion-certificate"
 _CAMPAIGN_ROOT = Path("/campaign")
 _CONTROL_ROOT = _CAMPAIGN_ROOT / "controls"
+_HISTORICAL_TIMING_SOURCE_COMMIT = "58822b496019177a02fa6196247ac30e788331bb"
+_TIMING_SOURCE_PATHS = {
+    "runner_sha256": "ops/calibration/run_krea_ladder.py",
+    "measurement_tool_sha256": "ops/calibration/krea_timing_probe.py",
+}
+
+
+def _historical_timing_source_identities(source_commit: str) -> dict[str, str]:
+    """Hash the exact historical Git blobs that produced sealed timing evidence."""
+
+    if source_commit != _HISTORICAL_TIMING_SOURCE_COMMIT:
+        raise ValueError("historical timing source commit is not authorized")
+    root = Path(__file__).resolve().parents[2]
+    identities: dict[str, str] = {}
+    for key, relative in _TIMING_SOURCE_PATHS.items():
+        try:
+            result = subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(root),
+                    "show",
+                    f"{source_commit}:{relative}",
+                ],
+                check=True,
+                capture_output=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "GIT_CONFIG_GLOBAL": "/dev/null",
+                    "GIT_CONFIG_SYSTEM": "/dev/null",
+                },
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError("historical timing source is unavailable") from exc
+        identities[key] = hashlib.sha256(result.stdout).hexdigest()
+    return identities
 
 
 def _strict_utc(value: Any, label: str) -> str:
@@ -1571,7 +1611,15 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     _, probe_contract, probe_contract_file_sha = _load_binding(
         timing_evidence["probe_contract"], "timing probe contract"
     )
-    validate_timing_probe_plan(probe_contract)
+    historical_probe_source_commit = None
+    if accelerated_campaign is not None:
+        historical_probe_source_commit = accelerated_campaign["document"][
+            "historical_compatibility"
+        ]["source_commit"]
+    validate_timing_probe_plan(
+        probe_contract,
+        historical_source_commit=historical_probe_source_commit,
+    )
     try:
         from . import krea_timing_probe
     except ImportError:  # pragma: no cover - direct script execution.
@@ -1968,7 +2016,9 @@ def seal_plan(payload: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
-def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
+def validate_timing_probe_plan(
+    plan: dict[str, Any], *, historical_source_commit: str | None = None
+) -> dict[str, Any]:
     """Validate the executable pre-profile probe contract.
 
     This contract intentionally has no throughput profile, budget-derived arm
@@ -2265,9 +2315,18 @@ def validate_timing_probe_plan(plan: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "timing probe command must be the bounded run_krea_ladder bootstrap argv"
         )
+    expected_code_identities = (
+        {
+            "runner_sha256": krea_provenance.file_sha256(runner_path),
+            "measurement_tool_sha256": krea_provenance.file_sha256(tool_path),
+        }
+        if historical_source_commit is None
+        else _historical_timing_source_identities(historical_source_commit)
+    )
     if (
-        krea_provenance.file_sha256(runner_path) != plan["runner_sha256"]
-        or krea_provenance.file_sha256(tool_path) != plan["measurement_tool_sha256"]
+        expected_code_identities["runner_sha256"] != plan["runner_sha256"]
+        or expected_code_identities["measurement_tool_sha256"]
+        != plan["measurement_tool_sha256"]
         or envelope.measurement_tool_sha256 != plan["measurement_tool_sha256"]
     ):
         raise ValueError(
