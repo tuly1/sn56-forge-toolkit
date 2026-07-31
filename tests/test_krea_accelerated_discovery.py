@@ -11,6 +11,7 @@ from ops.calibration import krea_budget
 from ops.calibration import krea_provenance
 from ops.calibration import krea_execution_plan
 from ops.calibration import krea_runtime_binding as runtime_binding
+from ops.calibration import krea_timing_probe
 from ops.calibration import krea_training_evidence
 from ops.calibration import run_krea_ladder as runner
 
@@ -584,6 +585,42 @@ def test_admitted_588_timing_probe_uses_exact_historical_git_blobs() -> None:
     ) == {key: admitted_probe[key] for key in krea_execution_plan._TIMING_SOURCE_PATHS}
     with pytest.raises(ValueError, match="not authorized"):
         krea_execution_plan._historical_timing_source_identities("0" * 40)
+
+
+def test_archival_replay_propagates_exact_historical_source_through_all_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_commit = "58822b496019177a02fa6196247ac30e788331bb"
+    seen: list[str | None] = []
+
+    def validate_capture(_value):
+        seen.append(krea_execution_plan._HISTORICAL_TIMING_REPLAY_SOURCE.get())
+        raise RuntimeError("capture-context-observed")
+
+    monkeypatch.setattr(krea_timing_probe, "validate_capture", validate_capture)
+    with pytest.raises(RuntimeError, match="capture-context-observed"):
+        krea_execution_plan._replay_historical_timing(
+            source_commit, krea_timing_probe.raw_from_captures, [{}]
+        )
+    with pytest.raises(RuntimeError, match="capture-context-observed"):
+        krea_execution_plan._replay_historical_timing(
+            source_commit, krea_timing_probe.end_to_end_from_records, [{}], []
+        )
+    with pytest.raises(RuntimeError, match="capture-context-observed"):
+        krea_execution_plan._replay_historical_timing(
+            None, krea_timing_probe.raw_from_captures, [{}]
+        )
+    assert seen == [source_commit, source_commit, None]
+    assert krea_execution_plan._HISTORICAL_TIMING_REPLAY_SOURCE.get() is None
+    assert krea_execution_plan._replay_historical_timing(
+        source_commit,
+        lambda: krea_execution_plan._HISTORICAL_TIMING_REPLAY_SOURCE.get(),
+    ) == source_commit
+    assert krea_execution_plan._HISTORICAL_TIMING_REPLAY_SOURCE.get() is None
+    with pytest.raises(ValueError, match="not authorized"):
+        krea_execution_plan._replay_historical_timing(
+            "0" * 40, lambda: None
+        )
 
 
 def test_runner_allows_only_the_plan_derived_proxy_mismatch_set(

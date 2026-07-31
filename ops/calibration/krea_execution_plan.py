@@ -10,6 +10,7 @@ certification record.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -84,6 +85,9 @@ _TIMING_SOURCE_PATHS = {
     "runner_sha256": "ops/calibration/run_krea_ladder.py",
     "measurement_tool_sha256": "ops/calibration/krea_timing_probe.py",
 }
+_HISTORICAL_TIMING_REPLAY_SOURCE: ContextVar[str | None] = ContextVar(
+    "forge_krea_historical_timing_replay_source", default=None
+)
 
 
 def _historical_timing_source_identities(source_commit: str) -> dict[str, str]:
@@ -118,6 +122,25 @@ def _historical_timing_source_identities(source_commit: str) -> dict[str, str]:
             raise ValueError("historical timing source is unavailable") from exc
         identities[key] = hashlib.sha256(result.stdout).hexdigest()
     return identities
+
+
+def _replay_historical_timing(
+    source_commit: str | None, callback: Any, /, *args: Any
+) -> Any:
+    """Scope an authenticated historical identity to archival replay only."""
+
+    if source_commit is None:
+        return callback(*args)
+    if source_commit != _HISTORICAL_TIMING_SOURCE_COMMIT:
+        raise ValueError("historical timing replay source is not authorized")
+    active = _HISTORICAL_TIMING_REPLAY_SOURCE.get()
+    if active is not None and active != source_commit:
+        raise ValueError("historical timing replay source changed mid-validation")
+    token = _HISTORICAL_TIMING_REPLAY_SOURCE.set(source_commit)
+    try:
+        return callback(*args)
+    finally:
+        _HISTORICAL_TIMING_REPLAY_SOURCE.reset(token)
 
 
 def _strict_utc(value: Any, label: str) -> str:
@@ -1640,11 +1663,16 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     measurement_capture_rows = evidence_array("measurement_captures")
     heldout_capture_rows = evidence_array("heldout_captures")
     heldout_run_rows = evidence_array("heldout_run_records")
-    recomputed_raw = krea_timing_probe.raw_from_captures(
-        [document for document, _ in measurement_capture_rows]
+    recomputed_raw = _replay_historical_timing(
+        historical_probe_source_commit,
+        krea_timing_probe.raw_from_captures,
+        [document for document, _ in measurement_capture_rows],
     )
-    recomputed_e2e = krea_timing_probe.end_to_end_from_records(
-        [document for document, _ in heldout_capture_rows], heldout_run_rows
+    recomputed_e2e = _replay_historical_timing(
+        historical_probe_source_commit,
+        krea_timing_probe.end_to_end_from_records,
+        [document for document, _ in heldout_capture_rows],
+        heldout_run_rows,
     )
     timing_approval_actors: list[dict[str, Any]] = []
     for capture, _ in measurement_capture_rows + heldout_capture_rows:
@@ -2315,13 +2343,18 @@ def validate_timing_probe_plan(
         raise ValueError(
             "timing probe command must be the bounded run_krea_ladder bootstrap argv"
         )
+    effective_historical_source = (
+        historical_source_commit
+        if historical_source_commit is not None
+        else _HISTORICAL_TIMING_REPLAY_SOURCE.get()
+    )
     expected_code_identities = (
         {
             "runner_sha256": krea_provenance.file_sha256(runner_path),
             "measurement_tool_sha256": krea_provenance.file_sha256(tool_path),
         }
-        if historical_source_commit is None
-        else _historical_timing_source_identities(historical_source_commit)
+        if effective_historical_source is None
+        else _historical_timing_source_identities(effective_historical_source)
     )
     if (
         expected_code_identities["runner_sha256"] != plan["runner_sha256"]
