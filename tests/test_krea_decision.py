@@ -96,6 +96,8 @@ def _custodian_actor() -> dict:
 
 
 class Harness:
+    profile_index_registry: dict[str, tuple[Path, dict, str]] = {}
+
     def __init__(self, root: Path):
         self.root = root
         source = Path("ops/calibration/week5/krea-discovery-plan.json")
@@ -153,6 +155,136 @@ class Harness:
         )
         self.authorization_path, self.authorization_sha = _write(
             root / "discovery-authorization.json", self.authorization
+        )
+        self.arm_classes = {
+            row["id"]: row["throughput_equivalence_class"]
+            for row in self.plan["arms"]
+        }
+        classes = sorted(set(self.arm_classes.values()))
+        runtime_identity = {
+            "micro_batch_size": 1,
+            "gradient_accumulation_steps": 8,
+            "data_parallel_replicas": 1,
+            "resolution_policy_sha256": _sha("resolution-policy"),
+            "precision_policy_sha256": _sha("precision-policy"),
+            "cache_latents_to_disk": True,
+            "cache_text_embeddings": True,
+            "compile_enabled": False,
+            "jit_enabled": True,
+            "dataloader_workers": 2,
+            "base_model_identity_sha256": _sha("base-model"),
+            "runtime_identity_sha256": _sha("runtime"),
+            "host_execution_identity_sha256": _sha("one-host"),
+            "execution_surface": "staged_host_venv",
+            "execution_scope": "discovery_only",
+            "venv_tree_manifest_sha256": _sha("venv-tree"),
+            "reference_container_image_sha256": _sha("container"),
+            "gpu_identity_sha256": _sha("gpu"),
+            "trainer_identity_sha256": _sha("trainer"),
+            "measurement_tool_sha256": _sha("measurement-tool"),
+        }
+        campaign_runtime_identity = krea_provenance.canonical_sha256(runtime_identity)
+        self.profile_envelopes: dict[str, dict[str, dict]] = {}
+        indexed_fixtures = {}
+        for fixture_id, training_pairs in (("D1", 18), ("D2", 36)):
+            self.profile_envelopes[fixture_id] = {}
+            profiles = {}
+            for class_name in classes:
+                class_fields = {
+                    "network_rank": 64 if class_name.startswith("C-") else 32,
+                    "network_alpha": 64 if class_name.startswith("C-") else 32,
+                    "optimizer": (
+                        "automagic" if class_name.startswith("C-") else "adamw8bit"
+                    ),
+                    "loss": "mae" if class_name.startswith("B-") else "mse",
+                    "differential_guidance_enabled": True,
+                    "guidance_scale": 3.0 if class_name.startswith("B-") else 2.0,
+                }
+                envelope = {
+                    **runtime_identity,
+                    **class_fields,
+                    "equivalence_class": class_name,
+                    "training_pair_count": training_pairs,
+                    "training_dataset_shape_sha256": _sha(
+                        f"training-shape-{fixture_id}"
+                    ),
+                    "execution_envelope_sha256": _sha(
+                        f"execution-envelope-{fixture_id}-{class_name}"
+                    ),
+                }
+                profile = {
+                    "profile_sha256": _sha(f"profile-{fixture_id}-{class_name}"),
+                    "execution_envelope": envelope,
+                }
+                profile_path, profile_file_sha = _write(
+                    root / f"profile-{fixture_id}-{_sha(class_name)[:8]}.json",
+                    profile,
+                )
+                self.profile_envelopes[fixture_id][class_name] = envelope
+                profiles[class_name] = {
+                    "path": str(profile_path),
+                    "file_sha256": profile_file_sha,
+                    "profile_sha256": profile["profile_sha256"],
+                    "execution_envelope_sha256": envelope[
+                        "execution_envelope_sha256"
+                    ],
+                    "campaign_runtime_identity_sha256": campaign_runtime_identity,
+                }
+            indexed_fixtures[fixture_id] = {
+                "manifest": {
+                    "path": str(root / f"fixture-{fixture_id}.json"),
+                    "file_sha256": _sha(f"fixture-file-{fixture_id}"),
+                    "manifest_sha256": _sha(f"admitted-fixture-{fixture_id}"),
+                },
+                "approval": {
+                    "path": str(root / f"fixture-{fixture_id}.approval.json"),
+                    "file_sha256": _sha(f"fixture-approval-{fixture_id}"),
+                    "approval_sha256": _sha(
+                        f"fixture-approval-semantic-{fixture_id}"
+                    ),
+                },
+                "concept_id": f"concept-{fixture_id}",
+                "training_pair_count": training_pairs,
+                "training_dataset_shape_sha256": _sha(
+                    f"training-shape-{fixture_id}"
+                ),
+                "profiles": profiles,
+            }
+        index_body = {
+            "schema": 2,
+            "kind": "forge-krea-discovery-profile-index",
+            "discovery_plan": {
+                "path": str(self.plan_path),
+                "file_sha256": self.plan_sha,
+            },
+            "discovery_execution_authorization": {
+                "path": str(self.authorization_path),
+                "file_sha256": self.authorization_sha,
+                "authorization_sha256": self.authorization["authorization_sha256"],
+            },
+            "throughput_equivalence_classes": classes,
+            "required_profile_count": 6,
+            "cross_fixture_profile_reuse_forbidden": True,
+            "campaign_runtime_identity_sha256": campaign_runtime_identity,
+            "fixtures": indexed_fixtures,
+            "gpu_execution_authorized": False,
+        }
+        self.profile_index = {
+            **index_body,
+            "index_sha256": krea_provenance.canonical_sha256(index_body),
+        }
+        self.profile_index_path, self.profile_index_file_sha = _write(
+            root / "discovery-profile-index.json", self.profile_index
+        )
+        self.profile_index_binding = {
+            "path": str(self.profile_index_path),
+            "file_sha256": self.profile_index_file_sha,
+            "index_sha256": self.profile_index["index_sha256"],
+        }
+        self.profile_index_registry[str(self.profile_index_path)] = (
+            self.profile_index_path,
+            self.profile_index,
+            self.profile_index_file_sha,
         )
         seal_payload = {
             "schema": 1,
@@ -253,9 +385,9 @@ class Harness:
         denominator: int = 1000,
     ) -> tuple[Path, dict]:
         if fixture_id == "D1":
-            training_pairs, evaluation_rows = 20, 24
+            training_pairs, evaluation_rows = 18, 24
         elif fixture_id == "D2":
-            training_pairs, evaluation_rows = 40, 40
+            training_pairs, evaluation_rows = 36, 40
         elif fixture_id in {"C1", "C2", "C3", "C4"}:
             shape = self.plan["confirmation_contract"]["fixture_shape_contract"][
                 fixture_id
@@ -322,7 +454,9 @@ class Harness:
                 }
             )
         fixture_internal = (
-            self.plan["discovery_tasks"][fixture_id]["fixture_split_manifest_sha256"]
+            self.profile_index["fixtures"][fixture_id]["manifest"][
+                "manifest_sha256"
+            ]
             if fixture_id in {"D1", "D2"}
             else self.plan["confirmation_contract"]["identities"].get(
                 fixture_id, _sha(f"fixture-internal-{fixture_id}")
@@ -476,7 +610,23 @@ class Harness:
             {
                 "arm_id": run["arm_id"],
                 "execution_plan_sha256": run["execution_plan_sha256"],
+                **(
+                    {
+                        "execution_envelope": self.profile_envelopes[fixture_id][
+                            self.arm_classes[run["arm_id"]]
+                        ],
+                        "throughput_profile_sha256": self.profile_index["fixtures"][
+                            fixture_id
+                        ]["profiles"][self.arm_classes[run["arm_id"]]][
+                            "profile_sha256"
+                        ],
+                    }
+                    if fixture_id in {"D1", "D2"}
+                    else {}
+                ),
                 "budget_plan": {"hard_budget_s": 2700},
+                "budget_plan_sha256": _sha(f"budget-{batch_id}-{run['arm_id']}"),
+                "schedule": {"mode": "natural_completion"},
                 **(
                     {
                         "candidate_decision": {
@@ -648,6 +798,7 @@ class Harness:
             "discovery_execution_authorization": _binding(
                 self.authorization_path, self.authorization_sha
             ),
+            "discovery_profile_index": dict(self.profile_index_binding),
             "confirmation_fixture_seal": _binding(self.seal_path, self.seal_sha),
             "score_batches": batches,
             "bootstrap": BOOTSTRAP,
@@ -733,6 +884,7 @@ class Harness:
             "discovery_execution_authorization": _binding(
                 self.authorization_path, self.authorization_sha
             ),
+            "discovery_profile_index": dict(self.profile_index_binding),
             "confirmation_fixture_seal": _binding(self.seal_path, self.seal_sha),
             "discovery_decision": _binding(discovery_path, discovery_sha),
             "candidate_family_id": candidate,
@@ -769,7 +921,13 @@ def harness(tmp_path: Path, monkeypatch) -> Harness:
         "validate",
         lambda value: value,
     )
-    return Harness(tmp_path)
+    result = Harness(tmp_path)
+    monkeypatch.setattr(
+        krea_decision.krea_profile_index,
+        "load_binding",
+        lambda value: Harness.profile_index_registry[value["path"]],
+    )
+    return result
 
 
 def _enable_agent_decision_governance(
@@ -793,6 +951,33 @@ def _enable_agent_decision_governance(
     }
     harness.authorization_path, harness.authorization_sha = _write(
         harness.authorization_path, harness.authorization
+    )
+    index_body = {
+        key: deepcopy(value)
+        for key, value in harness.profile_index.items()
+        if key != "index_sha256"
+    }
+    index_body["discovery_execution_authorization"] = {
+        "path": str(harness.authorization_path),
+        "file_sha256": harness.authorization_sha,
+        "authorization_sha256": harness.authorization["authorization_sha256"],
+    }
+    harness.profile_index = {
+        **index_body,
+        "index_sha256": krea_provenance.canonical_sha256(index_body),
+    }
+    harness.profile_index_path, harness.profile_index_file_sha = _write(
+        harness.profile_index_path, harness.profile_index
+    )
+    harness.profile_index_binding = {
+        "path": str(harness.profile_index_path),
+        "file_sha256": harness.profile_index_file_sha,
+        "index_sha256": harness.profile_index["index_sha256"],
+    }
+    harness.profile_index_registry[str(harness.profile_index_path)] = (
+        harness.profile_index_path,
+        harness.profile_index,
+        harness.profile_index_file_sha,
     )
     admission = {
         "accountable_owner_identity": "Jordan Example",
@@ -874,6 +1059,7 @@ def _agent_discovery_case(
         "discovery_execution_authorization": _binding(
             harness.authorization_path, harness.authorization_sha
         ),
+        "discovery_profile_index": dict(harness.profile_index_binding),
         "confirmation_fixture_seal": _binding(harness.seal_path, harness.seal_sha),
         "score_batches": sorted(batches, key=lambda row: row["batch_id"]),
         "bootstrap": BOOTSTRAP,
@@ -918,11 +1104,90 @@ def test_discovery_freeze_rejects_status_blocker_and_dummy_profile_rewrites(
             ].__setitem__("A-rank32-adamw8bit-mse-guidance2", _sha("dummy-profile")),
             "deferred index sentinel",
         ),
+        (
+            lambda plan: plan["arms"][0].__setitem__(
+                "throughput_profile_sha256", _sha("late-flat-profile")
+            ),
+            "legacy flat hash",
+        ),
     ):
         changed = deepcopy(harness.plan)
         mutation(changed)
         with pytest.raises(ValueError, match=message):
             krea_decision._validate_discovery_plan(changed)
+
+
+def test_decision_binds_index_without_rewriting_the_blocked_freeze(harness: Harness):
+    before = harness.plan_path.read_bytes()
+    record, _, policy_path, _ = harness.discovery_case(
+        losses_by_fixture=_agreement_losses()
+    )
+    policy = json.loads(policy_path.read_text())
+
+    assert harness.plan_path.read_bytes() == before
+    assert harness.plan["gpu_execution_authorized"] is False
+    assert all(
+        row.get("throughput_profile_sha256") is None
+        and row.get("fixture_manifest_sha256") is None
+        and row.get("fixture_approval_sha256") is None
+        for row in harness.plan["arms"]
+    )
+    assert policy["discovery_profile_index"] == harness.profile_index_binding
+    assert (
+        record["discovery_profile_index_sha256"]
+        == harness.profile_index["index_sha256"]
+    )
+    assert (
+        record["discovery_profile_index_file_sha256"]
+        == harness.profile_index_file_sha
+    )
+
+
+def test_discovery_policy_rejects_nonindexed_fixture_approval(harness: Harness):
+    _, _, policy_path, _ = harness.discovery_case(
+        losses_by_fixture=_agreement_losses()
+    )
+    body = json.loads(policy_path.read_text())
+    body.pop("policy_sha256")
+    body["score_batches"][0]["fixture_approval_sha256"] = _sha(
+        "unindexed-approval"
+    )
+
+    with pytest.raises(ValueError, match="indexed exact fixture approval"):
+        krea_decision.seal_discovery_policy(body)
+
+
+@pytest.mark.parametrize("drift", ["class", "host"])
+def test_decision_rejects_profile_class_and_one_host_drift(
+    harness: Harness, drift: str
+):
+    _, aggregate_paths, policy_path, approval_path = harness.discovery_case(
+        losses_by_fixture=_agreement_losses()
+    )
+    aggregate_path = aggregate_paths[0]
+    aggregate = json.loads(aggregate_path.read_text())
+    envelope = aggregate["training_run_envelopes"][0]["execution_envelope"]
+    if drift == "class":
+        envelope["equivalence_class"] = "B-rank32-adamw8bit-mae-guidance3"
+    else:
+        envelope["host_execution_identity_sha256"] = _sha("foreign-host")
+    body = {
+        key: value for key, value in aggregate.items() if key != "aggregate_sha256"
+    }
+    aggregate = {
+        **body,
+        "aggregate_sha256": krea_provenance.canonical_sha256(body),
+    }
+    _write(aggregate_path, aggregate)
+
+    with pytest.raises(ValueError, match="escaped indexed"):
+        krea_decision.decide_discovery(
+            policy_path=policy_path,
+            approval_path=approval_path,
+            aggregate_paths=aggregate_paths,
+            output=harness.root / f"krea-discovery-decision-{drift}-drift.json",
+            decided_at_utc="2026-07-28T00:03:00Z",
+        )
 
 
 def _agreement_losses() -> dict[str, dict[str, float]]:
@@ -1371,6 +1636,7 @@ def test_strict_freeze_chronology_rejects_same_second_unblinding(harness: Harnes
                 "discovery_execution_authorization": _binding(
                     frozen.authorization_path, frozen.authorization_sha
                 ),
+                "discovery_profile_index": dict(frozen.profile_index_binding),
                 "confirmation_fixture_seal": _binding(
                     frozen.seal_path, frozen.seal_sha
                 ),
@@ -1507,6 +1773,7 @@ def test_confirmation_policy_requires_all_eight_quality_and_six_boundary_cells(
         "discovery_execution_authorization": _binding(
             harness.authorization_path, harness.authorization_sha
         ),
+        "discovery_profile_index": dict(harness.profile_index_binding),
         "confirmation_fixture_seal": _binding(harness.seal_path, harness.seal_sha),
         "discovery_decision": _binding(discovery_path, discovery_sha),
         "candidate_family_id": "K1",
@@ -1613,6 +1880,7 @@ def test_boundary_fallback_or_late_decision_is_rejected_before_statistics(
         "discovery_execution_authorization": _binding(
             other.authorization_path, other.authorization_sha
         ),
+        "discovery_profile_index": dict(other.profile_index_binding),
         "confirmation_fixture_seal": _binding(other.seal_path, other.seal_sha),
         "discovery_decision": _binding(discovery_path, discovery_sha),
         "candidate_family_id": candidate,
@@ -1653,6 +1921,7 @@ def test_confirmation_candidate_must_be_predeclared_noncontrol_finalist(
         "discovery_execution_authorization": _binding(
             harness.authorization_path, harness.authorization_sha
         ),
+        "discovery_profile_index": dict(harness.profile_index_binding),
         "confirmation_fixture_seal": _binding(harness.seal_path, harness.seal_sha),
         "discovery_decision": _binding(path, digest),
         "candidate_family_id": "K5",

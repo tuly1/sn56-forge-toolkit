@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Exact-score a reviewed Krea candidate set in isolated sequential processes.
+"""Exact-score a reviewed Krea candidate set in isolated processes.
 
 Every candidate is evaluated by ``evaluate_krea_local.py`` in a fresh process.
-The aggregate is published only after full candidate coverage under one common
-dataset, evaluator, source, asset, and runtime envelope.  This is an offline
-calibration artifact; it can never write Forge's production selection file.
+The legacy ``batch`` mode remains available.  Long campaigns can instead run
+one create-only ``candidate-shard`` per candidate and later use
+``assemble-shards``; assembly independently revalidates every staged input,
+result, log, binding, and complete-set hash before publishing.  No aggregate is
+published without full candidate coverage under one common dataset, evaluator,
+source, asset, and runtime envelope.  This is an offline calibration artifact;
+it can never write Forge's production selection file.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 from fractions import Fraction
 import hashlib
 import json
@@ -34,7 +39,9 @@ try:  # Direct script execution places this directory on sys.path.
     from . import krea_execution_plan
     from . import krea_execution_surface_policy
     from . import krea_fixture
+    from . import krea_historical_training_evidence
     from . import krea_provenance
+    from . import krea_scorer_extension_policy
 except ImportError:  # pragma: no cover - exercised by CLI, not module tests.
     import krea_dataset_identity  # type: ignore[no-redef]
     import krea_delegated_review_contract  # type: ignore[no-redef]
@@ -42,7 +49,9 @@ except ImportError:  # pragma: no cover - exercised by CLI, not module tests.
     import krea_execution_plan  # type: ignore[no-redef]
     import krea_execution_surface_policy  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
+    import krea_historical_training_evidence  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
+    import krea_scorer_extension_policy  # type: ignore[no-redef]
 
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -51,6 +60,18 @@ _GIT_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SCHEMA = 1
 _KIND = "forge-krea-exact-score-batch"
 _FORBIDDEN_OUTPUT = "forge_holdout_scores.json"
+_COMFY_LORA_PLACEHOLDER = "put_loras_here"
+_SCORER_SUPPORT_MODULE_SHA256 = {
+    "krea_execution_surface_policy.py": (
+        "597e5047e419a5007e5dd7e9c80c3d771ac21995028899edaac38ba47bf02722"
+    ),
+    "krea_historical_training_evidence.py": (
+        "6734200163e856a14a2d41a370e98e1b4b801091e5f828c37817ff9d4435f3d0"
+    ),
+    "krea_scorer_extension_policy.py": (
+        "b0c033025dc35f0cdc3e348234507c24f17ac636f522eaff3a392cd3e74a062b"
+    ),
+}
 _FIXTURE_KIND = "forge-krea-fixture-split"
 _CONDITION_KIND = "forge-krea-training-condition"
 _COMPLETION_KIND = "forge-krea-training-completion"
@@ -99,6 +120,8 @@ _ROLE_LABELS = frozenset(
         "dri",
     }
 )
+_SCORER_LEASE_GUARD = threading.Lock()
+_ACTIVE_SCORER_LEASES: dict[str, tuple[int, str]] = {}
 
 
 class _EvaluatorCancellation(BaseException):
@@ -142,9 +165,16 @@ def _minimal_evaluator_environment(
 
 def _parse() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=("batch", "candidate-shard", "assemble-shards"),
+        default="batch",
+    )
     parser.add_argument("--plan", required=True, type=Path)
-    parser.add_argument("--results-dir", required=True, type=Path)
+    parser.add_argument("--results-dir", type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--candidate-id")
+    parser.add_argument("--shard", action="append", type=Path, default=[])
     return parser.parse_args()
 
 
@@ -708,6 +738,8 @@ def _validate_evaluator(value: Any) -> dict[str, Any]:
             "startup_timeout_s",
             "evaluation_timeout_s",
             "shutdown_timeout_s",
+            "scorer_extension_policy",
+            "scorer_timeout_profile",
         },
     )
     normalized = dict(evaluator)
@@ -895,7 +927,42 @@ def _validate_evaluator(value: Any) -> dict[str, Any]:
                 or number <= 0
             ):
                 raise ValueError(f"plan.evaluator.{key} must be finite and positive")
+    if "scorer_extension_policy" in normalized:
+        normalized["scorer_extension_policy"] = (
+            krea_scorer_extension_policy.validate(
+                normalized["scorer_extension_policy"]
+            )
+        )
+    if "scorer_timeout_profile" in normalized:
+        profile = normalized["scorer_timeout_profile"]
+        krea_scorer_extension_policy.timeout_profile(profile)
     return normalized
+
+
+def _validate_scorer_fixture_timeout(
+    evaluator: dict[str, Any], fixture: dict[str, Any]
+) -> dict[str, Any]:
+    """Bind the effective scorer ceiling to the admitted fixture shape."""
+
+    extension_present = "scorer_extension_policy" in evaluator
+    profile_present = "scorer_timeout_profile" in evaluator
+    if not extension_present and not profile_present:
+        return {}
+    if extension_present != profile_present:
+        raise ValueError("scorer extension and timeout profile must be paired")
+    role = evaluator.get("scorer_timeout_profile")
+    if role != fixture.get("experimental_role"):
+        raise ValueError("scorer timeout profile differs from fixture role")
+    rows = fixture.get("evaluation_rows")
+    if not isinstance(rows, list):
+        raise ValueError("fixture evaluation rows are missing")
+    defaults = evaluator.get("expected_eval_defaults")
+    generations = defaults.get("generations") if isinstance(defaults, dict) else None
+    return krea_scorer_extension_policy.validate_fixture_profile(
+        role,
+        evaluation_rows=len(rows),
+        generations=generations,
+    )
 
 
 def _timeout_policy(evaluator: dict[str, Any]) -> dict[str, Any]:
@@ -962,6 +1029,8 @@ def _plan_approval_expected(
             "runtime_identity": evaluator["expected_runtime_identity"],
             "assets": evaluator["expected_assets"],
             "cache_provenance_sha256": evaluator["cache_provenance_sha256"],
+            "scorer_extension_policy": evaluator.get("scorer_extension_policy"),
+            "scorer_timeout_profile": evaluator.get("scorer_timeout_profile"),
         },
         "timeout_policy": _timeout_policy(evaluator),
         "batch_runner_sha256": _sha256(Path(__file__).resolve(strict=True)),
@@ -1393,7 +1462,11 @@ def _load_candidate_binding(value: Any, label: str) -> tuple[Path, dict[str, Any
 
 
 def _validate_cross_fixture_review_surface(
-    value: dict[str, Any], *, fixture: dict[str, Any], source_path: Path | None = None
+    value: dict[str, Any],
+    *,
+    fixture: dict[str, Any],
+    source_path: Path | None = None,
+    fixture_admission_validator: Any | None = None,
 ) -> dict[str, Any]:
     """Validate the admitted six-fixture review surface available to scoring.
 
@@ -1405,12 +1478,14 @@ def _validate_cross_fixture_review_surface(
     if value.get("kind") == "forge-krea-fixture-admission-envelope":
         if source_path is None:
             raise ValueError("agent cross-fixture admission requires its bound path")
-        try:
-            from . import krea_fixture_admission
-        except ImportError:  # pragma: no cover - direct script execution.
-            import krea_fixture_admission  # type: ignore[no-redef]
+        if fixture_admission_validator is None:
+            try:
+                from . import krea_fixture_admission
+            except ImportError:  # pragma: no cover - direct script execution.
+                import krea_fixture_admission  # type: ignore[no-redef]
 
-        resolved = krea_fixture_admission.validate_envelope(source_path)
+            fixture_admission_validator = krea_fixture_admission
+        resolved = fixture_admission_validator.validate_envelope(source_path)
         role = fixture.get("experimental_role")
         admitted = _object(resolved.get("fixtures"), "admitted fixtures").get(role)
         acceptance = _object(resolved.get("blinded_acceptance"), "blinded acceptance")
@@ -1524,6 +1599,7 @@ def _validate_campaign_manifest(value: Any) -> dict[str, Any]:
             "manifest_sha256",
         },
         "exact-score campaign manifest",
+        {"historical_training_evidence_validator"},
     )
     body = {key: item for key, item in manifest.items() if key != "manifest_sha256"}
     if (
@@ -1545,6 +1621,10 @@ def _validate_campaign_manifest(value: Any) -> dict[str, Any]:
     if manifest["confirmation_contract"] != _CONFIRMATION_DECISION_BINDING:
         raise ValueError(
             "campaign confirmation contract differs from the frozen policy"
+        )
+    if "historical_training_evidence_validator" in manifest:
+        krea_historical_training_evidence.validate_identity(
+            manifest["historical_training_evidence_validator"]
         )
     runs = manifest["runs"]
     if not isinstance(runs, list) or not runs:
@@ -1839,6 +1919,10 @@ def _validate_run_completion(
     execution_approval: dict[str, Any],
     execution_approval_file_sha: str,
     fixture: dict[str, Any],
+    execution_plan_validator: Any = krea_execution_plan,
+    expected_execution_surface_policy_sha256: str = (
+        krea_execution_surface_policy.POLICY["policy_sha256"]
+    ),
 ) -> None:
     _exact_keys(
         completion,
@@ -1902,12 +1986,12 @@ def _validate_run_completion(
         or completion["natural_completion"] is not True
         or completion["in_task_proxy_selection"] != {"enabled": False, "reserve_s": 0}
         or completion["execution_surface_policy_sha256"]
-        != krea_execution_surface_policy.POLICY["policy_sha256"]
+        != expected_execution_surface_policy_sha256
         or completion["execution_surface"] != "staged_host_venv"
         or completion["execution_scope"] != "discovery_only"
     ):
         raise ValueError("run completion does not bind the approved natural run")
-    resolved = krea_execution_plan.validate_plan(execution_plan)
+    resolved = execution_plan_validator.validate_plan(execution_plan)
     if (
         completion["host_execution_identity_sha256"]
         != resolved["host_execution_manifest"]["host_execution_identity_sha256"]
@@ -2010,10 +2094,59 @@ def _v2_plan_approval_expected(
     }
 
 
+def _validate_scorer_support_modules() -> dict[str, str]:
+    calibration_root = Path(__file__).resolve(strict=True).parent
+    modules = {
+        "krea_execution_surface_policy.py": krea_execution_surface_policy,
+        "krea_historical_training_evidence.py": krea_historical_training_evidence,
+        "krea_scorer_extension_policy.py": krea_scorer_extension_policy,
+    }
+    observed = {}
+    for name, module in modules.items():
+        path = Path(module.__file__).resolve(strict=True)
+        if path != calibration_root / name:
+            raise ValueError(f"scorer support module resolved outside Forge: {name}")
+        observed[name] = _sha256(_safe_file(path, f"scorer support module {name}"))
+    if observed != _SCORER_SUPPORT_MODULE_SHA256:
+        raise ValueError("scorer support module bytes drifted")
+    return observed
+
+
 def _validate_stage1_exact_scorer(evaluator: dict[str, Any]) -> dict[str, Any]:
     """Reject any schema-3 scorer surface not frozen by owner ratification."""
 
+    _validate_scorer_support_modules()
     contract = krea_execution_surface_policy.POLICY["stage1_exact_scorer_contract"]
+    if (
+        krea_execution_surface_policy.POLICY["policy_sha256"]
+        != krea_scorer_extension_policy.POLICY[
+            "base_execution_surface_policy_sha256"
+        ]
+    ):
+        raise ValueError("scorer extension is not bound to this training policy")
+    extension = krea_scorer_extension_policy.validate(
+        evaluator.get("scorer_extension_policy")
+    )
+    effective_timeouts = krea_scorer_extension_policy.effective_timeouts(
+        contract["timeouts_s"], evaluator.get("scorer_timeout_profile")
+    )
+    timeout_policy = _timeout_policy(evaluator)
+    if {
+        "startup": timeout_policy["startup_timeout_s"],
+        "evaluation": timeout_policy["evaluation_timeout_s"],
+        "shutdown": timeout_policy["shutdown_timeout_s"],
+        "containment_term_grace": evaluator["containment"]["term_grace_s"],
+    } != effective_timeouts:
+        raise ValueError("exact scorer effective timeouts differ from its extension")
+    marker = extension["changes"]["comfy_lora_placeholder"]
+    if (
+        marker["relative_path"]
+        != f"models/loras/{_COMFY_LORA_PLACEHOLDER}"
+        or marker["required_type"] != "regular_file"
+        or marker["required_bytes"] != 0
+        or marker["required_link_count"] != 1
+    ):
+        raise ValueError("exact scorer placeholder exception widened")
     observed_assets = {
         name: {
             "basename": Path(row["canonical_path"]).name,
@@ -2037,12 +2170,9 @@ def _validate_stage1_exact_scorer(evaluator: dict[str, Any]) -> dict[str, Any]:
         "assets": observed_assets,
         "source_trees": contract["source_trees"],
         "runtime_materialization": contract["runtime_materialization"],
-        "timeouts_s": {
-            "startup": _timeout_policy(evaluator)["startup_timeout_s"],
-            "evaluation": _timeout_policy(evaluator)["evaluation_timeout_s"],
-            "shutdown": _timeout_policy(evaluator)["shutdown_timeout_s"],
-            "containment_term_grace": evaluator["containment"]["term_grace_s"],
-        },
+        # The base policy remains byte/semantic compatible with the training
+        # evidence.  Effective scorer timeouts are validated separately above.
+        "timeouts_s": contract["timeouts_s"],
         "estimated_seconds_per_candidate": 720,
         "execution_scope": "offline_stage1_discovery_only",
     }
@@ -2151,8 +2281,12 @@ def _stage1_exact_scorer_readiness(evaluator: dict[str, Any]) -> dict[str, Any]:
     if (comfy_root / "extra_model_paths.yaml").exists():
         raise ValueError("exact scorer refuses Comfy extra_model_paths.yaml")
     lora_root = comfy_root / "models" / "loras"
-    if lora_root.exists() and any(lora_root.iterdir()):
-        raise ValueError("exact scorer LoRA directory is not empty before scoring")
+    if os.path.lexists(lora_root):
+        _empty_real_directory(
+            lora_root,
+            "exact scorer LoRA directory before scoring",
+            allowed_zero_byte_placeholder=_COMFY_LORA_PLACEHOLDER,
+        )
 
     comfy_python = Path(evaluator["comfy_python"])
     driver_python = Path(evaluator["driver_python"])
@@ -2204,6 +2338,97 @@ def _stage1_exact_scorer_readiness(evaluator: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "exact scorer critical package versions differ from owner contract"
         )
+    cuda_probe = """
+import base64
+import csv
+import hashlib
+import importlib.metadata
+import io
+import json
+
+import torch
+
+
+def active_owner(cu12_name, cu13_name, relative_path):
+    distributions = [
+        importlib.metadata.distribution(cu12_name),
+        importlib.metadata.distribution(cu13_name),
+    ]
+    path = distributions[0].locate_file(relative_path)
+    actual = hashlib.sha256(path.read_bytes()).digest()
+    matches = []
+    for distribution in distributions:
+        records = {
+            row[0]: row[1]
+            for row in csv.reader(io.StringIO(distribution.read_text("RECORD")))
+        }
+        encoded = records.get(relative_path, "")
+        if not encoded.startswith("sha256="):
+            raise RuntimeError(f"missing wheel RECORD hash: {relative_path}")
+        digest = encoded.split("=", 1)[1]
+        expected = base64.urlsafe_b64decode(digest + "=" * (-len(digest) % 4))
+        if actual == expected:
+            matches.append(
+                f"{distribution.metadata['Name']}=={distribution.version}"
+            )
+    if len(matches) != 1:
+        raise RuntimeError(f"ambiguous CUDA namespace owner: {relative_path}")
+    return matches[0]
+
+
+owners = {
+    "cudnn": active_owner(
+        "nvidia-cudnn-cu12",
+        "nvidia-cudnn-cu13",
+        "nvidia/cudnn/lib/libcudnn.so.9",
+    ),
+    "cusparselt": active_owner(
+        "nvidia-cusparselt-cu12",
+        "nvidia-cusparselt-cu13",
+        "nvidia/cusparselt/lib/libcusparseLt.so.0",
+    ),
+    "nccl": active_owner(
+        "nvidia-nccl-cu12",
+        "nvidia-nccl-cu13",
+        "nvidia/nccl/lib/libnccl.so.2",
+    ),
+    "nvshmem": active_owner(
+        "nvidia-nvshmem-cu12",
+        "nvidia-nvshmem-cu13",
+        "nvidia/nvshmem/lib/libnvshmem_host.so.3",
+    ),
+}
+x = torch.randn(1, 4, 4, 32, 32, device="cuda", dtype=torch.bfloat16)
+layer = torch.nn.Conv3d(4, 8, 3, padding=1, device="cuda", dtype=torch.bfloat16)
+result = layer(x)
+torch.cuda.synchronize()
+print(
+    json.dumps(
+        {
+            "torch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "cudnn_version": torch.backends.cudnn.version(),
+            "bf16_conv3d": tuple(result.shape) == (1, 8, 4, 32, 32),
+            "overlapping_namespace_owners": owners,
+        },
+        sort_keys=True,
+    )
+)
+""".strip()
+    try:
+        cuda_runtime = json.loads(
+            subprocess.check_output(
+                [str(comfy_python), "-I", "-c", cuda_probe],
+                env=local_evaluator._inspection_environment(),
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=60,
+            )
+        )
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise RuntimeError("exact scorer CUDA/cuDNN probe failed") from exc
+    if cuda_runtime != runtime_contract["cuda_runtime_probe"]:
+        raise ValueError("exact scorer CUDA/cuDNN runtime differs from owner contract")
     observed_runtime_identity = {
         "comfy_python_identity_sha256": krea_provenance.canonical_sha256(
             python_environment
@@ -2222,11 +2447,61 @@ def _stage1_exact_scorer_readiness(evaluator: dict[str, Any]) -> dict[str, Any]:
         "dependency_lock_sha256": lock_contract["sha256"],
         "assets": observed_assets,
         "runtime_identity": observed_runtime_identity,
+        "cuda_runtime_probe": cuda_runtime,
         "runtime_contract_sha256": krea_provenance.canonical_sha256(runtime_contract),
-        "timeouts_s": contract["timeouts_s"],
+        "base_timeouts_s": contract["timeouts_s"],
+        "effective_timeouts_s": krea_scorer_extension_policy.effective_timeouts(
+            contract["timeouts_s"], evaluator["scorer_timeout_profile"]
+        ),
+        "scorer_extension_policy": krea_scorer_extension_policy.POLICY,
+        "scorer_timeout_profile": evaluator["scorer_timeout_profile"],
+        "scorer_support_module_sha256": _validate_scorer_support_modules(),
         "ready": True,
     }
     return {**body, "readiness_sha256": krea_provenance.canonical_sha256(body)}
+
+
+def _plan_authority_modules(plan: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the authority graph that emitted a schema-2 campaign.
+
+    The scorer may evolve without forcing already-admitted training evidence to
+    be rewritten.  When the campaign explicitly binds the one admitted c9f30b1
+    validator, every authority-sensitive read must use that isolated graph.
+    """
+
+    campaign_binding = plan.get("campaign_manifest")
+    historical = None
+    # Approval builders are also used to construct a document before the full
+    # plan has been materialized in tests/tools.  Only an exact bound campaign
+    # may select a historical graph; anything else remains on current authority
+    # and is still rejected later by full plan validation.
+    if isinstance(campaign_binding, dict) and set(campaign_binding) == {
+        "path",
+        "sha256",
+    }:
+        _, _, campaign, campaign_raw = _bound_file(
+            campaign_binding, "exact-score campaign manifest"
+        )
+        _canonical_control_file(
+            campaign, campaign_raw, "exact-score campaign manifest"
+        )
+        _validate_campaign_manifest(campaign)
+        historical = campaign.get("historical_training_evidence_validator")
+    if historical is not None:
+        _validate_scorer_support_modules()
+        return krea_historical_training_evidence.load_modules(historical)
+    try:
+        from . import krea_fixture_admission
+    except ImportError:  # pragma: no cover - direct script execution.
+        import krea_fixture_admission  # type: ignore[no-redef]
+
+    return {
+        "discovery_authorization": krea_discovery_authorization,
+        "delegated_review_contract": krea_delegated_review_contract,
+        "execution_plan": krea_execution_plan,
+        "fixture": krea_fixture,
+        "fixture_admission": krea_fixture_admission,
+    }
 
 
 def build_agent_sealed_plan_approval(
@@ -2245,12 +2520,15 @@ def build_agent_sealed_plan_approval(
     evaluator = _validate_evaluator(plan["evaluator"])
     _validate_stage1_exact_scorer(evaluator)
     readiness = _stage1_exact_scorer_readiness(evaluator)
-    _, authorization, _ = krea_discovery_authorization.load_binding(
+    authority = _plan_authority_modules(plan)
+    discovery_authorization = authority["discovery_authorization"]
+    delegated_review_contract = authority["delegated_review_contract"]
+    _, authorization, _ = discovery_authorization.load_binding(
         discovery_execution_authorization
     )
     if "offline_exact_scoring" not in authorization["authorized_actions"]:
         raise ValueError("discovery authorization does not permit exact scoring")
-    actor = krea_delegated_review_contract.validate_actor(
+    actor = delegated_review_contract.validate_actor(
         "exact_score_plan_reviewer", technical_reviewer_actor
     )
     candidates = []
@@ -2282,7 +2560,7 @@ def build_agent_sealed_plan_approval(
             "owner_ratification_sha256"
         ],
         "discovery_execution_authorization": dict(discovery_execution_authorization),
-        "delegated_review_contract": krea_delegated_review_contract.binding(),
+        "delegated_review_contract": delegated_review_contract.binding(),
         "agent_review_is_not_human_review": True,
         "scorer_readiness": readiness,
         **expected,
@@ -2322,10 +2600,13 @@ def _validate_v2_approval(
         )
         _validate_stage1_exact_scorer(evaluator)
         readiness = _stage1_exact_scorer_readiness(evaluator)
-        _, authorization, _ = krea_discovery_authorization.load_binding(
+        authority = _plan_authority_modules(plan)
+        discovery_authorization = authority["discovery_authorization"]
+        delegated_review_contract = authority["delegated_review_contract"]
+        _, authorization, _ = discovery_authorization.load_binding(
             value["discovery_execution_authorization"]
         )
-        actor = krea_delegated_review_contract.validate_actor(
+        actor = delegated_review_contract.validate_actor(
             "exact_score_plan_reviewer", value["technical_reviewer_actor"]
         )
         expected = {
@@ -2340,7 +2621,7 @@ def _validate_v2_approval(
             "discovery_execution_authorization": dict(
                 value["discovery_execution_authorization"]
             ),
-            "delegated_review_contract": krea_delegated_review_contract.binding(),
+            "delegated_review_contract": delegated_review_contract.binding(),
             "agent_review_is_not_human_review": True,
             "scorer_readiness": readiness,
             **expected_fields,
@@ -2413,11 +2694,34 @@ def _validate_plan_v2(
     dataset_spec = _object(plan["dataset"], "plan.dataset")
     _exact_keys(dataset_spec, {"path", "sha256"}, "plan.dataset")
     dataset = _safe_directory(dataset_spec["path"], "exact-evaluation dataset")
+    campaign_path, campaign_file_sha, campaign, campaign_raw = _bound_file(
+        plan["campaign_manifest"], "exact-score campaign manifest"
+    )
+    _canonical_control_file(campaign, campaign_raw, "exact-score campaign manifest")
+    _validate_campaign_manifest(campaign)
+    if campaign_file_sha != plan["campaign_manifest"]["sha256"]:
+        raise ValueError("campaign manifest file binding mismatch")
+    authority = _plan_authority_modules(plan)
+    fixture_validator = authority["fixture"]
+    fixture_admission_validator = authority["fixture_admission"]
+    execution_plan_validator = authority["execution_plan"]
+    training_evidence_validator = authority.get("training_evidence")
+    if training_evidence_validator is None:
+        try:
+            from . import krea_training_evidence as training_evidence_validator
+        except ImportError:  # pragma: no cover
+            import krea_training_evidence as training_evidence_validator  # type: ignore[no-redef]
+    historical_identity = campaign.get("historical_training_evidence_validator")
+    expected_training_policy_sha256 = (
+        krea_execution_surface_policy.POLICY["policy_sha256"]
+        if historical_identity is None
+        else historical_identity["execution_surface_policy_sha256"]
+    )
     fixture_path, fixture_file_sha, fixture, fixture_raw = _bound_file(
         plan["fixture_manifest"], "fixture manifest"
     )
     _canonical_control_file(fixture, fixture_raw, "fixture manifest")
-    krea_fixture.validate_manifest(fixture)
+    fixture_validator.validate_manifest(fixture)
     if fixture_file_sha != plan["fixture_manifest"]["sha256"]:
         raise ValueError("fixture manifest file binding mismatch")
     (
@@ -2427,7 +2731,7 @@ def _validate_plan_v2(
         fixture_approval_raw,
     ) = _bound_file(plan["fixture_approval"], "fixture approval")
     _canonical_control_file(fixture_approval, fixture_approval_raw, "fixture approval")
-    krea_fixture.validate_approval(fixture_approval, fixture_manifest=fixture)
+    fixture_validator.validate_approval(fixture_approval, fixture_manifest=fixture)
     cross_review_path, cross_review_file_sha, cross_review, cross_review_raw = (
         _bound_file(plan["cross_fixture_review"], "cross-fixture admission surface")
     )
@@ -2435,15 +2739,11 @@ def _validate_plan_v2(
         cross_review, cross_review_raw, "cross-fixture admission surface"
     )
     _validate_cross_fixture_review_surface(
-        cross_review, fixture=fixture, source_path=cross_review_path
+        cross_review,
+        fixture=fixture,
+        source_path=cross_review_path,
+        fixture_admission_validator=fixture_admission_validator,
     )
-    campaign_path, campaign_file_sha, campaign, campaign_raw = _bound_file(
-        plan["campaign_manifest"], "exact-score campaign manifest"
-    )
-    _canonical_control_file(campaign, campaign_raw, "exact-score campaign manifest")
-    _validate_campaign_manifest(campaign)
-    if campaign_file_sha != plan["campaign_manifest"]["sha256"]:
-        raise ValueError("campaign manifest file binding mismatch")
     decision_context = _validate_score_decision_context(
         plan["decision_context"], campaign=campaign
     )
@@ -2463,6 +2763,7 @@ def _validate_plan_v2(
         raise ValueError("batch dataset differs from the approved exact-eval fixture")
 
     evaluator = _validate_evaluator(plan["evaluator"])
+    _validate_scorer_fixture_timeout(evaluator, fixture)
     raw_candidates = plan["candidates"]
     if not isinstance(raw_candidates, list) or not raw_candidates:
         raise ValueError("plan.candidates must be non-empty")
@@ -2566,7 +2867,9 @@ def _validate_plan_v2(
             execution_plan_path, execution_plan_value, execution_plan_file_sha = (
                 _load_candidate_binding(binding["execution_plan"], "execution plan")
             )
-            execution_resolved = krea_execution_plan.validate_plan(execution_plan_value)
+            execution_resolved = execution_plan_validator.validate_plan(
+                execution_plan_value
+            )
             if (
                 execution_plan_value["arm_id"] != arm_id
                 or execution_resolved["fixture"]["manifest_sha256"]
@@ -2581,7 +2884,7 @@ def _validate_plan_v2(
             approval_path, approval_value, approval_file_sha = _load_candidate_binding(
                 binding["execution_approval"], "execution approval"
             )
-            krea_execution_plan.validate_approval(
+            execution_plan_validator.validate_approval(
                 approval_value,
                 plan=execution_plan_value,
                 approval_path=approval_path,
@@ -2596,6 +2899,10 @@ def _validate_plan_v2(
                 execution_approval=approval_value,
                 execution_approval_file_sha=approval_file_sha,
                 fixture=fixture,
+                execution_plan_validator=execution_plan_validator,
+                expected_execution_surface_policy_sha256=(
+                    expected_training_policy_sha256
+                ),
             )
             matching = [
                 item
@@ -2769,13 +3076,7 @@ def _validate_plan_v2(
                 }
             )
         elif mode == "zero_lora_control":
-            # Lazy import avoids a module cycle: the producer imports this
-            # validator for its filesystem primitives.
-            try:
-                from . import krea_training_evidence
-            except ImportError:  # pragma: no cover
-                import krea_training_evidence  # type: ignore[no-redef]
-            krea_training_evidence.validate_zero_control(
+            training_evidence_validator.validate_zero_control(
                 binding, artifact_path=candidate_path
             )
             if binding["evaluation_dataset_sha256"] != dataset_sha or binding[
@@ -2901,6 +3202,7 @@ def _validate_plan_v2(
     evaluator["_campaign_manifest_path"] = str(campaign_path)
     evaluator["_campaign_manifest_file_sha256"] = campaign_file_sha
     evaluator["_campaign_manifest_sha256"] = campaign["manifest_sha256"]
+    evaluator["_fixture_validator"] = fixture_validator
     evaluator["_decision_context"] = decision_context
     evaluator["_training_run_envelopes"] = [
         {
@@ -3257,6 +3559,15 @@ def _evaluator_command(
     for key, flag in flags.items():
         if key in evaluator:
             command.extend((flag, str(evaluator[key])))
+    expected_identity = evaluator.get("_expected_dataset_identity")
+    if expected_identity is not None:
+        order = expected_identity.get("evaluator_order")
+        if not isinstance(order, list) or not order:
+            raise ValueError("sealed evaluator image order is missing")
+        for image_name in order:
+            if not isinstance(image_name, str) or not image_name:
+                raise ValueError("sealed evaluator image order is invalid")
+            command.extend(("--expected-image", image_name))
     return command
 
 
@@ -3727,16 +4038,47 @@ def _copy_verified(
         os.close(source_fd)
 
 
-def _empty_real_directory(path: Path, label: str) -> Path:
+def _empty_real_directory(
+    path: Path,
+    label: str,
+    *,
+    allowed_zero_byte_placeholder: str | None = None,
+) -> Path:
+    """Require an empty real directory, optionally allowing one inert marker.
+
+    ComfyUI tracks ``models/loras/put_loras_here`` as a zero-byte regular file.
+    It is not a model and cannot be removed from a clean pinned checkout.  The
+    exception is deliberately exact: a different name, a symlink, a hardlink,
+    a directory, or any non-zero content still fails closed.
+    """
+
     path = _absolute_lexical(path)
     _reject_symlink_ancestors(path, label)
     if path.is_symlink() or not path.is_dir():
         raise ValueError(f"{label} must be a real directory: {path}")
-    with os.scandir(path) as entries:
-        names = sorted(entry.name for entry in entries)
-    if names:
-        raise ValueError(f"{label} must be empty; found {names}")
-    return path
+    with os.scandir(path) as scan:
+        entries = sorted(list(scan), key=lambda entry: entry.name)
+    if not entries:
+        return path
+    if (
+        allowed_zero_byte_placeholder is not None
+        and len(entries) == 1
+        and entries[0].name == allowed_zero_byte_placeholder
+    ):
+        placeholder = entries[0]
+        details = placeholder.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_size != 0
+            or details.st_nlink != 1
+        ):
+            raise ValueError(
+                f"{label} placeholder must be one zero-byte regular file "
+                "with no hardlinks"
+            )
+        return path
+    names = [entry.name for entry in entries]
+    raise ValueError(f"{label} must be empty; found {names}")
 
 
 def _publish_decision_evidence_bundle(
@@ -3887,51 +4229,135 @@ def _publish_decision_evidence_bundle(
         raise
 
 
+def _scorer_lease_path(comfy_root: Path) -> Path:
+    root = _safe_directory(comfy_root, "scorer lease Comfy root")
+    identity = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:20]
+    parent = _safe_directory(root.parent, "scorer lease directory")
+    return parent / f".forge-krea-scorer-{identity}.lock"
+
+
+def _acquire_scorer_lease(*, comfy_root: Path, target: Path) -> str:
+    """Fail closed if another batch/shard owns the shared scorer surface."""
+
+    lock_path = _scorer_lease_path(comfy_root)
+    key = str(lock_path)
+    target_text = str(_absolute_lexical(target))
+    with _SCORER_LEASE_GUARD:
+        if key in _ACTIVE_SCORER_LEASES:
+            raise RuntimeError("exact scorer surface is already leased")
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise RuntimeError("could not open exact scorer lease") from exc
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_nlink != 1
+                or details.st_uid != os.geteuid()
+                or details.st_mode & 0o077
+            ):
+                raise RuntimeError("exact scorer lease file is unsafe")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError("exact scorer surface is already leased") from exc
+            _ACTIVE_SCORER_LEASES[key] = (descriptor, target_text)
+            return key
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+
+def _release_scorer_lease(key: str, *, target: Path) -> None:
+    target_text = str(_absolute_lexical(target))
+    with _SCORER_LEASE_GUARD:
+        active = _ACTIVE_SCORER_LEASES.pop(key, None)
+    if active is None or active[1] != target_text:
+        if active is not None:
+            with _SCORER_LEASE_GUARD:
+                _ACTIVE_SCORER_LEASES[key] = active
+        raise RuntimeError("exact scorer lease ownership is inconsistent")
+    descriptor = active[0]
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
 def _stage_comfy_lora(
     *, comfy_root: Path, candidate: Path, candidate_sha256: str
 ) -> dict[str, Any]:
     """Exclusively stage the exact bytes ComfyUI will resolve by LoRA name."""
 
-    lora_dir = _empty_real_directory(
-        comfy_root / "models" / "loras", "ComfyUI LoRA staging directory"
-    )
     lora_name = f"candidate-{candidate_sha256}.safetensors"
-    target = lora_dir / lora_name
+    target = _absolute_lexical(comfy_root / "models" / "loras" / lora_name)
+    lease_key = _acquire_scorer_lease(comfy_root=comfy_root, target=target)
     try:
+        lora_dir = _empty_real_directory(
+            comfy_root / "models" / "loras",
+            "ComfyUI LoRA staging directory",
+            allowed_zero_byte_placeholder=_COMFY_LORA_PLACEHOLDER,
+        )
         row = _copy_verified(candidate, target, expected_sha256=candidate_sha256)
+        os.chmod(target, 0o400)
+        directory_fd = os.open(
+            lora_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return {
+            "comfy_lora_name": lora_name,
+            "comfy_lora_path": str(target),
+            "sha256": row["sha256"],
+            "bytes": row["bytes"],
+        }
     except BaseException:
         if target.exists() and not target.is_symlink() and target.is_file():
             target.unlink()
+        _release_scorer_lease(lease_key, target=target)
         raise
-    os.chmod(target, 0o400)
-    directory_fd = os.open(lora_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-    return {
-        "comfy_lora_name": lora_name,
-        "comfy_lora_path": str(target),
-        "sha256": row["sha256"],
-        "bytes": row["bytes"],
-    }
 
 
 def _remove_comfy_lora(binding: dict[str, Any], *, comfy_root: Path) -> None:
     lora_dir = _absolute_lexical(comfy_root / "models" / "loras")
     target = _absolute_lexical(binding["comfy_lora_path"])
-    if target.parent != lora_dir or target.name != binding["comfy_lora_name"]:
+    lease_key = str(_scorer_lease_path(comfy_root))
+    if (
+        target.parent != lora_dir
+        or target.name != binding["comfy_lora_name"]
+    ):
         raise RuntimeError("refusing unsafe ComfyUI LoRA cleanup target")
-    safe = _safe_file(target, "staged ComfyUI LoRA")
-    if _sha256(safe) != binding["sha256"] or safe.stat().st_size != binding["bytes"]:
-        raise RuntimeError("staged ComfyUI LoRA changed before cleanup")
-    safe.unlink()
-    directory_fd = os.open(lora_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        os.fsync(directory_fd)
+        safe = _safe_file(target, "staged ComfyUI LoRA")
+        if (
+            _sha256(safe) != binding["sha256"]
+            or safe.stat().st_size != binding["bytes"]
+        ):
+            raise RuntimeError("staged ComfyUI LoRA changed before cleanup")
+        safe.unlink()
+        directory_fd = os.open(
+            lora_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        _empty_real_directory(
+            lora_dir,
+            "ComfyUI LoRA staging directory after cleanup",
+            allowed_zero_byte_placeholder=_COMFY_LORA_PLACEHOLDER,
+        )
     finally:
-        os.close(directory_fd)
-    _empty_real_directory(lora_dir, "ComfyUI LoRA staging directory after cleanup")
+        _release_scorer_lease(lease_key, target=target)
 
 
 def _stage_inputs(
@@ -4007,6 +4433,57 @@ def _stage_inputs(
     }
     manifest = {**body, "manifest_sha256": krea_provenance.canonical_sha256(body)}
     return dataset_target, staged_candidates, script_target, manifest
+
+
+def _candidate_completion_row(
+    *,
+    candidate: dict[str, Any],
+    result_path: Path,
+    result_file_sha256: str,
+    result: dict[str, Any],
+    log_path: Path,
+    comfy_staging: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize one independently validated result for later publication."""
+
+    return {
+        "candidate_id": candidate["id"],
+        "arm_id": candidate["source_arm_id"],
+        "family_id": candidate["source_arm_id"],
+        "mode": candidate["candidate_binding"]["mode"],
+        "source_arm_id": candidate["source_arm_id"],
+        "candidate_sha256": candidate["sha256"],
+        "candidate_bytes": candidate["path"].stat().st_size,
+        "provenance_manifest_sha256": candidate["provenance"]["manifest_sha256"],
+        "provenance_file_sha256": candidate["provenance_file_sha256"],
+        "normalized_recipe": candidate["candidate_binding"].get(
+            "normalized_recipe", candidate["provenance"].get("normalized_recipe")
+        ),
+        "candidate_binding": candidate["candidate_binding"],
+        "result_file": result_path.name,
+        "result_file_sha256": result_file_sha256,
+        "result_canonical_sha256": krea_provenance.canonical_sha256(result),
+        "weighted_loss": result["weighted_loss"],
+        "text_mean": result["text_mean"],
+        "blank_mean": result["blank_mean"],
+        "paired_rows": result["scored_rows"],
+        "mechanics": (
+            {
+                "natural_completion": True,
+                "upload_ready": True,
+                "clean_telemetry": True,
+            }
+            if candidate["candidate_binding"]["mode"] == "local_run_candidate"
+            else None
+        ),
+        "comfy_staging": comfy_staging,
+        "_candidate_path": str(candidate["path"]),
+        "_provenance_path": str(candidate["provenance_path"]),
+        "_result_path": str(result_path),
+        "_log_path": str(log_path),
+        "_log_sha256": result["runtime"]["comfy_log_sha256"],
+        **{key: value for key, value in candidate.items() if key.startswith("_")},
+    }
 
 
 def run_batch(
@@ -4089,7 +4566,9 @@ def run_batch(
     evaluator_script_sha = _sha256(staged_evaluator_script)
     comfy_root = _safe_directory(evaluator["comfy_root"], "comfy_root")
     _empty_real_directory(
-        comfy_root / "models" / "loras", "ComfyUI LoRA staging directory"
+        comfy_root / "models" / "loras",
+        "ComfyUI LoRA staging directory",
+        allowed_zero_byte_placeholder=_COMFY_LORA_PLACEHOLDER,
     )
     completed: list[dict[str, Any]] = []
     common_envelope: dict[str, Any] | None = None
@@ -4101,12 +4580,13 @@ def run_batch(
         if any(os.path.lexists(path) for path in (result_path, temp_path, log_path)):
             raise FileExistsError(f"stale candidate evidence for {candidate['id']}")
         staged_candidate = staged_candidates[candidate["id"]]
-        comfy_staging = _stage_comfy_lora(
-            comfy_root=comfy_root,
-            candidate=staged_candidate,
-            candidate_sha256=candidate["sha256"],
-        )
+        comfy_staging: dict[str, Any] | None = None
         try:
+            comfy_staging = _stage_comfy_lora(
+                comfy_root=comfy_root,
+                candidate=staged_candidate,
+                candidate_sha256=candidate["sha256"],
+            )
             command = _evaluator_command(
                 evaluator_script=staged_evaluator_script,
                 dataset=staged_dataset,
@@ -4143,7 +4623,10 @@ def run_batch(
                 comfy_staging=comfy_staging,
             )
         finally:
-            _remove_comfy_lora(comfy_staging, comfy_root=comfy_root)
+            if comfy_staging is not None:
+                _remove_comfy_lora(comfy_staging, comfy_root=comfy_root)
+        if comfy_staging is None:  # pragma: no cover - fail-closed type guard
+            raise RuntimeError("candidate LoRA was not staged")
         envelope_sha = krea_provenance.canonical_sha256(envelope)
         if common_envelope is None:
             common_envelope = envelope
@@ -4153,51 +4636,14 @@ def run_batch(
                 f"candidate {candidate['id']} escaped the common evaluation envelope"
             )
         completed.append(
-            {
-                "candidate_id": candidate["id"],
-                "arm_id": candidate["source_arm_id"],
-                "family_id": candidate["source_arm_id"],
-                "mode": candidate["candidate_binding"]["mode"],
-                "source_arm_id": candidate["source_arm_id"],
-                "candidate_sha256": candidate["sha256"],
-                "candidate_bytes": candidate["path"].stat().st_size,
-                "provenance_manifest_sha256": candidate["provenance"][
-                    "manifest_sha256"
-                ],
-                "provenance_file_sha256": candidate["provenance_file_sha256"],
-                "normalized_recipe": candidate["candidate_binding"].get(
-                    "normalized_recipe",
-                    candidate["provenance"].get("normalized_recipe"),
-                ),
-                "candidate_binding": candidate["candidate_binding"],
-                "result_file": result_path.name,
-                "result_file_sha256": result_file_sha,
-                "result_canonical_sha256": krea_provenance.canonical_sha256(result),
-                "weighted_loss": result["weighted_loss"],
-                "text_mean": result["text_mean"],
-                "blank_mean": result["blank_mean"],
-                "paired_rows": result["scored_rows"],
-                "mechanics": (
-                    {
-                        "natural_completion": True,
-                        "upload_ready": True,
-                        "clean_telemetry": True,
-                    }
-                    if candidate["candidate_binding"]["mode"] == "local_run_candidate"
-                    else None
-                ),
-                "comfy_staging": comfy_staging,
-                "_candidate_path": str(candidate["path"]),
-                "_provenance_path": str(candidate["provenance_path"]),
-                "_result_path": str(result_path),
-                "_log_path": str(log_path),
-                "_log_sha256": result["runtime"]["comfy_log_sha256"],
-                **{
-                    key: value
-                    for key, value in candidate.items()
-                    if key.startswith("_")
-                },
-            }
+            _candidate_completion_row(
+                candidate=candidate,
+                result_path=result_path,
+                result_file_sha256=result_file_sha,
+                result=result,
+                log_path=log_path,
+                comfy_staging=comfy_staging,
+            )
         )
 
     if (
@@ -4308,7 +4754,7 @@ def run_batch(
         )
         if fixture_file_sha != evaluator["_fixture_manifest_file_sha256"]:
             raise RuntimeError("fixture manifest changed before publication")
-        krea_fixture.validate_manifest(fixture)
+        evaluator.get("_fixture_validator", krea_fixture).validate_manifest(fixture)
     body: dict[str, Any] = {
         "schema": 2 if is_v2 else _SCHEMA,
         "kind": _KIND,
@@ -4416,6 +4862,15 @@ def run_batch(
                     "decision_contract": campaign["decision_contract"],
                     "confirmation_contract": campaign["confirmation_contract"],
                     "runs": campaign["runs"],
+                    **(
+                        {
+                            "historical_training_evidence_validator": campaign[
+                                "historical_training_evidence_validator"
+                            ]
+                        }
+                        if "historical_training_evidence_validator" in campaign
+                        else {}
+                    ),
                 },
                 "fixture": {
                     "manifest_sha256": fixture["manifest_sha256"],
@@ -4444,16 +4899,857 @@ def run_batch(
     return aggregate
 
 
+def _validated_plan_bytes(
+    plan: dict[str, Any], plan_raw: bytes | None
+) -> tuple[bytes, dict[str, str]]:
+    if plan_raw is None:
+        plan_raw = krea_provenance.canonical_bytes(plan) + b"\n"
+    try:
+        decoded = json.loads(plan_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("raw plan bytes are not valid JSON") from exc
+    if decoded != plan:
+        raise ValueError("raw plan bytes do not decode to the supplied plan")
+    return plan_raw, {
+        "raw_sha256": hashlib.sha256(plan_raw).hexdigest(),
+        "canonical_sha256": krea_provenance.canonical_sha256(plan),
+    }
+
+
+def _portable_staged_inputs(
+    manifest: dict[str, Any], *, results_dir: Path
+) -> dict[str, Any]:
+    def portable(row: dict[str, Any], *, candidate_id: str | None = None) -> dict[str, Any]:
+        path = Path(row["staged_path"])
+        try:
+            relative = path.relative_to(results_dir)
+        except ValueError as exc:
+            raise RuntimeError("staged input escaped its candidate shard") from exc
+        value = {
+            "path": relative.as_posix(),
+            "sha256": row["sha256"],
+            "bytes": row["bytes"],
+        }
+        if candidate_id is not None:
+            value["candidate_id"] = candidate_id
+        return value
+
+    body = {
+        "schema": 1,
+        "kind": "forge-krea-portable-candidate-staged-inputs",
+        "path_rule": "relative_to_shard_manifest_parent",
+        "dataset": [portable(row) for row in manifest["dataset"]],
+        "candidates": [
+            portable(row, candidate_id=row["candidate_id"])
+            for row in manifest["candidates"]
+        ],
+        "evaluator_script": portable(manifest["evaluator_script"]),
+        "dataset_identity_module": portable(manifest["dataset_identity_module"]),
+    }
+    return {**body, "manifest_sha256": krea_provenance.canonical_sha256(body)}
+
+
+def _relative_shard_file(root: Path, value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} path is invalid")
+    relative = Path(value)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"{label} path must be a strict relative path")
+    path = root.joinpath(*relative.parts)
+    _reject_symlink_ancestors(path, label)
+    return _safe_file(path, label)
+
+
+def _validate_portable_file_row(
+    row: Any,
+    *,
+    root: Path,
+    label: str,
+    expected_path: str,
+    expected_sha256: str,
+    expected_bytes: int,
+    candidate_id: str | None = None,
+) -> Path:
+    value = _object(row, label)
+    required = {"path", "sha256", "bytes"}
+    if candidate_id is not None:
+        required.add("candidate_id")
+    _exact_keys(value, required, label)
+    if candidate_id is not None and value["candidate_id"] != candidate_id:
+        raise ValueError(f"{label} candidate id mismatch")
+    if (
+        value["path"] != expected_path
+        or value["sha256"] != expected_sha256
+        or value["bytes"] != expected_bytes
+    ):
+        raise ValueError(f"{label} differs from the approved input")
+    path = _relative_shard_file(root, value["path"], label)
+    if _sha256(path) != expected_sha256 or path.stat().st_size != expected_bytes:
+        raise ValueError(f"{label} bytes changed")
+    return path
+
+
+def _staged_dataset_rows(dataset: Path) -> list[dict[str, Any]]:
+    _reject_symlink_ancestors(dataset, "exact-evaluation dataset")
+    with os.scandir(dataset) as scan:
+        entries = sorted(scan, key=lambda item: item.name)
+    rows = []
+    for entry in entries:
+        source = Path(entry.path)
+        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+            raise ValueError(f"dataset contains unsafe entry: {source}")
+        rows.append(
+            {
+                "path": f"_inputs/dataset/{entry.name}",
+                "sha256": _sha256(source),
+                "bytes": source.stat().st_size,
+            }
+        )
+    return rows
+
+
+def run_candidate_shard(
+    plan: dict[str, Any],
+    *,
+    candidate_id: str,
+    results_dir: Path,
+    output: Path,
+    plan_raw: bytes | None = None,
+) -> dict[str, Any]:
+    """Evaluate exactly one approved candidate and publish a create-only shard."""
+
+    if plan.get("schema") != 2:
+        raise ValueError("candidate shards require a schema-2 approved plan")
+    plan_raw, plan_hashes = _validated_plan_bytes(plan, plan_raw)
+    dataset, dataset_sha256, candidates, evaluator = _validate_plan(plan)
+    selected = [candidate for candidate in candidates if candidate["id"] == candidate_id]
+    if len(selected) != 1:
+        raise ValueError("candidate shard id must select exactly one planned candidate")
+    candidate = selected[0]
+    results_dir = _absolute_lexical(results_dir)
+    output = _absolute_lexical(output)
+    if output != results_dir / "shard.json":
+        raise ValueError("candidate shard output must be RESULTS_DIR/shard.json")
+    if output.name == _FORBIDDEN_OUTPUT:
+        raise ValueError(f"refusing production selection filename: {_FORBIDDEN_OUTPUT}")
+    if _paths_overlap(results_dir, dataset) or _paths_overlap(
+        results_dir, candidate["path"]
+    ):
+        raise ValueError("candidate shard output overlaps an approved input")
+    _reject_symlink_ancestors(results_dir.parent, "candidate shard parent")
+    results_dir.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestors(results_dir.parent, "candidate shard parent")
+    try:
+        results_dir.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise FileExistsError("candidate shard results-dir must be exclusively new") from exc
+
+    result_path = results_dir / f"{candidate['id']}.json"
+    temp_path = Path(f"{result_path}.tmp")
+    log_path = Path(f"{result_path}.comfy.log")
+    if any(os.path.lexists(path) for path in (output, result_path, temp_path, log_path)):
+        raise FileExistsError("candidate shard has stale evidence paths")
+    evaluator_script = Path(__file__).with_name("evaluate_krea_local.py").resolve(
+        strict=True
+    )
+    (
+        staged_dataset,
+        staged_candidates,
+        staged_evaluator_script,
+        staged_input_manifest,
+    ) = _stage_inputs(
+        results_dir=results_dir,
+        dataset=dataset,
+        candidates=[candidate],
+        evaluator_script=evaluator_script,
+    )
+    evaluator_script_sha = _sha256(staged_evaluator_script)
+    comfy_root = _safe_directory(evaluator["comfy_root"], "comfy_root")
+    _empty_real_directory(
+        comfy_root / "models" / "loras",
+        "ComfyUI LoRA staging directory",
+        allowed_zero_byte_placeholder=_COMFY_LORA_PLACEHOLDER,
+    )
+    staged_candidate = staged_candidates[candidate["id"]]
+    comfy_staging: dict[str, Any] | None = None
+    try:
+        comfy_staging = _stage_comfy_lora(
+            comfy_root=comfy_root,
+            candidate=staged_candidate,
+            candidate_sha256=candidate["sha256"],
+        )
+        command = _evaluator_command(
+            evaluator_script=staged_evaluator_script,
+            dataset=staged_dataset,
+            candidate={**candidate, "path": staged_candidate},
+            result_path=result_path,
+            evaluator=evaluator,
+        )
+        process = _run_contained(
+            command,
+            timeout_s=_timeout_policy(evaluator)["total_candidate_timeout_s"],
+            candidate_id=candidate["id"],
+            containment=evaluator["containment"],
+        )
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"candidate {candidate['id']} evaluator failed "
+                f"({process.returncode}): {process.stderr[-4000:]}"
+            )
+        if os.path.lexists(temp_path):
+            raise RuntimeError(f"candidate {candidate['id']} left a partial result")
+        result, result_file_sha, _ = _load_json_file(
+            result_path, f"result {candidate['id']}"
+        )
+        envelope = _validate_result(
+            result,
+            candidate={**candidate, "path": staged_candidate},
+            dataset=staged_dataset,
+            expected_dataset_sha256=dataset_sha256,
+            expected_dataset_identity=evaluator.get("_expected_dataset_identity"),
+            evaluator=evaluator,
+            evaluator_script_sha=evaluator_script_sha,
+            log_path=log_path,
+            comfy_staging=comfy_staging,
+        )
+    finally:
+        if comfy_staging is not None:
+            _remove_comfy_lora(comfy_staging, comfy_root=comfy_root)
+    if comfy_staging is None:  # pragma: no cover - fail-closed type guard
+        raise RuntimeError("candidate LoRA was not staged")
+
+    completed = _candidate_completion_row(
+        candidate=candidate,
+        result_path=result_path,
+        result_file_sha256=result_file_sha,
+        result=result,
+        log_path=log_path,
+        comfy_staging=comfy_staging,
+    )
+    for path_key, digest_key in (
+        ("_candidate_path", "candidate_sha256"),
+        ("_provenance_path", "provenance_file_sha256"),
+        ("_result_path", "result_file_sha256"),
+        ("_log_path", "_log_sha256"),
+    ):
+        if _sha256(Path(completed[path_key])) != completed[digest_key]:
+            raise RuntimeError(f"candidate shard input changed: {path_key}")
+    portable_inputs = _portable_staged_inputs(
+        staged_input_manifest, results_dir=results_dir
+    )
+    for group in ("dataset", "candidates"):
+        for row in staged_input_manifest[group]:
+            if _sha256(Path(row["staged_path"])) != row["sha256"]:
+                raise RuntimeError("candidate shard staged input changed")
+    for group in ("evaluator_script", "dataset_identity_module"):
+        row = staged_input_manifest[group]
+        if _sha256(Path(row["staged_path"])) != row["sha256"]:
+            raise RuntimeError("candidate shard staged evaluator changed")
+    public_completed = {
+        key: value for key, value in completed.items() if not key.startswith("_")
+    }
+    result_binding = {
+        "path": result_path.name,
+        "file_sha256": result_file_sha,
+        "canonical_sha256": krea_provenance.canonical_sha256(result),
+        "log_path": log_path.name,
+        "log_sha256": result["runtime"]["comfy_log_sha256"],
+        "log_bytes": result["runtime"]["comfy_log_bytes"],
+        "evaluation_envelope": envelope,
+        "evaluation_envelope_sha256": krea_provenance.canonical_sha256(envelope),
+    }
+    body = {
+        "schema": 1,
+        "kind": "forge-krea-exact-score-candidate-shard",
+        "status": "complete",
+        "path_rule": "relative_to_shard_manifest_parent",
+        "plan": {
+            **plan_hashes,
+            "approved_payload_sha256": evaluator["_plan_payload_sha256"],
+        },
+        "sealed_plan_approval_sha256": evaluator["_sealed_plan_approval_sha256"],
+        "batch_runner_sha256": evaluator["_batch_runner_sha256"],
+        "candidate": {
+            "id": candidate["id"],
+            "source_arm_id": candidate["source_arm_id"],
+            "sha256": candidate["sha256"],
+            "bytes": candidate["path"].stat().st_size,
+            "binding_manifest_sha256": candidate["provenance_file_sha256"],
+            "candidate_binding": candidate["candidate_binding"],
+            "candidate_binding_sha256": krea_provenance.canonical_sha256(
+                candidate["candidate_binding"]
+            ),
+        },
+        "staged_inputs": portable_inputs,
+        "result": result_binding,
+        "completed_candidate": public_completed,
+    }
+    shard = {**body, "shard_sha256": krea_provenance.canonical_sha256(body)}
+    _publish_exclusive(output, shard)
+    return shard
+
+
+def _validate_candidate_shard(
+    shard_path: Path,
+    *,
+    plan_hashes: dict[str, str],
+    dataset: Path,
+    dataset_sha256: str,
+    candidate: dict[str, Any],
+    evaluator: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    shard_path = _safe_file(shard_path, "candidate shard manifest")
+    _reject_symlink_ancestors(shard_path, "candidate shard manifest")
+    shard, shard_file_sha, shard_raw = _load_json_file(
+        shard_path, "candidate shard manifest"
+    )
+    _canonical_control_file(shard, shard_raw, "candidate shard manifest")
+    _exact_keys(
+        shard,
+        {
+            "schema",
+            "kind",
+            "status",
+            "path_rule",
+            "plan",
+            "sealed_plan_approval_sha256",
+            "batch_runner_sha256",
+            "candidate",
+            "staged_inputs",
+            "result",
+            "completed_candidate",
+            "shard_sha256",
+        },
+        "candidate shard manifest",
+    )
+    body = {key: value for key, value in shard.items() if key != "shard_sha256"}
+    if (
+        shard["schema"] != 1
+        or shard["kind"] != "forge-krea-exact-score-candidate-shard"
+        or shard["status"] != "complete"
+        or shard["path_rule"] != "relative_to_shard_manifest_parent"
+        or shard["shard_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("candidate shard manifest is incomplete or does not reseal")
+    expected_plan = {
+        **plan_hashes,
+        "approved_payload_sha256": evaluator["_plan_payload_sha256"],
+    }
+    if (
+        shard["plan"] != expected_plan
+        or shard["sealed_plan_approval_sha256"]
+        != evaluator["_sealed_plan_approval_sha256"]
+        or shard["batch_runner_sha256"] != evaluator["_batch_runner_sha256"]
+    ):
+        raise ValueError("candidate shard differs from the approved score plan")
+    candidate_binding = candidate["candidate_binding"]
+    expected_candidate = {
+        "id": candidate["id"],
+        "source_arm_id": candidate["source_arm_id"],
+        "sha256": candidate["sha256"],
+        "bytes": candidate["path"].stat().st_size,
+        "binding_manifest_sha256": candidate["provenance_file_sha256"],
+        "candidate_binding": candidate_binding,
+        "candidate_binding_sha256": krea_provenance.canonical_sha256(
+            candidate_binding
+        ),
+    }
+    if shard["candidate"] != expected_candidate:
+        raise ValueError("candidate shard binding differs from the planned candidate")
+
+    root = shard_path.parent
+    staged = _object(shard["staged_inputs"], "candidate shard staged inputs")
+    _exact_keys(
+        staged,
+        {
+            "schema",
+            "kind",
+            "path_rule",
+            "dataset",
+            "candidates",
+            "evaluator_script",
+            "dataset_identity_module",
+            "manifest_sha256",
+        },
+        "candidate shard staged inputs",
+    )
+    staged_body = {
+        key: value for key, value in staged.items() if key != "manifest_sha256"
+    }
+    if (
+        staged["schema"] != 1
+        or staged["kind"] != "forge-krea-portable-candidate-staged-inputs"
+        or staged["path_rule"] != "relative_to_shard_manifest_parent"
+        or staged["manifest_sha256"]
+        != krea_provenance.canonical_sha256(staged_body)
+    ):
+        raise ValueError("candidate shard staged-input manifest does not reseal")
+    expected_dataset_rows = _staged_dataset_rows(dataset)
+    dataset_rows = staged["dataset"]
+    if not isinstance(dataset_rows, list) or len(dataset_rows) != len(
+        expected_dataset_rows
+    ):
+        raise ValueError("candidate shard dataset coverage is incomplete")
+    rebound: list[dict[str, Any]] = []
+    for index, expected in enumerate(expected_dataset_rows):
+        path = _validate_portable_file_row(
+            dataset_rows[index],
+            root=root,
+            label=f"candidate shard dataset[{index}]",
+            expected_path=expected["path"],
+            expected_sha256=expected["sha256"],
+            expected_bytes=expected["bytes"],
+        )
+        rebound.append({"path": str(path), "sha256": expected["sha256"]})
+    candidate_rows = staged["candidates"]
+    if not isinstance(candidate_rows, list) or len(candidate_rows) != 1:
+        raise ValueError("candidate shard must stage exactly one candidate")
+    expected_candidate_path = (
+        f"_inputs/candidates/{candidate['id']}/{candidate['path'].name}"
+    )
+    staged_candidate = _validate_portable_file_row(
+        candidate_rows[0],
+        root=root,
+        label="candidate shard candidate",
+        expected_path=expected_candidate_path,
+        expected_sha256=candidate["sha256"],
+        expected_bytes=candidate["path"].stat().st_size,
+        candidate_id=candidate["id"],
+    )
+    rebound.append({"path": str(staged_candidate), "sha256": candidate["sha256"]})
+    evaluator_source = Path(__file__).with_name("evaluate_krea_local.py").resolve(
+        strict=True
+    )
+    staged_evaluator = _validate_portable_file_row(
+        staged["evaluator_script"],
+        root=root,
+        label="candidate shard evaluator",
+        expected_path=f"_inputs/evaluator/{evaluator_source.name}",
+        expected_sha256=_sha256(evaluator_source),
+        expected_bytes=evaluator_source.stat().st_size,
+    )
+    rebound.append({"path": str(staged_evaluator), "sha256": _sha256(evaluator_source)})
+    identity_source = evaluator_source.with_name("krea_dataset_identity.py")
+    staged_identity = _validate_portable_file_row(
+        staged["dataset_identity_module"],
+        root=root,
+        label="candidate shard dataset identity module",
+        expected_path=f"_inputs/evaluator/{identity_source.name}",
+        expected_sha256=_sha256(identity_source),
+        expected_bytes=identity_source.stat().st_size,
+    )
+    rebound.append({"path": str(staged_identity), "sha256": _sha256(identity_source)})
+
+    result_binding = _object(shard["result"], "candidate shard result binding")
+    _exact_keys(
+        result_binding,
+        {
+            "path",
+            "file_sha256",
+            "canonical_sha256",
+            "log_path",
+            "log_sha256",
+            "log_bytes",
+            "evaluation_envelope",
+            "evaluation_envelope_sha256",
+        },
+        "candidate shard result binding",
+    )
+    result_path = _relative_shard_file(
+        root, result_binding["path"], "candidate shard raw result"
+    )
+    log_path = _relative_shard_file(
+        root, result_binding["log_path"], "candidate shard evaluator log"
+    )
+    if (
+        result_binding["path"] != f"{candidate['id']}.json"
+        or result_binding["log_path"] != f"{candidate['id']}.json.comfy.log"
+    ):
+        raise ValueError("candidate shard result filenames are not candidate-bound")
+    result, result_file_sha, _ = _load_json_file(
+        result_path, f"candidate shard result {candidate['id']}"
+    )
+    if (
+        result_file_sha != result_binding["file_sha256"]
+        or krea_provenance.canonical_sha256(result)
+        != result_binding["canonical_sha256"]
+        or _sha256(log_path) != result_binding["log_sha256"]
+        or log_path.stat().st_size != result_binding["log_bytes"]
+    ):
+        raise ValueError("candidate shard raw result or log changed")
+    completed_public = _object(
+        shard["completed_candidate"], "candidate shard completed candidate"
+    )
+    comfy_staging = _object(
+        completed_public.get("comfy_staging"), "candidate shard Comfy staging"
+    )
+    envelope = _validate_result(
+        result,
+        candidate={**candidate, "path": staged_candidate},
+        # The evaluator records its original absolute shard path.  Portable
+        # relocation is proven separately by the content-bound staged manifest.
+        dataset=Path(result["dataset"]),
+        expected_dataset_sha256=dataset_sha256,
+        expected_dataset_identity=evaluator.get("_expected_dataset_identity"),
+        evaluator=evaluator,
+        evaluator_script_sha=_sha256(staged_evaluator),
+        log_path=log_path,
+        comfy_staging=comfy_staging,
+    )
+    if (
+        envelope != result_binding["evaluation_envelope"]
+        or krea_provenance.canonical_sha256(envelope)
+        != result_binding["evaluation_envelope_sha256"]
+    ):
+        raise ValueError("candidate shard evaluation envelope changed")
+    completed = _candidate_completion_row(
+        candidate=candidate,
+        result_path=result_path,
+        result_file_sha256=result_file_sha,
+        result=result,
+        log_path=log_path,
+        comfy_staging=comfy_staging,
+    )
+    expected_public = {
+        key: value for key, value in completed.items() if not key.startswith("_")
+    }
+    if completed_public != expected_public:
+        raise ValueError("candidate shard summary differs from its raw result")
+    normalized_envelope = dict(envelope)
+    normalized_envelope["dataset"] = str(dataset)
+    rebound.extend(
+        [
+            {"path": str(result_path), "sha256": result_file_sha},
+            {"path": str(log_path), "sha256": result_binding["log_sha256"]},
+        ]
+    )
+    summary = {
+        "candidate_id": candidate["id"],
+        "shard_file_sha256": shard_file_sha,
+        "shard_sha256": shard["shard_sha256"],
+        "staged_input_manifest_sha256": staged["manifest_sha256"],
+        "result_file_sha256": result_file_sha,
+        "result_canonical_sha256": result_binding["canonical_sha256"],
+        "log_sha256": result_binding["log_sha256"],
+    }
+    return completed, normalized_envelope, summary, rebound
+
+
+def _schema2_candidate_rows(completed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for private in completed:
+        row = {key: value for key, value in private.items() if not key.startswith("_")}
+        binding = row["candidate_binding"]
+        fraction = binding["candidate_fraction"]
+        rows.append(
+            {
+                "candidate_id": row["candidate_id"],
+                "arm_id": row["arm_id"] if row["mode"] == "local_run_candidate" else None,
+                "mode": row["mode"],
+                "family_id": (
+                    row["family_id"] if row["mode"] == "local_run_candidate" else None
+                ),
+                "candidate_sha256": row["candidate_sha256"],
+                "candidate_bytes": row["candidate_bytes"],
+                "execution_plan_sha256": binding.get("execution_plan_sha256"),
+                "run_completion_sha256": binding.get("run_completion_sha256"),
+                "step": binding["candidate_step"],
+                "fraction_numerator": fraction["numerator"] if fraction is not None else None,
+                "fraction_denominator": (
+                    fraction["denominator"] if fraction is not None else None
+                ),
+                "image_exposures": (
+                    binding["candidate_image_exposures"]
+                    if row["mode"] == "local_run_candidate"
+                    else None
+                ),
+                "binding_manifest_sha256": binding["binding_manifest_sha256"],
+                "zero_control_manifest_sha256": (
+                    binding["zero_control_manifest_sha256"]
+                    if row["mode"] == "zero_lora_control"
+                    else None
+                ),
+                "result_file": row["result_file"],
+                "result_file_sha256": row["result_file_sha256"],
+                "result_canonical_sha256": row["result_canonical_sha256"],
+                "weighted_loss": row["weighted_loss"],
+                "text_mean": row["text_mean"],
+                "blank_mean": row["blank_mean"],
+                "paired_rows": row["paired_rows"],
+                "mechanics": row["mechanics"],
+            }
+        )
+    return rows
+
+
+def assemble_candidate_shards(
+    plan: dict[str, Any],
+    *,
+    shard_paths: list[Path],
+    output: Path,
+    plan_raw: bytes | None = None,
+) -> dict[str, Any]:
+    """Validate one immutable shard per candidate and publish one full aggregate."""
+
+    if plan.get("schema") != 2:
+        raise ValueError("candidate-shard assembly requires a schema-2 approved plan")
+    plan_raw, plan_hashes = _validated_plan_bytes(plan, plan_raw)
+    dataset, dataset_sha256, candidates, evaluator = _validate_plan(plan)
+    output = _absolute_lexical(output)
+    if output.name == _FORBIDDEN_OUTPUT:
+        raise ValueError(f"refusing production selection filename: {_FORBIDDEN_OUTPUT}")
+    evidence_path = output.parent / f"{output.name}.evidence"
+    evidence_temporary = output.parent / f".{output.name}.evidence.tmp"
+    if any(
+        os.path.lexists(path)
+        for path in (output, Path(f"{output}.tmp"), evidence_path, evidence_temporary)
+    ):
+        raise FileExistsError(f"refusing stale aggregate path: {output}")
+    if _paths_overlap(output, dataset):
+        raise ValueError("aggregate output overlaps the exact-evaluation dataset")
+    for candidate in candidates:
+        if _paths_overlap(output, candidate["path"]):
+            raise ValueError("aggregate output overlaps a candidate input")
+    _reject_symlink_ancestors(output.parent, "aggregate output parent")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestors(output.parent, "aggregate output parent")
+
+    candidates_by_id = {candidate["id"]: candidate for candidate in candidates}
+    observed: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = {}
+    staged_bindings: list[dict[str, Any]] = []
+    for raw_path in shard_paths:
+        shard_path = _absolute_lexical(raw_path)
+        preview, _, _ = _load_json_file(shard_path, "candidate shard manifest")
+        candidate_id = _object(
+            preview.get("candidate"), "candidate shard candidate"
+        ).get("id")
+        if candidate_id not in candidates_by_id:
+            raise ValueError("candidate shard is extra or not present in the score plan")
+        if candidate_id in observed:
+            raise ValueError(f"duplicate candidate shard: {candidate_id}")
+        completed, envelope, summary, rebound = _validate_candidate_shard(
+            shard_path,
+            plan_hashes=plan_hashes,
+            dataset=dataset,
+            dataset_sha256=dataset_sha256,
+            candidate=candidates_by_id[candidate_id],
+            evaluator=evaluator,
+        )
+        observed[candidate_id] = (completed, envelope, summary)
+        staged_bindings.extend(rebound)
+    if set(observed) != set(candidates_by_id):
+        missing = sorted(set(candidates_by_id) - set(observed))
+        extra = sorted(set(observed) - set(candidates_by_id))
+        raise ValueError(
+            f"candidate shard coverage is incomplete: missing={missing}, extra={extra}"
+        )
+
+    completed = [observed[candidate["id"]][0] for candidate in candidates]
+    envelopes = [observed[candidate["id"]][1] for candidate in candidates]
+    common_envelope = envelopes[0]
+    common_envelope_sha = krea_provenance.canonical_sha256(common_envelope)
+    if any(
+        envelope != common_envelope
+        or krea_provenance.canonical_sha256(envelope) != common_envelope_sha
+        for envelope in envelopes[1:]
+    ):
+        raise RuntimeError("candidate shards escaped the common evaluation envelope")
+    shard_rows = [observed[candidate["id"]][2] for candidate in candidates]
+    staged_body = {
+        "schema": 1,
+        "kind": "forge-krea-complete-sharded-staged-inputs",
+        "candidate_order": [candidate["id"] for candidate in candidates],
+        "shards": shard_rows,
+    }
+    staged_input_manifest = {
+        **staged_body,
+        "manifest_sha256": krea_provenance.canonical_sha256(staged_body),
+    }
+
+    # Rebind every approved source and every shard byte immediately before the
+    # complete-set publication.  A long campaign cannot silently absorb drift.
+    for row in completed:
+        if _sha256(Path(row["_candidate_path"])) != row["candidate_sha256"]:
+            raise RuntimeError(f"candidate {row['candidate_id']} changed before assembly")
+        if _sha256(Path(row["_provenance_path"])) != row["provenance_file_sha256"]:
+            raise RuntimeError(
+                f"provenance {row['candidate_id']} changed before assembly"
+            )
+        if _sha256(Path(row["_result_path"])) != row["result_file_sha256"]:
+            raise RuntimeError(f"result {row['candidate_id']} changed before assembly")
+        if _sha256(Path(row["_log_path"])) != row["_log_sha256"]:
+            raise RuntimeError(f"log {row['candidate_id']} changed before assembly")
+        for path_key, bound_path in row.items():
+            if not path_key.startswith("_") or not path_key.endswith("_path"):
+                continue
+            digest_key = f"{path_key[:-5]}_sha256"
+            if digest_key in row and _sha256(Path(bound_path)) != row[digest_key]:
+                raise RuntimeError(
+                    f"bound evidence {path_key} for {row['candidate_id']} changed"
+                )
+    for binding in staged_bindings:
+        if _sha256(Path(binding["path"])) != binding["sha256"]:
+            raise RuntimeError("candidate shard bytes changed before assembly")
+    sealed_path = Path(evaluator["_sealed_plan_approval_path"])
+    if _sha256(sealed_path) != evaluator["_sealed_plan_approval_sha256"]:
+        raise RuntimeError("sealed plan approval changed before assembly")
+    for path_key, sha_key, label in (
+        ("_fixture_manifest_path", "_fixture_manifest_file_sha256", "fixture manifest"),
+        ("_campaign_manifest_path", "_campaign_manifest_file_sha256", "campaign manifest"),
+        ("_fixture_approval_path", "_fixture_approval_file_sha256", "fixture approval"),
+        (
+            "_cross_fixture_review_path",
+            "_cross_fixture_review_file_sha256",
+            "cross-fixture review",
+        ),
+    ):
+        if _sha256(Path(evaluator[path_key])) != evaluator[sha_key]:
+            raise RuntimeError(f"{label} changed before assembly")
+    decision_context = evaluator.get("_decision_context")
+    if decision_context is not None and decision_context["phase"] == "boundary":
+        frozen = Path(decision_context["_frozen_discovery_decision_path"])
+        if _sha256(frozen) != decision_context[
+            "_frozen_discovery_decision_file_sha256"
+        ]:
+            raise RuntimeError("frozen discovery decision changed before assembly")
+
+    campaign, campaign_file_sha, _ = _load_json_file(
+        Path(evaluator["_campaign_manifest_path"]), "campaign manifest"
+    )
+    if campaign_file_sha != evaluator["_campaign_manifest_file_sha256"]:
+        raise RuntimeError("campaign manifest changed before assembly")
+    _validate_campaign_manifest(campaign)
+    fixture, fixture_file_sha, _ = _load_json_file(
+        Path(evaluator["_fixture_manifest_path"]), "fixture manifest"
+    )
+    if fixture_file_sha != evaluator["_fixture_manifest_file_sha256"]:
+        raise RuntimeError("fixture manifest changed before assembly")
+    evaluator.get("_fixture_validator", krea_fixture).validate_manifest(fixture)
+
+    schema2_candidates = _schema2_candidate_rows(completed)
+    body: dict[str, Any] = {
+        "schema": 2,
+        "kind": _KIND,
+        "coverage": {
+            "planned": len(candidates),
+            "completed": len(completed),
+            "complete": True,
+        },
+        "direction": "min",
+        "plan": {
+            **plan_hashes,
+            "approved_payload_sha256": evaluator["_plan_payload_sha256"],
+        },
+        "sealed_plan_approval_sha256": evaluator["_sealed_plan_approval_sha256"],
+        "sealed_plan_approval": evaluator["_sealed_plan_approval"],
+        "batch_runner_sha256": evaluator["_batch_runner_sha256"],
+        "staged_input_manifest": staged_input_manifest,
+        "common_training_envelope": evaluator["_common_training_envelope"],
+        "common_training_envelope_sha256": evaluator[
+            "_common_training_envelope_sha256"
+        ],
+        "evaluator_script_sha256": _sha256(
+            Path(__file__).with_name("evaluate_krea_local.py").resolve(strict=True)
+        ),
+        "evaluation_envelope": common_envelope,
+        "evaluation_envelope_sha256": common_envelope_sha,
+        "candidates": schema2_candidates,
+        "campaign_manifest_sha256": evaluator["_campaign_manifest_file_sha256"],
+        "fixture_manifest_sha256": evaluator["_fixture_manifest_file_sha256"],
+        "fixture_approval_sha256": evaluator["_fixture_approval_file_sha256"],
+        "fixture_contract": {
+            "fixture_manifest_identity_sha256": fixture["manifest_sha256"],
+            "training_pair_count": len(fixture["training_rows"]),
+            "evaluation_row_count": len(fixture["evaluation_rows"]),
+            "training_dataset_sha256": fixture["training_dataset_identity"]["sha256"],
+            "evaluation_dataset_sha256": fixture["evaluation_dataset_identity"]["sha256"],
+            "cross_fixture_review_sha256": evaluator[
+                "_cross_fixture_review_file_sha256"
+            ],
+        },
+        "campaign": {
+            "manifest_sha256": evaluator["_campaign_manifest_sha256"],
+            "file_sha256": evaluator["_campaign_manifest_file_sha256"],
+            "fixture_manifest_sha256": campaign["fixture_manifest_sha256"],
+            "discovery_plan_sha256": campaign["discovery_plan_sha256"],
+            "zero_control_manifest_sha256": campaign["zero_control_manifest_sha256"],
+            "decision_contract": campaign["decision_contract"],
+            "confirmation_contract": campaign["confirmation_contract"],
+            "runs": campaign["runs"],
+            **(
+                {
+                    "historical_training_evidence_validator": campaign[
+                        "historical_training_evidence_validator"
+                    ]
+                }
+                if "historical_training_evidence_validator" in campaign
+                else {}
+            ),
+        },
+        "fixture": {
+            "manifest_sha256": fixture["manifest_sha256"],
+            "file_sha256": evaluator["_fixture_manifest_file_sha256"],
+            "concept_id": fixture["concept_id"],
+            "experimental_role": fixture["experimental_role"],
+            "evaluation_dataset_sha256": dataset_sha256,
+        },
+        "training_run_envelopes": _schema2_training_run_envelopes(
+            campaign=campaign,
+            candidates=schema2_candidates,
+            envelopes=evaluator["_training_run_envelopes"],
+            decision_context=evaluator["_decision_context"],
+        ),
+    }
+    body["decision_evidence"] = _publish_decision_evidence_bundle(
+        output=output,
+        plan=plan,
+        plan_raw=plan_raw,
+        approval_path=sealed_path,
+        completed=completed,
+    )
+    aggregate = {**body, "aggregate_sha256": krea_provenance.canonical_sha256(body)}
+    _publish_exclusive(output, aggregate)
+    return aggregate
+
+
 def main() -> int:
     args = _parse()
     plan, _, plan_raw = _load_json_file(args.plan, "plan")
-    aggregate = run_batch(
-        plan,
-        results_dir=args.results_dir,
-        output=args.output,
-        plan_raw=plan_raw,
-    )
-    print(krea_provenance.canonical_bytes(aggregate).decode("utf-8"))
+    if args.mode == "batch":
+        if args.results_dir is None or args.candidate_id is not None or args.shard:
+            raise ValueError(
+                "batch mode requires --results-dir and forbids shard-only arguments"
+            )
+        result = run_batch(
+            plan,
+            results_dir=args.results_dir,
+            output=args.output,
+            plan_raw=plan_raw,
+        )
+    elif args.mode == "candidate-shard":
+        if args.results_dir is None or args.candidate_id is None or args.shard:
+            raise ValueError(
+                "candidate-shard mode requires --results-dir and --candidate-id"
+            )
+        result = run_candidate_shard(
+            plan,
+            candidate_id=args.candidate_id,
+            results_dir=args.results_dir,
+            output=args.output,
+            plan_raw=plan_raw,
+        )
+    else:
+        if args.results_dir is not None or args.candidate_id is not None or not args.shard:
+            raise ValueError(
+                "assemble-shards mode requires one or more --shard arguments only"
+            )
+        result = assemble_candidate_shards(
+            plan,
+            shard_paths=args.shard,
+            output=args.output,
+            plan_raw=plan_raw,
+        )
+    print(krea_provenance.canonical_bytes(result).decode("utf-8"))
     return 0
 
 

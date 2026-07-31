@@ -63,7 +63,7 @@ _BODY = {
         "comfy_commit": "091b70edda0c062fc9338a1d7e8e2f94f4c0ad0b",
         "tooling_commit": "5d3194f4d4158ab31df7a060e1e4c56fa03f320c",
         "evaluator_script_sha256": (
-            "c8cead34c6398fea70571da6dc7681deaa7c622c3a2734fb8cce0a4d44bce7c8"
+            "6204384b44c846c2ae545a3f365c7489d829353bb34b96ffd11c28a92d3c40c0"
         ),
         "dataset_identity_module_sha256": (
             "632f6ca7d58a0bdb38519bef510d621bef09405bd87f5479fe3bad68d69e955f"
@@ -142,16 +142,33 @@ _BODY = {
                 "torchvision": "0.24.1+cu128",
                 "torchaudio": "2.9.1+cu128",
             },
+            "cuda_runtime_probe": {
+                "torch": "2.9.1+cu128",
+                "torch_cuda": "12.8",
+                "cudnn_version": 91002,
+                "bf16_conv3d": True,
+                "overlapping_namespace_owners": {
+                    "cudnn": "nvidia-cudnn-cu12==9.10.2.21",
+                    "cusparselt": "nvidia-cusparselt-cu12==0.7.1",
+                    "nccl": "nvidia-nccl-cu12==2.27.5",
+                    "nvshmem": "nvidia-nvshmem-cu12==3.3.20",
+                },
+            },
             "install_order": [
                 "comfyui_requirements",
                 "force_torch_trio_cu128",
                 "tooling_requirements",
                 "diffusers_and_huggingface_hub",
                 "god_validator_requirements",
+                "force_all_overlapping_cuda12_namespace_wheels_last",
             ],
         },
         "timeouts_s": {
             "startup": 300.0,
+            # This is the owner-ratified training/scoring base contract.  A
+            # scorer-only extension may raise the effective evaluation limit,
+            # but must not mutate this policy (and thereby orphan valid
+            # training evidence produced under it).
             "evaluation": 3600.0,
             "shutdown": 20.0,
             "containment_term_grace": 20.0,

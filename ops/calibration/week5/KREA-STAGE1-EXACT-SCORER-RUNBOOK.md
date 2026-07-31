@@ -26,7 +26,32 @@ uv pip install --python "$PY" --no-deps \
   --index-strategy unsafe-best-match \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
   -r "$LOCK"
+# The lock intentionally contains CUDA-12 and CUDA-13 support distributions.
+# Four wheel pairs own the same runtime paths.  Reinstall every torch-cu128
+# namespace owner last so concurrent installer extraction order cannot choose
+# any CUDA-13 payload nondeterministically.
+uv pip install --python "$PY" --no-deps --reinstall \
+  --index-strategy unsafe-best-match \
+  --extra-index-url https://download.pytorch.org/whl/cu128 \
+  nvidia-cudnn-cu12==9.10.2.21 \
+  nvidia-cusparselt-cu12==0.7.1 \
+  nvidia-nccl-cu12==2.27.5 \
+  nvidia-nvshmem-cu12==3.3.20
 uv pip check --python "$PY"
+
+"$PY" -I - <<'PY'
+import torch
+
+assert torch.__version__ == "2.9.1+cu128"
+assert torch.version.cuda == "12.8"
+assert torch.backends.cudnn.version() == 91002
+x = torch.randn(1, 4, 4, 32, 32, device="cuda", dtype=torch.bfloat16)
+layer = torch.nn.Conv3d(4, 8, 3, padding=1, device="cuda", dtype=torch.bfloat16)
+result = layer(x)
+torch.cuda.synchronize()
+assert tuple(result.shape) == (1, 8, 4, 32, 32)
+print("SN56_KREA_SCORER_CUDNN_CONV3D=PASS")
+PY
 ```
 
 `uv venv` deliberately omits `--seed`: the attested 229-distribution lock does
@@ -95,7 +120,8 @@ is literal:
 ```
 
 There must be no `extra_model_paths.yaml` and
-`models/loras/` must be empty. `base_name` in the evaluator config is exactly
+`models/loras/` must be empty except for ComfyUI's tracked, zero-byte regular
+file `put_loras_here` (one link, never a symlink). `base_name` in the evaluator config is exactly
 `krea2_raw_fp8_scaled.safetensors`. The scorer starts one loopback-only Comfy
 process per candidate in a transient systemd service and supplies a constructed
 offline environment; it does not inherit `HF_HOME`, proxy, allocator, loader,
@@ -103,8 +129,11 @@ thread, CUDA, or Python controls from the operator shell.
 
 ```bash
 test ! -e "$ROOT/src/ComfyUI/extra_model_paths.yaml"
-test ! -d "$ROOT/src/ComfyUI/models/loras" || \
-  test -z "$(find "$ROOT/src/ComfyUI/models/loras" -mindepth 1 -print -quit)"
+LORA_MARKER="$ROOT/src/ComfyUI/models/loras/put_loras_here"
+test -f "$LORA_MARKER" && test ! -L "$LORA_MARKER"
+test "$(stat -c %s "$LORA_MARKER")" = 0
+test "$(stat -c %h "$LORA_MARKER")" = 1
+test "$(find "$ROOT/src/ComfyUI/models/loras" -mindepth 1 -maxdepth 1 -printf '%f\n')" = put_loras_here
 test "$(stat -c %s "$ROOT/src/ComfyUI/models/diffusion_models/krea2_raw_fp8_scaled.safetensors")" = 13141730784
 test "$(sha256sum "$ROOT/src/ComfyUI/models/diffusion_models/krea2_raw_fp8_scaled.safetensors" | awk '{print $1}')" = 48cd5d6c100297968349b41a8e77c6591d1dac18a215807f5f25f59e5c54cd61
 test "$(stat -c %s "$ROOT/src/ComfyUI/models/text_encoders/qwen3vl_4b_fp8_scaled.safetensors")" = 5242467968
@@ -118,8 +147,11 @@ test "$(sha256sum "$ROOT/src/ComfyUI/models/vae/qwen_image_vae.safetensors" | aw
 All JSON controls are canonical JSON plus one newline and are create-only. The
 evaluator config binds the commits, trees, three files, Python 3.10.20, the raw
 distribution identity `bbcd979cae4ca3cc3e8a35c16c3d1908512bec1b8b7e9a540582122e97648bed`,
-and timeouts `startup=300`, `evaluation=3600`, `shutdown=20`,
-`term_grace=20`. `driver_python` and `comfy_python` are both `$PY`.
+and the immutable base timeouts `startup=300`, `evaluation=3600`,
+`shutdown=20`, `term_grace=20`. The exact scorer-only extension selects a
+fixture-shape-bound effective evaluation ceiling: D1 (24 rows, 240 prompt
+comparisons) is 5400 seconds; D2 (40 rows, 400 prompt comparisons) is 9000
+seconds. `driver_python` and `comfy_python` are both `$PY`.
 
 ```bash
 BATCH_MODULE='import runpy,sys;sys.path.insert(0,"/app/forge");runpy.run_module("ops.calibration.batch_evaluate_krea",run_name="__main__")'
@@ -127,7 +159,12 @@ DECISION_MODULE='import runpy,sys;sys.path.insert(0,"/app/forge");runpy.run_modu
 DELEGATE_MODULE='import runpy,sys;sys.path.insert(0,"/app/forge");runpy.run_module("ops.calibration.krea_delegated_review_contract",run_name="__main__")'
 AUTH=/campaign/controls/discovery-execution-authorization.json
 SCORE_ACTOR=/campaign/controls/exact-score-plan-technical-actor.json
+TRAINING_VALIDATOR_ROOT=/app/forge-c9f30b1
 ASSET_RECEIPT_FILE_SHA256=$(sha256sum "$ASSET_RECEIPT" | awk '{print $1}')
+
+test "$(git -C "$TRAINING_VALIDATOR_ROOT" rev-parse HEAD)" = c9f30b14de5358a5fd8e3c2e23a8e6427c2fdb1d
+test "$(git -C "$TRAINING_VALIDATOR_ROOT" rev-parse HEAD^{tree})" = c2d106ebc9165768ac0dcd3b3d6686056fe5a8c2
+test -z "$(git -C "$TRAINING_VALIDATOR_ROOT" status --porcelain=v1 --untracked-files=all)"
 
 "$PY" -I -c "$DELEGATE_MODULE" \
   --actor exact_score_plan_reviewer --output "$SCORE_ACTOR"
@@ -136,7 +173,8 @@ ASSET_RECEIPT_FILE_SHA256=$(sha256sum "$ASSET_RECEIPT" | awk '{print $1}')
   --god-root "$ROOT/src/G.O.D" \
   --python "$PY" \
   --cache-provenance-sha256 "$ASSET_RECEIPT_FILE_SHA256" \
-  --output /campaign/controls/stage1-exact-evaluator.json
+  --fixture-role D1 \
+  --output /campaign/controls/D1-stage1-exact-evaluator.json
 
 "$PY" -I -c "$SCORE_MODULE" build \
   --bundle /campaign/evidence/D1-K0-A/bundle.json \
@@ -150,7 +188,8 @@ ASSET_RECEIPT_FILE_SHA256=$(sha256sum "$ASSET_RECEIPT" | awk '{print $1}')
   --fixture-manifest /campaign/controls/admission/fixtures/D1/fixture-manifest.json \
   --fixture-approval /campaign/controls/admission/fixtures/D1/fixture-approval.json \
   --cross-fixture-review /campaign/controls/admission/admission-envelope.json \
-  --evaluator-config /campaign/controls/stage1-exact-evaluator.json \
+  --evaluator-config /campaign/controls/D1-stage1-exact-evaluator.json \
+  --historical-training-validator-root "$TRAINING_VALIDATOR_ROOT" \
   --phase discovery --output-dir /campaign/scoring/D1-A
 
 "$PY" -I -c "$SCORE_MODULE" approve \
@@ -166,15 +205,54 @@ ASSET_RECEIPT_FILE_SHA256=$(sha256sum "$ASSET_RECEIPT" | awk '{print $1}')
   --output /campaign/scoring/D1-A/aggregate.json
 ```
 
-Repeat the literal build/approve/run sequence for D2/A with
+For D2/A, first build a separate evaluator config with the same command plus
+`--fixture-role D2` and output it as
+`/campaign/controls/D2-stage1-exact-evaluator.json`; reusing the D1 config is a
+hard failure. Then repeat the literal build/approve/run sequence with
 `/campaign/controls/admission/fixture-package-v2/D2/evaluation`, the D2 admitted
-manifest/approval, and D2-K0-A through D2-K5-A bundles. The one owner-ratified
+manifest/approval, D2-K0-A through D2-K5-A bundles, the D2 evaluator config,
+and the same exact historical-validator root. The one owner-ratified
 `exact_score_plan_reviewer` reviews both plans independently in its single bound
 campaign review instance; an invented second actor would fail validation.
 Approval recomputes live
 source, dependency-lock, requirements, asset, runtime, empty-LoRA, containment,
 and timeout readiness before it publishes either approval or executable plan.
 The batch recomputes readiness again immediately before execution.
+
+### Streaming per-arm score batches
+
+Scoring may begin as soon as one arm completion is sealed. Build and approve a
+separate exhaustive score plan for that arm (all of its checkpoints plus the
+same zero-LoRA control), then run its candidate shards and ordinary
+`assemble-shards` publication. Do not amend that plan when later arms arrive.
+
+After all arms exist, seal one complete campaign manifest containing the exact
+union of the per-arm run completions and compose the already-finished batches:
+
+```bash
+ADDITIVE_MODULE='import runpy,sys; sys.path.insert(0,"/app/forge/ops/calibration"); runpy.run_module("krea_additive_score",run_name="__main__")'
+
+"$PY" -I -c "$ADDITIVE_MODULE" \
+  --campaign /campaign/controls/D1-A-complete-campaign.json \
+  --member /campaign/scoring/D1-A/K0/aggregate.json \
+  --member /campaign/scoring/D1-A/K1/aggregate.json \
+  --member /campaign/scoring/D1-A/K2/aggregate.json \
+  --member /campaign/scoring/D1-A/K3/aggregate.json \
+  --member /campaign/scoring/D1-A/K4/aggregate.json \
+  --member /campaign/scoring/D1-A/K5/aggregate.json \
+  --output /campaign/scoring/D1-A/additive.json
+```
+
+Every member must be below the additive output directory so the result remains
+portable with its member evidence trees. Composition reopens every raw plan,
+approval, shard result, and evidence bundle; requires exactly one exhaustive
+arm per member; verifies disjoint candidate identities and exact full-campaign
+coverage; and requires one fixture, evaluation dataset, zero score, evaluator,
+runtime, provenance, and approval authority. Input order does not affect the
+composite identity. Any missing/duplicate arm, candidate collision, or surface
+drift fails before publication. The policy binds `plan.canonical_sha256`,
+`sealed_plan_approval_sha256`, and `campaign_manifest_sha256` from
+`additive.json`; the ordinary all-arms single-plan path remains supported.
 
 ## 4. Agent-bound discovery decision
 

@@ -81,32 +81,43 @@ def _evidence_manifest(output: Path) -> tuple[Path, dict]:
 
 
 class ProducerHarness:
-    def __init__(self, root: Path, monkeypatch: pytest.MonkeyPatch):
+    def __init__(
+        self,
+        root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        arm: str = "K1",
+        fixture_role: str = "B-0p5-small",
+        surface_root: Path | None = None,
+    ):
         self.root = root
-        self.arm = "K1"
-        self.execution_sha = _sha("execution-plan")
-        self.completion_sha = _sha("run-completion")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.arm = arm
+        self.execution_sha = _sha(f"execution-plan-{arm}")
+        self.completion_sha = _sha(f"run-completion-{arm}")
         self.zero_manifest_sha = _sha("zero-control-manifest")
         self.discovery_plan_sha = _sha("discovery-plan-file")
         self.dataset_sha = _sha("evaluation-dataset")
         self.training_sha = _sha("training-dataset")
 
-        self.dataset = root / "evaluation-dataset"
-        self.dataset.mkdir()
+        surface_root = surface_root or root
+        surface_root.mkdir(parents=True, exist_ok=True)
+        self.dataset = surface_root / "evaluation-dataset"
+        self.dataset.mkdir(exist_ok=True)
         (self.dataset / "row-000.png").write_bytes(b"not-decoded-by-this-test")
-        self.comfy_root = root / "comfy"
-        (self.comfy_root / "models" / "loras").mkdir(parents=True)
-        self.god_root = root / "god"
-        self.god_root.mkdir()
+        self.comfy_root = surface_root / "comfy"
+        (self.comfy_root / "models" / "loras").mkdir(parents=True, exist_ok=True)
+        self.god_root = surface_root / "god"
+        self.god_root.mkdir(exist_ok=True)
 
-        self.local_path = root / "K1-step-50.safetensors"
+        self.local_path = root / f"{arm}-step-50.safetensors"
         self.zero_path = root / "zero.safetensors"
-        self.local_path.write_bytes(b"local-candidate-bytes")
+        self.local_path.write_bytes(f"local-candidate-bytes-{arm}".encode())
         self.zero_path.write_bytes(b"zero-control-bytes")
         self.local_sha = krea_provenance.file_sha256(self.local_path)
         self.zero_sha = krea_provenance.file_sha256(self.zero_path)
         self.sealed_candidate = {
-            "candidate_id": "K1-step-50",
+            "candidate_id": f"{arm}-step-50",
             "sha256": self.local_sha,
             "bytes": self.local_path.stat().st_size,
             "step": 50,
@@ -123,7 +134,7 @@ class ProducerHarness:
         self.fixture = {
             "manifest_sha256": self.fixture_identity_sha,
             "concept_id": "boundary-concept",
-            "experimental_role": "B-0p5-small",
+            "experimental_role": fixture_role,
             "training_rows": [{"row_id": f"train-{index:02d}"} for index in range(20)],
             "evaluation_rows": [{"row_id": f"row-{index:03d}"} for index in range(24)],
             "training_dataset_identity": {"sha256": self.training_sha},
@@ -165,8 +176,8 @@ class ProducerHarness:
         }
         self.discovery = {
             "outcome": "finalists_frozen",
-            "finalist_family_ids": ["K1", "K0"],
-            "checkpoint_rules": {"K1": self.checkpoint_rule},
+            "finalist_family_ids": [arm, "K0"],
+            "checkpoint_rules": {arm: self.checkpoint_rule},
         }
         self.discovery_path = root / "frozen-discovery.json"
         self.discovery_file_sha = _canonical_file(self.discovery_path, self.discovery)
@@ -325,7 +336,9 @@ class ProducerHarness:
     ) -> dict:
         digest = krea_provenance.file_sha256(path)
         binding_path = self.root / f"{candidate_id}.binding.json"
-        binding_file_sha = _canonical_file(binding_path, {"mode": mode})
+        binding_file_sha = _canonical_file(
+            binding_path, {"mode": mode, "candidate_id": candidate_id}
+        )
         if mode == "local_run_candidate":
             normalized = {
                 "mode": mode,
@@ -598,7 +611,15 @@ def test_schema2_publication_round_trips_into_decision_consumer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     harness = ProducerHarness(tmp_path, monkeypatch)
+    placeholder = harness.comfy_root / "models" / "loras" / "put_loras_here"
+    placeholder.write_bytes(b"")
     output, aggregate = harness.publish()
+
+    assert placeholder.is_file()
+    assert placeholder.stat().st_size == 0
+    assert sorted(path.name for path in placeholder.parent.iterdir()) == [
+        "put_loras_here"
+    ]
 
     assert aggregate["campaign"]["runs"] == [harness.run]
     assert [row["arm_id"] for row in aggregate["campaign"]["runs"]] == ["K1"]
@@ -647,6 +668,40 @@ def test_schema2_publication_round_trips_into_decision_consumer(
     )
     assert list(observed) == ["B-0p5-small"]
     assert bindings[0]["aggregate_sha256"] == aggregate["aggregate_sha256"]
+
+
+def test_batch_lora_directory_allows_only_exact_inert_placeholder(
+    tmp_path: Path,
+) -> None:
+    lora_root = tmp_path / "models" / "loras"
+    lora_root.mkdir(parents=True)
+    placeholder = lora_root / "put_loras_here"
+    placeholder.write_bytes(b"")
+    assert (
+        batch._empty_real_directory(
+            lora_root,
+            "test LoRA directory",
+            allowed_zero_byte_placeholder=batch._COMFY_LORA_PLACEHOLDER,
+        )
+        == lora_root
+    )
+
+    (lora_root / "foreign.safetensors").write_bytes(b"real-lora")
+    with pytest.raises(ValueError, match="must be empty"):
+        batch._empty_real_directory(
+            lora_root,
+            "test LoRA directory",
+            allowed_zero_byte_placeholder=batch._COMFY_LORA_PLACEHOLDER,
+        )
+
+    (lora_root / "foreign.safetensors").unlink()
+    placeholder.write_bytes(b"not-inert")
+    with pytest.raises(ValueError, match="placeholder must be one zero-byte"):
+        batch._empty_real_directory(
+            lora_root,
+            "test LoRA directory",
+            allowed_zero_byte_placeholder=batch._COMFY_LORA_PLACEHOLDER,
+        )
 
 
 def test_decision_consumer_reloads_every_raw_result_and_fails_when_one_is_missing(
@@ -873,3 +928,405 @@ def test_explicit_boundary_context_blocks_phase_ambiguity_and_rule_drift(
     context["selected_candidate"] = wrong_candidate
     with pytest.raises(ValueError, match="does not map the frozen checkpoint rule"):
         batch._validate_score_decision_context(context, campaign=wrong_campaign)
+
+
+def _candidate_shards(
+    harness: ProducerHarness, root: Path
+) -> list[Path]:
+    # The legacy publication constructs the complete approved test plan.  The
+    # external evaluator remains mocked, so using it here costs no real scorer
+    # work and simultaneously proves the new mode does not break the old one.
+    harness.publish()
+    manifests = []
+    for candidate in harness.candidates:
+        directory = root / f"shard-{candidate['id']}"
+        manifest = directory / "shard.json"
+        batch.run_candidate_shard(
+            harness.plan,
+            candidate_id=candidate["id"],
+            results_dir=directory,
+            output=manifest,
+        )
+        manifests.append(manifest)
+    return manifests
+
+
+def test_candidate_shards_assemble_complete_set_and_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = ProducerHarness(tmp_path, monkeypatch)
+    shards = _candidate_shards(harness, tmp_path)
+    output = tmp_path / "assembled.json"
+    aggregate = batch.assemble_candidate_shards(
+        harness.plan, shard_paths=list(reversed(shards)), output=output
+    )
+
+    assert aggregate["coverage"] == {
+        "planned": 2,
+        "completed": 2,
+        "complete": True,
+    }
+    assert aggregate["staged_input_manifest"]["candidate_order"] == [
+        candidate["id"] for candidate in harness.candidates
+    ]
+    assert [row["candidate_id"] for row in aggregate["candidates"]] == [
+        candidate["id"] for candidate in harness.candidates
+    ]
+    harness.patch_match_context(monkeypatch)
+    observed, _ = krea_decision._match_aggregates(
+        policy=harness.boundary_policy(aggregate), aggregate_paths=[output]
+    )
+    assert list(observed) == ["B-0p5-small"]
+
+
+def test_candidate_shard_assembly_rejects_missing_duplicate_and_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = ProducerHarness(tmp_path, monkeypatch)
+    shards = _candidate_shards(harness, tmp_path)
+    with pytest.raises(ValueError, match="coverage is incomplete"):
+        batch.assemble_candidate_shards(
+            harness.plan,
+            shard_paths=shards[:1],
+            output=tmp_path / "missing.json",
+        )
+    assert not (tmp_path / "missing.json").exists()
+
+    with pytest.raises(ValueError, match="duplicate candidate shard"):
+        batch.assemble_candidate_shards(
+            harness.plan,
+            shard_paths=[shards[0], shards[0]],
+            output=tmp_path / "duplicate.json",
+        )
+    assert not (tmp_path / "duplicate.json").exists()
+
+    forged_dir = tmp_path / "extra-shard"
+    shutil.copytree(shards[0].parent, forged_dir)
+    forged_path = forged_dir / "shard.json"
+    forged = json.loads(forged_path.read_text(encoding="utf-8"))
+    forged["candidate"]["id"] = "not-in-approved-plan"
+    forged_body = {
+        key: value for key, value in forged.items() if key != "shard_sha256"
+    }
+    forged["shard_sha256"] = krea_provenance.canonical_sha256(forged_body)
+    forged_path.write_bytes(krea_provenance.canonical_bytes(forged) + b"\n")
+    with pytest.raises(ValueError, match="extra or not present"):
+        batch.assemble_candidate_shards(
+            harness.plan,
+            shard_paths=[*shards, forged_path],
+            output=tmp_path / "extra.json",
+        )
+    assert not (tmp_path / "extra.json").exists()
+
+
+def test_candidate_shard_assembly_rejects_tampered_result_and_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result_case = tmp_path / "result-case"
+    result_case.mkdir()
+    harness = ProducerHarness(result_case, monkeypatch)
+    shards = _candidate_shards(harness, result_case)
+    shard = json.loads(shards[0].read_text(encoding="utf-8"))
+    raw_result = shards[0].parent / shard["result"]["path"]
+    raw_result.write_bytes(raw_result.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="raw result or log changed"):
+        batch.assemble_candidate_shards(
+            harness.plan,
+            shard_paths=shards,
+            output=result_case / "tampered-result.json",
+        )
+
+    manifest_case = tmp_path / "manifest-case"
+    manifest_case.mkdir()
+    other = ProducerHarness(manifest_case, monkeypatch)
+    other_shards = _candidate_shards(other, manifest_case)
+    other_shards[0].write_bytes(other_shards[0].read_bytes() + b" ")
+    with pytest.raises(ValueError, match="canonical JSON"):
+        batch.assemble_candidate_shards(
+            other.plan,
+            shard_paths=other_shards,
+            output=manifest_case / "tampered-manifest.json",
+        )
+
+
+def test_candidate_shards_are_create_only_and_portable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    harness = ProducerHarness(source, monkeypatch)
+    shards = _candidate_shards(harness, source)
+    first_candidate = harness.candidates[0]
+    with pytest.raises(FileExistsError, match="exclusively new"):
+        batch.run_candidate_shard(
+            harness.plan,
+            candidate_id=first_candidate["id"],
+            results_dir=shards[0].parent,
+            output=shards[0],
+        )
+
+    relocated = tmp_path / "relocated"
+    relocated.mkdir()
+    moved = []
+    for shard in shards:
+        destination = relocated / shard.parent.name
+        shutil.copytree(shard.parent, destination)
+        moved.append(destination / "shard.json")
+    for shard in shards:
+        shard.parent.rename(source / f"retired-{shard.parent.name}")
+    output = tmp_path / "portable-aggregate.json"
+    aggregate = batch.assemble_candidate_shards(
+        harness.plan, shard_paths=moved, output=output
+    )
+    assert aggregate["coverage"]["complete"] is True
+
+
+def test_candidate_shards_exclusively_lease_shared_comfy_surface(
+    tmp_path: Path,
+) -> None:
+    comfy = tmp_path / "ComfyUI"
+    lora_root = comfy / "models" / "loras"
+    lora_root.mkdir(parents=True)
+    (lora_root / "put_loras_here").write_bytes(b"")
+    first = tmp_path / "first.safetensors"
+    second = tmp_path / "second.safetensors"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first_sha = krea_provenance.file_sha256(first)
+    second_sha = krea_provenance.file_sha256(second)
+
+    first_binding = batch._stage_comfy_lora(
+        comfy_root=comfy,
+        candidate=first,
+        candidate_sha256=first_sha,
+    )
+    with pytest.raises(RuntimeError, match="already leased"):
+        batch._stage_comfy_lora(
+            comfy_root=comfy,
+            candidate=second,
+            candidate_sha256=second_sha,
+        )
+    batch._remove_comfy_lora(first_binding, comfy_root=comfy)
+
+    second_binding = batch._stage_comfy_lora(
+        comfy_root=comfy,
+        candidate=second,
+        candidate_sha256=second_sha,
+    )
+    batch._remove_comfy_lora(second_binding, comfy_root=comfy)
+
+
+def _additive_case(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    second_fixture_role: str = "D1",
+) -> tuple[list[ProducerHarness], list[Path], Path]:
+    surface = root / "shared-scorer-surface"
+    first = ProducerHarness(
+        root / "K1",
+        monkeypatch,
+        arm="K1",
+        fixture_role="D1",
+        surface_root=surface,
+    )
+    first_path, _ = first.publish()
+    second = ProducerHarness(
+        root / "K2",
+        monkeypatch,
+        arm="K2",
+        fixture_role=second_fixture_role,
+        surface_root=surface,
+    )
+    second_path, _ = second.publish()
+    campaign_body = {
+        key: deepcopy(value)
+        for key, value in first.campaign.items()
+        if key not in {"runs", "manifest_sha256"}
+    }
+    campaign_body["runs"] = sorted(
+        [deepcopy(first.run), deepcopy(second.run)], key=lambda row: row["arm_id"]
+    )
+    campaign = batch.seal_campaign_manifest(campaign_body)
+    campaign_path = root / "complete-campaign.json"
+    _canonical_file(campaign_path, campaign)
+    return [first, second], [first_path, second_path], campaign_path
+
+
+def test_additive_score_batches_round_trip_and_are_order_deterministic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harnesses, members, campaign_path = _additive_case(tmp_path, monkeypatch)
+    output = tmp_path / "additive.json"
+    aggregate = krea_decision.assemble_additive_score_aggregates(
+        campaign_path=campaign_path,
+        aggregate_paths=list(reversed(members)),
+        output=output,
+    )
+    second_output = tmp_path / "additive-second.json"
+    second = krea_decision.assemble_additive_score_aggregates(
+        campaign_path=campaign_path,
+        aggregate_paths=members,
+        output=second_output,
+    )
+
+    assert aggregate["aggregate_sha256"] == second["aggregate_sha256"]
+    assert aggregate["coverage"] == {
+        "expected_arms": ["K1", "K2"],
+        "completed_arms": ["K1", "K2"],
+        "expected_candidates": 3,
+        "completed_candidates": 3,
+        "complete": True,
+    }
+    assert [row["arm_id"] for row in aggregate["members"]] == ["K1", "K2"]
+    assert [row["candidate_id"] for row in aggregate["candidates"]] == [
+        "K1-step-50",
+        "K2-step-50",
+        "zero-control",
+    ]
+    loaded, _ = krea_decision._aggregate(output)
+    evidence = krea_decision._reload_decision_evidence(
+        aggregate_path=output, aggregate=loaded
+    )
+    assert evidence["kind"] == "forge-krea-additive-decision-evidence"
+    assert [row["arm_id"] for row in evidence["members"]] == ["K1", "K2"]
+
+    first = harnesses[0]
+    monkeypatch.setattr(
+        krea_decision,
+        "_bound_plan_and_seal",
+        lambda _policy: (
+            {
+                "arm_ids": ["K1", "K2"],
+                "arm_classes": {"K1": "A", "K2": "A"},
+                "document": {},
+            },
+            {},
+            {
+                "fixtures": [],
+                "cross_fixture_review_sha256": first.cross_review_sha,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        krea_decision,
+        "_bound_discovery_profile_index",
+        lambda *_args, **_kwargs: {
+            "document": {
+                "fixtures": {
+                    "D1": {
+                        "manifest": {
+                            "manifest_sha256": first.fixture_identity_sha
+                        }
+                    }
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        krea_decision, "_validate_indexed_discovery_aggregate", lambda *_a, **_k: None
+    )
+    policy = {
+        "phase": "discovery",
+        "discovery_plan": {"sha256": first.discovery_plan_sha},
+        "score_batches": [
+            {
+                "batch_id": "D1-A",
+                "phase": "discovery",
+                "fixture_id": "D1",
+                "seed_role": "A",
+                "hours": None,
+                "dataset_boundary": None,
+                "plan_canonical_sha256": aggregate["plan"]["canonical_sha256"],
+                "campaign_manifest_sha256": aggregate[
+                    "campaign_manifest_sha256"
+                ],
+                "fixture_manifest_sha256": first.fixture_file_sha,
+                "fixture_approval_sha256": first.fixture_approval_sha,
+                "sealed_plan_approval_sha256": aggregate[
+                    "sealed_plan_approval_sha256"
+                ],
+            }
+        ],
+    }
+    observed, bindings = krea_decision._match_aggregates(
+        policy=policy, aggregate_paths=[output]
+    )
+    assert list(observed) == ["D1-A"]
+    assert bindings[0]["decision_evidence"]["kind"] == (
+        "forge-krea-additive-decision-evidence"
+    )
+
+
+def test_additive_score_batches_fail_closed_on_omission_and_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _harnesses, members, campaign_path = _additive_case(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="campaign coverage is incomplete"):
+        krea_decision.assemble_additive_score_aggregates(
+            campaign_path=campaign_path,
+            aggregate_paths=members[:1],
+            output=tmp_path / "missing.json",
+        )
+    assert not (tmp_path / "missing.json").exists()
+
+    with pytest.raises(ValueError, match="repeats a member path"):
+        krea_decision.assemble_additive_score_aggregates(
+            campaign_path=campaign_path,
+            aggregate_paths=[members[0], members[0]],
+            output=tmp_path / "duplicate.json",
+        )
+    assert not (tmp_path / "duplicate.json").exists()
+
+
+def test_additive_score_batches_reject_runtime_drift_and_candidate_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harnesses, members, campaign_path = _additive_case(tmp_path, monkeypatch)
+    drifted = json.loads(members[1].read_text(encoding="utf-8"))
+    drifted["batch_runner_sha256"] = _sha("different-batch-runner")
+    drifted = _reseal_aggregate(drifted)
+    members[1].write_bytes(krea_provenance.canonical_bytes(drifted) + b"\n")
+    with pytest.raises(
+        ValueError, match="batch runner|fixture/evaluator/runtime/authority"
+    ):
+        krea_decision.assemble_additive_score_aggregates(
+            campaign_path=campaign_path,
+            aggregate_paths=members,
+            output=tmp_path / "runtime-drift.json",
+        )
+
+    campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
+    body = {
+        key: deepcopy(value)
+        for key, value in campaign.items()
+        if key != "manifest_sha256"
+    }
+    first_candidate = body["runs"][0]["candidates"][0]
+    body["runs"][1]["candidates"][0]["candidate_id"] = first_candidate[
+        "candidate_id"
+    ]
+    body["runs"][1]["candidates"][0]["sha256"] = first_candidate["sha256"]
+    collision = batch.seal_campaign_manifest(body)
+    collision_path = tmp_path / "collision-campaign.json"
+    _canonical_file(collision_path, collision)
+    with pytest.raises(ValueError, match="duplicate ids or bytes"):
+        krea_decision.assemble_additive_score_aggregates(
+            campaign_path=collision_path,
+            aggregate_paths=[members[0]],
+            output=tmp_path / "collision.json",
+        )
+
+
+def test_additive_score_batches_reject_cross_fixture_mixing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _harnesses, members, campaign_path = _additive_case(
+        tmp_path, monkeypatch, second_fixture_role="D2"
+    )
+    with pytest.raises(ValueError, match="fixture/evaluator/runtime/authority"):
+        krea_decision.assemble_additive_score_aggregates(
+            campaign_path=campaign_path,
+            aggregate_paths=members,
+            output=tmp_path / "mixed-fixtures.json",
+        )

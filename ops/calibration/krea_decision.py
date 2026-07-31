@@ -26,6 +26,7 @@ try:
     from . import krea_c1c4_amendment
     from . import krea_delegated_review_contract
     from . import krea_fixture
+    from . import krea_profile_index
     from . import krea_provenance
     from . import krea_discovery_authorization
 except ImportError:  # pragma: no cover - direct script execution.
@@ -33,6 +34,7 @@ except ImportError:  # pragma: no cover - direct script execution.
     import krea_c1c4_amendment  # type: ignore[no-redef]
     import krea_delegated_review_contract  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
+    import krea_profile_index  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_discovery_authorization  # type: ignore[no-redef]
 
@@ -170,7 +172,36 @@ _BOUNDARY_FIXTURE_COUNTS = {
     "small": (18, 24, 24),
     "large": (36, 48, 40),
 }
+_CAMPAIGN_RUNTIME_IDENTITY_FIELDS = (
+    "micro_batch_size",
+    "gradient_accumulation_steps",
+    "data_parallel_replicas",
+    "resolution_policy_sha256",
+    "precision_policy_sha256",
+    "cache_latents_to_disk",
+    "cache_text_embeddings",
+    "compile_enabled",
+    "jit_enabled",
+    "dataloader_workers",
+    "base_model_identity_sha256",
+    "runtime_identity_sha256",
+    "host_execution_identity_sha256",
+    "execution_surface",
+    "execution_scope",
+    "venv_tree_manifest_sha256",
+    "reference_container_image_sha256",
+    "gpu_identity_sha256",
+    "trainer_identity_sha256",
+    "measurement_tool_sha256",
+)
 _LOSS_KEYS = frozenset({"text_guided_loss", "blank_prompt_loss"})
+_ADDITIVE_AGGREGATE_KIND = "forge-krea-additive-exact-score-aggregate"
+_ADDITIVE_EVIDENCE_KIND = "forge-krea-additive-decision-evidence"
+_ADDITIVE_PLAN_SET_KIND = "forge-krea-additive-exact-score-plan-set"
+_ADDITIVE_APPROVAL_SET_KIND = "forge-krea-additive-exact-score-approval-set"
+_ARM_VARIANT_TRAINING_ENVELOPE_KEYS = frozenset(
+    {"hard_budget_s", "predeclared_recipe_axes", "fixed_execution_fields"}
+)
 _OUTPUT_NAME = re.compile(
     r"krea-(?:discovery|confirmation)-decision(?:-[A-Za-z0-9_.-]+)?\.json"
 )
@@ -210,9 +241,16 @@ def _object(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
-def _exact(value: Mapping[str, Any], keys: set[str], label: str) -> None:
+def _exact(
+    value: Mapping[str, Any],
+    keys: set[str],
+    label: str,
+    *,
+    optional: set[str] | None = None,
+) -> None:
+    optional = optional or set()
     missing = keys - set(value)
-    extra = set(value) - keys
+    extra = set(value) - keys - optional
     if missing or extra:
         raise ValueError(
             f"{label} keys mismatch: missing={sorted(missing)}, "
@@ -400,6 +438,68 @@ def _manifest_file_entry(value: Any, label: str) -> dict[str, str]:
 
 def _validate_decision_evidence_binding(value: Any) -> dict[str, Any]:
     binding = _object(value, "decision evidence binding")
+    if binding.get("kind") == _ADDITIVE_EVIDENCE_KIND:
+        _exact(binding, {"schema", "kind", "members"}, "additive decision evidence")
+        if binding["schema"] != 1:
+            raise ValueError("additive decision evidence schema is invalid")
+        raw_members = binding["members"]
+        if not isinstance(raw_members, list) or not raw_members:
+            raise ValueError("additive decision evidence must contain members")
+        members = []
+        previous = None
+        for index, raw in enumerate(raw_members):
+            label = f"additive decision evidence member[{index}]"
+            row = _object(raw, label)
+            _exact(
+                row,
+                {
+                    "arm_id",
+                    "aggregate_path",
+                    "file_sha256",
+                    "aggregate_sha256",
+                    "plan_canonical_sha256",
+                    "sealed_plan_approval_sha256",
+                    "decision_evidence",
+                },
+                label,
+            )
+            arm_id = _identifier(row["arm_id"], f"{label}.arm_id")
+            if previous is not None and arm_id <= previous:
+                raise ValueError(
+                    "additive decision evidence members must be unique and sorted"
+                )
+            previous = arm_id
+            aggregate_path = _portable_relative_path(
+                row["aggregate_path"], f"{label}.aggregate_path"
+            )
+            members.append(
+                {
+                    "arm_id": arm_id,
+                    "aggregate_path": aggregate_path.as_posix(),
+                    "file_sha256": _digest(
+                        row["file_sha256"], f"{label}.file_sha256"
+                    ),
+                    "aggregate_sha256": _digest(
+                        row["aggregate_sha256"], f"{label}.aggregate_sha256"
+                    ),
+                    "plan_canonical_sha256": _digest(
+                        row["plan_canonical_sha256"],
+                        f"{label}.plan_canonical_sha256",
+                    ),
+                    "sealed_plan_approval_sha256": _digest(
+                        row["sealed_plan_approval_sha256"],
+                        f"{label}.sealed_plan_approval_sha256",
+                    ),
+                    "decision_evidence": _validate_decision_evidence_binding(
+                        row["decision_evidence"]
+                    ),
+                }
+            )
+        return {
+            "schema": 1,
+            "kind": _ADDITIVE_EVIDENCE_KIND,
+            "members": members,
+        }
     _exact(
         binding,
         {
@@ -669,9 +769,27 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arms, list) or not arms:
         raise ValueError("discovery plan arms are absent")
     arm_ids = []
+    arm_classes: dict[str, str] = {}
     for raw in arms:
         arm = _object(raw, "discovery arm")
-        arm_ids.append(_identifier(arm.get("id"), "discovery arm id"))
+        arm_id = _identifier(arm.get("id"), "discovery arm id")
+        arm_ids.append(arm_id)
+        arm_classes[arm_id] = _identifier(
+            arm.get("throughput_equivalence_class"),
+            f"discovery arm {arm_id} throughput class",
+        )
+        if any(
+            arm.get(key) is not None
+            for key in (
+                "throughput_profile_sha256",
+                "fixture_manifest_sha256",
+                "fixture_approval_sha256",
+            )
+        ):
+            raise ValueError(
+                f"discovery arm {arm_id} rewrites a legacy flat hash; "
+                "post-timing identities belong only in the profile index"
+            )
     if arm_ids != sorted(set(arm_ids)):
         raise ValueError("discovery arms must be unique and sorted")
     if _CONTROL_FAMILY not in arm_ids or not set(_PUBLIC_FAMILIES).issubset(arm_ids):
@@ -689,6 +807,10 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 f"throughput profile {name} must remain the deferred index sentinel"
             )
+    if set(arm_classes.values()) != set(profiles):
+        raise ValueError(
+            "discovery arm classes differ from the deferred profile-index classes"
+        )
     profile_index_contract = _object(
         _object(value["budget_contract"], "budget_contract").get(
             "profile_index_contract"
@@ -868,6 +990,7 @@ def _validate_discovery_plan(value: dict[str, Any]) -> dict[str, Any]:
     return {
         "document": value,
         "arm_ids": arm_ids,
+        "arm_classes": arm_classes,
         "seed_a": seed_a,
         "seed_b": seed_b,
         "report_targets": [Decimal(str(item)) for item in report_targets],
@@ -1092,6 +1215,189 @@ def _bound_plan_and_seal(
     return plan_state, plan, seal
 
 
+def _bound_discovery_profile_index(
+    policy: Mapping[str, Any], *, plan_state: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Load the post-timing six-cell index without rewriting the freeze.
+
+    The discovery freeze intentionally remains blocked and carries only null
+    legacy arm hashes plus deferred profile sentinels.  Executable fixture,
+    approval, throughput-class, and host identities therefore come exclusively
+    from this separately sealed, non-authorizing index.
+    """
+
+    index_path, index, index_file_sha = krea_profile_index.load_binding(
+        policy["discovery_profile_index"]
+    )
+    plan_path = _safe_file(policy["discovery_plan"]["path"], "discovery plan")
+    authorization_path, authorization, authorization_file_sha = _binding(
+        policy["discovery_execution_authorization"],
+        "discovery execution authorization",
+    )
+    indexed_plan = _object(index["discovery_plan"], "indexed discovery plan")
+    indexed_authorization = _object(
+        index["discovery_execution_authorization"],
+        "indexed discovery execution authorization",
+    )
+    if (
+        str(plan_path) != indexed_plan.get("path")
+        or policy["discovery_plan"]["sha256"]
+        != indexed_plan.get("file_sha256")
+        or str(authorization_path) != indexed_authorization.get("path")
+        or authorization_file_sha != indexed_authorization.get("file_sha256")
+        or authorization.get("authorization_sha256")
+        != indexed_authorization.get("authorization_sha256")
+    ):
+        raise ValueError(
+            "discovery policy, authorization, and profile index bind different freezes"
+        )
+    expected_classes = sorted(set(plan_state["arm_classes"].values()))
+    if (
+        index.get("throughput_equivalence_classes") != expected_classes
+        or index.get("required_profile_count") != 6
+        or index.get("cross_fixture_profile_reuse_forbidden") is not True
+        or index.get("gpu_execution_authorized") is not False
+    ):
+        raise ValueError("discovery profile index weakens the frozen six-cell contract")
+    return {
+        "document": index,
+        "path": index_path,
+        "file_sha256": index_file_sha,
+        "index_sha256": index["index_sha256"],
+    }
+
+
+def _validate_indexed_discovery_batches(
+    batches: Sequence[Mapping[str, Any]], *, index: Mapping[str, Any]
+) -> None:
+    fixtures = _object(index["fixtures"], "indexed discovery fixtures")
+    for row in batches:
+        fixture_id = row["fixture_id"]
+        slot = _object(fixtures[fixture_id], f"indexed fixture {fixture_id}")
+        manifest = _object(slot["manifest"], f"indexed {fixture_id} manifest")
+        approval = _object(slot["approval"], f"indexed {fixture_id} approval")
+        if (
+            row["fixture_manifest_sha256"] != manifest["file_sha256"]
+            or row["fixture_approval_sha256"] != approval["file_sha256"]
+        ):
+            raise ValueError(
+                f"discovery batch {row['batch_id']} escaped its indexed exact "
+                "fixture approval"
+            )
+
+
+def _indexed_profile_document(
+    index: Mapping[str, Any], *, fixture_id: str, class_name: str
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    fixture = _object(index["fixtures"][fixture_id], f"indexed fixture {fixture_id}")
+    slot = _object(
+        _object(fixture["profiles"], f"indexed {fixture_id} profiles")[class_name],
+        f"indexed profile {fixture_id}/{class_name}",
+    )
+    document, file_sha = _load_canonical(
+        slot["path"], f"indexed profile {fixture_id}/{class_name}"
+    )
+    envelope = _object(
+        document.get("execution_envelope"),
+        f"indexed profile {fixture_id}/{class_name} execution envelope",
+    )
+    if (
+        file_sha != slot["file_sha256"]
+        or document.get("profile_sha256") != slot["profile_sha256"]
+        or envelope.get("execution_envelope_sha256")
+        != slot["execution_envelope_sha256"]
+    ):
+        raise ValueError(f"indexed profile {fixture_id}/{class_name} bytes drifted")
+    return envelope, slot
+
+
+def _validate_indexed_discovery_aggregate(
+    aggregate: Mapping[str, Any],
+    *,
+    fixture_id: str,
+    plan_state: Mapping[str, Any],
+    profile_index: Mapping[str, Any],
+) -> None:
+    """Prove every discovery run occupies its admitted fixture/class/host cell."""
+
+    index = profile_index["document"]
+    fixture = _object(index["fixtures"][fixture_id], f"indexed fixture {fixture_id}")
+    manifest = _object(fixture["manifest"], f"indexed {fixture_id} manifest")
+    approval = _object(fixture["approval"], f"indexed {fixture_id} approval")
+    adapter = aggregate["fixture"]
+    if (
+        aggregate["fixture_manifest_sha256"] != manifest["file_sha256"]
+        or adapter["manifest_sha256"] != manifest["manifest_sha256"]
+        or adapter["file_sha256"] != manifest["file_sha256"]
+        or aggregate["fixture_approval_sha256"] != approval["file_sha256"]
+        or aggregate["fixture_contract"]["training_pair_count"]
+        != fixture["training_pair_count"]
+    ):
+        raise ValueError(
+            f"discovery aggregate {fixture_id} escaped its indexed admitted fixture"
+        )
+
+    runs = {row["arm_id"]: row for row in aggregate["campaign"]["runs"]}
+    raw_envelopes = aggregate["training_run_envelopes"]
+    if not isinstance(raw_envelopes, list):
+        raise ValueError("discovery training-run envelopes must be a list")
+    envelopes: dict[str, Mapping[str, Any]] = {}
+    observed_runtime_identities: set[str] = set()
+    for raw in raw_envelopes:
+        row = _object(raw, "indexed discovery training-run envelope")
+        _exact(
+            row,
+            {
+                "arm_id",
+                "execution_plan_sha256",
+                "execution_envelope",
+                "throughput_profile_sha256",
+                "budget_plan",
+                "budget_plan_sha256",
+                "schedule",
+            },
+            "indexed discovery training-run envelope",
+        )
+        arm_id = _identifier(row["arm_id"], "indexed discovery envelope arm")
+        if arm_id in envelopes or arm_id not in runs:
+            raise ValueError("indexed discovery envelopes are duplicate or unexpected")
+        if row["execution_plan_sha256"] != runs[arm_id]["execution_plan_sha256"]:
+            raise ValueError("indexed discovery envelope binds another execution plan")
+        class_name = plan_state["arm_classes"][arm_id]
+        indexed_envelope, profile_slot = _indexed_profile_document(
+            index, fixture_id=fixture_id, class_name=class_name
+        )
+        measured_envelope = _object(
+            row["execution_envelope"], "discovery measured execution envelope"
+        )
+        runtime_identity = {
+            key: measured_envelope.get(key)
+            for key in _CAMPAIGN_RUNTIME_IDENTITY_FIELDS
+        }
+        runtime_identity_sha = krea_provenance.canonical_sha256(runtime_identity)
+        if (
+            measured_envelope != indexed_envelope
+            or measured_envelope.get("equivalence_class") != class_name
+            or row["throughput_profile_sha256"]
+            != profile_slot["profile_sha256"]
+            or runtime_identity_sha
+            != profile_slot["campaign_runtime_identity_sha256"]
+        ):
+            raise ValueError(
+                f"discovery run {arm_id} escaped indexed {fixture_id}/{class_name}"
+            )
+        observed_runtime_identities.add(runtime_identity_sha)
+        envelopes[arm_id] = row
+    if set(envelopes) != set(runs):
+        raise ValueError("indexed discovery envelopes do not cover every arm")
+    if observed_runtime_identities != {
+        index["campaign_runtime_identity_sha256"]
+    }:
+        raise ValueError(
+            "discovery aggregates do not share the indexed one-host runtime"
+        )
+
+
 def _validate_score_batch(value: Any, *, confirmation: bool) -> dict[str, Any]:
     row = _object(value, "score batch")
     base_keys = {
@@ -1169,6 +1475,7 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "prepared_by",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "score_batches",
             "bootstrap",
@@ -1183,6 +1490,7 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("unsupported discovery decision policy")
     prepared_by = _named_human(payload["prepared_by"], "policy preparer")
     plan_state, _, seal = _bound_plan_and_seal(payload)
+    profile_index = _bound_discovery_profile_index(payload, plan_state=plan_state)
     _, authorization, _ = _binding(
         payload["discovery_execution_authorization"],
         "discovery execution authorization",
@@ -1224,6 +1532,9 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("discovery batch fixture must be D1 or D2")
         if row["hours"] is not None or row["dataset_boundary"] is not None:
             raise ValueError("discovery batch must not masquerade as a boundary cell")
+    _validate_indexed_discovery_batches(
+        batches, index=profile_index["document"]
+    )
     return {
         "schema": 2,
         "kind": "forge-krea-discovery-decision-policy",
@@ -1233,6 +1544,7 @@ def _validate_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "discovery_execution_authorization": dict(
             payload["discovery_execution_authorization"]
         ),
+        "discovery_profile_index": dict(payload["discovery_profile_index"]),
         "confirmation_fixture_seal": dict(payload["confirmation_fixture_seal"]),
         "score_batches": batches,
         "bootstrap": bootstrap,
@@ -1254,6 +1566,7 @@ def _validate_agent_discovery_policy_payload(
             "fixture_admission_envelope",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "score_batches",
             "bootstrap",
@@ -1274,6 +1587,7 @@ def _validate_agent_discovery_policy_payload(
         delegated_actor_name="discovery_decision_policy_preparer",
     )
     plan_state, plan, seal = _bound_plan_and_seal(payload)
+    profile_index = _bound_discovery_profile_index(payload, plan_state=plan_state)
     if (
         context["authorization"]["discovery_plan"]["file_sha256"]
         != payload["discovery_plan"]["sha256"]
@@ -1331,6 +1645,9 @@ def _validate_agent_discovery_policy_payload(
             raise ValueError("discovery batch fixture must be D1 or D2")
         if row["hours"] is not None or row["dataset_boundary"] is not None:
             raise ValueError("discovery batch must not masquerade as a boundary cell")
+    _validate_indexed_discovery_batches(
+        batches, index=profile_index["document"]
+    )
     return {
         "schema": 3,
         "kind": "forge-krea-agent-discovery-decision-policy",
@@ -1345,6 +1662,7 @@ def _validate_agent_discovery_policy_payload(
         "discovery_execution_authorization": dict(
             payload["discovery_execution_authorization"]
         ),
+        "discovery_profile_index": dict(payload["discovery_profile_index"]),
         "confirmation_fixture_seal": dict(payload["confirmation_fixture_seal"]),
         "score_batches": batches,
         "bootstrap": bootstrap,
@@ -1379,6 +1697,7 @@ def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
             "fixture_admission_envelope",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "score_batches",
             "bootstrap",
@@ -1394,6 +1713,7 @@ def validate_policy(value: dict[str, Any]) -> dict[str, Any]:
             "prepared_by",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "score_batches",
             "bootstrap",
@@ -1422,6 +1742,7 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
             "prepared_by",
             "discovery_plan",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "confirmation_fixture_seal",
             "discovery_decision",
             "candidate_family_id",
@@ -1440,6 +1761,7 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
         raise ValueError("unsupported confirmation decision policy")
     prepared_by = _named_human(payload["prepared_by"], "policy preparer")
     plan_state, _, seal = _bound_plan_and_seal(payload)
+    profile_index = _bound_discovery_profile_index(payload, plan_state=plan_state)
     if seal.get("schema") == 1 and prepared_by == seal["reviewer_identity"]:
         raise ValueError("fixture sealer must be independent from policy preparer")
     _, discovery, _ = _binding(payload["discovery_decision"], "discovery decision")
@@ -1448,6 +1770,10 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
         discovery["outcome"] != "finalists_frozen"
         or discovery["discovery_plan_file_sha256"]
         != payload["discovery_plan"]["sha256"]
+        or discovery["discovery_profile_index_sha256"]
+        != profile_index["index_sha256"]
+        or discovery["discovery_profile_index_file_sha256"]
+        != profile_index["file_sha256"]
         or discovery["confirmation_fixture_seal_sha256"] != seal["seal_sha256"]
     ):
         raise ValueError("confirmation policy lacks a matching frozen discovery")
@@ -1538,6 +1864,7 @@ def _validate_confirmation_policy_payload(payload: dict[str, Any]) -> dict[str, 
         "discovery_execution_authorization": dict(
             payload["discovery_execution_authorization"]
         ),
+        "discovery_profile_index": dict(payload["discovery_profile_index"]),
         "confirmation_fixture_seal": dict(payload["confirmation_fixture_seal"]),
         "discovery_decision": dict(payload["discovery_decision"]),
         "candidate_family_id": candidate_family_id,
@@ -1569,6 +1896,7 @@ def validate_confirmation_policy(value: dict[str, Any]) -> dict[str, Any]:
         "prepared_by",
         "discovery_plan",
         "discovery_execution_authorization",
+        "discovery_profile_index",
         "confirmation_fixture_seal",
         "discovery_decision",
         "candidate_family_id",
@@ -1639,6 +1967,7 @@ def build_approval(
             "discovery_execution_authorization": dict(
                 policy["discovery_execution_authorization"]
             ),
+            "discovery_profile_index": dict(policy["discovery_profile_index"]),
             "delegated_review_contract": krea_delegated_review_contract.binding(),
             "agent_review_is_not_human_review": True,
             "approved_at_utc": _timestamp(approved_at_utc, "approved_at_utc"),
@@ -1748,6 +2077,7 @@ def _validate_agent_discovery_approval(
             "owner_ratification_sha256",
             "fixture_admission_envelope",
             "discovery_execution_authorization",
+            "discovery_profile_index",
             "delegated_review_contract",
             "agent_review_is_not_human_review",
             "approved_at_utc",
@@ -1765,6 +2095,7 @@ def _validate_agent_discovery_approval(
         or value["decision"] != "approved"
         or value["discovery_execution_authorization"]
         != policy["discovery_execution_authorization"]
+        or value["discovery_profile_index"] != policy["discovery_profile_index"]
         or value["approval_sha256"] != krea_provenance.canonical_sha256(body)
     ):
         raise ValueError("agent decision approval does not bind this policy")
@@ -2052,6 +2383,8 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
         "policy_approval_sha256",
         "policy_approval_file_sha256",
         "discovery_plan_file_sha256",
+        "discovery_profile_index_sha256",
+        "discovery_profile_index_file_sha256",
         "confirmation_fixture_seal_sha256",
         "aggregate_bindings",
         "bootstrap",
@@ -2111,6 +2444,8 @@ def _validate_discovery_record(value: dict[str, Any]) -> dict[str, Any]:
         "policy_approval_sha256",
         "policy_approval_file_sha256",
         "discovery_plan_file_sha256",
+        "discovery_profile_index_sha256",
+        "discovery_profile_index_file_sha256",
         "confirmation_fixture_seal_sha256",
     ):
         _digest(value[key], key)
@@ -2601,6 +2936,7 @@ def _validate_campaign_adapter(value: Any) -> dict[str, Any]:
             "runs",
         },
         "aggregate campaign adapter",
+        optional={"historical_training_evidence_validator"},
     )
     for key in (
         "manifest_sha256",
@@ -2714,6 +3050,15 @@ def _validate_campaign_adapter(value: Any) -> dict[str, Any]:
         "zero_control_manifest_sha256": campaign["zero_control_manifest_sha256"],
         "decision_contract": campaign["decision_contract"],
         "confirmation_contract": campaign["confirmation_contract"],
+        **(
+            {
+                "historical_training_evidence_validator": campaign[
+                    "historical_training_evidence_validator"
+                ]
+            }
+            if "historical_training_evidence_validator" in campaign
+            else {}
+        ),
     }
     manifest_sha = krea_provenance.canonical_sha256(manifest_body)
     manifest = {**manifest_body, "manifest_sha256": manifest_sha}
@@ -2819,6 +3164,16 @@ def _validate_score_plan_evidence(
         raise ValueError("decision-evidence score plan identity is invalid")
     if krea_provenance.canonical_sha256(plan) != aggregate["plan_canonical_sha256"]:
         raise ValueError("decision-evidence score plan differs from the aggregate")
+    for binding_name, aggregate_key in (
+        ("fixture_manifest", "fixture_manifest_sha256"),
+        ("fixture_approval", "fixture_approval_sha256"),
+    ):
+        bound = _object(plan[binding_name], f"score plan {binding_name}")
+        _exact(bound, {"path", "sha256"}, f"score plan {binding_name}")
+        if bound["sha256"] != aggregate[aggregate_key]:
+            raise ValueError(
+                f"decision-evidence {binding_name} differs from the aggregate"
+            )
 
     sealed = _object(plan["sealed_plan_approval"], "plan approval binding")
     _exact(sealed, {"path", "sha256"}, "plan approval binding")
@@ -2969,10 +3324,665 @@ def _validate_raw_evaluator_result(
         raise ValueError("raw evaluator result text weight differs from aggregate")
 
 
+def _campaign_adapter_from_manifest(
+    manifest: Mapping[str, Any], *, file_sha256: str
+) -> dict[str, Any]:
+    """Build the consumer adapter for one already-validated campaign manifest."""
+
+    return {
+        "manifest_sha256": manifest["manifest_sha256"],
+        "file_sha256": file_sha256,
+        "fixture_manifest_sha256": manifest["fixture_manifest_sha256"],
+        "discovery_plan_sha256": manifest["discovery_plan_sha256"],
+        "zero_control_manifest_sha256": manifest["zero_control_manifest_sha256"],
+        "decision_contract": manifest["decision_contract"],
+        "confirmation_contract": manifest["confirmation_contract"],
+        "runs": manifest["runs"],
+        **(
+            {
+                "historical_training_evidence_validator": manifest[
+                    "historical_training_evidence_validator"
+                ]
+            }
+            if "historical_training_evidence_validator" in manifest
+            else {}
+        ),
+    }
+
+
+def _additive_member_path(root: Path, path: Path | str, label: str) -> tuple[Path, str]:
+    root = root.resolve(strict=True)
+    member = _safe_file(path, label)
+    try:
+        relative = member.resolve(strict=True).relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"{label} must be beneath the additive aggregate directory"
+        ) from exc
+    portable = _portable_relative_path(relative.as_posix(), f"{label}.path")
+    if member.stat().st_nlink != 1:
+        raise ValueError(f"{label} has an unexpected hardlink")
+    return member, portable.as_posix()
+
+
+def _shared_training_runtime(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove only the fields that are predeclared to differ between arms."""
+
+    return {
+        key: value
+        for key, value in envelope.items()
+        if key not in _ARM_VARIANT_TRAINING_ENVELOPE_KEYS
+    }
+
+
+def _shared_evaluation_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop only the per-batch immutable staging path, never dataset identity."""
+
+    return {key: value for key, value in envelope.items() if key != "dataset"}
+
+
+def _zero_score_semantics(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The base score must agree even when result filenames/timestamps differ."""
+
+    ignored = {"result_file", "result_file_sha256", "result_canonical_sha256"}
+    return {key: value for key, value in row.items() if key not in ignored}
+
+
+def _load_additive_members(
+    *, root: Path, member_paths: Iterable[Path | str]
+) -> list[dict[str, Any]]:
+    members = []
+    seen_paths: set[str] = set()
+    seen_arms: set[str] = set()
+    for index, raw_path in enumerate(member_paths):
+        path, relative = _additive_member_path(
+            root, raw_path, f"additive aggregate member[{index}]"
+        )
+        if relative in seen_paths:
+            raise ValueError("additive aggregate repeats a member path")
+        seen_paths.add(relative)
+        aggregate, file_sha = _aggregate(path)
+        document = aggregate["document"]
+        if (
+            document.get("schema") != 2
+            or document.get("kind") != "forge-krea-exact-score-batch"
+        ):
+            raise ValueError("additive members must be ordinary schema-2 score batches")
+        evidence = _reload_decision_evidence(
+            aggregate_path=path, aggregate=aggregate
+        )
+        runs = aggregate["campaign"]["runs"]
+        if len(runs) != 1:
+            raise ValueError("each additive score member must exhaust exactly one arm")
+        arm_id = runs[0]["arm_id"]
+        if arm_id in seen_arms:
+            raise ValueError(f"additive aggregate repeats arm {arm_id}")
+        seen_arms.add(arm_id)
+        members.append(
+            {
+                "arm_id": arm_id,
+                "path": path,
+                "relative_path": relative,
+                "file_sha256": file_sha,
+                "aggregate": aggregate,
+                "decision_evidence": evidence,
+            }
+        )
+    if not members:
+        raise ValueError("additive aggregate requires at least one score member")
+    return sorted(members, key=lambda item: item["arm_id"])
+
+
+def _additive_body(
+    *,
+    campaign_manifest: dict[str, Any],
+    campaign_file_sha256: str,
+    members: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Recompute an additive aggregate only from validated member evidence."""
+
+    krea_batch._validate_campaign_manifest(campaign_manifest)
+    expected_campaign = _validate_campaign_adapter(
+        _campaign_adapter_from_manifest(
+            campaign_manifest, file_sha256=campaign_file_sha256
+        )
+    )
+    expected_by_arm = {row["arm_id"]: row for row in expected_campaign["runs"]}
+    if len(expected_by_arm) != len(expected_campaign["runs"]):
+        raise ValueError("expected campaign repeats an arm")
+
+    first_document = members[0]["aggregate"]["document"]
+    required_member_fields = {
+        "batch_runner_sha256",
+        "common_training_envelope",
+        "common_training_envelope_sha256",
+        "evaluator_script_sha256",
+        "evaluation_envelope_sha256",
+    }
+    for member in members:
+        missing = required_member_fields - set(member["aggregate"]["document"])
+        if missing:
+            raise ValueError(
+                f"additive member {member['arm_id']} lacks scorer bindings: "
+                f"{sorted(missing)}"
+            )
+
+    first_training = _object(
+        first_document["common_training_envelope"],
+        "additive common training envelope",
+    )
+    if (
+        first_document["common_training_envelope_sha256"]
+        != krea_provenance.canonical_sha256(first_training)
+    ):
+        raise ValueError("additive member common training envelope digest is invalid")
+    first_evaluation = _object(
+        first_document["evaluation_envelope"], "additive evaluation envelope"
+    )
+    if (
+        first_document["evaluation_envelope_sha256"]
+        != krea_provenance.canonical_sha256(first_evaluation)
+    ):
+        raise ValueError("additive member evaluation envelope digest is invalid")
+    shared_evaluation = _shared_evaluation_envelope(first_evaluation)
+    common_surface = {
+        "batch_runner_sha256": _digest(
+            first_document["batch_runner_sha256"], "additive batch runner"
+        ),
+        "evaluator_script_sha256": _digest(
+            first_document["evaluator_script_sha256"], "additive evaluator script"
+        ),
+        "evaluation_envelope": shared_evaluation,
+        "shared_training_runtime": _shared_training_runtime(first_training),
+        "fixture_manifest_sha256": first_document["fixture_manifest_sha256"],
+        "fixture_approval_sha256": first_document["fixture_approval_sha256"],
+        "fixture_contract": first_document["fixture_contract"],
+        "fixture": first_document["fixture"],
+        "sealed_plan_approval": first_document["sealed_plan_approval"],
+    }
+    campaign_common_keys = {
+        "fixture_manifest_sha256",
+        "discovery_plan_sha256",
+        "zero_control_manifest_sha256",
+        "decision_contract",
+        "confirmation_contract",
+        "historical_training_evidence_validator",
+    }
+    expected_campaign_common = {
+        key: expected_campaign[key]
+        for key in campaign_common_keys
+        if key in expected_campaign
+    }
+
+    public_members = []
+    plan_members = []
+    local_public: list[dict[str, Any]] = []
+    local_normalized: list[dict[str, Any]] = []
+    training_envelopes: list[dict[str, Any]] = []
+    training_members = []
+    zero_public: dict[str, Any] | None = None
+    zero_normalized: dict[str, Any] | None = None
+    zero_semantics: dict[str, Any] | None = None
+    seen_candidate_ids: set[str] = set()
+    seen_candidate_shas: set[str] = set()
+    seen_binding_shas: set[str] = set()
+    observed_runs = []
+    reviewer = members[0]["aggregate"]["score_plan_reviewer"]
+
+    for member in members:
+        arm_id = member["arm_id"]
+        aggregate = member["aggregate"]
+        document = aggregate["document"]
+        campaign = aggregate["campaign"]
+        campaign_common = {
+            key: campaign[key] for key in campaign_common_keys if key in campaign
+        }
+        if campaign_common != expected_campaign_common:
+            raise ValueError(f"additive member {arm_id} escaped the expected campaign")
+        if (
+            arm_id not in expected_by_arm
+            or campaign["runs"][0] != expected_by_arm[arm_id]
+        ):
+            raise ValueError(f"additive member {arm_id} differs from the expected run")
+        observed_runs.append(campaign["runs"][0])
+
+        training = _object(
+            document["common_training_envelope"],
+            f"additive member {arm_id} training envelope",
+        )
+        training_sha = document["common_training_envelope_sha256"]
+        if training_sha != krea_provenance.canonical_sha256(training):
+            raise ValueError(f"additive member {arm_id} training envelope drifted")
+        evaluation = _object(
+            document["evaluation_envelope"],
+            f"additive member {arm_id} evaluation envelope",
+        )
+        if document["evaluation_envelope_sha256"] != krea_provenance.canonical_sha256(
+            evaluation
+        ):
+            raise ValueError(f"additive member {arm_id} evaluation envelope drifted")
+        surface = {
+            "batch_runner_sha256": document["batch_runner_sha256"],
+            "evaluator_script_sha256": document["evaluator_script_sha256"],
+            "evaluation_envelope": _shared_evaluation_envelope(evaluation),
+            "shared_training_runtime": _shared_training_runtime(training),
+            "fixture_manifest_sha256": document["fixture_manifest_sha256"],
+            "fixture_approval_sha256": document["fixture_approval_sha256"],
+            "fixture_contract": document["fixture_contract"],
+            "fixture": document["fixture"],
+            "sealed_plan_approval": document["sealed_plan_approval"],
+        }
+        if surface != common_surface:
+            raise ValueError(
+                f"additive member {arm_id} differs in "
+                "fixture/evaluator/runtime/authority"
+            )
+        if aggregate["score_plan_reviewer"] != reviewer:
+            raise ValueError("additive members use different score-plan authorities")
+
+        raw_rows = document["candidates"]
+        member_zero = [row for row in raw_rows if row["mode"] == "zero_lora_control"]
+        member_local = [row for row in raw_rows if row["mode"] == "local_run_candidate"]
+        normalized_zero = [
+            row
+            for row in aggregate["candidates"]
+            if row["mode"] == "zero_lora_control"
+        ]
+        normalized_local = [
+            row
+            for row in aggregate["candidates"]
+            if row["mode"] == "local_run_candidate"
+        ]
+        if len(member_zero) != 1 or len(normalized_zero) != 1 or not member_local:
+            raise ValueError(
+                f"additive member {arm_id} lacks exact zero/local coverage"
+            )
+        semantics = _zero_score_semantics(member_zero[0])
+        if zero_semantics is None:
+            zero_semantics = semantics
+            zero_public = member_zero[0]
+            zero_normalized = normalized_zero[0]
+        elif semantics != zero_semantics:
+            raise ValueError("additive members do not share one exact zero-LoRA score")
+
+        for public, normalized in zip(
+            sorted(member_local, key=lambda row: row["candidate_id"]),
+            sorted(normalized_local, key=lambda row: row["candidate_id"]),
+            strict=True,
+        ):
+            if public["candidate_id"] != normalized["candidate_id"]:
+                raise RuntimeError("additive candidate normalization order diverged")
+            candidate_id = public["candidate_id"]
+            candidate_sha = public["candidate_sha256"]
+            binding_sha = public["binding_manifest_sha256"]
+            if (
+                candidate_id in seen_candidate_ids
+                or candidate_sha in seen_candidate_shas
+                or binding_sha in seen_binding_shas
+            ):
+                raise ValueError("additive candidates repeat an id, bytes, or binding")
+            seen_candidate_ids.add(candidate_id)
+            seen_candidate_shas.add(candidate_sha)
+            seen_binding_shas.add(binding_sha)
+            local_public.append(public)
+            local_normalized.append(normalized)
+
+        member_envelopes = document["training_run_envelopes"]
+        if not isinstance(member_envelopes, list) or len(member_envelopes) != 1:
+            raise ValueError(f"additive member {arm_id} has ambiguous run envelopes")
+        if member_envelopes[0].get("arm_id") != arm_id:
+            raise ValueError(f"additive member {arm_id} run envelope is misbound")
+        training_envelopes.append(member_envelopes[0])
+        training_members.append(
+            {
+                "arm_id": arm_id,
+                "envelope_sha256": training_sha,
+                "arm_variant": {
+                    key: training[key]
+                    for key in sorted(_ARM_VARIANT_TRAINING_ENVELOPE_KEYS)
+                    if key in training
+                },
+            }
+        )
+        local_ids = sorted(row["candidate_id"] for row in member_local)
+        public_members.append(
+            {
+                "arm_id": arm_id,
+                "path": member["relative_path"],
+                "file_sha256": member["file_sha256"],
+                "aggregate_sha256": aggregate["aggregate_sha256"],
+                "plan": document["plan"],
+                "sealed_plan_approval_sha256": document[
+                    "sealed_plan_approval_sha256"
+                ],
+                "candidate_ids": local_ids,
+            }
+        )
+        plan_members.append(
+            {
+                "arm_id": arm_id,
+                "aggregate_sha256": aggregate["aggregate_sha256"],
+                "plan": document["plan"],
+                "sealed_plan_approval_sha256": document[
+                    "sealed_plan_approval_sha256"
+                ],
+                "candidate_ids": local_ids,
+                "candidate_sha256s": sorted(
+                    row["candidate_sha256"] for row in member_local
+                ),
+            }
+        )
+
+    if observed_runs != expected_campaign["runs"]:
+        missing = sorted(
+            set(expected_by_arm) - {row["arm_id"] for row in observed_runs}
+        )
+        extra = sorted({row["arm_id"] for row in observed_runs} - set(expected_by_arm))
+        raise ValueError(
+            "additive campaign coverage is incomplete: "
+            f"missing={missing}, extra={extra}"
+        )
+    assert zero_public is not None and zero_normalized is not None
+    if zero_public["candidate_id"] in seen_candidate_ids or zero_public[
+        "candidate_sha256"
+    ] in seen_candidate_shas:
+        raise ValueError("additive zero control collides with a local candidate")
+
+    local_public.sort(
+        key=lambda row: (row["arm_id"], row["step"], row["candidate_sha256"])
+    )
+    local_normalized.sort(
+        key=lambda row: (row["arm_id"], row["step"], row["candidate_sha256"])
+    )
+    training_envelopes.sort(key=lambda row: row["arm_id"])
+    training_members.sort(key=lambda row: row["arm_id"])
+    public_candidates = sorted(
+        [zero_public, *local_public], key=lambda row: row["candidate_id"]
+    )
+    normalized_candidates = sorted(
+        [zero_normalized, *local_normalized], key=lambda row: row["candidate_id"]
+    )
+
+    plan_set = {
+        "schema": 1,
+        "kind": _ADDITIVE_PLAN_SET_KIND,
+        "campaign_manifest_sha256": campaign_file_sha256,
+        "members": plan_members,
+    }
+    plan_set_sha = krea_provenance.canonical_sha256(plan_set)
+    approved_payload = {
+        "plan_set_sha256": plan_set_sha,
+        "member_approved_payload_sha256s": [
+            {
+                "arm_id": row["arm_id"],
+                "approved_payload_sha256": row["plan"]["approved_payload_sha256"],
+            }
+            for row in public_members
+        ],
+    }
+    approval_set = {
+        "schema": 1,
+        "kind": _ADDITIVE_APPROVAL_SET_KIND,
+        "plan_set_sha256": plan_set_sha,
+        "score_plan_reviewer": first_document["sealed_plan_approval"],
+        "members": [
+            {
+                "arm_id": row["arm_id"],
+                "sealed_plan_approval_sha256": row[
+                    "sealed_plan_approval_sha256"
+                ],
+            }
+            for row in public_members
+        ],
+    }
+    additive_training = {
+        "schema": 1,
+        "kind": "forge-krea-additive-shared-training-runtime",
+        "shared": common_surface["shared_training_runtime"],
+        "members": training_members,
+    }
+    decision_evidence = {
+        "schema": 1,
+        "kind": _ADDITIVE_EVIDENCE_KIND,
+        "members": [
+            {
+                "arm_id": row["arm_id"],
+                "aggregate_path": row["path"],
+                "file_sha256": row["file_sha256"],
+                "aggregate_sha256": row["aggregate_sha256"],
+                "plan_canonical_sha256": row["plan"]["canonical_sha256"],
+                "sealed_plan_approval_sha256": row[
+                    "sealed_plan_approval_sha256"
+                ],
+            }
+            for row in public_members
+        ],
+    }
+    body = {
+        "schema": 1,
+        "kind": _ADDITIVE_AGGREGATE_KIND,
+        "coverage": {
+            "expected_arms": sorted(expected_by_arm),
+            "completed_arms": [row["arm_id"] for row in public_members],
+            "expected_candidates": 1
+            + sum(len(row["candidates"]) for row in expected_campaign["runs"]),
+            "completed_candidates": len(public_candidates),
+            "complete": True,
+        },
+        "direction": "min",
+        "plan": {
+            "raw_sha256": hashlib.sha256(
+                krea_provenance.canonical_bytes(plan_set) + b"\n"
+            ).hexdigest(),
+            "canonical_sha256": plan_set_sha,
+            "approved_payload_sha256": krea_provenance.canonical_sha256(
+                approved_payload
+            ),
+        },
+        "sealed_plan_approval_sha256": krea_provenance.canonical_sha256(
+            approval_set
+        ),
+        "sealed_plan_approval": first_document["sealed_plan_approval"],
+        "batch_runner_sha256": common_surface["batch_runner_sha256"],
+        "common_training_envelope": additive_training,
+        "common_training_envelope_sha256": krea_provenance.canonical_sha256(
+            additive_training
+        ),
+        "evaluator_script_sha256": common_surface["evaluator_script_sha256"],
+        "evaluation_envelope": common_surface["evaluation_envelope"],
+        "evaluation_envelope_sha256": krea_provenance.canonical_sha256(
+            common_surface["evaluation_envelope"]
+        ),
+        "candidates": public_candidates,
+        "campaign_manifest_sha256": campaign_file_sha256,
+        "fixture_manifest_sha256": common_surface["fixture_manifest_sha256"],
+        "fixture_approval_sha256": common_surface["fixture_approval_sha256"],
+        "fixture_contract": common_surface["fixture_contract"],
+        "campaign": expected_campaign,
+        "fixture": common_surface["fixture"],
+        "training_run_envelopes": training_envelopes,
+        "campaign_source": {
+            "file_sha256": campaign_file_sha256,
+            "manifest": campaign_manifest,
+        },
+        "members": public_members,
+        "decision_evidence": decision_evidence,
+    }
+    internal = {
+        "campaign": expected_campaign,
+        "candidates": normalized_candidates,
+        "zero": zero_normalized,
+        "text_weight": members[0]["aggregate"]["text_weight"],
+        "fixture_contract": members[0]["aggregate"]["fixture_contract"],
+        "fixture": members[0]["aggregate"]["fixture"],
+        "training_run_envelopes": training_envelopes,
+        "score_plan_reviewer": reviewer,
+        "members": members,
+    }
+    return body, internal
+
+
+def _aggregate_additive(
+    *, path: Path, value: dict[str, Any], file_sha: str
+) -> tuple[dict[str, Any], str]:
+    body = {key: item for key, item in value.items() if key != "aggregate_sha256"}
+    if (
+        value.get("schema") != 1
+        or value.get("kind") != _ADDITIVE_AGGREGATE_KIND
+        or value.get("direction") != "min"
+        or value.get("aggregate_sha256")
+        != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("additive exact-score aggregate identity is invalid")
+    source = _object(value.get("campaign_source"), "additive campaign source")
+    _exact(source, {"file_sha256", "manifest"}, "additive campaign source")
+    campaign = _object(source["manifest"], "additive campaign manifest")
+    campaign_file_sha = hashlib.sha256(
+        krea_provenance.canonical_bytes(campaign) + b"\n"
+    ).hexdigest()
+    if campaign_file_sha != source["file_sha256"]:
+        raise ValueError("additive campaign source file identity is invalid")
+    raw_members = value.get("members")
+    if not isinstance(raw_members, list) or not raw_members:
+        raise ValueError("additive aggregate has no members")
+    member_paths = []
+    for index, raw in enumerate(raw_members):
+        row = _object(raw, f"additive member[{index}]")
+        if "path" not in row:
+            raise ValueError("additive member lacks a path")
+        relative = _portable_relative_path(
+            row["path"], f"additive member[{index}].path"
+        )
+        member_paths.append(path.parent / relative)
+    members = _load_additive_members(root=path.parent, member_paths=member_paths)
+    expected_body, internal = _additive_body(
+        campaign_manifest=campaign,
+        campaign_file_sha256=campaign_file_sha,
+        members=members,
+    )
+    if body != expected_body:
+        raise ValueError(
+            "additive aggregate does not canonically recompute from members"
+        )
+    return {
+        "document": value,
+        "file_sha256": file_sha,
+        "plan_canonical_sha256": value["plan"]["canonical_sha256"],
+        "campaign_manifest_sha256": value["campaign_manifest_sha256"],
+        "fixture_manifest_sha256": value["fixture_manifest_sha256"],
+        "fixture_approval_sha256": value["fixture_approval_sha256"],
+        "sealed_plan_approval_sha256": value[
+            "sealed_plan_approval_sha256"
+        ],
+        "score_plan_reviewer": internal["score_plan_reviewer"],
+        "aggregate_sha256": value["aggregate_sha256"],
+        "candidates": internal["candidates"],
+        "zero": internal["zero"],
+        "text_weight": internal["text_weight"],
+        "fixture_contract": internal["fixture_contract"],
+        "campaign": internal["campaign"],
+        "fixture": internal["fixture"],
+        "training_run_envelopes": internal["training_run_envelopes"],
+        "additive_members": internal["members"],
+    }, file_sha
+
+
+def assemble_additive_score_aggregates(
+    *, campaign_path: Path, aggregate_paths: Iterable[Path], output: Path
+) -> dict[str, Any]:
+    """Publish one decision-valid aggregate from sealed per-arm score batches."""
+
+    output = Path(os.path.abspath(os.path.expanduser(output)))
+    if output.name in _FORBIDDEN_OUTPUTS or output.suffix != ".json":
+        raise ValueError("additive aggregate output must be a non-production JSON file")
+    current = output.parent
+    while current != current.parent:
+        if current.is_symlink():
+            raise ValueError(
+                f"additive aggregate output has symlink ancestor: {current}"
+            )
+        current = current.parent
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(f"{output}.tmp")
+    if os.path.lexists(output) or os.path.lexists(temporary):
+        raise FileExistsError(f"refusing existing additive aggregate output: {output}")
+    campaign, campaign_file_sha = _load_canonical(
+        campaign_path, "additive expected campaign"
+    )
+    krea_batch._validate_campaign_manifest(campaign)
+    members = _load_additive_members(
+        root=output.parent, member_paths=list(aggregate_paths)
+    )
+    body, _ = _additive_body(
+        campaign_manifest=campaign,
+        campaign_file_sha256=campaign_file_sha,
+        members=members,
+    )
+    document = {
+        **body,
+        "aggregate_sha256": krea_provenance.canonical_sha256(body),
+    }
+    payload = krea_provenance.canonical_bytes(document) + b"\n"
+    with temporary.open("xb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        loaded, _ = _aggregate(temporary)
+        _reload_decision_evidence(aggregate_path=temporary, aggregate=loaded)
+        os.link(temporary, output)
+        temporary.unlink()
+        directory_fd = os.open(
+            output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+    return document
+
+
+def _reload_additive_decision_evidence(
+    *, aggregate: Mapping[str, Any]
+) -> dict[str, Any]:
+    members = aggregate.get("additive_members")
+    if not isinstance(members, list) or not members:
+        raise ValueError("additive aggregate lost its validated member set")
+    rows = []
+    for member in members:
+        nested = member["aggregate"]
+        evidence = _reload_decision_evidence(
+            aggregate_path=member["path"], aggregate=nested
+        )
+        rows.append(
+            {
+                "arm_id": member["arm_id"],
+                "aggregate_path": member["relative_path"],
+                "file_sha256": member["file_sha256"],
+                "aggregate_sha256": nested["aggregate_sha256"],
+                "plan_canonical_sha256": nested["plan_canonical_sha256"],
+                "sealed_plan_approval_sha256": nested[
+                    "sealed_plan_approval_sha256"
+                ],
+                "decision_evidence": evidence,
+            }
+        )
+    return _validate_decision_evidence_binding(
+        {"schema": 1, "kind": _ADDITIVE_EVIDENCE_KIND, "members": rows}
+    )
+
+
 def _reload_decision_evidence(
     *, aggregate_path: Path, aggregate: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Reload the portable raw evidence bundle and prove every aggregate row."""
+
+    if aggregate["document"].get("kind") == _ADDITIVE_AGGREGATE_KIND:
+        return _reload_additive_decision_evidence(aggregate=aggregate)
 
     reference = _object(
         aggregate["document"].get("decision_evidence"),
@@ -3118,6 +4128,12 @@ def _reload_decision_evidence(
 
 def _aggregate(path: Path) -> tuple[dict[str, Any], str]:
     value, file_sha = _load_canonical(path, "exact-score aggregate")
+    if value.get("kind") == _ADDITIVE_AGGREGATE_KIND:
+        return _aggregate_additive(
+            path=Path(os.path.abspath(os.path.expanduser(path))),
+            value=value,
+            file_sha=file_sha,
+        )
     required = {
         "schema",
         "kind",
@@ -3371,6 +4387,11 @@ def _match_aggregates(
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     plan_state, _, seal = _bound_plan_and_seal(policy)
     confirmation_policy = policy["phase"] == "confirmation"
+    profile_index = (
+        None
+        if confirmation_policy
+        else _bound_discovery_profile_index(policy, plan_state=plan_state)
+    )
     discovery: dict[str, Any] | None = None
     if confirmation_policy:
         _, discovery, _ = _binding(policy["discovery_decision"], "discovery decision")
@@ -3406,6 +4427,14 @@ def _match_aggregates(
         fixture_adapter = aggregate["fixture"]
         if fixture_adapter["experimental_role"] != expected["fixture_id"]:
             raise ValueError("aggregate fixture role differs from the decision batch")
+        if not confirmation_policy:
+            assert profile_index is not None
+            _validate_indexed_discovery_aggregate(
+                aggregate,
+                fixture_id=expected["fixture_id"],
+                plan_state=plan_state,
+                profile_index=profile_index,
+            )
         campaign_arms = [row["arm_id"] for row in campaign["runs"]]
         if not confirmation_policy:
             expected_arms = list(plan_state["arm_ids"])
@@ -3492,11 +4521,12 @@ def _match_aggregates(
                 f"aggregate {expected['batch_id']} violates frozen fixture counts"
             )
         if fixture_id in _DISCOVERY_FIXTURES:
-            expected_identity = plan_state["document"]["discovery_tasks"][fixture_id][
-                "fixture_split_manifest_sha256"
-            ]
+            assert profile_index is not None
+            expected_identity = profile_index["document"]["fixtures"][fixture_id][
+                "manifest"
+            ]["manifest_sha256"]
             if contract["fixture_manifest_identity_sha256"] != expected_identity:
-                raise ValueError("discovery aggregate fixture identity drifted")
+                raise ValueError("discovery aggregate escaped its indexed fixture")
         elif fixture_id in _CONFIRMATION_FIXTURES:
             if (
                 contract["fixture_manifest_identity_sha256"]
@@ -3897,6 +4927,12 @@ def _base_discovery_body(
         "policy_approval_file_sha256": approval_file_sha,
         **governance,
         "discovery_plan_file_sha256": policy["discovery_plan"]["sha256"],
+        "discovery_profile_index_sha256": policy["discovery_profile_index"][
+            "index_sha256"
+        ],
+        "discovery_profile_index_file_sha256": policy["discovery_profile_index"][
+            "file_sha256"
+        ],
         "confirmation_fixture_seal_sha256": state["seal"]["seal_sha256"],
         "aggregate_bindings": aggregate_bindings,
         "bootstrap": policy["bootstrap"],
@@ -4247,6 +5283,8 @@ def _validate_confirmation_record(value: dict[str, Any]) -> dict[str, Any]:
         "policy_approval_file_sha256",
         "decision_reviewer_identity",
         "discovery_plan_file_sha256",
+        "discovery_profile_index_sha256",
+        "discovery_profile_index_file_sha256",
         "discovery_decision_sha256",
         "confirmation_fixture_seal_sha256",
         "aggregate_bindings",
@@ -4283,6 +5321,8 @@ def _validate_confirmation_record(value: dict[str, Any]) -> dict[str, Any]:
         "policy_approval_sha256",
         "policy_approval_file_sha256",
         "discovery_plan_file_sha256",
+        "discovery_profile_index_sha256",
+        "discovery_profile_index_file_sha256",
         "discovery_decision_sha256",
         "confirmation_fixture_seal_sha256",
     ):
@@ -4656,6 +5696,12 @@ def _base_confirmation_body(
         "policy_approval_file_sha256": approval_file_sha,
         "decision_reviewer_identity": approval["reviewer_identity"],
         "discovery_plan_file_sha256": policy["discovery_plan"]["sha256"],
+        "discovery_profile_index_sha256": policy["discovery_profile_index"][
+            "index_sha256"
+        ],
+        "discovery_profile_index_file_sha256": policy["discovery_profile_index"][
+            "file_sha256"
+        ],
         "discovery_decision_sha256": discovery_file_sha,
         "confirmation_fixture_seal_sha256": state["seal"]["seal_sha256"],
         "aggregate_bindings": aggregate_bindings,
