@@ -15,6 +15,7 @@ this boundary.
 
 from __future__ import annotations
 
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -22,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 try:
@@ -34,7 +36,7 @@ except ImportError:  # pragma: no cover - direct script execution.
     import krea_recovery_evidence  # type: ignore[no-redef]
 
 
-SCHEMA = 1
+SCHEMA = 2
 TARGETED_CONTRACT = "targeted-density-v1"
 EXHAUSTIVE92_CONTRACT = "exhaustive92"
 TARGET_PLAN_KIND = "forge-krea-density-target-plan"
@@ -49,6 +51,34 @@ RELIEF_NEIGHBOR_PROMOTED = "RELIEF_NEIGHBOR_PROMOTED"
 TARGETED_BACKFILL = "TARGETED_BACKFILL"
 RELIEF_TASK_ID = "d1-k1-step522"
 SEED_ROLE = "A"
+
+_TIE_UNCERTAINTY_BAND = Decimal("0.01")
+_TIE_ORDERED_AXES = (
+    "greater_selected_image_exposures",
+    "smaller_D1_D2_relative_improvement_spread",
+    "predeclared_family_preference",
+)
+_TIE_FAMILY_PREFERENCE = ("K2", "K3", "K4", "K5", "K1")
+
+
+def _tie_policy_document() -> dict[str, Any]:
+    """Return an isolated JSON projection of the frozen tie policy."""
+
+    return {
+        "uncertainty_band": float(_TIE_UNCERTAINTY_BAND),
+        "ordered_axes": list(_TIE_ORDERED_AXES),
+        "family_preference": list(_TIE_FAMILY_PREFERENCE),
+    }
+
+
+def _assert_external_tie_policy() -> None:
+    if krea_decision.FAMILY_TIE_BREAK_POLICY != _tie_policy_document():
+        raise RuntimeError(
+            "Krea density tie policy differs from the frozen decision policy"
+        )
+
+
+_assert_external_tie_policy()
 
 _SHA = re.compile(r"[0-9a-f]{64}")
 _FIXTURES = ("D1", "D2")
@@ -149,7 +179,13 @@ def _finite_loss(value: Any, label: str) -> float:
     return result
 
 
-def _canonical_universe() -> tuple[dict[str, Any], ...]:
+def _decimal_loss(value: Any, label: str) -> Decimal:
+    """Recover the canonical decimal value represented by a validated scalar."""
+
+    return Decimal(str(_finite_loss(value, label)))
+
+
+def _canonical_universe() -> tuple[Mapping[str, Any], ...]:
     rows: list[dict[str, Any]] = []
     for fixture in _FIXTURES:
         for family in _FAMILIES:
@@ -203,12 +239,12 @@ def _canonical_universe() -> tuple[dict[str, Any], ...]:
                 "universe_tier": INDEPENDENT_ZERO,
             }
         )
-    return tuple(rows)
+    return tuple(MappingProxyType(row) for row in rows)
 
 
 CANONICAL_UNIVERSE = _canonical_universe()
 CANONICAL_UNIVERSE_SHA256 = krea_provenance.canonical_sha256(
-    list(CANONICAL_UNIVERSE)
+    [dict(row) for row in CANONICAL_UNIVERSE]
 )
 _UNIVERSE_BY_ID = {row["task_id"]: row for row in CANONICAL_UNIVERSE}
 _SPARSE_IDS = tuple(
@@ -239,47 +275,136 @@ def _assert_internal_universe() -> None:
 _assert_internal_universe()
 
 
-def _primary_losses(value: Mapping[str, Any]) -> dict[str, float]:
-    if not isinstance(value, Mapping):
-        raise ValueError("primary_losses must be a mapping")
-    expected = set(_SPARSE_IDS)
-    if set(value) != expected:
-        raise ValueError(
-            "primary loss coverage differs from the canonical 56 sparse rows: "
-            f"missing={sorted(expected - set(value))}, "
-            f"extra={sorted(set(value) - expected)}"
-        )
-    return {task_id: _finite_loss(value[task_id], task_id) for task_id in _SPARSE_IDS}
+def _file_binding_projection(value: Any, label: str) -> dict[str, Any]:
+    binding = _object(value, label)
+    result = {key: binding.get(key) for key in ("path", "bytes", "file_sha256")}
+    if (
+        not isinstance(result["path"], str)
+        or not result["path"].startswith("/")
+        or os.path.normpath(result["path"]) != result["path"]
+        or isinstance(result["bytes"], bool)
+        or not isinstance(result["bytes"], int)
+        or result["bytes"] < 0
+        or not isinstance(result["file_sha256"], str)
+        or _SHA.fullmatch(result["file_sha256"]) is None
+    ):
+        raise ValueError(f"{label} is malformed")
+    return result
 
 
-def _primary_loss_rows(losses: Mapping[str, float]) -> list[dict[str, Any]]:
+def _result_binding_projection(value: Any, label: str) -> dict[str, Any]:
+    binding = _object(value, label)
+    result = _file_binding_projection(binding, label)
+    semantic = binding.get("semantic_sha256")
+    if not isinstance(semantic, str) or _SHA.fullmatch(semantic) is None:
+        raise ValueError(f"{label} semantic binding is malformed")
+    result["semantic_sha256"] = semantic
+    return result
+
+
+def _validated_score_projection(
+    row: Mapping[str, Any], task_id: str
+) -> dict[str, Any]:
+    validated = row.get("validated_artifact")
+    if row.get("selection_eligible") is not True or not isinstance(validated, dict):
+        raise ValueError(f"recovery row is not selection eligible: {task_id}")
+    result = _object(validated.get("result"), f"{task_id} validated result")
+    candidate_binding = _file_binding_projection(
+        validated.get("candidate"), f"{task_id} candidate binding"
+    )
+    if candidate_binding["file_sha256"] != row.get("expected_candidate_sha256"):
+        raise ValueError(f"selected candidate binding differs: {task_id}")
+    return {
+        "weighted_loss": _finite_loss(result.get("weighted_loss"), task_id),
+        "candidate_binding": candidate_binding,
+        "result_binding": _result_binding_projection(
+            result, f"{task_id} result binding"
+        ),
+        "evidence_binding": _file_binding_projection(
+            validated.get("evidence"), f"{task_id} evidence binding"
+        ),
+        "receipt_binding": _file_binding_projection(
+            validated.get("receipt"), f"{task_id} receipt binding"
+        ),
+    }
+
+
+def _primary_evidence_from_recovery_rows(
+    rows: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
     return [
-        {"task_id": task_id, "weighted_loss": losses[task_id]}
+        {"task_id": task_id, **_validated_score_projection(rows[task_id], task_id)}
         for task_id in _SPARSE_IDS
     ]
 
 
-def _bound_primary_losses(value: Any, contract: str) -> dict[str, float]:
+_PRIMARY_EVIDENCE_KEYS = {
+    "task_id",
+    "weighted_loss",
+    "candidate_binding",
+    "result_binding",
+    "evidence_binding",
+    "receipt_binding",
+}
+
+
+def _bound_primary_evidence(
+    value: Any,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
     if not isinstance(value, list):
         raise ValueError("plan primary_losses must be a list")
     if len(value) != len(_SPARSE_IDS):
-        raise ValueError("plan must bind all 56 sparse primary losses")
+        raise ValueError("plan must bind all 56 sparse primary evidence rows")
+    normalized: list[dict[str, Any]] = []
     losses: dict[str, float] = {}
     for index, raw in enumerate(value):
         row = _object(raw, f"primary_losses[{index}]")
-        _exact(row, {"task_id", "weighted_loss"}, f"primary_losses[{index}]")
+        _exact(row, _PRIMARY_EVIDENCE_KEYS, f"primary_losses[{index}]")
         expected_id = _SPARSE_IDS[index]
         if row["task_id"] != expected_id or expected_id in losses:
-            raise ValueError("plan primary losses differ from canonical sparse order")
-        losses[expected_id] = _finite_loss(row["weighted_loss"], expected_id)
-    return losses
+            raise ValueError("plan primary evidence differs from canonical sparse order")
+        for key in ("candidate_binding", "evidence_binding", "receipt_binding"):
+            _exact(
+                _object(row[key], f"primary_losses[{index}].{key}"),
+                {"path", "bytes", "file_sha256"},
+                f"primary_losses[{index}].{key}",
+            )
+        _exact(
+            _object(
+                row["result_binding"],
+                f"primary_losses[{index}].result_binding",
+            ),
+            {"path", "bytes", "file_sha256", "semantic_sha256"},
+            f"primary_losses[{index}].result_binding",
+        )
+        normalized_row = {
+            "task_id": expected_id,
+            "weighted_loss": _finite_loss(row["weighted_loss"], expected_id),
+            "candidate_binding": _file_binding_projection(
+                row["candidate_binding"],
+                f"primary_losses[{index}].candidate_binding",
+            ),
+            "result_binding": _result_binding_projection(
+                row["result_binding"],
+                f"primary_losses[{index}].result_binding",
+            ),
+            "evidence_binding": _file_binding_projection(
+                row["evidence_binding"],
+                f"primary_losses[{index}].evidence_binding",
+            ),
+            "receipt_binding": _file_binding_projection(
+                row["receipt_binding"],
+                f"primary_losses[{index}].receipt_binding",
+            ),
+        }
+        normalized.append(normalized_row)
+        losses[expected_id] = normalized_row["weighted_loss"]
+    return normalized, losses
 
 
 def _family_preference(family: str) -> int:
     try:
-        return krea_decision.FAMILY_TIE_BREAK_POLICY["family_preference"].index(
-            family
-        )
+        return _TIE_FAMILY_PREFERENCE.index(family)
     except ValueError as exc:
         raise ValueError(f"family {family} is absent from FAMILY_TIE_BREAK_POLICY") from exc
 
@@ -294,11 +419,17 @@ def _peak_for_cell(
         and row["family"] == family
         and row["universe_tier"] == SPARSE_PRIMARY
     ]
-    minimum = min(losses[row["task_id"]] for row in sparse)
+    minimum = min(
+        _decimal_loss(losses[row["task_id"]], row["task_id"]) for row in sparse
+    )
     # Density targets the empirical peak, not every checkpoint inside the
     # family-level uncertainty band.  Exact-equality ties retain the frozen
     # first tie axis: greater selected image exposures.
-    tied = [row for row in sparse if losses[row["task_id"]] == minimum]
+    tied = [
+        row
+        for row in sparse
+        if _decimal_loss(losses[row["task_id"]], row["task_id"]) == minimum
+    ]
     return max(tied, key=lambda row: (row["image_exposures"], row["task_id"]))
 
 
@@ -333,16 +464,18 @@ def _rank_cells(
 
     remaining = list(cells)
     result: list[tuple[str, str]] = []
-    band = krea_decision.FAMILY_TIE_BREAK_POLICY["uncertainty_band"]
     while remaining:
-        raw_best = min(
-            losses[_peak_for_cell(fixture, family, losses)["task_id"]]
-            for fixture, family in remaining
-        )
+        peak_losses: dict[tuple[str, str], Decimal] = {}
+        for cell in remaining:
+            peak = _peak_for_cell(*cell, losses)
+            peak_losses[cell] = _decimal_loss(
+                losses[peak["task_id"]], peak["task_id"]
+            )
+        raw_best = min(peak_losses.values())
         tied = [
             cell
             for cell in remaining
-            if losses[_peak_for_cell(*cell, losses)["task_id"]] <= raw_best + band
+            if peak_losses[cell] <= raw_best + _TIE_UNCERTAINTY_BAND
         ]
         chosen = min(
             tied,
@@ -462,16 +595,18 @@ def _adapt_recovery_index(index: Mapping[str, Any]) -> dict[str, dict[str, Any]]
         expected_final = expected["label"].startswith("final-") or expected["family"] is None
         expected_zero = expected["family"] is None
         ledger_tier = row.get("coverage_tier")
-        allowed_tiers = {expected["universe_tier"]}
-        if task_id == RELIEF_TASK_ID:
-            allowed_tiers.add(EXHAUSTIVE_BACKFILL)
+        expected_ledger_tier = (
+            EXHAUSTIVE_BACKFILL
+            if task_id == RELIEF_TASK_ID
+            else expected["universe_tier"]
+        )
         if (
             row.get("fixture_id") != expected["fixture"]
             or row.get("family_id") != expected_family
             or row.get("step") != expected["step"]
             or row.get("is_final") is not expected_final
             or row.get("zero_control") is not expected_zero
-            or ledger_tier not in allowed_tiers
+            or ledger_tier != expected_ledger_tier
             or not isinstance(row.get("selection_eligible"), bool)
         ):
             raise ValueError(f"recovery index target identity differs: {task_id}")
@@ -489,24 +624,8 @@ def _load_recovery_index(
     return index, binding, _adapt_recovery_index(index)
 
 
-def _losses_from_recovery_rows(
-    rows: Mapping[str, Mapping[str, Any]],
-) -> dict[str, float]:
-    losses: dict[str, float] = {}
-    for task_id in _SPARSE_IDS:
-        row = rows[task_id]
-        validated = row.get("validated_artifact")
-        if row.get("selection_eligible") is not True or not isinstance(validated, dict):
-            raise ValueError(f"sparse recovery row is not selection eligible: {task_id}")
-        result = validated.get("result")
-        if not isinstance(result, dict):
-            raise ValueError(f"eligible sparse row lacks validated result: {task_id}")
-        losses[task_id] = _finite_loss(result.get("weighted_loss"), task_id)
-    return losses
-
-
 def _build_plan(
-    primary_losses: Mapping[str, Any],
+    primary_evidence: Sequence[Mapping[str, Any]],
     recovery_index_binding: Mapping[str, Any],
     ledger_tiers: Mapping[str, str],
     *,
@@ -515,7 +634,10 @@ def _build_plan(
 ) -> dict[str, Any]:
     """Private normalized builder; public callers must use a recovery index."""
 
-    losses = _primary_losses(primary_losses)
+    _assert_external_tie_policy()
+    bound_primary_evidence, losses = _bound_primary_evidence(
+        list(primary_evidence)
+    )
     binding = _validate_recovery_binding(recovery_index_binding)
     if set(ledger_tiers) != set(_UNIVERSE_BY_ID):
         raise ValueError("ledger tier coverage differs from canonical universe")
@@ -584,9 +706,9 @@ def _build_plan(
             "contract": contract,
             "seed_role": SEED_ROLE,
             "canonical_universe_sha256": CANONICAL_UNIVERSE_SHA256,
-            "family_tie_break_policy": krea_decision.FAMILY_TIE_BREAK_POLICY,
+            "family_tie_break_policy": _tie_policy_document(),
             "recovery_index": dict(binding),
-            "primary_losses": _primary_loss_rows(losses),
+            "primary_losses": bound_primary_evidence,
             "selection_policy": policy,
             "rows": rows,
             "selected_count": sum(row["selected"] for row in rows),
@@ -605,16 +727,19 @@ def _validate_universe_projection(rows: Sequence[Mapping[str, Any]]) -> None:
         _exact(row, _PLAN_ROW_KEYS, f"rows[{index}]")
         if {key: row[key] for key in _UNIVERSE_KEYS} != expected:
             raise ValueError(f"rows[{index}] differs from the canonical Seed-A universe")
-        allowed = {expected["universe_tier"]}
-        if expected["task_id"] == RELIEF_TASK_ID:
-            allowed.add(EXHAUSTIVE_BACKFILL)
-        if row["ledger_coverage_tier"] not in allowed:
+        expected_ledger_tier = (
+            EXHAUSTIVE_BACKFILL
+            if expected["task_id"] == RELIEF_TASK_ID
+            else expected["universe_tier"]
+        )
+        if row["ledger_coverage_tier"] != expected_ledger_tier:
             raise ValueError(f"rows[{index}] ledger coverage tier differs")
         if not isinstance(row["selected"], bool):
             raise ValueError(f"rows[{index}].selected must be boolean")
 
 
 def _validate_plan_structural(value: Any) -> dict[str, Any]:
+    _assert_external_tie_policy()
     plan = _object(value, "density plan")
     _exact(plan, _PLAN_KEYS, "density plan")
     contract = plan["contract"]
@@ -627,14 +752,14 @@ def _validate_plan_structural(value: Any) -> dict[str, Any]:
         or plan["kind"] != expected_kind
         or plan["seed_role"] != SEED_ROLE
         or plan["canonical_universe_sha256"] != CANONICAL_UNIVERSE_SHA256
-        or plan["family_tie_break_policy"] != krea_decision.FAMILY_TIE_BREAK_POLICY
+        or plan["family_tie_break_policy"] != _tie_policy_document()
     ):
         raise ValueError("density plan identity or frozen policy drifted")
     _validate_recovery_binding(plan["recovery_index"])
     if not isinstance(plan["rows"], list):
         raise ValueError("density plan rows must be a list")
     _validate_universe_projection(plan["rows"])
-    bound_losses = _bound_primary_losses(plan["primary_losses"], contract)
+    _, bound_losses = _bound_primary_evidence(plan["primary_losses"])
     body = {key: item for key, item in plan.items() if key != "target_plan_sha256"}
     if plan["target_plan_sha256"] != krea_provenance.canonical_sha256(body):
         raise ValueError("density plan hash seal differs")
@@ -707,9 +832,9 @@ def build_plan_from_recovery_index(
     """Build a plan only from receipt-validated recovery evidence."""
 
     _, binding, rows = _load_recovery_index(recovery_index_path)
-    losses = _losses_from_recovery_rows(rows)
+    primary_evidence = _primary_evidence_from_recovery_rows(rows)
     return _build_plan(
-        losses,
+        primary_evidence,
         binding,
         {task_id: row["ledger_coverage_tier"] for task_id, row in rows.items()},
         contract=contract,
@@ -720,10 +845,10 @@ def build_plan_from_recovery_index(
 def validate_plan(value: Any) -> dict[str, Any]:
     plan = _validate_plan_structural(value)
     _, binding, rows = _load_recovery_index(plan["recovery_index"]["path"])
-    losses = _losses_from_recovery_rows(rows)
+    primary_evidence = _primary_evidence_from_recovery_rows(rows)
     additional = plan["selection_policy"].get("requested_additional_target_count", 11)
     expected = _build_plan(
-        losses,
+        primary_evidence,
         binding,
         {task_id: row["ledger_coverage_tier"] for task_id, row in rows.items()},
         contract=plan["contract"],
@@ -814,20 +939,6 @@ def write_artifacts(
     return tuple(hashlib.sha256(path.read_bytes()).hexdigest() for path, _ in targets)  # type: ignore[return-value]
 
 
-def _file_binding_projection(value: Any, label: str) -> dict[str, Any]:
-    binding = _object(value, label)
-    result = {key: binding.get(key) for key in ("path", "bytes", "file_sha256")}
-    if (
-        not isinstance(result["path"], str)
-        or isinstance(result["bytes"], bool)
-        or not isinstance(result["bytes"], int)
-        or not isinstance(result["file_sha256"], str)
-        or _SHA.fullmatch(result["file_sha256"]) is None
-    ):
-        raise ValueError(f"{label} is malformed")
-    return result
-
-
 def _build_decision_input(
     plan: Mapping[str, Any],
     sidecar: Mapping[str, Any],
@@ -837,8 +948,9 @@ def _build_decision_input(
     """Build only from an index already revalidated by ``load_index``."""
 
     decision_rows: list[dict[str, Any]] = []
-    bound_losses = {
-        row["task_id"]: row["weighted_loss"] for row in plan["primary_losses"]
+    bound_primary = {
+        row["task_id"]: {key: item for key, item in row.items() if key != "task_id"}
+        for row in plan["primary_losses"]
     }
     for target in plan["rows"]:
         if not target["selected"]:
@@ -849,23 +961,14 @@ def _build_decision_input(
             raise ValueError(f"selected recovery row is not selection eligible: {target['task_id']}")
         if row["ledger_coverage_tier"] != target["ledger_coverage_tier"]:
             raise ValueError(f"selected ledger tier differs: {target['task_id']}")
-        result = _object(validated.get("result"), "validated result")
-        loss = _finite_loss(result.get("weighted_loss"), target["task_id"])
-        if target["task_id"] in bound_losses and loss != bound_losses[target["task_id"]]:
-            raise ValueError("final sparse loss differs from the plan-bound recovery index")
-        result_binding = _file_binding_projection(result, "result binding")
-        semantic = result.get("semantic_sha256")
-        if not isinstance(semantic, str) or _SHA.fullmatch(semantic) is None:
-            raise ValueError("result semantic binding is malformed")
-        result_binding["semantic_sha256"] = semantic
-        candidate_binding = _file_binding_projection(
-            result.get("candidate"), "candidate binding"
-        )
-        if candidate_binding["file_sha256"] != row.get(
-            "expected_candidate_sha256"
+        score = _validated_score_projection(row, target["task_id"])
+        if (
+            target["task_id"] in bound_primary
+            and score != bound_primary[target["task_id"]]
         ):
             raise ValueError(
-                f"selected candidate binding differs: {target['task_id']}"
+                "final sparse receipt/candidate/result/evidence binding differs "
+                "from the plan-bound recovery index"
             )
         decision_rows.append(
             {
@@ -877,15 +980,11 @@ def _build_decision_input(
                 "plan_tier": target["plan_tier"],
                 "step": target["step"],
                 "image_exposures": target["step"],
-                "weighted_loss": loss,
-                "candidate_binding": candidate_binding,
-                "result_binding": result_binding,
-                "evidence_binding": _file_binding_projection(
-                    validated.get("evidence"), "evidence binding"
-                ),
-                "receipt_binding": _file_binding_projection(
-                    validated.get("receipt"), "receipt binding"
-                ),
+                "weighted_loss": score["weighted_loss"],
+                "candidate_binding": score["candidate_binding"],
+                "result_binding": score["result_binding"],
+                "evidence_binding": score["evidence_binding"],
+                "receipt_binding": score["receipt_binding"],
             }
         )
     if len(decision_rows) != plan["selected_count"]:

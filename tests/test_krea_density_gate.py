@@ -6,7 +6,7 @@ from copy import deepcopy
 import hashlib
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
@@ -29,14 +29,13 @@ def _file_binding(task_id: str, kind: str) -> dict[str, Any]:
     }
 
 
-def _artifact(source: dict[str, Any], *, loss: float = 1.0) -> dict[str, Any]:
+def _artifact(source: Mapping[str, Any], *, loss: float = 1.0) -> dict[str, Any]:
     task_id = source["task_id"]
     candidate = _file_binding(task_id, "candidate")
     result = {
         **_file_binding(task_id, "result"),
         "semantic_sha256": _digest(f"{task_id}:result-semantic"),
         "weighted_loss": loss,
-        "candidate": candidate,
     }
     return {
         "task_id": task_id,
@@ -46,10 +45,15 @@ def _artifact(source: dict[str, Any], *, loss: float = 1.0) -> dict[str, Any]:
         "is_final": source["label"].startswith("final-")
         or source["family"] is None,
         "zero_control": source["family"] is None,
-        "coverage_tier": source["universe_tier"],
+        "coverage_tier": (
+            gate.EXHAUSTIVE_BACKFILL
+            if task_id == gate.RELIEF_TASK_ID
+            else source["universe_tier"]
+        ),
         "selection_eligible": True,
         "expected_candidate_sha256": candidate["file_sha256"],
         "validated_artifact": {
+            "candidate": candidate,
             "result": result,
             "evidence": _file_binding(task_id, "evidence"),
             "receipt": _file_binding(task_id, "receipt"),
@@ -190,6 +194,27 @@ def test_receipt_index_target_plan_is_bounded_and_deterministic(
     ]
 
 
+def test_returned_plan_and_public_universe_cannot_mutate_frozen_policy(
+    recovery_indexes: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _plan(recovery_indexes)
+    frozen_policy = deepcopy(first["family_tie_break_policy"])
+    first["family_tie_break_policy"]["uncertainty_band"] = 99.0
+    first["family_tie_break_policy"]["family_preference"].reverse()
+
+    second = _plan(recovery_indexes)
+    assert second["family_tie_break_policy"] == frozen_policy
+    assert gate.krea_decision.FAMILY_TIE_BREAK_POLICY == frozen_policy
+    with pytest.raises(TypeError):
+        gate.CANONICAL_UNIVERSE[0]["image_exposures"] = 999
+
+    monkeypatch.setitem(
+        gate.krea_decision.FAMILY_TIE_BREAK_POLICY, "uncertainty_band", 0.02
+    )
+    with pytest.raises(RuntimeError, match="differs from the frozen"):
+        _plan(recovery_indexes)
+
+
 def test_full_target_plan_covers_nine_cells_plus_two_fixture_bonuses(
     recovery_indexes: dict[str, Any],
 ) -> None:
@@ -211,6 +236,28 @@ def test_full_target_plan_covers_nine_cells_plus_two_fixture_bonuses(
     assert sorted(counts.values()) == [1] * 7 + [2, 2]
     assert counts[("D1", "K2")] == 2
     assert counts[("D2", "K2")] == 2
+
+
+def test_relief_promotion_keeps_logical_and_real_ledger_tiers_distinct(
+    recovery_indexes: dict[str, Any],
+) -> None:
+    plan = _plan(recovery_indexes, additional_target_count=0)
+    relief = next(
+        row for row in plan["rows"] if row["task_id"] == gate.RELIEF_TASK_ID
+    )
+    assert relief["universe_tier"] == gate.RELIEF_NEIGHBOR_PROMOTED
+    assert relief["plan_tier"] == gate.RELIEF_NEIGHBOR_PROMOTED
+    assert relief["ledger_coverage_tier"] == gate.EXHAUSTIVE_BACKFILL
+
+    sidecar = gate.build_sidecar(plan)
+    decision = _decision(recovery_indexes, plan, sidecar)
+    decision_relief = next(
+        row
+        for row in decision["candidate_rows_for_krea_decision"]
+        if row["task_id"] == gate.RELIEF_TASK_ID
+    )
+    assert decision_relief["plan_tier"] == gate.RELIEF_NEIGHBOR_PROMOTED
+    assert decision_relief["ledger_coverage_tier"] == gate.EXHAUSTIVE_BACKFILL
 
 
 def test_peak_adjacency_uses_exact_minimum_not_family_uncertainty_band(
@@ -236,6 +283,27 @@ def test_peak_adjacency_uses_exact_minimum_not_family_uncertainty_band(
     }
     assert "d1-k2-step174" in selected
     assert "d1-k2-step522" not in selected
+
+
+def test_exact_decimal_uncertainty_boundary_is_inclusive(
+    recovery_indexes: dict[str, Any],
+) -> None:
+    for row in gate.CANONICAL_UNIVERSE:
+        if row["fixture"] == "D1" and row["universe_tier"] == gate.SPARSE_PRIMARY:
+            if row["family"] == "K3":
+                _set_loss(recovery_indexes["initial"], row["task_id"], 0.0045)
+            elif row["family"] == "K2":
+                _set_loss(recovery_indexes["initial"], row["task_id"], 0.0145)
+
+    plan = _plan(recovery_indexes, additional_target_count=1)
+    targeted = [
+        row for row in plan["rows"] if row["plan_tier"] == gate.TARGETED_BACKFILL
+    ]
+    assert len(targeted) == 1
+    # K2 is exactly 0.01 above K3 and therefore remains inside the inclusive
+    # band; the frozen family preference chooses K2.
+    assert targeted[0]["fixture"] == "D1"
+    assert targeted[0]["family"] == "K2"
 
 
 def test_plan_builder_rejects_partial_duplicate_nonfinite_and_bad_target_counts(
@@ -373,6 +441,30 @@ def test_plan_validation_replays_its_bound_receipt_index(
         gate.validate_plan(plan)
 
 
+@pytest.mark.parametrize(
+    "binding_key",
+    ["candidate_binding", "result_binding", "evidence_binding", "receipt_binding"],
+)
+def test_plan_rejects_resealed_sparse_loss_and_binding_tampering(
+    recovery_indexes: dict[str, Any], binding_key: str
+) -> None:
+    original = _plan(recovery_indexes)
+
+    changed = deepcopy(original)
+    changed["primary_losses"][0]["weighted_loss"] = 1.001
+    changed = _reseal(changed, "target_plan_sha256")
+    with pytest.raises(ValueError, match="revalidated recovery index"):
+        gate.validate_plan(changed)
+
+    changed = deepcopy(original)
+    changed["primary_losses"][0][binding_key]["file_sha256"] = _digest(
+        f"tampered:{binding_key}"
+    )
+    changed = _reseal(changed, "target_plan_sha256")
+    with pytest.raises(ValueError, match="revalidated recovery index"):
+        gate.validate_plan(changed)
+
+
 def test_sidecar_is_hash_sealed_and_exactly_equivalent(
     recovery_indexes: dict[str, Any],
 ) -> None:
@@ -444,8 +536,8 @@ def test_decision_builder_rejects_partial_duplicate_and_bad_candidate_receipts(
         _decision(recovery_indexes, plan, sidecar)
     _restore(source, original)
 
-    result = _artifact_by_id(source, selected_id)["validated_artifact"]["result"]
-    result["candidate"]["file_sha256"] = _digest("wrong-candidate")
+    validated = _artifact_by_id(source, selected_id)["validated_artifact"]
+    validated["candidate"]["file_sha256"] = _digest("wrong-candidate")
     with pytest.raises(ValueError, match="selected candidate binding differs"):
         _decision(recovery_indexes, plan, sidecar)
 
@@ -494,7 +586,30 @@ def test_decision_builder_rejects_nonfinite_and_plan_bound_sparse_loss_drift(
     _restore(source, original)
 
     _set_loss(source, sparse_id, 1.001)
-    with pytest.raises(ValueError, match="plan-bound"):
+    with pytest.raises(ValueError, match="plan-bound recovery index"):
+        _decision(recovery_indexes, plan, sidecar)
+
+
+@pytest.mark.parametrize(
+    "binding_key", ["candidate", "result", "evidence", "receipt"]
+)
+def test_decision_builder_requires_full_sparse_binding_continuity(
+    recovery_indexes: dict[str, Any], binding_key: str
+) -> None:
+    plan = _plan(recovery_indexes, additional_target_count=0)
+    sidecar = gate.build_sidecar(plan)
+    sparse_id = plan["primary_losses"][0]["task_id"]
+    artifact = _artifact_by_id(recovery_indexes["final"], sparse_id)
+    artifact["validated_artifact"][binding_key]["file_sha256"] = _digest(
+        f"replacement:{binding_key}"
+    )
+    if binding_key == "candidate":
+        # Preserve the final index's own candidate/ledger agreement so this
+        # probes initial-to-final continuity rather than the local SHA guard.
+        artifact["expected_candidate_sha256"] = artifact["validated_artifact"][
+            "candidate"
+        ]["file_sha256"]
+    with pytest.raises(ValueError, match="receipt/candidate/result/evidence"):
         _decision(recovery_indexes, plan, sidecar)
 
 
