@@ -442,7 +442,11 @@ def _controls(
             "checkpoints": "/test/checkpoints",
             "run_evidence": "/test/evidence",
         },
-        trigger_word=fixture["trigger_token"],
+        trigger_word=(
+            None
+            if fixture["experimental_role"] in timing._CONFIRMATION_ROLES
+            else fixture["trigger_token"]
+        ),
     )
     host = _host()
     gpu = _gpu()
@@ -687,6 +691,51 @@ def test_real_c1_and_boundary_chains_validate_without_monkeypatch(
     assert boundary_plan["sealed_content_authority"]["fixture_commitment"]["mode"] == (
         "boundary_manifest_semantic_sha256"
     )
+
+
+def test_probe_preserves_legacy_null_trigger_and_boundary_trigger() -> None:
+    common = {
+        "created_at_utc": "2026-07-30T00:00:30Z",
+        "production_image_id": "sha256:" + "3" * 64,
+        "measurement_tool_sha256": _sha("measurement-tool"),
+        "collector_executable_sha256": _sha("collector"),
+        "executable_sha256": _sha("docker"),
+        "gpu_device": 0,
+        "fixture_manifest_sha256": _sha("fixture"),
+        "training_archive_sha256": _sha("archive"),
+        "training_archive_bytes": 123,
+        "profile_id": "K1",
+        "hard_budget_s": 2700.0,
+        "mount_sources": {
+            "base_model": "/test/base-model",
+            "text_encoder": "/test/text-encoder",
+            "dataset_cache": "/test/datasets",
+            "checkpoints": "/test/checkpoints",
+            "run_evidence": "/test/evidence",
+        },
+    }
+    confirmation = timing.seal_probe_contract(
+        **common,
+        fixture_role="C1",
+        trigger_word=None,
+    )
+    assert confirmation["command_fields"]["trigger_word"] is None
+    assert "--trigger-word" not in confirmation["command_argv_template"]
+    assert timing.validate_probe_contract(confirmation) == confirmation
+
+    boundary = timing.seal_probe_contract(
+        **common,
+        fixture_role="B-0p75-small",
+        trigger_word="SN56",
+    )
+    trigger_index = boundary["command_argv_template"].index("--trigger-word")
+    assert boundary["command_argv_template"][trigger_index + 1] == "SN56"
+    with pytest.raises(ValueError, match="trigger word"):
+        timing.seal_probe_contract(
+            **common,
+            fixture_role="B-0p75-small",
+            trigger_word=None,
+        )
 
 
 def test_canonical_fixture_schema_never_accepts_null_trigger(real_surface: dict) -> None:

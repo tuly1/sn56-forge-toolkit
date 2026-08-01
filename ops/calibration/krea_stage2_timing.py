@@ -513,10 +513,10 @@ def _probe_command_template(
             typed_fields["expected_repo_name"],
             "--hours-to-complete",
             typed_fields["hours_to_complete"],
-            "--trigger-word",
-            typed_fields["trigger_word"],
         ]
     )
+    if typed_fields["trigger_word"] is not None:
+        command.extend(["--trigger-word", typed_fields["trigger_word"]])
     return command
 
 
@@ -596,7 +596,7 @@ def seal_probe_contract(
     profile_id: str,
     hard_budget_s: float,
     mount_sources: Mapping[str, str],
-    trigger_word: str,
+    trigger_word: str | None,
     bootstrap_steps: int = 34,
 ) -> dict[str, Any]:
     if (
@@ -623,7 +623,12 @@ def seal_probe_contract(
         or training_archive_bytes <= 0
     ):
         raise ValueError("Stage-2 timing training archive byte count is invalid")
-    trigger = _safe_id(trigger_word, "timing trigger word")
+    if role in _CONFIRMATION_ROLES:
+        if trigger_word is not None:
+            raise ValueError("legacy confirmation timing must preserve null trigger")
+        trigger = None
+    else:
+        trigger = _safe_id(trigger_word, "timing trigger word")
     slug = role.lower().replace(".", "p")
     task_id = (
         f"forge-stage2-timing-{slug}-{profile_id.lower()}-h{hours_label}-g{gpu_device}"
@@ -788,6 +793,7 @@ def _admission_controls(
     value: Any,
     *,
     fixture: Mapping[str, Any],
+    fixture_control: Mapping[str, Any],
     fixture_file_sha256: str,
     fixture_file_bytes: int,
     identity: Mapping[str, Any],
@@ -842,12 +848,26 @@ def _admission_controls(
         raise ValueError("timing fixture is absent from exact admitted materialization")
     request = records["request"]
     if role in _CONFIRMATION_ROLES:
-        if request["public_commitment_sha256s"][role] != fixture_file_sha256:
+        if fixture_control.get("kind") == (
+            "forge-krea-stage2-legacy-confirmation-wrapper"
+        ):
+            committed_sha256 = _sha(
+                _object(
+                    fixture_control.get("published_checksum_manifest"),
+                    "legacy published checksum manifest",
+                ).get("file_sha256"),
+                "legacy published checksum manifest file",
+            )
+            commitment_mode = "legacy_confirmation_checksum_manifest_file_sha256"
+        else:
+            committed_sha256 = fixture_file_sha256
+            commitment_mode = "confirmation_manifest_file_sha256"
+        if request["public_commitment_sha256s"][role] != committed_sha256:
             raise ValueError("confirmation timing fixture differs from its commitment")
         fixture_commitment = {
-            "mode": "confirmation_manifest_file_sha256",
+            "mode": commitment_mode,
             "role": role,
-            "sha256": fixture_file_sha256,
+            "sha256": committed_sha256,
         }
     elif (
         request["boundary_fixture_manifest_sha256s"].get(role)
@@ -893,6 +913,21 @@ def _profile_binding(profile_id: str) -> tuple[Any, dict[str, Any]]:
         "throughput_equivalence_class": frozen.throughput_equivalence_class,
         "frozen_record_sha256": krea_provenance.canonical_sha256(record),
     }
+
+
+def _training_pair_count(fixture: Mapping[str, Any]) -> int:
+    rows = fixture.get("training_rows")
+    if rows is None and (
+        fixture.get("legacy_wrapper_sha256") is not None
+        and fixture.get("original_fixture_manifest_reconstructed") is False
+    ):
+        rows = _object(
+            fixture.get("training_dataset_identity"),
+            "legacy training dataset identity",
+        ).get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("timing fixture has no exact training-pair identity")
+    return len(rows)
 
 
 def _normalize_controls(value: Any) -> dict[str, Any]:
@@ -957,6 +992,7 @@ def _normalize_controls(value: Any) -> dict[str, Any]:
         authority, authority_binding = _admission_controls(
             authority,
             fixture=fixture,
+            fixture_control=fixture_control,
             fixture_file_sha256=controls["fixture_manifest_file_sha256"],
             fixture_file_bytes=fixture_bytes,
             identity=identity,
@@ -995,7 +1031,7 @@ def _execution_envelope(*, frozen: Any, controls: Mapping[str, Any]) -> dict[str
         loss=frozen.loss,
         differential_guidance_enabled=True,
         guidance_scale=frozen.guidance,
-        training_pair_count=len(fixture["training_rows"]),
+        training_pair_count=_training_pair_count(fixture),
         training_dataset_shape_sha256=fixture["training_dataset_shape_sha256"],
         micro_batch_size=1,
         gradient_accumulation_steps=1,
@@ -1094,7 +1130,7 @@ def build_plan(
         ),
         "fixture_manifest_file_bytes": resolved["fixture_manifest_file_bytes"],
         "fixture_role": fixture["experimental_role"],
-        "training_pair_count": len(fixture["training_rows"]),
+        "training_pair_count": _training_pair_count(fixture),
         "training_dataset_shape_sha256": fixture["training_dataset_shape_sha256"],
         "calibration_profile": profile,
         "execution_envelope": envelope,
@@ -1233,6 +1269,7 @@ def validate_plan(value: Any) -> dict[str, Any]:
         _exact(commitment, {"mode", "role", "sha256"}, "fixture commitment")
         if commitment["role"] != role or commitment["mode"] not in {
             "confirmation_manifest_file_sha256",
+            "legacy_confirmation_checksum_manifest_file_sha256",
             "boundary_manifest_semantic_sha256",
         }:
             raise ValueError("Stage-2 timing fixture commitment differs")

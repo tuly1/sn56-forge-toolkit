@@ -17,6 +17,7 @@ from ops.calibration import krea_density_seedb_freeze as density_freeze
 from ops.calibration import krea_stage2_admission_chain as chain
 from ops.calibration import krea_stage2_production_identity as production
 from ops.calibration import krea_stage2_legacy_confirmation as legacy
+from ops.calibration import krea_stage2_timing as timing
 
 
 def _sha(label: str) -> str:
@@ -606,6 +607,41 @@ def test_legacy_wrapper_rejects_an_invented_postfreeze_trigger(
     wrapper["wrapper_sha256"] = chain.canonical_sha256(body)
     with pytest.raises(ValueError, match="wrapper contract drifted"):
         legacy.validate_wrapper(wrapper)
+
+
+def test_timing_authority_binds_legacy_checksum_without_impersonating_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec, _ = _case(tmp_path, monkeypatch)
+    output = tmp_path / "authority"
+    chain.admit(spec_path=spec, output_dir=output)
+    authority = json.loads((output / "authority-bundle.json").read_bytes())
+    role_root = output / "materialized" / "C1"
+    wrapper_path = role_root / legacy.WRAPPER_NAME
+    wrapper = json.loads(wrapper_path.read_bytes())
+    wrapper = legacy.validate_wrapper_file(wrapper=wrapper, role_root=role_root)
+    fixture = legacy.score_view(wrapper)
+    assert timing._training_pair_count(fixture) == len(
+        wrapper["training_dataset_identity"]["rows"]
+    )
+    content_controls = {
+        key: authority[key]
+        for key in timing._ADMISSION_CONTROL_KEYS
+    }
+    _, binding = timing._admission_controls(
+        content_controls,
+        fixture=fixture,
+        fixture_control=wrapper,
+        fixture_file_sha256=hashlib.sha256(wrapper_path.read_bytes()).hexdigest(),
+        fixture_file_bytes=wrapper_path.stat().st_size,
+        identity=authority["production_identity"],
+        identity_file_sha256=authority["production_identity_file_sha256"],
+    )
+    assert binding["fixture_commitment"] == {
+        "mode": "legacy_confirmation_checksum_manifest_file_sha256",
+        "role": "C1",
+        "sha256": wrapper["published_checksum_manifest"]["file_sha256"],
+    }
 
 
 def test_policy_and_ratification_truthfully_disclose_post_freeze_custodian_read(
