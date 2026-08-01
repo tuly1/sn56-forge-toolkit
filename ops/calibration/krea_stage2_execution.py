@@ -23,7 +23,7 @@ import re
 import stat
 import subprocess
 import sys
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from forge import krea_calibration_profiles, recipe
 
@@ -36,6 +36,7 @@ try:
     from . import krea_stage2_production_identity
     from . import krea_stage2_admission_chain
     from . import krea_stage2_legacy_confirmation
+    from . import krea_stage2_timing
     from . import krea_waiver_finalist_freeze
 except ImportError:  # pragma: no cover - direct CLI execution.
     import krea_confirmation_admission  # type: ignore[no-redef]
@@ -46,6 +47,7 @@ except ImportError:  # pragma: no cover - direct CLI execution.
     import krea_stage2_production_identity  # type: ignore[no-redef]
     import krea_stage2_admission_chain  # type: ignore[no-redef]
     import krea_stage2_legacy_confirmation  # type: ignore[no-redef]
+    import krea_stage2_timing  # type: ignore[no-redef]
     import krea_waiver_finalist_freeze  # type: ignore[no-redef]
 
 
@@ -1460,15 +1462,144 @@ def _validate_live_throughput_environment(
         or profile.profile_sha256 != binding["profile_sha256"]
     ):
         raise ValueError("live throughput profile binding drifted")
+    measured_host, measured_gpu_sha, probe_checkpoint_device = (
+        _load_bound_timing_probe_environment(
+            profile_path=Path(binding["path"]),
+            profile_record=record,
+            profile_file_sha256=file_sha,
+        )
+    )
     host = live_stage2_host_identity(checkpoint_mount)
     gpu = live_stage2_gpu_identity(gpu_device)
     envelope = profile.execution_envelope
+    stable_host_fields = {
+        key: value
+        for key, value in host.items()
+        if key not in {"checkpoint_device", "host_execution_identity_sha256"}
+    }
+    measured_stable_host_fields = {
+        key: value
+        for key, value in measured_host.items()
+        if key not in {"checkpoint_device", "host_execution_identity_sha256"}
+    }
     if (
         envelope.host_execution_identity_sha256
-        != host["host_execution_identity_sha256"]
+        != measured_host["host_execution_identity_sha256"]
+        or stable_host_fields != measured_stable_host_fields
+        or host["checkpoint_device"] != probe_checkpoint_device
+        or envelope.gpu_identity_sha256 != measured_gpu_sha
         or envelope.gpu_identity_sha256 != gpu["gpu_identity_sha256"]
     ):
         raise ValueError("live host/GPU differs from the measured timing envelope")
+
+
+def _load_bound_timing_probe_environment(
+    *,
+    profile_path: Path,
+    profile_record: Mapping[str, Any],
+    profile_file_sha256: str,
+) -> tuple[dict[str, Any], str, dict[str, int]]:
+    """Recover the actual probe mount from its fully bound timing evidence.
+
+    Older timing capture recorded the host receipt against the persistent
+    evidence directory even though the probe wrote checkpoints to ephemeral
+    storage.  The timing bundle and its exact probe contract are authoritative:
+    this loader validates both and returns the device of the probe's real
+    checkpoint source without weakening any other host or GPU identity axis.
+    """
+
+    source = Path(os.path.abspath(os.path.expanduser(profile_path)))
+    bundle_root = source.parent
+    if (
+        source.name != "throughput-profile.json"
+        or bundle_root.parent.name != "bundles"
+    ):
+        raise ValueError("live throughput profile is outside a timing bundle")
+    loaded = krea_stage2_timing.load_timing_bundle(bundle_root)
+    if (
+        loaded["root"] != str(bundle_root)
+        or loaded["throughput_profile"] != dict(profile_record)
+        or krea_provenance.file_sha256(source) != profile_file_sha256
+    ):
+        raise ValueError("live throughput profile escaped its timing bundle")
+    timing_plan = krea_stage2_timing.validate_plan(loaded["plan"])
+
+    timing_root = bundle_root.parent.parent
+    prepared_root = timing_root / "prepared"
+    if prepared_root.is_symlink() or not prepared_root.is_dir():
+        raise ValueError("timing probe controls directory is unavailable")
+    probe_binding = _object(timing_plan["probe_contract"], "timing probe binding")
+    target_file_sha = _sha(probe_binding["file_sha256"], "timing probe binding file")
+    matches: list[tuple[Path, dict[str, Any]]] = []
+    for candidate_root in prepared_root.iterdir():
+        if candidate_root.is_symlink() or not candidate_root.is_dir():
+            raise ValueError("timing probe controls inventory is not real directories")
+        candidate = candidate_root / "probe-contract.json"
+        if not candidate.exists():
+            continue
+        probe, candidate_sha = _canonical_json_file(candidate, "timing probe contract")
+        if candidate_sha == target_file_sha:
+            matches.append((candidate_root, probe))
+    if len(matches) != 1:
+        raise ValueError("timing probe binding does not resolve exactly once")
+    prepared, probe = matches[0]
+    controls, _ = _canonical_json_file(
+        prepared / "timing-controls.json", "timing probe controls"
+    )
+    prepared_plan, prepared_plan_sha = _canonical_json_file(
+        prepared / "timing-plan.json", "prepared timing plan"
+    )
+    bundle_plan_path = bundle_root / "timing-plan.json"
+    _, bundle_plan_sha = _canonical_json_file(bundle_plan_path, "bundle timing plan")
+    if prepared_plan != timing_plan or prepared_plan_sha != bundle_plan_sha:
+        raise ValueError("prepared timing plan differs from its sealed bundle")
+    krea_stage2_timing.validate_plan_with_controls(timing_plan, controls=controls)
+    probe = krea_stage2_timing.validate_probe_contract(probe, plan=timing_plan)
+    if (
+        controls.get("probe_contract") != probe
+        or controls.get("probe_contract_file_sha256") != target_file_sha
+        or probe.get("probe_contract_sha256")
+        != probe_binding.get("probe_contract_sha256")
+    ):
+        raise ValueError("timing probe contract differs from bound controls")
+
+    measured_host = _object(
+        controls.get("live_host_identity"), "timing host identity"
+    )
+    host_body = {
+        key: value
+        for key, value in measured_host.items()
+        if key != "host_execution_identity_sha256"
+    }
+    expected_host_sha = krea_provenance.canonical_sha256(host_body)
+    expected_host_file_sha = hashlib.sha256(
+        krea_provenance.canonical_bytes(measured_host) + b"\n"
+    ).hexdigest()
+    live_host_binding = _object(timing_plan["live_host_receipt"], "timing host binding")
+    if (
+        measured_host.get("host_execution_identity_sha256") != expected_host_sha
+        or controls.get("live_host_identity_file_sha256") != expected_host_file_sha
+        or live_host_binding
+        != {
+            "file_sha256": expected_host_file_sha,
+            "host_execution_identity_sha256": expected_host_sha,
+        }
+    ):
+        raise ValueError("timing host identity differs from its sealed plan")
+
+    measured_gpu = _object(controls.get("live_gpu_identity"), "timing GPU identity")
+    gpu_sha = _sha(measured_gpu.get("gpu_identity_sha256"), "timing GPU identity")
+    if timing_plan["live_gpu_receipt"].get("gpu_identity_sha256") != gpu_sha:
+        raise ValueError("timing GPU identity differs from its sealed plan")
+
+    checkpoint_mounts = [
+        row for row in probe["mounts"] if row.get("purpose") == "checkpoints"
+    ]
+    if len(checkpoint_mounts) != 1:
+        raise ValueError("timing probe checkpoint mount is not unique")
+    probe_source = Path(checkpoint_mounts[0]["source_root"])
+    probe_identity = live_stage2_host_identity(probe_source)
+    return measured_host, gpu_sha, probe_identity["checkpoint_device"]
 
 
 def _validate_live_base_assets(

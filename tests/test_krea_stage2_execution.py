@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import struct
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,213 @@ def _sha(label: str) -> str:
 
 def _binding(label: str, semantic_key: str) -> dict[str, str]:
     return {"file_sha256": _sha(f"{label}-file"), semantic_key: _sha(label)}
+
+
+def _host_identity(*, device: int, machine: str = "x86_64") -> dict:
+    body = {
+        "schema": 1,
+        "kind": "forge-krea-stage2-live-host-identity",
+        "machine_id_sha256": _sha("machine"),
+        "boot_id_sha256": _sha("boot"),
+        "kernel_release": "6.8.0-test",
+        "machine": machine,
+        "cpu_affinity_ids": [0, 1],
+        "memory_total_bytes": 1024,
+        "checkpoint_device": {
+            "st_dev": device,
+            "major": 253,
+            "minor": device,
+        },
+    }
+    return {
+        **body,
+        "host_execution_identity_sha256": krea_provenance.canonical_sha256(body),
+    }
+
+
+def test_live_throughput_gate_uses_actual_probe_checkpoint_device(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile_path = tmp_path / "throughput-profile.json"
+    profile_path.write_text("{}\n", encoding="utf-8")
+    measured = _host_identity(device=32)
+    current = _host_identity(device=16)
+    gpu_sha = _sha("gpu")
+    envelope = SimpleNamespace(
+        host_execution_identity_sha256=measured["host_execution_identity_sha256"],
+        gpu_identity_sha256=gpu_sha,
+    )
+    monkeypatch.setattr(stage2, "_canonical_json_file", lambda *_args: ({}, "f" * 64))
+    monkeypatch.setattr(
+        stage2.krea_budget,
+        "load_throughput_profile",
+        lambda _record: SimpleNamespace(
+            profile_sha256="p" * 64, execution_envelope=envelope
+        ),
+    )
+    monkeypatch.setattr(
+        stage2,
+        "_load_bound_timing_probe_environment",
+        lambda **_kwargs: (measured, gpu_sha, current["checkpoint_device"]),
+    )
+    monkeypatch.setattr(stage2, "live_stage2_host_identity", lambda _path: current)
+    monkeypatch.setattr(
+        stage2,
+        "live_stage2_gpu_identity",
+        lambda _gpu: {"gpu_identity_sha256": gpu_sha},
+    )
+    plan = {
+        "execution_environment_profile": {
+            "path": str(profile_path),
+            "file_sha256": "f" * 64,
+            "profile_sha256": "p" * 64,
+        }
+    }
+    stage2._validate_live_throughput_environment(
+        plan, checkpoint_mount=tmp_path, gpu_device=0
+    )
+
+    persistent = _host_identity(device=32)
+    monkeypatch.setattr(stage2, "live_stage2_host_identity", lambda _path: persistent)
+    with pytest.raises(ValueError, match="measured timing envelope"):
+        stage2._validate_live_throughput_environment(
+            plan, checkpoint_mount=tmp_path, gpu_device=0
+        )
+
+
+def test_live_throughput_gate_rejects_non_device_host_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    measured = _host_identity(device=32)
+    current = _host_identity(device=16, machine="aarch64")
+    gpu_sha = _sha("gpu")
+    monkeypatch.setattr(stage2, "_canonical_json_file", lambda *_args: ({}, "f" * 64))
+    monkeypatch.setattr(
+        stage2.krea_budget,
+        "load_throughput_profile",
+        lambda _record: SimpleNamespace(
+            profile_sha256="p" * 64,
+            execution_envelope=SimpleNamespace(
+                host_execution_identity_sha256=measured[
+                    "host_execution_identity_sha256"
+                ],
+                gpu_identity_sha256=gpu_sha,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        stage2,
+        "_load_bound_timing_probe_environment",
+        lambda **_kwargs: (measured, gpu_sha, current["checkpoint_device"]),
+    )
+    monkeypatch.setattr(stage2, "live_stage2_host_identity", lambda _path: current)
+    monkeypatch.setattr(
+        stage2,
+        "live_stage2_gpu_identity",
+        lambda _gpu: {"gpu_identity_sha256": gpu_sha},
+    )
+    plan = {
+        "execution_environment_profile": {
+            "path": str(tmp_path / "throughput-profile.json"),
+            "file_sha256": "f" * 64,
+            "profile_sha256": "p" * 64,
+        }
+    }
+    with pytest.raises(ValueError, match="measured timing envelope"):
+        stage2._validate_live_throughput_environment(
+            plan, checkpoint_mount=tmp_path, gpu_device=0
+        )
+
+
+def test_bound_timing_probe_rejects_path_and_hash_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = {"profile_sha256": _sha("profile")}
+    outside = tmp_path / "outside" / "throughput-profile.json"
+    outside.parent.mkdir()
+    outside.write_bytes(krea_provenance.canonical_bytes(profile) + b"\n")
+    with pytest.raises(ValueError, match="outside a timing bundle"):
+        stage2._load_bound_timing_probe_environment(
+            profile_path=outside,
+            profile_record=profile,
+            profile_file_sha256=krea_provenance.file_sha256(outside),
+        )
+
+    root = tmp_path / "timing"
+    bundle = root / "bundles" / "cell"
+    prepared = root / "prepared" / "cell"
+    bundle.mkdir(parents=True)
+    prepared.mkdir(parents=True)
+    profile_path = bundle / "throughput-profile.json"
+    profile_path.write_bytes(krea_provenance.canonical_bytes(profile) + b"\n")
+    measured = _host_identity(device=32)
+    probe = {
+        "probe_contract_sha256": _sha("probe"),
+        "mounts": [
+            {
+                "purpose": "checkpoints",
+                "source_root": str(tmp_path / "probe-checkpoints"),
+            }
+        ],
+    }
+    probe_bytes = krea_provenance.canonical_bytes(probe) + b"\n"
+    probe_file_sha = __import__("hashlib").sha256(probe_bytes).hexdigest()
+    timing_plan = {
+        "probe_contract": {
+            "file_sha256": probe_file_sha,
+            "probe_contract_sha256": probe["probe_contract_sha256"],
+        },
+        "live_host_receipt": {
+            "file_sha256": __import__("hashlib")
+            .sha256(krea_provenance.canonical_bytes(measured) + b"\n")
+            .hexdigest(),
+            "host_execution_identity_sha256": measured[
+                "host_execution_identity_sha256"
+            ],
+        },
+        "live_gpu_receipt": {"gpu_identity_sha256": _sha("gpu")},
+    }
+    for path in (bundle / "timing-plan.json", prepared / "timing-plan.json"):
+        path.write_bytes(krea_provenance.canonical_bytes(timing_plan) + b"\n")
+    (prepared / "probe-contract.json").write_bytes(probe_bytes)
+    controls = {
+        "probe_contract": probe,
+        "probe_contract_file_sha256": "0" * 64,
+        "live_host_identity": measured,
+        "live_host_identity_file_sha256": timing_plan["live_host_receipt"][
+            "file_sha256"
+        ],
+        "live_gpu_identity": {"gpu_identity_sha256": _sha("gpu")},
+    }
+    (prepared / "timing-controls.json").write_bytes(
+        krea_provenance.canonical_bytes(controls) + b"\n"
+    )
+    monkeypatch.setattr(
+        stage2.krea_stage2_timing,
+        "load_timing_bundle",
+        lambda _root: {
+            "root": str(bundle),
+            "throughput_profile": profile,
+            "plan": timing_plan,
+        },
+    )
+    monkeypatch.setattr(stage2.krea_stage2_timing, "validate_plan", lambda value: value)
+    monkeypatch.setattr(
+        stage2.krea_stage2_timing,
+        "validate_plan_with_controls",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        stage2.krea_stage2_timing,
+        "validate_probe_contract",
+        lambda value, **_kwargs: value,
+    )
+    with pytest.raises(ValueError, match="differs from bound controls"):
+        stage2._load_bound_timing_probe_environment(
+            profile_path=profile_path,
+            profile_record=profile,
+            profile_file_sha256=krea_provenance.file_sha256(profile_path),
+        )
 
 
 _TEST_BASE = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=5)
