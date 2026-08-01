@@ -55,6 +55,24 @@ _STAGE2_BOUNDARY_ROLE_COUNTS = {
     "B-1-small": ((18, 24), (24, 24)),
     "B-1-large": ((36, 48), (40, 40)),
 }
+_STAGE2_BOUNDARY_SOURCE_ROLES = {
+    "B-0p5-small": "D1",
+    "B-0p5-large": "D2",
+    "B-0p75-small": "D1",
+    "B-0p75-large": "D2",
+    "B-1-small": "D1",
+    "B-1-large": "D2",
+}
+_STAGE2_BOUNDARY_DERIVATION_MODE = (
+    "byte-identical-admitted-discovery-fixture-mechanics-only-v1"
+)
+_STAGE2_BOUNDARY_DERIVATION_CLAIM_LIMIT = (
+    "mechanics-only-byte-preserving-derivation-from-an-owner-admitted-D1-or-D2-"
+    "fixture;source-governance-and-approval-remain-evidence-only-and-do-not-"
+    "authorize-the-boundary-role;fresh-Stage-2-owner-ratification-and-GPU-"
+    "authorization-remain-required;not-competitiveness-release-or-deployment-"
+    "evidence"
+)
 _ROLE_COUNTS = {**_DISCOVERY_ROLE_COUNTS, **_CONFIRMATION_ROLE_COUNTS}
 _CROSS_FIXTURE_ROLES = ("D1", "D2", "C1", "C2", "C3", "C4")
 _BASE_GROUP_FIELDS = frozenset(
@@ -1520,6 +1538,151 @@ def _validate_agent_governed_manifest(manifest: dict[str, Any]) -> dict[str, Any
     return manifest
 
 
+def _validate_stage2_boundary_derived_manifest(
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate a truthful, mechanics-only D1/D2 boundary derivation.
+
+    The embedded source governance and approval are deliberately kept under
+    ``source_*`` names.  They prove the source fixture was admitted; they are
+    never represented as authorizing the new boundary role.  Reconstructing
+    and validating the exact source schema-2 document makes every dataset,
+    archive, caption, rights, and leakage byte immutable across derivation.
+    """
+
+    expected = {
+        "schema",
+        "kind",
+        "concept_id",
+        "experimental_role",
+        "trigger_token",
+        "caption_policy",
+        "source_rights",
+        "preparer_identity",
+        "training_archive",
+        "training_archive_identity",
+        "training_dataset_identity",
+        "evaluation_dataset_identity",
+        "training_dataset_shape_sha256",
+        "evaluation_dataset_shape_sha256",
+        "training_rows",
+        "evaluation_rows",
+        "tool_identity",
+        "near_duplicate_policy",
+        "source_governance",
+        "source_approval",
+        "boundary_derivation",
+        "manifest_sha256",
+    }
+    _exact(manifest, expected, "Stage-2 boundary-derived fixture manifest")
+    body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    if (
+        manifest["schema"] != 3
+        or manifest["kind"] != "forge-krea-curated-fixture"
+        or manifest["manifest_sha256"] != krea_provenance.canonical_sha256(body)
+    ):
+        raise ValueError("Stage-2 boundary-derived manifest digest mismatch")
+
+    role = manifest["experimental_role"]
+    source_role = _STAGE2_BOUNDARY_SOURCE_ROLES.get(role)
+    if source_role is None:
+        raise ValueError("schema-3 fixture must use an exact Stage-2 boundary role")
+    _validate_role_counts(
+        role, len(manifest["training_rows"]), len(manifest["evaluation_rows"])
+    )
+
+    derivation = _object(manifest["boundary_derivation"], "boundary derivation")
+    _exact(
+        derivation,
+        {
+            "mode",
+            "source_role",
+            "source_manifest_file_sha256",
+            "source_manifest_sha256",
+            "source_approval_file_sha256",
+            "source_approval_sha256",
+            "public_freeze_binding",
+            "actor",
+            "fixture_bytes_changed",
+            "group_evidence_changed",
+            "source_governance_is_evidence_only",
+            "source_governance_authorizes_boundary",
+            "source_approval_authorizes_boundary",
+            "fresh_stage2_owner_ratification_required",
+            "boundary_admission_authorized",
+            "gpu_execution_authorized",
+            "science_selection_input",
+            "claim_limit",
+        },
+        "boundary derivation",
+    )
+    freeze = _object(
+        derivation["public_freeze_binding"], "boundary public-freeze binding"
+    )
+    _exact(
+        freeze,
+        {"path", "file_sha256", "binding_sha256", "commit_sha1"},
+        "boundary public-freeze binding",
+    )
+    _text(freeze["path"], "boundary public-freeze path")
+    if not isinstance(freeze["commit_sha1"], str) or not re.fullmatch(
+        r"[0-9a-f]{40}", freeze["commit_sha1"]
+    ):
+        raise ValueError("boundary public-freeze commit is invalid")
+    for key in (
+        "source_manifest_file_sha256",
+        "source_manifest_sha256",
+        "source_approval_file_sha256",
+        "source_approval_sha256",
+    ):
+        _digest(derivation[key], f"boundary derivation {key}")
+    for key in ("file_sha256", "binding_sha256"):
+        _digest(freeze[key], f"boundary public-freeze {key}")
+    _agent_actor(derivation["actor"], "boundary derivation actor")
+    if (
+        derivation["mode"] != _STAGE2_BOUNDARY_DERIVATION_MODE
+        or derivation["source_role"] != source_role
+        or derivation["fixture_bytes_changed"] is not False
+        or derivation["group_evidence_changed"] is not False
+        or derivation["source_governance_is_evidence_only"] is not True
+        or derivation["source_governance_authorizes_boundary"] is not False
+        or derivation["source_approval_authorizes_boundary"] is not False
+        or derivation["fresh_stage2_owner_ratification_required"] is not True
+        or derivation["boundary_admission_authorized"] is not False
+        or derivation["gpu_execution_authorized"] is not False
+        or derivation["science_selection_input"] is not False
+        or derivation["claim_limit"] != _STAGE2_BOUNDARY_DERIVATION_CLAIM_LIMIT
+    ):
+        raise ValueError("Stage-2 boundary derivation overstates its authority")
+
+    # Recover the exact admitted source fixture.  In particular, a D2-derived
+    # large boundary retains the stronger play/accession grouping and its
+    # already-reviewed report; dropping those fields would fail this equality.
+    source = deepcopy(manifest)
+    source.pop("boundary_derivation")
+    source["governance"] = source.pop("source_governance")
+    source.pop("source_approval")
+    source["schema"] = 2
+    source["experimental_role"] = source_role
+    source["manifest_sha256"] = derivation["source_manifest_sha256"]
+    _validate_agent_governed_manifest(source)
+    if (
+        hashlib.sha256(krea_provenance.canonical_bytes(source) + b"\n").hexdigest()
+        != derivation["source_manifest_file_sha256"]
+    ):
+        raise ValueError("boundary derivation source-manifest file binding drifted")
+    approval = _validate_agent_governed_approval(
+        manifest["source_approval"], fixture_manifest=source
+    )
+    if (
+        approval["approval_sha256"] != derivation["source_approval_sha256"]
+        or hashlib.sha256(krea_provenance.canonical_bytes(approval) + b"\n").hexdigest()
+        != derivation["source_approval_file_sha256"]
+    ):
+        raise ValueError("boundary derivation source-approval binding drifted")
+    return manifest
+
+
 def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     """Dispatch without weakening the legacy named-human contract."""
 
@@ -1528,6 +1691,8 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         return _validate_legacy_manifest(manifest)
     if manifest.get("schema") == 2:
         return _validate_agent_governed_manifest(manifest)
+    if manifest.get("schema") == 3:
+        return _validate_stage2_boundary_derived_manifest(manifest)
     raise ValueError("unsupported fixture manifest")
 
 

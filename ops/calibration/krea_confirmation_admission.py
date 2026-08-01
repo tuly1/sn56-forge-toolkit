@@ -2,8 +2,9 @@
 
 Public governance is validated first.  Ratification and reveal authorization
 may resolve the opaque sealed-root locator only after that validation; neither
-operation reads a file below it.  ``materialize`` is the sole function in this
-module that calls the sealed-file reader.
+operation reads a file below it.  The post-freeze inventory materialization
+and final content materialization are the only operations that call the sealed
+file reader.  The former emits byte identities only, never fixture payloads.
 """
 
 from __future__ import annotations
@@ -20,10 +21,14 @@ import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
 try:
+    from . import krea_fixture
+    from . import krea_stage2_boundary_derivation
     from . import krea_stage2_delegated_review_contract
     from . import krea_stage2_execution_surface_policy
     from . import krea_stage2_production_identity
 except ImportError:  # pragma: no cover - direct script execution.
+    import krea_fixture  # type: ignore[no-redef]
+    import krea_stage2_boundary_derivation  # type: ignore[no-redef]
     import krea_stage2_delegated_review_contract  # type: ignore[no-redef]
     import krea_stage2_execution_surface_policy  # type: ignore[no-redef]
     import krea_stage2_production_identity  # type: ignore[no-redef]
@@ -34,6 +39,7 @@ RATIFICATION_KIND = "forge-krea-stage2-owner-ratification"
 REVEAL_KIND = "forge-krea-stage2-confirmation-reveal-authorization"
 MATERIALIZATION_KIND = "forge-krea-stage2-confirmation-materialization"
 GPU_AUTHORIZATION_KIND = "forge-krea-stage2-gpu-execution-authorization"
+POSTFREEZE_INVENTORY_KIND = "forge-krea-stage2-postfreeze-sealed-inventory"
 SCHEMA = 1
 OWNER_IDENTITY = "Atulya Shetty"
 _CONFIRMATION_ROLES = ("C1", "C2", "C3", "C4")
@@ -628,7 +634,7 @@ def authorize_reveal(
 
 
 def _read_sealed_file(root: Path, relative: str) -> bytes:
-    """The single sealed-content read primitive; called only by materialize."""
+    """Sealed-content primitive used only by materialization operations."""
 
     path = root.joinpath(*PurePosixPath(relative).parts)
     current = path
@@ -645,6 +651,252 @@ def _read_sealed_file(root: Path, relative: str) -> bytes:
     if identity(before) != identity(after):
         raise RuntimeError(f"sealed file changed while read: {relative}")
     return raw
+
+
+def _postfreeze_inventory_body(
+    *,
+    public_commitment_sha256s: Mapping[str, str],
+    boundary_fixture_manifest_sha256s: Mapping[str, str],
+    boundary_fixture_manifest_file_sha256s: Mapping[str, str],
+    actor: Mapping[str, Any],
+    captured_at_utc: str,
+    sealed_root_locator_sha256_value: str,
+    files: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    commitments = _role_digests(
+        dict(public_commitment_sha256s),
+        roles=_CONFIRMATION_ROLES,
+        label="public commitment hashes",
+    )
+    boundary_semantic = _role_digests(
+        dict(boundary_fixture_manifest_sha256s),
+        roles=_BOUNDARY_ROLES,
+        label="boundary fixture manifest hashes",
+    )
+    boundary_files = _role_digests(
+        dict(boundary_fixture_manifest_file_sha256s),
+        roles=_BOUNDARY_ROLES,
+        label="boundary fixture manifest file hashes",
+    )
+    materializer = krea_stage2_delegated_review_contract.validate_actor(
+        "confirmation_materialization_reviewer", dict(actor)
+    )
+    rows = _sealed_files([dict(row) for row in files])
+    return {
+        "schema": SCHEMA,
+        "kind": POSTFREEZE_INVENTORY_KIND,
+        "captured_at_utc": _utc(captured_at_utc, "post-freeze inventory capture time"),
+        "public_freeze_binding": {
+            "path": krea_stage2_boundary_derivation.FREEZE_BINDING_PATH,
+            "file_sha256": (krea_stage2_boundary_derivation.FREEZE_BINDING_FILE_SHA256),
+            "binding_sha256": (krea_stage2_boundary_derivation.FREEZE_BINDING_SHA256),
+            "commit_sha1": krea_stage2_boundary_derivation.FREEZE_BINDING_COMMIT,
+            "remote_reachable": True,
+        },
+        "actor": materializer,
+        "sealed_root_locator_sha256": _digest(
+            sealed_root_locator_sha256_value, "sealed root locator SHA-256"
+        ),
+        "public_commitment_sha256s": commitments,
+        "boundary_fixture_manifest_sha256s": boundary_semantic,
+        "boundary_fixture_manifest_file_sha256s": boundary_files,
+        "files": rows,
+        "file_set_sha256": canonical_sha256(rows),
+        "role_file_counts": {
+            role: sum(row["role"] == role for row in rows) for role in _ALL_ROLES
+        },
+        "fixture_payload_bytes_emitted": False,
+        "path_and_digest_metadata_only": True,
+        "admission_authorized": False,
+        "gpu_execution_authorized": False,
+        "claim_limit": (
+            "post-finalist-freeze-private-inventory-materialization-only;contains-"
+            "paths-sizes-and-digests-but-no-image-caption-or-manifest-payloads;not-"
+            "admission-GPU-release-deployment-or-competitiveness-authority"
+        ),
+    }
+
+
+def validate_postfreeze_inventory(value: Any) -> dict[str, Any]:
+    record = _object(value, "post-freeze sealed inventory")
+    _exact(
+        record,
+        {
+            "schema",
+            "kind",
+            "captured_at_utc",
+            "public_freeze_binding",
+            "actor",
+            "sealed_root_locator_sha256",
+            "public_commitment_sha256s",
+            "boundary_fixture_manifest_sha256s",
+            "boundary_fixture_manifest_file_sha256s",
+            "files",
+            "file_set_sha256",
+            "role_file_counts",
+            "fixture_payload_bytes_emitted",
+            "path_and_digest_metadata_only",
+            "admission_authorized",
+            "gpu_execution_authorized",
+            "claim_limit",
+            "inventory_sha256",
+        },
+        "post-freeze sealed inventory",
+    )
+    body = {key: item for key, item in record.items() if key != "inventory_sha256"}
+    expected = _postfreeze_inventory_body(
+        public_commitment_sha256s=record["public_commitment_sha256s"],
+        boundary_fixture_manifest_sha256s=record["boundary_fixture_manifest_sha256s"],
+        boundary_fixture_manifest_file_sha256s=record[
+            "boundary_fixture_manifest_file_sha256s"
+        ],
+        actor=record["actor"],
+        captured_at_utc=record["captured_at_utc"],
+        sealed_root_locator_sha256_value=record["sealed_root_locator_sha256"],
+        files=record["files"],
+    )
+    if body != expected or record["inventory_sha256"] != canonical_sha256(body):
+        raise ValueError("post-freeze sealed inventory drifted")
+    return record
+
+
+def materialize_postfreeze_inventory(
+    *,
+    public_freeze_binding_path: str | Path,
+    remote_reachable_commit_sha1: str,
+    public_commitment_sha256s: Mapping[str, str],
+    boundary_fixture_manifest_sha256s: Mapping[str, str],
+    boundary_fixture_manifest_file_sha256s: Mapping[str, str],
+    sealed_root: str | Path,
+    output_path: str | Path,
+    actor: Mapping[str, Any],
+    captured_at_utc: str,
+) -> dict[str, Any]:
+    """Materialize the exact inventory after the pushed finalist freeze.
+
+    Public/freeze/actor inputs fail before root resolution.  The output is the
+    private path/size/digest inventory needed by ``build_request``; no fixture
+    file payload is copied or emitted.
+    """
+
+    materializer = krea_stage2_delegated_review_contract.validate_actor(
+        "confirmation_materialization_reviewer", dict(actor)
+    )
+    freeze_path = Path(public_freeze_binding_path)
+    if freeze_path.is_symlink() or not freeze_path.is_file():
+        raise ValueError("public finalist-freeze binding is not a regular file")
+    freeze_raw = freeze_path.read_bytes()
+    try:
+        freeze = json.loads(freeze_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("public finalist-freeze binding is not JSON") from exc
+    freeze_file_sha = hashlib.sha256(freeze_raw).hexdigest()
+    if freeze_raw != canonical_bytes(freeze) + b"\n":
+        raise ValueError("public finalist-freeze binding is not canonical JSON")
+    krea_stage2_boundary_derivation.validate_public_freeze_binding(
+        freeze, file_sha256=freeze_file_sha
+    )
+    if (
+        remote_reachable_commit_sha1
+        != krea_stage2_boundary_derivation.FREEZE_BINDING_COMMIT
+    ):
+        raise ValueError("pushed finalist-freeze commit was not observed remotely")
+    if _utc_value(captured_at_utc, "post-freeze inventory capture time") <= _utc_value(
+        freeze["binding_created_at_utc"], "public finalist-freeze binding time"
+    ):
+        raise ValueError("sealed inventory must follow the public finalist freeze")
+    commitments = _role_digests(
+        dict(public_commitment_sha256s),
+        roles=_CONFIRMATION_ROLES,
+        label="public commitment hashes",
+    )
+    boundary_semantic = _role_digests(
+        dict(boundary_fixture_manifest_sha256s),
+        roles=_BOUNDARY_ROLES,
+        label="boundary fixture manifest hashes",
+    )
+    boundary_files = _role_digests(
+        dict(boundary_fixture_manifest_file_sha256s),
+        roles=_BOUNDARY_ROLES,
+        label="boundary fixture manifest file hashes",
+    )
+
+    # First sealed-root interaction.  This is the inventory phase of
+    # materialization and reads bytes only to hash them.
+    root = _resolve_sealed_root(sealed_root)
+    rows: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(
+                f"sealed root contains a symlink: {path.relative_to(root)}"
+            )
+        mode = path.stat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise ValueError(
+                f"sealed root contains a special node: {path.relative_to(root)}"
+            )
+        relative = path.relative_to(root).as_posix()
+        parts = PurePosixPath(relative).parts
+        if not parts or parts[0] not in _ALL_ROLES:
+            raise ValueError("sealed root has a file outside an exact fixture role")
+        raw = _read_sealed_file(root, relative)
+        rows.append(
+            {
+                "role": parts[0],
+                "relative_path": relative,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "bytes": len(raw),
+            }
+        )
+    rows.sort(key=lambda row: (row["role"], row["relative_path"]))
+    rows = _sealed_files(rows)
+    expected_manifest_files = {**commitments, **boundary_files}
+    for role, expected_file_sha in expected_manifest_files.items():
+        matches = [
+            row
+            for row in rows
+            if row["role"] == role and row["sha256"] == expected_file_sha
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{role} committed manifest is absent from sealed inventory"
+            )
+        manifest_raw = _read_sealed_file(root, matches[0]["relative_path"])
+        try:
+            manifest = json.loads(manifest_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{role} committed manifest is not JSON") from exc
+        if manifest_raw != canonical_bytes(manifest) + b"\n":
+            raise ValueError(f"{role} committed manifest is not canonical JSON")
+        manifest = krea_fixture.validate_manifest(manifest)
+        if manifest["experimental_role"] != role:
+            raise ValueError(f"{role} committed manifest role drifted")
+        if role in boundary_semantic and (
+            manifest["manifest_sha256"] != boundary_semantic[role]
+        ):
+            raise ValueError(f"{role} boundary semantic manifest binding drifted")
+
+    body = _postfreeze_inventory_body(
+        public_commitment_sha256s=commitments,
+        boundary_fixture_manifest_sha256s=boundary_semantic,
+        boundary_fixture_manifest_file_sha256s=boundary_files,
+        actor=materializer,
+        captured_at_utc=captured_at_utc,
+        sealed_root_locator_sha256_value=sealed_root_locator_sha256(root),
+        files=rows,
+    )
+    record = {**body, "inventory_sha256": canonical_sha256(body)}
+    validate_postfreeze_inventory(record)
+    output = Path(output_path)
+    _reject_symlink_ancestors(output, "post-freeze inventory output")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("xb") as handle:
+        handle.write(canonical_bytes(record) + b"\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return record
 
 
 def _validate_sealed_tree(root: Path, expected: Sequence[Mapping[str, Any]]) -> None:
