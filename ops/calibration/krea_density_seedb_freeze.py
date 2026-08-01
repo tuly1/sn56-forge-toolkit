@@ -315,7 +315,7 @@ def _validate_binding(value: Any, label: str) -> dict[str, Any]:
     if (
         isinstance(binding["bytes"], bool)
         or not isinstance(binding["bytes"], int)
-        or binding["bytes"] <= 0
+        or binding["bytes"] < 0
     ):
         raise DensitySeedBFreezeError(f"{label} byte count is invalid")
     _digest(binding["file_sha256"], f"{label} file_sha256")

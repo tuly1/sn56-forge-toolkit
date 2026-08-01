@@ -390,6 +390,17 @@ def test_create_only_c_path_and_tampered_binding(
     with pytest.raises(freeze.DensitySeedBFreezeError, match="drifted"):
         freeze._validate_binding(bad, "source")
 
+    empty = tmp_path / "empty.stderr"
+    empty.write_bytes(b"")
+    assert freeze._validate_binding(
+        freeze._binding(empty, "empty stderr"), "empty stderr"
+    )["bytes"] == 0
+    with pytest.raises(freeze.DensitySeedBFreezeError, match="byte count is invalid"):
+        freeze._validate_binding(
+            {**freeze._binding(empty, "empty stderr"), "bytes": -1},
+            "empty stderr",
+        )
+
     body = {
         "schema": freeze.SCHEMA,
         "kind": freeze.FREEZE_KIND,
