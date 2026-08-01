@@ -493,11 +493,11 @@ def _run_one(
     evidence_watch.close()
     if timed_out:
         raise RuntimeError("timing bootstrap exceeded its hard budget")
+    if returncode != 0:
+        raise RuntimeError(f"timing bootstrap Docker command failed: {returncode}")
     events = stream.finish()
     ended_monotonic_ns = time.monotonic_ns()
     ended_unix_ns = time.time_ns()
-    if returncode != 0:
-        raise RuntimeError(f"timing bootstrap Docker command failed: {returncode}")
     _validate_run_outputs(
         plan=plan,
         probe=probe,

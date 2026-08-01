@@ -944,6 +944,13 @@ def test_probe_command_is_exactly_rendered_and_substitutions_fail(
     )
     assert rendered.count(image) == 1
     assert "--mount" in rendered
+    mount_specs = [
+        rendered[index + 1]
+        for index, value in enumerate(rendered[:-1])
+        if value == "--mount"
+    ]
+    assert all(not value.endswith((",rw", ",ro")) for value in mount_specs)
+    assert sum(value.endswith(",readonly") for value in mount_specs) == 3
     assert "device=0" in rendered
     assert "/bin/true" not in probe["command_argv_template"]
     image_index = probe["command_argv_template"].index(image)

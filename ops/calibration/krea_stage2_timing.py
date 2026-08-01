@@ -475,11 +475,13 @@ def _probe_command_template(
             source = _COMMAND_PLACEHOLDERS["checkpoint_source"]
         elif mount["purpose"] == "run_evidence":
             source = _COMMAND_PLACEHOLDERS["evidence_source"]
-        mode = "ro" if mount["read_only"] else "rw"
+        specification = f"type=bind,src={source},dst={mount['destination']}"
+        if mount["read_only"]:
+            specification += ",readonly"
         command.extend(
             [
                 "--mount",
-                f"type=bind,src={source},dst={mount['destination']},{mode}",
+                specification,
             ]
         )
     command.extend(
