@@ -1085,6 +1085,30 @@ def test_stage2_family_is_bound_to_owner_ratified_finalist_freeze() -> None:
         == freeze
     )
 
+    density_body = {
+        **body,
+        "schema": stage2.krea_density_seedb_freeze.SCHEMA,
+        "kind": stage2.krea_density_seedb_freeze.FREEZE_KIND,
+        "claims": stage2.krea_density_seedb_freeze.FALSE_CLAIMS,
+        "authority": stage2.krea_density_seedb_freeze.AUTHORITY,
+    }
+    density_freeze = {
+        **density_body,
+        "freeze_sha256": krea_provenance.canonical_sha256(density_body),
+    }
+    density_request = {
+        "waiver_freeze_sha256": density_freeze["freeze_sha256"],
+        "waiver_freeze_file_sha256": __import__("hashlib")
+        .sha256(krea_provenance.canonical_bytes(density_freeze) + b"\n")
+        .hexdigest(),
+    }
+    assert (
+        stage2._validate_frozen_execution_family(
+            plan, freeze=density_freeze, request=density_request
+        )
+        == density_freeze
+    )
+
     drifted_rules = deepcopy(rules)
     drifted_rules["K1"]["target_fraction"] = 0.5
     drifted_body = {

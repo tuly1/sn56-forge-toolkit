@@ -595,18 +595,24 @@ def _adapt_recovery_index(index: Mapping[str, Any]) -> dict[str, dict[str, Any]]
         expected_final = expected["label"].startswith("final-") or expected["family"] is None
         expected_zero = expected["family"] is None
         ledger_tier = row.get("coverage_tier")
-        expected_ledger_tier = (
-            EXHAUSTIVE_BACKFILL
-            if task_id == RELIEF_TASK_ID
-            else expected["universe_tier"]
-        )
+        if task_id == RELIEF_TASK_ID:
+            # The row was originally scored under the exhaustive ledger and
+            # was later promoted by the authorised density relief.  Both
+            # immutable histories are legitimate inputs; retain whichever
+            # state the receipt-validated index actually records.
+            valid_ledger_tiers = {
+                EXHAUSTIVE_BACKFILL,
+                RELIEF_NEIGHBOR_PROMOTED,
+            }
+        else:
+            valid_ledger_tiers = {expected["universe_tier"]}
         if (
             row.get("fixture_id") != expected["fixture"]
             or row.get("family_id") != expected_family
             or row.get("step") != expected["step"]
             or row.get("is_final") is not expected_final
             or row.get("zero_control") is not expected_zero
-            or ledger_tier != expected_ledger_tier
+            or ledger_tier not in valid_ledger_tiers
             or not isinstance(row.get("selection_eligible"), bool)
         ):
             raise ValueError(f"recovery index target identity differs: {task_id}")
@@ -727,12 +733,12 @@ def _validate_universe_projection(rows: Sequence[Mapping[str, Any]]) -> None:
         _exact(row, _PLAN_ROW_KEYS, f"rows[{index}]")
         if {key: row[key] for key in _UNIVERSE_KEYS} != expected:
             raise ValueError(f"rows[{index}] differs from the canonical Seed-A universe")
-        expected_ledger_tier = (
-            EXHAUSTIVE_BACKFILL
+        valid_ledger_tiers = (
+            {EXHAUSTIVE_BACKFILL, RELIEF_NEIGHBOR_PROMOTED}
             if expected["task_id"] == RELIEF_TASK_ID
-            else expected["universe_tier"]
+            else {expected["universe_tier"]}
         )
-        if row["ledger_coverage_tier"] != expected_ledger_tier:
+        if row["ledger_coverage_tier"] not in valid_ledger_tiers:
             raise ValueError(f"rows[{index}] ledger coverage tier differs")
         if not isinstance(row["selected"], bool):
             raise ValueError(f"rows[{index}].selected must be boolean")

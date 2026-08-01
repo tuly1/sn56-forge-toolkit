@@ -260,6 +260,39 @@ def test_relief_promotion_keeps_logical_and_real_ledger_tiers_distinct(
     assert decision_relief["ledger_coverage_tier"] == gate.EXHAUSTIVE_BACKFILL
 
 
+def test_already_promoted_relief_ledger_tier_is_preserved(
+    recovery_indexes: dict[str, Any],
+) -> None:
+    for index in (recovery_indexes["initial"], recovery_indexes["final"]):
+        _artifact_by_id(index, gate.RELIEF_TASK_ID)["coverage_tier"] = (
+            gate.RELIEF_NEIGHBOR_PROMOTED
+        )
+
+    plan = _plan(recovery_indexes, additional_target_count=0)
+    relief = next(
+        row for row in plan["rows"] if row["task_id"] == gate.RELIEF_TASK_ID
+    )
+    assert relief["ledger_coverage_tier"] == gate.RELIEF_NEIGHBOR_PROMOTED
+    sidecar = gate.build_sidecar(plan)
+    decision = _decision(recovery_indexes, plan, sidecar)
+    decision_relief = next(
+        row
+        for row in decision["candidate_rows_for_krea_decision"]
+        if row["task_id"] == gate.RELIEF_TASK_ID
+    )
+    assert decision_relief["ledger_coverage_tier"] == gate.RELIEF_NEIGHBOR_PROMOTED
+
+
+def test_relief_ledger_rejects_unrecognised_tier(
+    recovery_indexes: dict[str, Any],
+) -> None:
+    _artifact_by_id(recovery_indexes["initial"], gate.RELIEF_TASK_ID)[
+        "coverage_tier"
+    ] = gate.SPARSE_PRIMARY
+    with pytest.raises(ValueError, match="target identity differs"):
+        _plan(recovery_indexes, additional_target_count=0)
+
+
 def test_peak_adjacency_uses_exact_minimum_not_family_uncertainty_band(
     recovery_indexes: dict[str, Any],
 ) -> None:

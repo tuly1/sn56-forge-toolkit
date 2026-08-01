@@ -30,6 +30,7 @@ from forge import krea_calibration_profiles, recipe
 try:
     from . import krea_confirmation_admission
     from . import krea_budget
+    from . import krea_density_seedb_freeze
     from . import krea_fixture
     from . import krea_provenance
     from . import krea_stage2_production_identity
@@ -37,6 +38,7 @@ try:
 except ImportError:  # pragma: no cover - direct CLI execution.
     import krea_confirmation_admission  # type: ignore[no-redef]
     import krea_budget  # type: ignore[no-redef]
+    import krea_density_seedb_freeze  # type: ignore[no-redef]
     import krea_fixture  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_stage2_production_identity  # type: ignore[no-redef]
@@ -1068,19 +1070,31 @@ def _validate_frozen_execution_family(
 
     record = _object(freeze, "waiver finalist freeze")
     body = {key: item for key, item in record.items() if key != "freeze_sha256"}
+    freeze_contract = {
+        krea_waiver_finalist_freeze.FREEZE_KIND: (
+            krea_waiver_finalist_freeze.SCHEMA,
+            krea_waiver_finalist_freeze.FALSE_CLAIMS,
+            krea_waiver_finalist_freeze.AUTHORITY,
+        ),
+        krea_density_seedb_freeze.FREEZE_KIND: (
+            krea_density_seedb_freeze.SCHEMA,
+            krea_density_seedb_freeze.FALSE_CLAIMS,
+            krea_density_seedb_freeze.AUTHORITY,
+        ),
+    }.get(record.get("kind"))
     expected_file_sha = hashlib.sha256(
         krea_provenance.canonical_bytes(record) + b"\n"
     ).hexdigest()
     if (
-        record.get("schema") != krea_waiver_finalist_freeze.SCHEMA
-        or record.get("kind") != krea_waiver_finalist_freeze.FREEZE_KIND
+        freeze_contract is None
+        or record.get("schema") != freeze_contract[0]
         or record.get("freeze_sha256") != krea_provenance.canonical_sha256(body)
         or record.get("freeze_sha256") != request["waiver_freeze_sha256"]
         or expected_file_sha != request["waiver_freeze_file_sha256"]
         or record.get("outcome") != "finalists_frozen"
         or record.get("blockers") != []
-        or record.get("claims") != krea_waiver_finalist_freeze.FALSE_CLAIMS
-        or record.get("authority") != krea_waiver_finalist_freeze.AUTHORITY
+        or record.get("claims") != freeze_contract[1]
+        or record.get("authority") != freeze_contract[2]
     ):
         raise ValueError("waiver finalist freeze differs from owner-ratified bytes")
     finalists = record.get("finalist_family_ids")
