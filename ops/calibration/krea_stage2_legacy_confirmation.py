@@ -37,13 +37,13 @@ WRAPPER_NAME = "legacy-fixture-wrapper.json"
 BLINDED_ACCEPTANCE = {
     "path": (
         "SN56-project/week5-krea-curation-20260729/"
-        "blinded-acceptance-v5.json"
+        "blinded-acceptance-v6.json"
     ),
     "file_sha256": (
-        "94cc99d9d9fb8907fb5eb31ad7933522d48315c3420ab8b2214bf18267719aad"
+        "062634e57fb490c7dbb0deed4eed1c85219f77941c694602fd66e25a14091276"
     ),
     "acceptance_sha256": (
-        "8b185a1291fd52838a4846651d15852612d0760be6ff94f2c4fb3690d1956571"
+        "8b23971ec3dbe8c26c661f260b73a8324874b6c94e8b0e39085c17c2696da8fc"
     ),
 }
 PRIOR_SEMANTIC_SHA256S = {
