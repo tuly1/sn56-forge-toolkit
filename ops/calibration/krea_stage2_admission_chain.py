@@ -487,26 +487,78 @@ def _verify_remote_freeze(*, repository_root: str | Path | None = None) -> None:
             text=True,
             timeout=30,
         )
-        subprocess.run(
-            ["git", "cat-file", "-e", f"{remote_head}^{{commit}}"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            timeout=30,
-        )
-        subprocess.run(
-            ["git", "merge-base", "--is-ancestor", _PUBLIC_FREEZE_COMMIT, remote_head],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            timeout=30,
-        )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError(
-            "pushed freeze commit is not a locally proven ancestor of remote head"
-        ) from exc
+        raise ValueError("freeze ancestry proof could not inspect local repository") from exc
     if status.stdout:
         raise ValueError("freeze ancestry proof requires a clean local repository")
+    # Prove ancestry in an isolated bare object database.  This avoids both a
+    # stale local object store and mutation of the clean campaign checkout.
+    try:
+        with tempfile.TemporaryDirectory(prefix="sn56-freeze-ancestry-") as temporary:
+            graph = Path(temporary) / "graph.git"
+            subprocess.run(
+                ["git", "init", "--bare", str(graph)],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(graph),
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    _PUBLIC_FREEZE_REPOSITORY,
+                    _PUBLIC_FREEZE_REF,
+                ],
+                check=True,
+                capture_output=True,
+                timeout=60,
+            )
+            fetched = subprocess.run(
+                ["git", "--git-dir", str(graph), "rev-parse", "FETCH_HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            ).stdout.strip()
+            if fetched != remote_head:
+                raise ValueError("remote head changed during freeze ancestry proof")
+            subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(graph),
+                    "cat-file",
+                    "-e",
+                    f"{_PUBLIC_FREEZE_COMMIT}^{{commit}}",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(graph),
+                    "merge-base",
+                    "--is-ancestor",
+                    _PUBLIC_FREEZE_COMMIT,
+                    remote_head,
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+    except ValueError:
+        raise
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(
+            "pushed freeze commit is not a remotely proven ancestor of remote head"
+        ) from exc
 
 
 def _stable_file_identity(path: Path, label: str) -> dict[str, Any]:
