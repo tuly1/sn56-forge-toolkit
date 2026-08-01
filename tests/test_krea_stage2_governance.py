@@ -97,6 +97,8 @@ def _governance_chain(tmp_path: Path) -> dict:
         boundary_fixture_manifest_sha256s={
             role: _sha(f"manifest-{role}") for role in surface.BOUNDARY_ROLES
         },
+        sealed_inventory_sha256=_sha("sealed-inventory"),
+        sealed_inventory_file_sha256=_sha("sealed-inventory-file"),
         sealed_root_locator_sha256=admission.sealed_root_locator_sha256(sealed_root),
         sealed_files=rows,
         prepared_at_utc=_time(base, 1),

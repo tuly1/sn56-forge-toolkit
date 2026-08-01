@@ -25,12 +25,14 @@ try:
     from . import krea_stage2_boundary_derivation
     from . import krea_stage2_delegated_review_contract
     from . import krea_stage2_execution_surface_policy
+    from . import krea_stage2_legacy_confirmation
     from . import krea_stage2_production_identity
 except ImportError:  # pragma: no cover - direct script execution.
     import krea_fixture  # type: ignore[no-redef]
     import krea_stage2_boundary_derivation  # type: ignore[no-redef]
     import krea_stage2_delegated_review_contract  # type: ignore[no-redef]
     import krea_stage2_execution_surface_policy  # type: ignore[no-redef]
+    import krea_stage2_legacy_confirmation  # type: ignore[no-redef]
     import krea_stage2_production_identity  # type: ignore[no-redef]
 
 
@@ -229,6 +231,8 @@ def build_request(
     waiver_freeze_file_sha256: str,
     public_commitment_sha256s: Mapping[str, str],
     boundary_fixture_manifest_sha256s: Mapping[str, str],
+    sealed_inventory_sha256: str,
+    sealed_inventory_file_sha256: str,
     sealed_root_locator_sha256: str,
     sealed_files: Sequence[Mapping[str, Any]],
     prepared_at_utc: str,
@@ -280,6 +284,12 @@ def build_request(
         "public_commitment_sha256s": commitments,
         "boundary_fixture_manifest_sha256s": boundary,
         "boundary_matrix_sha256": canonical_sha256(boundary),
+        "sealed_inventory_sha256": _digest(
+            sealed_inventory_sha256, "sealed inventory semantic SHA-256"
+        ),
+        "sealed_inventory_file_sha256": _digest(
+            sealed_inventory_file_sha256, "sealed inventory file SHA-256"
+        ),
         "sealed_root_locator_sha256": _digest(
             sealed_root_locator_sha256, "sealed root locator SHA-256"
         ),
@@ -320,6 +330,8 @@ def validate_request(
             "public_commitment_sha256s",
             "boundary_fixture_manifest_sha256s",
             "boundary_matrix_sha256",
+            "sealed_inventory_sha256",
+            "sealed_inventory_file_sha256",
             "sealed_root_locator_sha256",
             "sealed_files",
             "sealed_file_set_sha256",
@@ -355,6 +367,8 @@ def validate_request(
         "waiver_freeze_sha256",
         "waiver_freeze_file_sha256",
         "boundary_matrix_sha256",
+        "sealed_inventory_sha256",
+        "sealed_inventory_file_sha256",
         "sealed_root_locator_sha256",
         "sealed_file_set_sha256",
         "request_sha256",
@@ -399,7 +413,9 @@ def _ratification_acknowledgements() -> dict[str, bool]:
         "production_identity_reviewed": True,
         "public_commitments_and_boundary_matrix_reviewed": True,
         "waiver_freeze_reviewed": True,
-        "sealed_fixture_content_not_read": True,
+        "post_freeze_custodian_hash_copy_and_inventory_reviewed": True,
+        "finalist_selection_actors_did_not_read_fixture_content_before_freeze": True,
+        "ratification_operation_did_not_read_fixture_content": True,
         "gpu_execution_requires_separate_authorization": True,
     }
 
@@ -449,6 +465,10 @@ def build_ratification(
         "waiver_freeze_file_sha256": request_value["waiver_freeze_file_sha256"],
         "public_commitment_sha256s": request_value["public_commitment_sha256s"],
         "boundary_matrix_sha256": request_value["boundary_matrix_sha256"],
+        "sealed_inventory_sha256": request_value["sealed_inventory_sha256"],
+        "sealed_inventory_file_sha256": request_value[
+            "sealed_inventory_file_sha256"
+        ],
         "sealed_root_locator_sha256": request_value["sealed_root_locator_sha256"],
         "acknowledgements": _ratification_acknowledgements(),
         "admission_authorized": False,
@@ -564,6 +584,10 @@ def build_reveal_authorization(
         "waiver_freeze_file_sha256": request_value["waiver_freeze_file_sha256"],
         "public_commitment_sha256s": request_value["public_commitment_sha256s"],
         "boundary_matrix_sha256": request_value["boundary_matrix_sha256"],
+        "sealed_inventory_sha256": request_value["sealed_inventory_sha256"],
+        "sealed_inventory_file_sha256": request_value[
+            "sealed_inventory_file_sha256"
+        ],
         "sealed_root_locator_sha256": request_value["sealed_root_locator_sha256"],
         "sealed_content_read": False,
         "reveal_authorized": True,
@@ -656,6 +680,7 @@ def _read_sealed_file(root: Path, relative: str) -> bytes:
 def _postfreeze_inventory_body(
     *,
     public_commitment_sha256s: Mapping[str, str],
+    confirmation_wrapper_file_sha256s: Mapping[str, str],
     boundary_fixture_manifest_sha256s: Mapping[str, str],
     boundary_fixture_manifest_file_sha256s: Mapping[str, str],
     actor: Mapping[str, Any],
@@ -667,6 +692,11 @@ def _postfreeze_inventory_body(
         dict(public_commitment_sha256s),
         roles=_CONFIRMATION_ROLES,
         label="public commitment hashes",
+    )
+    wrappers = _role_digests(
+        dict(confirmation_wrapper_file_sha256s),
+        roles=_CONFIRMATION_ROLES,
+        label="confirmation wrapper file hashes",
     )
     boundary_semantic = _role_digests(
         dict(boundary_fixture_manifest_sha256s),
@@ -698,6 +728,7 @@ def _postfreeze_inventory_body(
             sealed_root_locator_sha256_value, "sealed root locator SHA-256"
         ),
         "public_commitment_sha256s": commitments,
+        "confirmation_wrapper_file_sha256s": wrappers,
         "boundary_fixture_manifest_sha256s": boundary_semantic,
         "boundary_fixture_manifest_file_sha256s": boundary_files,
         "files": rows,
@@ -729,6 +760,7 @@ def validate_postfreeze_inventory(value: Any) -> dict[str, Any]:
             "actor",
             "sealed_root_locator_sha256",
             "public_commitment_sha256s",
+            "confirmation_wrapper_file_sha256s",
             "boundary_fixture_manifest_sha256s",
             "boundary_fixture_manifest_file_sha256s",
             "files",
@@ -746,6 +778,9 @@ def validate_postfreeze_inventory(value: Any) -> dict[str, Any]:
     body = {key: item for key, item in record.items() if key != "inventory_sha256"}
     expected = _postfreeze_inventory_body(
         public_commitment_sha256s=record["public_commitment_sha256s"],
+        confirmation_wrapper_file_sha256s=record[
+            "confirmation_wrapper_file_sha256s"
+        ],
         boundary_fixture_manifest_sha256s=record["boundary_fixture_manifest_sha256s"],
         boundary_fixture_manifest_file_sha256s=record[
             "boundary_fixture_manifest_file_sha256s"
@@ -765,6 +800,7 @@ def materialize_postfreeze_inventory(
     public_freeze_binding_path: str | Path,
     remote_reachable_commit_sha1: str,
     public_commitment_sha256s: Mapping[str, str],
+    confirmation_wrapper_file_sha256s: Mapping[str, str],
     boundary_fixture_manifest_sha256s: Mapping[str, str],
     boundary_fixture_manifest_file_sha256s: Mapping[str, str],
     sealed_root: str | Path,
@@ -810,6 +846,11 @@ def materialize_postfreeze_inventory(
         roles=_CONFIRMATION_ROLES,
         label="public commitment hashes",
     )
+    wrappers = _role_digests(
+        dict(confirmation_wrapper_file_sha256s),
+        roles=_CONFIRMATION_ROLES,
+        label="confirmation wrapper file hashes",
+    )
     boundary_semantic = _role_digests(
         dict(boundary_fixture_manifest_sha256s),
         roles=_BOUNDARY_ROLES,
@@ -852,7 +893,7 @@ def materialize_postfreeze_inventory(
         )
     rows.sort(key=lambda row: (row["role"], row["relative_path"]))
     rows = _sealed_files(rows)
-    expected_manifest_files = {**commitments, **boundary_files}
+    expected_manifest_files = {**wrappers, **boundary_files}
     for role, expected_file_sha in expected_manifest_files.items():
         matches = [
             row
@@ -870,16 +911,26 @@ def materialize_postfreeze_inventory(
             raise ValueError(f"{role} committed manifest is not JSON") from exc
         if manifest_raw != canonical_bytes(manifest) + b"\n":
             raise ValueError(f"{role} committed manifest is not canonical JSON")
-        manifest = krea_fixture.validate_manifest(manifest)
-        if manifest["experimental_role"] != role:
-            raise ValueError(f"{role} committed manifest role drifted")
-        if role in boundary_semantic and (
-            manifest["manifest_sha256"] != boundary_semantic[role]
-        ):
-            raise ValueError(f"{role} boundary semantic manifest binding drifted")
+        if role in _CONFIRMATION_ROLES:
+            wrapper = krea_stage2_legacy_confirmation.validate_wrapper_file(
+                wrapper=manifest, role_root=root / role
+            )
+            if (
+                wrapper["experimental_role"] != role
+                or wrapper["published_checksum_manifest"]["file_sha256"]
+                != commitments[role]
+            ):
+                raise ValueError(f"{role} legacy wrapper commitment drifted")
+        else:
+            manifest = krea_fixture.validate_manifest(manifest)
+            if manifest["experimental_role"] != role:
+                raise ValueError(f"{role} committed manifest role drifted")
+            if manifest["manifest_sha256"] != boundary_semantic[role]:
+                raise ValueError(f"{role} boundary semantic manifest binding drifted")
 
     body = _postfreeze_inventory_body(
         public_commitment_sha256s=commitments,
+        confirmation_wrapper_file_sha256s=wrappers,
         boundary_fixture_manifest_sha256s=boundary_semantic,
         boundary_fixture_manifest_file_sha256s=boundary_files,
         actor=materializer,
@@ -967,6 +1018,8 @@ def _materialization_body(
         "waiver_freeze_file_sha256": request["waiver_freeze_file_sha256"],
         "public_commitment_sha256s": request["public_commitment_sha256s"],
         "boundary_matrix_sha256": request["boundary_matrix_sha256"],
+        "sealed_inventory_sha256": request["sealed_inventory_sha256"],
+        "sealed_inventory_file_sha256": request["sealed_inventory_file_sha256"],
         "sealed_root_locator_sha256": request["sealed_root_locator_sha256"],
         "files": request["sealed_files"],
         "file_set_sha256": request["sealed_file_set_sha256"],
@@ -1235,6 +1288,10 @@ def build_gpu_execution_authorization(
         "waiver_freeze_file_sha256": request_value["waiver_freeze_file_sha256"],
         "public_commitment_sha256s": request_value["public_commitment_sha256s"],
         "boundary_matrix_sha256": request_value["boundary_matrix_sha256"],
+        "sealed_inventory_sha256": request_value["sealed_inventory_sha256"],
+        "sealed_inventory_file_sha256": request_value[
+            "sealed_inventory_file_sha256"
+        ],
         "acknowledgements": _gpu_authorization_acknowledgements(),
         "admission_authorized": True,
         "gpu_execution_authorized": True,
@@ -1318,6 +1375,8 @@ def _validate_standalone(value: Any) -> dict[str, Any]:
                 "public_commitment_sha256s",
                 "boundary_fixture_manifest_sha256s",
                 "boundary_matrix_sha256",
+                "sealed_inventory_sha256",
+                "sealed_inventory_file_sha256",
                 "sealed_root_locator_sha256",
                 "sealed_files",
                 "sealed_file_set_sha256",
@@ -1374,6 +1433,8 @@ def _validate_standalone(value: Any) -> dict[str, Any]:
                 "waiver_freeze_file_sha256",
                 "public_commitment_sha256s",
                 "boundary_matrix_sha256",
+                "sealed_inventory_sha256",
+                "sealed_inventory_file_sha256",
                 "sealed_root_locator_sha256",
                 "acknowledgements",
                 "admission_authorized",
@@ -1416,6 +1477,8 @@ def _validate_standalone(value: Any) -> dict[str, Any]:
                 "waiver_freeze_file_sha256",
                 "public_commitment_sha256s",
                 "boundary_matrix_sha256",
+                "sealed_inventory_sha256",
+                "sealed_inventory_file_sha256",
                 "sealed_root_locator_sha256",
                 "sealed_content_read",
                 "reveal_authorized",
@@ -1465,6 +1528,8 @@ def _validate_standalone(value: Any) -> dict[str, Any]:
                 "waiver_freeze_file_sha256",
                 "public_commitment_sha256s",
                 "boundary_matrix_sha256",
+                "sealed_inventory_sha256",
+                "sealed_inventory_file_sha256",
                 "sealed_root_locator_sha256",
                 "files",
                 "file_set_sha256",
@@ -1517,6 +1582,8 @@ def _validate_standalone(value: Any) -> dict[str, Any]:
                 "waiver_freeze_file_sha256",
                 "public_commitment_sha256s",
                 "boundary_matrix_sha256",
+                "sealed_inventory_sha256",
+                "sealed_inventory_file_sha256",
                 "acknowledgements",
                 "admission_authorized",
                 "gpu_execution_authorized",

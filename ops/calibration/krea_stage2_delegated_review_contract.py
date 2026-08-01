@@ -22,9 +22,9 @@ CONTRACT_PATH = (
     / "krea-stage2-delegated-agent-review-contract.json"
 )
 CONTRACT_FILE_SHA256 = (
-    "7d9503c60b0646b4adf9080c1ef154c919c1ca0acf88c1697a785fa2f22dbc66"
+    "99d8a9fedbb5eaead27b567470e889fb12cb16260126799bf20b354b3a81caa3"
 )
-CONTRACT_SHA256 = "db4f4eed14ec51a1768309759ab62bf64ee98529d90a0bdb8c48f757b97f1949"
+CONTRACT_SHA256 = "e56b7b6216513f4373f551be9fc8758e906d43389d72874602064e5d4b43d53a"
 
 
 def load() -> dict[str, Any]:

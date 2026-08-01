@@ -119,7 +119,7 @@ def _payload(*, boundary: bool = False, root: Path = Path("/tmp/stage2")) -> dic
         "expected_repo_name": expected_repo_name,
         "model": "krea/Krea-2-Raw",
         "model_type": "krea2",
-        "trigger_word": "SN56",
+        "trigger_word": "SN56" if boundary else None,
         "candidate_universe": _candidates(),
         "training_candidate_id": "K1-final691",
         "family_role": "candidate",
@@ -179,9 +179,7 @@ def _payload(*, boundary: bool = False, root: Path = Path("/tmp/stage2")) -> dic
             expected_repo_name,
             "--hours-to-complete",
             hours,
-            "--trigger-word",
-            "SN56",
-        ],
+        ] + (["--trigger-word", "SN56"] if boundary else []),
         "mounts": [
             {
                 "source": str(root / "models"),
@@ -225,6 +223,23 @@ def _payload(*, boundary: bool = False, root: Path = Path("/tmp/stage2")) -> dic
 
 def _plan(*, boundary: bool = False, root: Path = Path("/tmp/stage2")) -> dict:
     return stage2.seal_plan(_payload(boundary=boundary, root=root))
+
+
+def test_trigger_scope_is_fail_closed_between_legacy_confirmation_and_boundary() -> None:
+    confirmation = _payload()
+    confirmation["trigger_word"] = "invented-after-freeze"
+    confirmation["entrypoint_argv"].extend(
+        ["--trigger-word", "invented-after-freeze"]
+    )
+    with pytest.raises(ValueError, match="preserve the sealed null trigger"):
+        stage2.seal_plan(confirmation)
+
+    boundary = _payload(boundary=True)
+    boundary["trigger_word"] = None
+    index = boundary["entrypoint_argv"].index("--trigger-word")
+    del boundary["entrypoint_argv"][index : index + 2]
+    with pytest.raises(ValueError, match="boundary trigger_word"):
+        stage2.seal_plan(boundary)
 
 
 def _approval(plan: dict) -> dict:
@@ -367,8 +382,12 @@ def _fake_authority_bundle(plan: dict) -> tuple[dict, dict, dict]:
         "request": {"kind": "request-test"},
         "ratification": {"kind": "ratification-test"},
         "reveal": {"kind": "reveal-test"},
-        "materialization": {"kind": "materialization-test"},
+        "materialization": {"kind": "materialization-test", "files": []},
         "production_identity": {"kind": "production-identity-test"},
+        "sealed_inventory": {
+            "kind": "sealed-inventory-test",
+            "inventory_sha256": _sha("authority-inventory"),
+        },
     }
     files = {
         name: stage2.krea_confirmation_admission.canonical_file_sha256(record)
@@ -386,6 +405,10 @@ def _fake_authority_bundle(plan: dict) -> tuple[dict, dict, dict]:
         "production_identity_file_sha256": files["production_identity"],
         "policy_sha256": _sha("authority-policy"),
         "delegated_review_contract_sha256": _sha("authority-contract"),
+        "sealed_inventory_sha256": records["sealed_inventory"][
+            "inventory_sha256"
+        ],
+        "sealed_inventory_file_sha256": files["sealed_inventory"],
         "image_id": f"sha256:{_sha('authority-image')}",
     }
     records["gpu_execution_authorization"] = authorization
@@ -1159,6 +1182,16 @@ def test_stage2_plan_recomputes_complete_owner_authority_chain(
         stage2.krea_confirmation_admission,
         "validate_gpu_execution_authorization",
         fake_validate,
+    )
+    monkeypatch.setattr(
+        stage2.krea_stage2_admission_chain,
+        "validate_inventory",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        stage2.krea_stage2_admission_chain,
+        "inventory_sealed_files",
+        lambda _value: controls["materialization"].get("files"),
     )
     monkeypatch.setattr(
         stage2,

@@ -22,11 +22,13 @@ try:
     from . import krea_fixture
     from . import krea_provenance
     from . import krea_stage2_execution
+    from . import krea_stage2_legacy_confirmation
     from . import krea_stage2_training_evidence
 except ImportError:  # pragma: no cover
     import krea_fixture  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_stage2_execution  # type: ignore[no-redef]
+    import krea_stage2_legacy_confirmation  # type: ignore[no-redef]
     import krea_stage2_training_evidence  # type: ignore[no-redef]
 
 
@@ -234,6 +236,15 @@ def _binding(value: Any, label: str, semantic_key: str) -> dict[str, str]:
         "file_sha256": _sha(row["file_sha256"], f"{label}.file_sha256"),
         semantic_key: _sha(row[semantic_key], f"{label}.{semantic_key}"),
     }
+
+
+def _fixture_score_view(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate either a canonical B manifest or the admitted legacy C wrapper."""
+
+    document = dict(value)
+    if document.get("kind") == krea_stage2_legacy_confirmation.KIND:
+        return krea_stage2_legacy_confirmation.score_view(document)
+    return krea_fixture.validate_manifest(document)
 
 
 def _run_mechanics(value: Any, label: str = "run mechanics") -> dict[str, bool]:
@@ -922,7 +933,7 @@ def _validate_result(
     ):
         raise ValueError("exact-score candidate/evaluator identity differs")
     _number(result["elapsed_s"], "exact-score elapsed_s", positive=True)
-    fixture = krea_fixture.validate_manifest(dict(fixture_manifest))
+    fixture = _fixture_score_view(fixture_manifest)
     identity = fixture["evaluation_dataset_identity"]
     expected_rows = identity["rows"]
     if (
@@ -1025,7 +1036,7 @@ def build_receipt(
     candidates = {row["family_id"]: row for row in resolved["candidates"]}
     if family not in candidates:
         raise ValueError("receipt family is not in the approved score plan")
-    manifest = krea_fixture.validate_manifest(fixture_manifest)
+    manifest = _fixture_score_view(fixture_manifest)
     identity = manifest["evaluation_dataset_identity"]
     if (
         _sha(fixture_manifest_file_sha256, "fixture manifest file")
@@ -1191,7 +1202,7 @@ def validate_receipt_with_score_files(
 
     resolved = validate_plan(plan)
     receipt = validate_receipt(value, plan=resolved)
-    manifest = krea_fixture.validate_manifest(fixture_manifest)
+    manifest = _fixture_score_view(fixture_manifest)
     identity = manifest["evaluation_dataset_identity"]
     if (
         _sha(fixture_manifest_file_sha256, "fixture manifest file")
