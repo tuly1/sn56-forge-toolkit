@@ -91,59 +91,44 @@ _TIMING_METRICS = (
     "upload",
 )
 _SEALED_ROLES = {f"C{index}" for index in range(1, 5)} | {
-    f"B-{hours}-{size}"
-    for hours in ("0p5", "0p75", "1")
-    for size in ("small", "large")
+    f"B-{hours}-{size}" for hours in ("0p5", "0p75", "1") for size in ("small", "large")
 }
 _CONFIRMATION_ROLES = {f"C{index}" for index in range(1, 5)}
 _MEASUREMENT_RECEIPTS = 3
 _HELDOUT_RECEIPTS = 1
 _CLOCK_TOLERANCE_NS = 250_000_000
-_COMMAND_TEMPLATE_ID = "docker-nvidia-offline-stage2-v1"
+_COMMAND_TEMPLATE_ID = "docker-nvidia-offline-stage2-timing-bootstrap-v2"
 _EXECUTABLE_ID = "docker-cli-v1"
 _EXECUTABLE_PATH = "/usr/bin/docker"
-_COMMAND_HEAD = (
-    _EXECUTABLE_PATH,
-    "run",
-    "--rm",
-    "--name",
-    "forge-krea-stage2-timing-probe",
-    "--gpus",
-    "device=0",
-    "--network",
-    "none",
-    "--runtime",
-    "nvidia",
-)
-_COMMAND_IMAGE_INDEX = len(_COMMAND_HEAD)
-_COMMAND_TAIL = (
-    "--task-id",
-    "forge-stage2-timing-probe",
-    "--model",
-    "krea/Krea-2-Raw",
-    "--dataset-zip",
-    "file:///cache/datasets/forge-stage2-timing-probe_tourn.zip",
-    "--model-type",
-    "krea2",
-    "--expected-repo-name",
-    "forge-stage2-timing-output",
-    "--hours-to-complete",
-    "0.75",
-    "--trigger-word",
-    "SN56",
-)
+_COMMAND_PLACEHOLDERS = {
+    "container_name": "{container_name}",
+    "checkpoint_source": "{checkpoint_source}",
+    "evidence_source": "{evidence_source}",
+    "timing_plan_sha256": "{timing_plan_sha256}",
+    "probe_contract_sha256": "{probe_contract_sha256}",
+    "seed": "{seed}",
+    "task_id": "{task_id}",
+    "expected_repo_name": "{expected_repo_name}",
+}
+_MOUNT_CONTRACT = {
+    "base_model": ("/cache/models/krea--Krea-2-Raw", True),
+    "text_encoder": ("/cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct", True),
+    "dataset_cache": ("/cache/datasets", True),
+    "checkpoints": ("/app/checkpoints", False),
+    "run_evidence": ("/run-evidence", False),
+}
 _COMMAND_TYPED_FIELDS = {
-    "gpu_device": 0,
     "network_mode": "none",
     "runtime": "nvidia",
     "entrypoint_mode": "immutable_image_default",
     "in_image_program": "forge.cli",
     "model_type": "krea2",
+    "bootstrap_mode": "preprofile_timing_bootstrap",
 }
 _EVENT_UNIT_SCHEDULE = {
     "startup": [1],
     "optimizer_update": [34],
-    "checkpoint_save": [3],
+    "checkpoint_save": [1, 1, 1],
     "finalization": [1],
     "upload": [1],
 }
@@ -276,9 +261,10 @@ def _safe_id(value: Any, label: str) -> str:
 
 
 def _utc(value: Any, label: str) -> str:
-    if not isinstance(value, str) or re.fullmatch(
-        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value
-    ) is None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value) is None
+    ):
         raise ValueError(f"{label} must be canonical whole-second UTC")
     try:
         parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -376,8 +362,14 @@ def _live_host(value: Any) -> dict[str, Any]:
         for item in device.values()
     ):
         raise ValueError("live Stage-2 checkpoint device differs")
-    body = {key: item for key, item in record.items() if key != "host_execution_identity_sha256"}
-    if record["host_execution_identity_sha256"] != krea_provenance.canonical_sha256(body):
+    body = {
+        key: item
+        for key, item in record.items()
+        if key != "host_execution_identity_sha256"
+    }
+    if record["host_execution_identity_sha256"] != krea_provenance.canonical_sha256(
+        body
+    ):
         raise ValueError("live Stage-2 host receipt digest differs")
     return dict(record)
 
@@ -399,17 +391,19 @@ def _live_gpu(value: Any) -> dict[str, Any]:
         },
         "live Stage-2 GPU receipt",
     )
-    if record["schema"] != 1 or record["kind"] != (
-        "forge-krea-stage2-live-gpu-identity"
-    ) or any(
-        not isinstance(record[field], str) or not record[field]
-        for field in (
-            "uuid",
-            "name",
-            "driver_version",
-            "memory_total_mib",
-            "compute_capability",
-            "pci_bus_id",
+    if (
+        record["schema"] != 1
+        or record["kind"] != ("forge-krea-stage2-live-gpu-identity")
+        or any(
+            not isinstance(record[field], str) or not record[field]
+            for field in (
+                "uuid",
+                "name",
+                "driver_version",
+                "memory_total_mib",
+                "compute_capability",
+                "pci_bus_id",
+            )
         )
     ):
         raise ValueError("live Stage-2 GPU receipt differs")
@@ -419,19 +413,167 @@ def _live_gpu(value: Any) -> dict[str, Any]:
     return dict(record)
 
 
-def render_probe_command(*, production_image_id: str, gpu_device: int) -> list[str]:
-    """Render the one permitted Docker invocation from typed, bounded fields."""
+def _timing_hours(hard_budget_s: float) -> tuple[float, str, str]:
+    hard = krea_budget._require_json_seconds(hard_budget_s, "hard_budget_s")
+    values = {
+        1800.0: ("0.5", "0p5"),
+        2700.0: ("0.75", "0p75"),
+        3600.0: ("1.0", "1p0"),
+    }
+    if hard not in values:
+        raise ValueError("Stage-2 timing budget must be 0.5, 0.75, or 1.0 hours")
+    hours, label = values[hard]
+    return hard, hours, label
 
-    if not isinstance(production_image_id, str) or _IMAGE_ID.fullmatch(
-        production_image_id
-    ) is None:
-        raise ValueError("Stage-2 probe image is not immutable")
-    if isinstance(gpu_device, bool) or not isinstance(gpu_device, int) or gpu_device != 0:
-        raise ValueError("Stage-2 timing probe requires the predeclared GPU device")
-    command = [*_COMMAND_HEAD, production_image_id, *_COMMAND_TAIL]
+
+def _mount_rows(value: Mapping[str, str]) -> list[dict[str, Any]]:
+    mounts = _object(value, "Stage-2 timing mount sources")
+    _exact(mounts, set(_MOUNT_CONTRACT), "Stage-2 timing mount sources")
+    rows = []
+    for purpose, (destination, read_only) in _MOUNT_CONTRACT.items():
+        source = mounts[purpose]
+        if (
+            not isinstance(source, str)
+            or not source.startswith("/")
+            or os.path.normpath(source) != source
+            or "\x00" in source
+        ):
+            raise ValueError(f"Stage-2 timing {purpose} mount source is invalid")
+        rows.append(
+            {
+                "purpose": purpose,
+                "source_root": source,
+                "destination": destination,
+                "read_only": read_only,
+            }
+        )
+    return rows
+
+
+def _probe_command_template(
+    *,
+    production_image_id: str,
+    typed_fields: Mapping[str, Any],
+    mounts: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    command = [
+        _EXECUTABLE_PATH,
+        "run",
+        "--rm",
+        "--name",
+        _COMMAND_PLACEHOLDERS["container_name"],
+        "--runtime",
+        "nvidia",
+        "--gpus",
+        f"device={typed_fields['gpu_device']}",
+        "--network",
+        "none",
+    ]
+    for mount in mounts:
+        source = mount["source_root"]
+        if mount["purpose"] == "checkpoints":
+            source = _COMMAND_PLACEHOLDERS["checkpoint_source"]
+        elif mount["purpose"] == "run_evidence":
+            source = _COMMAND_PLACEHOLDERS["evidence_source"]
+        mode = "ro" if mount["read_only"] else "rw"
+        command.extend(
+            [
+                "--mount",
+                f"type=bind,src={source},dst={mount['destination']},{mode}",
+            ]
+        )
+    command.extend(
+        [
+            "--env",
+            "FORGE_KREA_CALIBRATION_PROFILE=" + typed_fields["profile_id"],
+            "--env",
+            "FORGE_KREA_STAGE2_TIMING_PLAN_SHA256="
+            + _COMMAND_PLACEHOLDERS["timing_plan_sha256"],
+            "--env",
+            "FORGE_KREA_STAGE2_TIMING_PROBE_CONTRACT_SHA256="
+            + _COMMAND_PLACEHOLDERS["probe_contract_sha256"],
+            "--env",
+            "FORGE_KREA_STAGE2_TIMING_STEPS=" + str(typed_fields["bootstrap_steps"]),
+            "--env",
+            "FORGE_KREA_STAGE2_TIMING_SEED=" + _COMMAND_PLACEHOLDERS["seed"],
+            "--env",
+            "FORGE_KREA_STAGE2_TIMING_RECEIPT_PATH=/run-evidence/"
+            + _COMMAND_PLACEHOLDERS["timing_plan_sha256"]
+            + "/config-control.json",
+            production_image_id,
+            "--task-id",
+            typed_fields["task_id"],
+            "--model",
+            "krea/Krea-2-Raw",
+            "--dataset-zip",
+            "file:///cache/datasets/" + typed_fields["task_id"] + "_tourn.zip",
+            "--model-type",
+            "krea2",
+            "--expected-repo-name",
+            typed_fields["expected_repo_name"],
+            "--hours-to-complete",
+            typed_fields["hours_to_complete"],
+            "--trigger-word",
+            typed_fields["trigger_word"],
+        ]
+    )
+    return command
+
+
+def _receipt_namespace(probe: Mapping[str, Any], receipt_ordinal: int) -> str:
     if (
-        command[_COMMAND_IMAGE_INDEX] != production_image_id
-        or command.count(production_image_id) != 1
+        isinstance(receipt_ordinal, bool)
+        or not isinstance(receipt_ordinal, int)
+        or not 0 <= receipt_ordinal < len(_RECEIPT_SCHEDULE)
+    ):
+        raise ValueError("raw timing receipt ordinal differs")
+    return f"{probe['probe_contract_sha256'][:24]}-r{receipt_ordinal:02d}"
+
+
+def receipt_mount_sources(
+    probe_contract: Mapping[str, Any], *, receipt_ordinal: int
+) -> dict[str, str]:
+    """Return the two isolated writable host mount roots for one receipt."""
+
+    probe = validate_probe_contract(probe_contract)
+    namespace = _receipt_namespace(probe, receipt_ordinal)
+    roots = {row["purpose"]: row["source_root"] for row in probe["mounts"]}
+    return {
+        "checkpoint_source": os.path.join(roots["checkpoints"], namespace),
+        "evidence_source": os.path.join(roots["run_evidence"], namespace),
+    }
+
+
+def render_probe_command(
+    probe_contract: Mapping[str, Any],
+    *,
+    timing_plan_sha256: str,
+    receipt_ordinal: int,
+) -> list[str]:
+    """Realize one exact receipt command from a sealed placeholder template."""
+
+    probe = validate_probe_contract(probe_contract)
+    plan_sha = _sha(timing_plan_sha256, "timing plan")
+    schedule = probe["receipt_schedule"][receipt_ordinal]
+    namespace = _receipt_namespace(probe, receipt_ordinal)
+    writable = receipt_mount_sources(probe, receipt_ordinal=receipt_ordinal)
+    replacements = {
+        _COMMAND_PLACEHOLDERS["container_name"]: "forge-krea-timing-" + namespace,
+        _COMMAND_PLACEHOLDERS["checkpoint_source"]: writable["checkpoint_source"],
+        _COMMAND_PLACEHOLDERS["evidence_source"]: writable["evidence_source"],
+        _COMMAND_PLACEHOLDERS["timing_plan_sha256"]: plan_sha,
+        _COMMAND_PLACEHOLDERS["probe_contract_sha256"]: probe["probe_contract_sha256"],
+        _COMMAND_PLACEHOLDERS["seed"]: str(schedule["seed"]),
+    }
+    command = []
+    for item in probe["command_argv_template"]:
+        rendered = item
+        for token, replacement in replacements.items():
+            rendered = rendered.replace(token, replacement)
+        command.append(rendered)
+    if (
+        any("{" in item or "}" in item for item in command)
+        or command.count(probe["production_image_id"]) != 1
         or "--entrypoint" in command
         or any(item.startswith("--entrypoint=") for item in command)
     ):
@@ -444,20 +586,75 @@ def seal_probe_contract(
     created_at_utc: str,
     production_image_id: str,
     measurement_tool_sha256: str,
+    collector_executable_sha256: str,
     executable_sha256: str,
     gpu_device: int,
+    fixture_role: str,
+    fixture_manifest_sha256: str,
+    training_archive_sha256: str,
+    training_archive_bytes: int,
+    profile_id: str,
+    hard_budget_s: float,
+    mount_sources: Mapping[str, str],
+    trigger_word: str,
+    bootstrap_steps: int = 34,
 ) -> dict[str, Any]:
-    argv = render_probe_command(
-        production_image_id=production_image_id, gpu_device=gpu_device
+    if (
+        not isinstance(production_image_id, str)
+        or _IMAGE_ID.fullmatch(production_image_id) is None
+    ):
+        raise ValueError("Stage-2 probe image is not immutable")
+    if (
+        isinstance(gpu_device, bool)
+        or not isinstance(gpu_device, int)
+        or not 0 <= gpu_device <= 3
+    ):
+        raise ValueError("Stage-2 timing probe GPU must be one of 0, 1, 2, or 3")
+    role = _safe_id(fixture_role, "timing fixture role")
+    if role not in _SEALED_ROLES:
+        raise ValueError("Stage-2 timing fixture role is outside C/B")
+    frozen, profile = _profile_binding(profile_id)
+    hard, hours, hours_label = _timing_hours(hard_budget_s)
+    if isinstance(bootstrap_steps, bool) or bootstrap_steps != 34:
+        raise ValueError("Stage-2 timing bootstrap requires exactly 34 updates")
+    if (
+        not isinstance(training_archive_bytes, int)
+        or isinstance(training_archive_bytes, bool)
+        or training_archive_bytes <= 0
+    ):
+        raise ValueError("Stage-2 timing training archive byte count is invalid")
+    trigger = _safe_id(trigger_word, "timing trigger word")
+    slug = role.lower().replace(".", "p")
+    task_id = (
+        f"forge-stage2-timing-{slug}-{profile_id.lower()}-h{hours_label}-g{gpu_device}"
     )
-    typed_fields = {**_COMMAND_TYPED_FIELDS, "gpu_device": gpu_device}
+    expected_repo_name = task_id + "-output"
+    mounts = _mount_rows(mount_sources)
+    typed_fields = {
+        **_COMMAND_TYPED_FIELDS,
+        "gpu_device": gpu_device,
+        "fixture_role": role,
+        "profile_id": frozen.profile_id,
+        "throughput_equivalence_class": profile["throughput_equivalence_class"],
+        "hard_budget_s": hard,
+        "hours_to_complete": hours,
+        "bootstrap_steps": bootstrap_steps,
+        "task_id": task_id,
+        "expected_repo_name": expected_repo_name,
+        "trigger_word": trigger,
+    }
+    argv = _probe_command_template(
+        production_image_id=production_image_id,
+        typed_fields=typed_fields,
+        mounts=mounts,
+    )
     body = {
         "schema": SCHEMA,
         "kind": PROBE_CONTRACT_KIND,
         "created_at_utc": _utc(created_at_utc, "probe contract creation time"),
         "command_template_id": _COMMAND_TEMPLATE_ID,
         "command_fields": typed_fields,
-        "command_argv": argv,
+        "command_argv_template": argv,
         "command_template_sha256": krea_provenance.canonical_sha256(argv),
         "executable_id": _EXECUTABLE_ID,
         "executable_path": _EXECUTABLE_PATH,
@@ -465,7 +662,19 @@ def seal_probe_contract(
         "measurement_tool_sha256": _sha(
             measurement_tool_sha256, "probe measurement tool"
         ),
+        "collector_executable_sha256": _sha(
+            collector_executable_sha256, "probe collector executable"
+        ),
         "production_image_id": production_image_id,
+        "fixture_manifest": {
+            "role": role,
+            "manifest_sha256": _sha(fixture_manifest_sha256, "probe fixture manifest"),
+        },
+        "training_archive": {
+            "sha256": _sha(training_archive_sha256, "probe training archive"),
+            "bytes": training_archive_bytes,
+        },
+        "mounts": mounts,
         "receipt_schedule": deepcopy(list(_RECEIPT_SCHEDULE)),
         "network_mode": "none",
         "runtime": "nvidia",
@@ -473,7 +682,9 @@ def seal_probe_contract(
     return {**body, "probe_contract_sha256": krea_provenance.canonical_sha256(body)}
 
 
-def validate_probe_contract(value: Any) -> dict[str, Any]:
+def validate_probe_contract(
+    value: Any, *, plan: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     record = _object(value, "Stage-2 probe contract")
     _exact(
         record,
@@ -483,13 +694,17 @@ def validate_probe_contract(value: Any) -> dict[str, Any]:
             "created_at_utc",
             "command_template_id",
             "command_fields",
-            "command_argv",
+            "command_argv_template",
             "command_template_sha256",
             "executable_id",
             "executable_path",
             "executable_sha256",
             "measurement_tool_sha256",
+            "collector_executable_sha256",
             "production_image_id",
+            "fixture_manifest",
+            "training_archive",
+            "mounts",
             "receipt_schedule",
             "network_mode",
             "runtime",
@@ -501,13 +716,39 @@ def validate_probe_contract(value: Any) -> dict[str, Any]:
         created_at_utc=record["created_at_utc"],
         production_image_id=record["production_image_id"],
         measurement_tool_sha256=record["measurement_tool_sha256"],
+        collector_executable_sha256=record["collector_executable_sha256"],
         executable_sha256=record["executable_sha256"],
         gpu_device=_object(record["command_fields"], "probe command fields")[
             "gpu_device"
         ],
+        fixture_role=record["command_fields"]["fixture_role"],
+        fixture_manifest_sha256=record["fixture_manifest"]["manifest_sha256"],
+        training_archive_sha256=record["training_archive"]["sha256"],
+        training_archive_bytes=record["training_archive"]["bytes"],
+        profile_id=record["command_fields"]["profile_id"],
+        hard_budget_s=record["command_fields"]["hard_budget_s"],
+        mount_sources={row["purpose"]: row["source_root"] for row in record["mounts"]},
+        trigger_word=record["command_fields"]["trigger_word"],
+        bootstrap_steps=record["command_fields"]["bootstrap_steps"],
     )
     if record != expected:
         raise ValueError("Stage-2 probe contract drifted")
+    if plan is not None:
+        resolved = validate_plan(plan)
+        fields = record["command_fields"]
+        if (
+            record["probe_contract_sha256"]
+            != resolved["probe_contract"]["probe_contract_sha256"]
+            or record["production_image_id"] != resolved["production_image_id"]
+            or record["fixture_manifest"]["role"] != resolved["fixture_role"]
+            or record["fixture_manifest"]["manifest_sha256"]
+            != resolved["fixture_manifest"]["manifest_sha256"]
+            or fields["profile_id"] != resolved["calibration_profile"]["profile_id"]
+            or fields["throughput_equivalence_class"]
+            != resolved["calibration_profile"]["throughput_equivalence_class"]
+            or fields["hard_budget_s"] != resolved["hard_budget_s"]
+        ):
+            raise ValueError("Stage-2 probe contract differs from timing plan")
     return dict(record)
 
 
@@ -608,9 +849,10 @@ def _admission_controls(
             "role": role,
             "sha256": fixture_file_sha256,
         }
-    elif request["boundary_fixture_manifest_sha256s"].get(role) != fixture[
-        "manifest_sha256"
-    ]:
+    elif (
+        request["boundary_fixture_manifest_sha256s"].get(role)
+        != fixture["manifest_sha256"]
+    ):
         raise ValueError("boundary timing fixture differs from its commitment")
     else:
         fixture_commitment = {
@@ -656,7 +898,16 @@ def _profile_binding(profile_id: str) -> tuple[Any, dict[str, Any]]:
 def _normalize_controls(value: Any) -> dict[str, Any]:
     controls = _object(value, "Stage-2 timing controls")
     _exact(controls, _CONTROL_KEYS, "Stage-2 timing controls")
-    fixture = krea_fixture.validate_manifest(dict(controls["fixture_manifest"]))
+    fixture_control = dict(_object(controls["fixture_manifest"], "fixture control"))
+    if fixture_control.get("kind") == "forge-krea-stage2-legacy-confirmation-wrapper":
+        try:
+            from . import krea_stage2_legacy_confirmation as legacy
+        except ImportError:  # pragma: no cover - direct CLI execution.
+            import krea_stage2_legacy_confirmation as legacy  # type: ignore[no-redef]
+        wrapper = legacy.validate_wrapper(fixture_control)
+        fixture = legacy.score_view(wrapper)
+    else:
+        fixture = krea_fixture.validate_manifest(fixture_control)
     identity = production.validate(dict(controls["production_identity"]))
     assets = production.validate_asset_attestation(dict(controls["asset_attestation"]))
     probe = validate_probe_contract(controls["probe_contract"])
@@ -664,7 +915,7 @@ def _normalize_controls(value: Any) -> dict[str, Any]:
     gpu = _live_gpu(controls["live_gpu_identity"])
     margin = krea_budget.load_margin_policy(dict(controls["margin_policy"]))
     file_pairs = (
-        (fixture, "fixture_manifest_file_sha256"),
+        (fixture_control, "fixture_manifest_file_sha256"),
         (identity, "production_identity_file_sha256"),
         (assets, "asset_attestation_file_sha256"),
         (probe, "probe_contract_file_sha256"),
@@ -678,7 +929,7 @@ def _normalize_controls(value: Any) -> dict[str, Any]:
     if (
         isinstance(fixture_bytes, bool)
         or not isinstance(fixture_bytes, int)
-        or fixture_bytes != _canonical_file_bytes(fixture)
+        or fixture_bytes != _canonical_file_bytes(fixture_control)
     ):
         raise ValueError("Stage-2 timing fixture byte binding differs")
     if (
@@ -692,6 +943,12 @@ def _normalize_controls(value: Any) -> dict[str, Any]:
     ):
         raise ValueError("Stage-2 timing assets/probe differ from production identity")
     role = fixture["experimental_role"]
+    if (
+        probe["fixture_manifest"]
+        != {"role": role, "manifest_sha256": fixture["manifest_sha256"]}
+        or probe["training_archive"] != fixture["training_archive"]
+    ):
+        raise ValueError("Stage-2 timing probe differs from exact fixture/archive")
     authority = controls["content_authority_controls"]
     authority_binding = None
     if role in _SEALED_ROLES:
@@ -710,6 +967,7 @@ def _normalize_controls(value: Any) -> dict[str, Any]:
     return {
         **dict(controls),
         "fixture_manifest": fixture,
+        "fixture_control": fixture_control,
         "production_identity": identity,
         "asset_attestation": assets,
         "probe_contract": probe,
@@ -721,9 +979,7 @@ def _normalize_controls(value: Any) -> dict[str, Any]:
     }
 
 
-def _execution_envelope(
-    *, frozen: Any, controls: Mapping[str, Any]
-) -> dict[str, Any]:
+def _execution_envelope(*, frozen: Any, controls: Mapping[str, Any]) -> dict[str, Any]:
     fixture = controls["fixture_manifest"]
     identity = controls["production_identity"]
     runtime = identity["runtime_contract"]
@@ -799,6 +1055,13 @@ def build_plan(
     if _utc_ns(created, "timing plan creation time") <= max(chronology):
         raise ValueError("Stage-2 timing plan must follow all bound controls")
     hard = krea_budget._require_json_seconds(hard_budget_s, "hard_budget_s")
+    fields = probe["command_fields"]
+    if (
+        fields["profile_id"] != frozen.profile_id
+        or fields["throughput_equivalence_class"] != frozen.throughput_equivalence_class
+        or fields["hard_budget_s"] != hard
+    ):
+        raise ValueError("Stage-2 timing probe profile/budget differs")
     envelope = _execution_envelope(frozen=frozen, controls=resolved)
     forge = dict(identity["forge"])
     body = {
@@ -880,9 +1143,11 @@ def build_plan(
         "release_authorized": False,
         "deployment_authorized": False,
     }
-    return validate_plan(
+    plan = validate_plan(
         {**body, "plan_sha256": krea_provenance.canonical_sha256(body)}
     )
+    validate_probe_contract(probe, plan=plan)
+    return plan
 
 
 def validate_plan(value: Any) -> dict[str, Any]:
@@ -1034,7 +1299,8 @@ def validate_plan(value: Any) -> dict[str, Any]:
         or envelope.base_model_identity_sha256 != plan["base_model_identity_sha256"]
         or envelope.host_execution_identity_sha256
         != plan["live_host_receipt"]["host_execution_identity_sha256"]
-        or envelope.gpu_identity_sha256 != plan["live_gpu_receipt"]["gpu_identity_sha256"]
+        or envelope.gpu_identity_sha256
+        != plan["live_gpu_receipt"]["gpu_identity_sha256"]
         or envelope.measurement_tool_sha256 != plan["measurement_tool_sha256"]
     ):
         raise ValueError("Stage-2 timing execution envelope escaped its plan")
@@ -1083,7 +1349,9 @@ def validate_plan(value: Any) -> dict[str, Any]:
     return dict(plan)
 
 
-def validate_plan_with_controls(value: Any, *, controls: Mapping[str, Any]) -> dict[str, Any]:
+def validate_plan_with_controls(
+    value: Any, *, controls: Mapping[str, Any]
+) -> dict[str, Any]:
     plan = validate_plan(value)
     rebuilt = build_plan(
         controls=controls,
@@ -1181,9 +1449,7 @@ def seal_run_receipt(
         "artifact_manifest_file_sha256": _sha(
             artifact_manifest_file_sha256, "artifact manifest file"
         ),
-        "artifact_manifest_sha256": _sha(
-            artifact_manifest_sha256, "artifact manifest"
-        ),
+        "artifact_manifest_sha256": _sha(artifact_manifest_sha256, "artifact manifest"),
         "recorded_unix_ns": recorded_unix_ns,
     }
     return {**body, "run_receipt_sha256": krea_provenance.canonical_sha256(body)}
@@ -1318,9 +1584,7 @@ def _receipt_manifest_rows(
             "command_started_monotonic_ns": command.get("started_monotonic_ns"),
             "command_ended_monotonic_ns": command.get("ended_monotonic_ns"),
             "run_recorded_unix_ns": run.get("recorded_unix_ns"),
-            "run_receipt_sha256": _sha(
-                run.get("run_receipt_sha256"), "run receipt"
-            ),
+            "run_receipt_sha256": _sha(run.get("run_receipt_sha256"), "run receipt"),
             "run_artifact_manifest_file_sha256": _sha(
                 run.get("artifact_manifest_file_sha256"),
                 "run artifact manifest file",
@@ -1340,15 +1604,16 @@ def _receipt_manifest_rows(
                 raise ValueError("receipt manifest command clock differs")
         if (
             row["command_ended_unix_ns"] <= row["command_started_unix_ns"]
-            or row["command_ended_monotonic_ns"]
-            <= row["command_started_monotonic_ns"]
+            or row["command_ended_monotonic_ns"] <= row["command_started_monotonic_ns"]
         ):
             raise ValueError("receipt manifest command clock differs")
         rows.append(row)
     return rows
 
 
-def _validate_manifest_intervals_and_identities(rows: Sequence[Mapping[str, Any]]) -> None:
+def _validate_manifest_intervals_and_identities(
+    rows: Sequence[Mapping[str, Any]]
+) -> None:
     for left, right in zip(rows, rows[1:]):
         if (
             right["command_started_unix_ns"] < left["command_ended_unix_ns"]
@@ -1394,9 +1659,7 @@ def seal_receipt_manifest(
     if collector_created_ns > min(row["command_started_unix_ns"] for row in rows):
         raise ValueError("receipt collector identity postdates command start")
     if any(
-        not row["command_ended_unix_ns"]
-        <= row["run_recorded_unix_ns"]
-        <= created_ns
+        not row["command_ended_unix_ns"] <= row["run_recorded_unix_ns"] <= created_ns
         for row in rows
     ):
         raise ValueError("receipt manifest run chronology differs")
@@ -1446,8 +1709,7 @@ def validate_receipt_manifest(value: Any) -> dict[str, Any]:
     if (
         manifest["schema"] != SCHEMA
         or manifest["kind"] != RECEIPT_MANIFEST_KIND
-        or manifest["receipt_manifest_sha256"]
-        != krea_provenance.canonical_sha256(body)
+        or manifest["receipt_manifest_sha256"] != krea_provenance.canonical_sha256(body)
         or binding["file_sha256"] != _canonical_file_sha(collector)
         or binding["collector_identity_sha256"]
         != collector["collector_identity_sha256"]
@@ -1486,21 +1748,21 @@ def validate_receipt_manifest(value: Any) -> dict[str, Any]:
                 raise ValueError("receipt manifest command clock differs")
         if (
             row["command_ended_unix_ns"] <= row["command_started_unix_ns"]
-            or row["command_ended_monotonic_ns"]
-            <= row["command_started_monotonic_ns"]
+            or row["command_ended_monotonic_ns"] <= row["command_started_monotonic_ns"]
         ):
             raise ValueError("receipt manifest command clock differs")
     _validate_manifest_intervals_and_identities(rows)
     manifest_created_ns = _utc_ns(
         manifest["created_at_utc"], "receipt manifest creation time"
     )
-    if _utc_ns(
-        collector["created_at_utc"], "receipt collector creation time"
-    ) > manifest_created_ns:
+    if (
+        _utc_ns(collector["created_at_utc"], "receipt collector creation time")
+        > manifest_created_ns
+    ):
         raise ValueError("receipt collector identity postdates receipt manifest")
-    if _utc_ns(
-        collector["created_at_utc"], "receipt collector creation time"
-    ) > min(row["command_started_unix_ns"] for row in rows):
+    if _utc_ns(collector["created_at_utc"], "receipt collector creation time") > min(
+        row["command_started_unix_ns"] for row in rows
+    ):
         raise ValueError("receipt collector identity postdates command start")
     if any(
         not row["command_ended_unix_ns"]
@@ -1532,6 +1794,8 @@ def _command(
     value: Any,
     *,
     probe: Mapping[str, Any],
+    timing_plan_sha256: str,
+    receipt_ordinal: int,
     image_id: str,
     sealed: bool,
 ) -> dict[str, Any]:
@@ -1539,7 +1803,12 @@ def _command(
     expected_keys = _COMMAND_RECEIPT_KEYS | ({"invocation_id"} if sealed else set())
     _exact(command, expected_keys, "timing command receipt")
     if (
-        command["argv"] != probe["command_argv"]
+        command["argv"]
+        != render_probe_command(
+            probe,
+            timing_plan_sha256=timing_plan_sha256,
+            receipt_ordinal=receipt_ordinal,
+        )
         or command["executable_id"] != probe["executable_id"]
         or command["executable_path"] != probe["executable_path"]
         or command["executable_sha256"] != probe["executable_sha256"]
@@ -1613,6 +1882,8 @@ def seal_raw_receipt(
     normalized_command = _command(
         command,
         probe=probe,
+        timing_plan_sha256=resolved["plan_sha256"],
+        receipt_ordinal=receipt_ordinal,
         image_id=resolved["production_image_id"],
         sealed=False,
     )
@@ -1622,15 +1893,12 @@ def seal_raw_receipt(
         or [item["sequence"] for item in normalized_events]
         != list(range(len(normalized_events)))
         or any(
-            right["received_monotonic_ns"]
-            <= left["received_monotonic_ns"]
+            right["received_monotonic_ns"] <= left["received_monotonic_ns"]
             for left, right in zip(normalized_events, normalized_events[1:])
         )
     ):
         raise ValueError("raw timing receipt event order differs")
-    _derive_samples(
-        normalized_events, expected_units=schedule["expected_event_units"]
-    )
+    _derive_samples(normalized_events, expected_units=schedule["expected_event_units"])
     run = validate_run_receipt(run_receipt, measurement_role=measurement_role)
     body = {
         "schema": SCHEMA,
@@ -1675,7 +1943,9 @@ def _derive_samples(
     _exact(units_contract, set(_TIMING_METRICS), "expected timing event units")
     if units_contract != _EVENT_UNIT_SCHEDULE:
         raise ValueError("expected timing event unit schedule drifted")
-    samples: dict[str, list[dict[str, Any]]] = {metric: [] for metric in _TIMING_METRICS}
+    samples: dict[str, list[dict[str, Any]]] = {
+        metric: [] for metric in _TIMING_METRICS
+    }
     open_spans: dict[str, Mapping[str, Any]] = {}
     seen_spans: set[str] = set()
     event_ids: list[str] = []
@@ -1697,9 +1967,12 @@ def _derive_samples(
             raise ValueError("timing span counter did not advance")
         started = begin["received_monotonic_ns"]
         ended = event["received_monotonic_ns"]
-        observation = "obs-" + krea_provenance.canonical_sha256(
-            {"begin": begin["event_sha256"], "end": event["event_sha256"]}
-        )[:48]
+        observation = (
+            "obs-"
+            + krea_provenance.canonical_sha256(
+                {"begin": begin["event_sha256"], "end": event["event_sha256"]}
+            )[:48]
+        )
         samples[event["metric"]].append(
             {
                 "observation_id": observation,
@@ -1713,10 +1986,11 @@ def _derive_samples(
     if open_spans or any(not rows for rows in samples.values()):
         raise ValueError("timing receipt has incomplete metric spans")
     if {
-        metric: [row["units"] for row in rows]
-        for metric, rows in samples.items()
+        metric: [row["units"] for row in rows] for metric, rows in samples.items()
     } != units_contract:
-        raise ValueError("timing receipt event units differ from the predeclared schedule")
+        raise ValueError(
+            "timing receipt event units differ from the predeclared schedule"
+        )
     return samples, event_ids
 
 
@@ -1766,10 +2040,11 @@ def _derive_capture(
         or host["host_execution_identity_sha256"]
         != raw["live_host_receipt"]["host_execution_identity_sha256"]
         or _canonical_file_sha(gpu) != raw["live_gpu_receipt"]["file_sha256"]
-        or gpu["gpu_identity_sha256"]
-        != raw["live_gpu_receipt"]["gpu_identity_sha256"]
+        or gpu["gpu_identity_sha256"] != raw["live_gpu_receipt"]["gpu_identity_sha256"]
     ):
-        raise ValueError("external live host/GPU receipts differ from raw timing receipt")
+        raise ValueError(
+            "external live host/GPU receipts differ from raw timing receipt"
+        )
     role = raw["measurement_role"]
     ordinal = raw["receipt_ordinal"]
     if (
@@ -1788,6 +2063,8 @@ def _derive_capture(
     command = _command(
         raw["command"],
         probe=probe,
+        timing_plan_sha256=resolved["plan_sha256"],
+        receipt_ordinal=ordinal,
         image_id=resolved["production_image_id"],
         sealed=True,
     )
@@ -1812,9 +2089,7 @@ def _derive_capture(
     capture_id = "cap-" + semantic_sha[:48]
     samples = {
         metric: [
-            krea_budget._timing_sample(
-                {**row, "capture_id": capture_id}, metric=metric
-            )
+            krea_budget._timing_sample({**row, "capture_id": capture_id}, metric=metric)
             for row in rows
         ]
         for metric, rows in derived.items()
@@ -1980,7 +2255,9 @@ def _validate_capture_record(value: Any, *, plan: Mapping[str, Any]) -> dict[str
         if not isinstance(rows, list) or not rows:
             raise ValueError("sanitized timing samples are empty")
         normalized = [krea_budget._timing_sample(row, metric=metric) for row in rows]
-        if normalized != rows or any(row["capture_id"] != capture["capture_id"] for row in rows):
+        if normalized != rows or any(
+            row["capture_id"] != capture["capture_id"] for row in rows
+        ):
             raise ValueError("sanitized timing sample differs")
         observations.extend(row["observation_id"] for row in rows)
     if len(observations) != len(set(observations)):
@@ -2065,9 +2342,7 @@ def _derive_evidence(
     normalized_controls = _normalize_controls(controls)
     manifest = _bound_receipt_manifest(
         receipt_manifest=receipt_manifest,
-        expected_receipt_manifest_file_sha256=(
-            expected_receipt_manifest_file_sha256
-        ),
+        expected_receipt_manifest_file_sha256=(expected_receipt_manifest_file_sha256),
         expected_receipt_manifest_sha256=expected_receipt_manifest_sha256,
         receipt_bindings=receipt_bindings,
         plan=resolved,
@@ -2081,7 +2356,11 @@ def _derive_evidence(
         key=lambda item: item["receipt_ordinal"],
     )
     heldout = sorted(
-        (item for item in captures if item["measurement_role"] == "held_out_end_to_end"),
+        (
+            item
+            for item in captures
+            if item["measurement_role"] == "held_out_end_to_end"
+        ),
         key=lambda item: item["receipt_ordinal"],
     )
     if len(measurement) != _MEASUREMENT_RECEIPTS or len(heldout) != _HELDOUT_RECEIPTS:
@@ -2096,22 +2375,25 @@ def _derive_evidence(
             raise ValueError(f"Stage-2 timing {field} is not globally unique")
     receipt_ids = [item["source_receipt"]["receipt_sha256"] for item in captures]
     event_ids = [event for item in captures for event in item["event_identity_sha256s"]]
-    if len(receipt_ids) != len(set(receipt_ids)) or len(event_ids) != len(set(event_ids)):
+    if len(receipt_ids) != len(set(receipt_ids)) or len(event_ids) != len(
+        set(event_ids)
+    ):
         raise ValueError("Stage-2 receipt/event identity is not globally unique")
     invocation_ids = [item["command_receipt"]["invocation_id"] for item in captures]
     artifact_file_ids = [
         item["run_artifact_manifest"]["file_sha256"] for item in captures
     ]
     artifact_semantic_ids = [
-        item["run_artifact_manifest"]["artifact_manifest_sha256"]
-        for item in captures
+        item["run_artifact_manifest"]["artifact_manifest_sha256"] for item in captures
     ]
     if (
         len(invocation_ids) != len(set(invocation_ids))
         or len(artifact_file_ids) != len(set(artifact_file_ids))
         or len(artifact_semantic_ids) != len(set(artifact_semantic_ids))
     ):
-        raise ValueError("Stage-2 invocation/run artifact identity is not globally unique")
+        raise ValueError(
+            "Stage-2 invocation/run artifact identity is not globally unique"
+        )
     ordered_windows = [
         (
             item["command_receipt"]["started_unix_ns"],
@@ -2119,7 +2401,9 @@ def _derive_evidence(
         )
         for item in captures
     ]
-    if any(right[0] < left[1] for left, right in zip(ordered_windows, ordered_windows[1:])):
+    if any(
+        right[0] < left[1] for left, right in zip(ordered_windows, ordered_windows[1:])
+    ):
         raise ValueError("Stage-2 timing command intervals overlap or are out of order")
     samples = {metric: [] for metric in _TIMING_METRICS}
     command_captures = []
@@ -2133,7 +2417,8 @@ def _derive_evidence(
                     "template:" + item["command_policy"]["command_template_id"],
                     "sha256:" + item["command_policy"]["command_template_sha256"],
                 ],
-                "executable_path": "/sanitized/" + item["command_policy"]["executable_id"],
+                "executable_path": "/sanitized/"
+                + item["command_policy"]["executable_id"],
                 "executable_sha256": item["command_policy"]["executable_sha256"],
                 "returncode": 0,
                 "started_unix_ns": receipt["started_unix_ns"],
@@ -2153,12 +2438,13 @@ def _derive_evidence(
         command_captures=command_captures,
         samples=samples,
         seed_bindings=[
-            {"role": role, "seed": seed}
-            for role, seed in sorted(seed_bindings.items())
+            {"role": role, "seed": seed} for role, seed in sorted(seed_bindings.items())
         ],
     )
     e2e = krea_budget.seal_end_to_end_validation(
-        execution_envelope_sha256=resolved["execution_envelope"]["execution_envelope_sha256"],
+        execution_envelope_sha256=resolved["execution_envelope"][
+            "execution_envelope_sha256"
+        ],
         probe_contract_sha256=resolved["probe_contract"]["probe_contract_sha256"],
         runs=[
             {
@@ -2254,16 +2540,18 @@ def _load_canonical(path: Path, label: str) -> dict[str, Any]:
         value = json.loads(raw)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{label} is not canonical JSON") from exc
-    if not isinstance(value, dict) or raw != krea_provenance.canonical_bytes(value) + b"\n":
+    if (
+        not isinstance(value, dict)
+        or raw != krea_provenance.canonical_bytes(value) + b"\n"
+    ):
         raise ValueError(f"{label} is not canonical JSON plus newline")
     return value
 
 
-def _artifact_schema(measurement_count: int, heldout_count: int) -> list[tuple[str, str]]:
-    if (
-        measurement_count != _MEASUREMENT_RECEIPTS
-        or heldout_count != _HELDOUT_RECEIPTS
-    ):
+def _artifact_schema(
+    measurement_count: int, heldout_count: int
+) -> list[tuple[str, str]]:
+    if measurement_count != _MEASUREMENT_RECEIPTS or heldout_count != _HELDOUT_RECEIPTS:
         raise ValueError("Stage-2 timing artifact schema cardinality differs")
     return list(_FIXED_ARTIFACT_SCHEMA)
 
@@ -2285,9 +2573,7 @@ def produce_bundle(
         plan=resolved,
         controls=controls,
         receipt_manifest=receipt_manifest,
-        expected_receipt_manifest_file_sha256=(
-            expected_receipt_manifest_file_sha256
-        ),
+        expected_receipt_manifest_file_sha256=(expected_receipt_manifest_file_sha256),
         expected_receipt_manifest_sha256=expected_receipt_manifest_sha256,
         receipt_bindings=receipt_bindings,
         framework_stop_boundary_s=framework_stop_boundary_s,
@@ -2432,12 +2718,17 @@ def validate_bundle(value: Any, *, root: str | Path) -> dict[str, Any]:
         raise ValueError("Stage-2 timing bundle summary differs from plan")
     stored_records: dict[str, dict[str, Any]] = {}
     for row, (name, semantic_key) in zip(artifacts, schema):
-        if not isinstance(row, dict) or set(row) != {
-            "path",
-            "bytes",
-            "file_sha256",
-            "semantic_sha256",
-        } or row["path"] != name:
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {
+                "path",
+                "bytes",
+                "file_sha256",
+                "semantic_sha256",
+            }
+            or row["path"] != name
+        ):
             raise ValueError("Stage-2 timing artifact row differs")
         if (
             isinstance(row["bytes"], bool)
@@ -2477,8 +2768,7 @@ def validate_bundle(value: Any, *, root: str | Path) -> dict[str, Any]:
     end_to_end = stored_records["end-to-end.json"]
     profile = stored_records["throughput-profile.json"]
     if (
-        raw["raw_sample_manifest_sha256"]
-        != profile["raw_sample_manifest_sha256"]
+        raw["raw_sample_manifest_sha256"] != profile["raw_sample_manifest_sha256"]
         or end_to_end["end_to_end_validation_sha256"]
         != profile["end_to_end_validation_sha256"]
         or stored_records["margin-policy.json"]["margin_policy_sha256"]
@@ -2502,6 +2792,22 @@ def bundle_binding(root: str | Path) -> dict[str, str]:
     }
 
 
+def load_timing_bundle(root: str | Path) -> dict[str, Any]:
+    """Load and fully validate one immutable timing bundle directory."""
+
+    path = Path(os.path.abspath(os.path.expanduser(os.fspath(root))))
+    bundle = _load_canonical(path / "bundle.json", "timing bundle")
+    validate_bundle(bundle, root=path)
+    return {
+        "root": str(path),
+        "bundle": bundle,
+        "plan": _load_canonical(path / "timing-plan.json", "timing plan"),
+        "throughput_profile": _load_canonical(
+            path / "throughput-profile.json", "throughput profile"
+        ),
+    }
+
+
 def replay_bundle(
     root: str | Path,
     *,
@@ -2515,11 +2821,10 @@ def replay_bundle(
 ) -> dict[str, Any]:
     path = Path(os.path.abspath(os.path.expanduser(os.fspath(root))))
     bundle = _load_canonical(path / "bundle.json", "timing bundle")
-    if (
-        _canonical_file_sha(bundle)
-        != _sha(expected_bundle_file_sha256, "expected bundle file")
-        or bundle.get("bundle_sha256")
-        != _sha(expected_bundle_sha256, "expected bundle semantic")
+    if _canonical_file_sha(bundle) != _sha(
+        expected_bundle_file_sha256, "expected bundle file"
+    ) or bundle.get("bundle_sha256") != _sha(
+        expected_bundle_sha256, "expected bundle semantic"
     ):
         raise ValueError("Stage-2 timing bundle differs from external trust anchor")
     validate_bundle(bundle, root=path)
@@ -2539,9 +2844,7 @@ def replay_bundle(
         plan=plan,
         controls=controls,
         receipt_manifest=receipt_manifest,
-        expected_receipt_manifest_file_sha256=(
-            expected_receipt_manifest_file_sha256
-        ),
+        expected_receipt_manifest_file_sha256=(expected_receipt_manifest_file_sha256),
         expected_receipt_manifest_sha256=expected_receipt_manifest_sha256,
         receipt_bindings=receipt_bindings,
         framework_stop_boundary_s=stored_profile["framework_stop_boundary_s"],

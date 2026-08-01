@@ -18,6 +18,7 @@ from ops.calibration import krea_provenance
 from ops.calibration import krea_stage2_delegated_review_contract as review_contract
 from ops.calibration import krea_stage2_production_identity as production
 from ops.calibration import krea_stage2_timing as timing
+from ops.calibration import krea_stage2_timing_collector as collector
 
 
 def _sha(label: str) -> str:
@@ -318,7 +319,12 @@ def _admission_chain(
         digest = hashlib.sha256(raw).hexdigest()
         role_file_sha[role] = digest
         rows.append(
-            {"role": role, "relative_path": relative, "sha256": digest, "bytes": len(raw)}
+            {
+                "role": role,
+                "relative_path": relative,
+                "sha256": digest,
+                "bytes": len(raw),
+            }
         )
     identity_file_sha = _file_sha(identity)
     request = admission.build_request(
@@ -418,8 +424,23 @@ def _controls(
         created_at_utc="2026-07-30T00:00:30Z",
         production_image_id=identity["container_image"]["image_id"],
         measurement_tool_sha256=identity["runtime_contract"]["measurement_tool_sha256"],
+        collector_executable_sha256=_sha("separate-receipt-collector"),
         executable_sha256=_sha("docker-cli"),
         gpu_device=0,
+        fixture_role=fixture["experimental_role"],
+        fixture_manifest_sha256=fixture["manifest_sha256"],
+        training_archive_sha256=fixture["training_archive"]["sha256"],
+        training_archive_bytes=fixture["training_archive"]["bytes"],
+        profile_id="K1",
+        hard_budget_s=2700.0,
+        mount_sources={
+            "base_model": "/test/base-model",
+            "text_encoder": "/test/text-encoder",
+            "dataset_cache": "/test/datasets",
+            "checkpoints": "/test/checkpoints",
+            "run_evidence": "/test/evidence",
+        },
+        trigger_word=fixture["trigger_token"],
     )
     host = _host()
     gpu = _gpu()
@@ -452,9 +473,6 @@ def _events(index: int, canary: str) -> list[dict]:
     counters = {
         "startup": 1,
         "optimizer_update": 34,
-        "checkpoint_save": 3,
-        "finalization": 1,
-        "upload": 1,
     }
     for metric, units in counters.items():
         token = f"span-{index}-{metric}-{canary}"
@@ -480,6 +498,54 @@ def _events(index: int, canary: str) -> list[dict]:
             )
         )
         clock += 1_000_000_000
+    for save_index in range(3):
+        token = f"span-{index}-checkpoint_save-{save_index}-{canary}"
+        rows.append(
+            timing.seal_event(
+                sequence=len(rows),
+                span_token=token,
+                metric="checkpoint_save",
+                state="begin",
+                counter_value=0,
+                received_monotonic_ns=clock,
+            )
+        )
+        clock += 1_000_000_000
+        rows.append(
+            timing.seal_event(
+                sequence=len(rows),
+                span_token=token,
+                metric="checkpoint_save",
+                state="end",
+                counter_value=1,
+                received_monotonic_ns=clock,
+            )
+        )
+        clock += 1_000_000_000
+    for metric in ("finalization", "upload"):
+        token = f"span-{index}-{metric}-{canary}"
+        rows.append(
+            timing.seal_event(
+                sequence=len(rows),
+                span_token=token,
+                metric=metric,
+                state="begin",
+                counter_value=0,
+                received_monotonic_ns=clock,
+            )
+        )
+        clock += 1_000_000_000
+        rows.append(
+            timing.seal_event(
+                sequence=len(rows),
+                span_token=token,
+                metric=metric,
+                state="end",
+                counter_value=1,
+                received_monotonic_ns=clock,
+            )
+        )
+        clock += 1_000_000_000
     return rows
 
 
@@ -500,7 +566,11 @@ def _receipt(plan: dict, controls: dict, index: int, *, heldout: bool = False) -
         probe_contract=controls["probe_contract"],
         receipt_ordinal=3 if heldout else index,
         command={
-            "argv": controls["probe_contract"]["command_argv"],
+            "argv": timing.render_probe_command(
+                controls["probe_contract"],
+                timing_plan_sha256=plan["plan_sha256"],
+                receipt_ordinal=3 if heldout else index,
+            ),
             "executable_id": timing._EXECUTABLE_ID,
             "executable_path": timing._EXECUTABLE_PATH,
             "executable_sha256": controls["probe_contract"]["executable_sha256"],
@@ -527,9 +597,7 @@ def _receipt_manifest(receipts: list[dict], controls: dict) -> dict:
     collector = timing.seal_collector_identity(
         created_at_utc="2026-07-30T00:08:00Z",
         collector_executable_sha256=_sha("separate-receipt-collector"),
-        measurement_tool_sha256=controls["probe_contract"][
-            "measurement_tool_sha256"
-        ],
+        measurement_tool_sha256=controls["probe_contract"]["measurement_tool_sha256"],
     )
     return timing.seal_receipt_manifest(
         created_at_utc="2026-07-30T01:00:00Z",
@@ -664,7 +732,9 @@ def test_receipt_derived_bundle_replays_and_scrubs_sealed_canaries(
         _restore_writable(root)
 
 
-def test_capture_and_bundle_schemas_are_exact(real_surface: dict, tmp_path: Path) -> None:
+def test_capture_and_bundle_schemas_are_exact(
+    real_surface: dict, tmp_path: Path
+) -> None:
     plan, controls, receipts, manifest = _plan_and_receipts(real_surface)
     capture = timing._derive_capture(
         plan, controls=controls, receipt_binding=receipts[0]
@@ -710,9 +780,7 @@ def test_valid_but_different_stored_margin_cannot_rebind_bundle(
             reviewer_identity="Jordan Margin",
             approved_at_utc="2026-07-30T00:01:00Z",
             frozen_before_capture=True,
-            multiplicative_margin={
-                metric: 1.5 for metric in timing._TIMING_METRICS
-            },
+            multiplicative_margin={metric: 1.5 for metric in timing._TIMING_METRICS},
             additive_margin_s={metric: 0.5 for metric in timing._TIMING_METRICS},
         )
         os.chmod(root, 0o700)
@@ -720,7 +788,9 @@ def test_valid_but_different_stored_margin_cannot_rebind_bundle(
         os.chmod(margin_path, 0o600)
         _write_canonical(margin_path, replacement)
         os.chmod(margin_path, 0o400)
-        row = next(item for item in bundle["artifacts"] if item["path"] == margin_path.name)
+        row = next(
+            item for item in bundle["artifacts"] if item["path"] == margin_path.name
+        )
         row.update(
             bytes=margin_path.stat().st_size,
             file_sha256=krea_provenance.file_sha256(margin_path),
@@ -751,8 +821,8 @@ def test_caller_cannot_inject_derived_duration_or_units(
         for key, value in stale["record"]["events"][0].items()
         if key != "event_sha256"
     }
-    stale["record"]["events"][0]["event_sha256"] = (
-        krea_provenance.canonical_sha256(event_body)
+    stale["record"]["events"][0]["event_sha256"] = krea_provenance.canonical_sha256(
+        event_body
     )
     stale["record"] = {
         **{
@@ -794,14 +864,10 @@ def test_external_live_receipt_substitution_is_rejected(
         moved["live_host_identity"]["host_execution_identity_sha256"] = (
             krea_provenance.canonical_sha256(body)
         )
-        moved["live_host_identity_file_sha256"] = _file_sha(
-            moved["live_host_identity"]
-        )
+        moved["live_host_identity_file_sha256"] = _file_sha(moved["live_host_identity"])
     else:
         moved["live_gpu_identity"] = _gpu("GPU-test-other")
-        moved["live_gpu_identity_file_sha256"] = _file_sha(
-            moved["live_gpu_identity"]
-        )
+        moved["live_gpu_identity_file_sha256"] = _file_sha(moved["live_gpu_identity"])
     with pytest.raises(ValueError, match="exact control replay"):
         timing._derive_capture(plan, controls=moved, receipt_binding=receipts[0])
 
@@ -810,26 +876,28 @@ def test_external_live_receipt_substitution_is_rejected(
 def test_probe_command_is_exactly_rendered_and_substitutions_fail(
     real_surface: dict, substitution: str
 ) -> None:
-    _, controls, _, _ = _plan_and_receipts(real_surface)
+    plan, controls, _, _ = _plan_and_receipts(real_surface)
     probe = deepcopy(controls["probe_contract"])
     image = probe["production_image_id"]
-    assert probe["command_argv"] == timing.render_probe_command(
-        production_image_id=image, gpu_device=0
+    rendered = timing.render_probe_command(
+        probe, timing_plan_sha256=plan["plan_sha256"], receipt_ordinal=0
     )
-    assert probe["command_argv"][timing._COMMAND_IMAGE_INDEX] == image
-    assert probe["command_argv"][timing._COMMAND_IMAGE_INDEX + 1 :]
-    assert "/bin/true" not in probe["command_argv"]
+    assert rendered.count(image) == 1
+    assert "--mount" in rendered
+    assert "device=0" in rendered
+    assert "/bin/true" not in probe["command_argv_template"]
+    image_index = probe["command_argv_template"].index(image)
     if substitution == "image":
-        probe["command_argv"][timing._COMMAND_IMAGE_INDEX] = "sha256:" + "9" * 64
+        probe["command_argv_template"][image_index] = "sha256:" + "9" * 64
     elif substitution == "entrypoint":
-        probe["command_argv"][timing._COMMAND_IMAGE_INDEX:timing._COMMAND_IMAGE_INDEX] = [
+        probe["command_argv_template"][image_index:image_index] = [
             "--entrypoint",
             "/bin/sh",
         ]
     else:
-        probe["command_argv"].append("--unexpected-suffix")
+        probe["command_argv_template"].append("--unexpected-suffix")
     probe["command_template_sha256"] = krea_provenance.canonical_sha256(
-        probe["command_argv"]
+        probe["command_argv_template"]
     )
     body = {
         key: value for key, value in probe.items() if key != "probe_contract_sha256"
@@ -839,18 +907,117 @@ def test_probe_command_is_exactly_rendered_and_substitutions_fail(
         timing.validate_probe_contract(probe)
 
 
-def test_probe_typed_gpu_field_is_fixed(real_surface: dict) -> None:
-    identity = real_surface["identity"]
-    with pytest.raises(ValueError, match="predeclared GPU"):
-        timing.seal_probe_contract(
-            created_at_utc="2026-07-30T00:00:30Z",
-            production_image_id=identity["container_image"]["image_id"],
-            measurement_tool_sha256=identity["runtime_contract"][
-                "measurement_tool_sha256"
-            ],
-            executable_sha256=_sha("docker-cli"),
-            gpu_device=1,
-        )
+def test_probe_gpu_range_is_exact(real_surface: dict) -> None:
+    _, controls, _, _ = _plan_and_receipts(real_surface)
+    probe = controls["probe_contract"]
+    kwargs = {
+        "created_at_utc": probe["created_at_utc"],
+        "production_image_id": probe["production_image_id"],
+        "measurement_tool_sha256": probe["measurement_tool_sha256"],
+        "collector_executable_sha256": probe["collector_executable_sha256"],
+        "executable_sha256": probe["executable_sha256"],
+        "fixture_role": probe["fixture_manifest"]["role"],
+        "fixture_manifest_sha256": probe["fixture_manifest"]["manifest_sha256"],
+        "training_archive_sha256": probe["training_archive"]["sha256"],
+        "training_archive_bytes": probe["training_archive"]["bytes"],
+        "profile_id": probe["command_fields"]["profile_id"],
+        "hard_budget_s": probe["command_fields"]["hard_budget_s"],
+        "mount_sources": {
+            row["purpose"]: row["source_root"] for row in probe["mounts"]
+        },
+        "trigger_word": probe["command_fields"]["trigger_word"],
+    }
+    assert (
+        timing.seal_probe_contract(gpu_device=3, **kwargs)["command_fields"][
+            "gpu_device"
+        ]
+        == 3
+    )
+    with pytest.raises(ValueError, match="0, 1, 2, or 3"):
+        timing.seal_probe_contract(gpu_device=4, **kwargs)
+
+
+def test_exact_thirty_matrix_envelopes_render_isolated_three_plus_one_commands(
+    real_surface: dict,
+) -> None:
+    _, controls, _, _ = _plan_and_receipts(real_surface)
+    base = controls["probe_contract"]
+    assignments = [
+        *([(f"C{index}", 2700.0, index - 1) for index in range(1, 5)]),
+        ("B-0p5-small", 1800.0, 0),
+        ("B-0p5-large", 1800.0, 1),
+        ("B-0p75-small", 2700.0, 2),
+        ("B-0p75-large", 2700.0, 3),
+        ("B-1-small", 3600.0, 0),
+        ("B-1-large", 3600.0, 1),
+    ]
+    contracts = []
+    for role, hard_budget_s, gpu in assignments:
+        for profile_id in ("K1", "K3", "K4"):
+            contract = timing.seal_probe_contract(
+                created_at_utc=base["created_at_utc"],
+                production_image_id=base["production_image_id"],
+                measurement_tool_sha256=base["measurement_tool_sha256"],
+                collector_executable_sha256=base["collector_executable_sha256"],
+                executable_sha256=base["executable_sha256"],
+                gpu_device=gpu,
+                fixture_role=role,
+                fixture_manifest_sha256=_sha("fixture-" + role),
+                training_archive_sha256=_sha("archive-" + role),
+                training_archive_bytes=1234,
+                profile_id=profile_id,
+                hard_budget_s=hard_budget_s,
+                mount_sources={
+                    row["purpose"]: row["source_root"] for row in base["mounts"]
+                },
+                trigger_word="SN56",
+            )
+            assert timing.validate_probe_contract(contract) == contract
+            assert [
+                row["measurement_role"] for row in contract["receipt_schedule"]
+            ] == [
+                "timing_measurement",
+                "timing_measurement",
+                "timing_measurement",
+                "held_out_end_to_end",
+            ]
+            commands = [
+                timing.render_probe_command(
+                    contract,
+                    timing_plan_sha256=_sha(f"plan-{role}-{profile_id}"),
+                    receipt_ordinal=ordinal,
+                )
+                for ordinal in range(4)
+            ]
+            assert len({tuple(command) for command in commands}) == 4
+            assert all(f"device={gpu}" in command for command in commands)
+            assert all(
+                contract["production_image_id"] in command for command in commands
+            )
+            contracts.append(contract)
+    assert len(contracts) == 30
+    assert len({item["probe_contract_sha256"] for item in contracts}) == 30
+
+
+def test_host_collector_event_stream_is_real_three_save_plus_terminal_chain() -> None:
+    stream = collector._EventStream(0)
+    stream.emit("startup-r0", "startup", "begin", 1)
+    stream.evidence("config-control.json", collector._IN_CLOSE_WRITE)
+    for index in range(3):
+        name = f"checkpoint_{index:09d}.safetensors"
+        stream.checkpoint(name, collector._IN_CREATE)
+        stream.checkpoint(name, collector._IN_CLOSE_WRITE)
+    stream.evidence("training-terminal.json", collector._IN_CLOSE_WRITE)
+    stream.evidence("forge_checkpoint_selection.json", collector._IN_CLOSE_WRITE)
+    events = stream.finish()
+    samples, _ = timing._derive_samples(
+        events, expected_units=timing._EVENT_UNIT_SCHEDULE
+    )
+    assert len(samples["startup"]) == 1
+    assert len(samples["optimizer_update"]) == 1
+    assert len(samples["checkpoint_save"]) == 3
+    assert len(samples["finalization"]) == 1
+    assert len(samples["upload"]) == 1
 
 
 def test_coherent_counter_inflation_fails_schedule_and_original_manifest(
@@ -864,9 +1031,7 @@ def test_coherent_counter_inflation_fails_schedule_and_original_manifest(
     event["event_sha256"] = krea_provenance.canonical_sha256(event_body)
     _rehash_receipt(changed[0])
     with pytest.raises(ValueError, match="predeclared schedule"):
-        timing._derive_capture(
-            plan, controls=controls, receipt_binding=changed[0]
-        )
+        timing._derive_capture(plan, controls=controls, receipt_binding=changed[0])
     with pytest.raises(ValueError, match="exactly exhaust"):
         timing._derive_evidence(
             plan=plan,
@@ -921,9 +1086,7 @@ def test_future_run_receipts_cannot_postdate_anchored_manifest(
         old = binding["record"]["run_receipt"]
         binding["record"]["run_receipt"] = timing.seal_run_receipt(
             measurement_role=binding["record"]["measurement_role"],
-            artifact_manifest_file_sha256=old[
-                "artifact_manifest_file_sha256"
-            ],
+            artifact_manifest_file_sha256=old["artifact_manifest_file_sha256"],
             artifact_manifest_sha256=old["artifact_manifest_sha256"],
             recorded_unix_ns=manifest_ns + index * 1_000_000_000,
         )
@@ -942,9 +1105,7 @@ def test_collector_identity_must_precede_execution_and_manifest(
     collector = timing.seal_collector_identity(
         created_at_utc=collector_created,
         collector_executable_sha256=_sha("separate-receipt-collector"),
-        measurement_tool_sha256=controls["probe_contract"][
-            "measurement_tool_sha256"
-        ],
+        measurement_tool_sha256=controls["probe_contract"]["measurement_tool_sha256"],
     )
     with pytest.raises(ValueError, match="collector identity postdates"):
         timing.seal_receipt_manifest(
@@ -977,9 +1138,7 @@ def test_clock_chronology_and_predeclared_budget_fail_closed(
     if mode == "clock":
         command["ended_monotonic_ns"] += timing._CLOCK_TOLERANCE_NS + 1
     elif mode == "chronology":
-        command["started_unix_ns"] = timing._utc_ns(
-            plan["created_at_utc"], "plan"
-        )
+        command["started_unix_ns"] = timing._utc_ns(plan["created_at_utc"], "plan")
         command["ended_unix_ns"] = command["started_unix_ns"] + 60_000_000_000
     else:
         command["ended_unix_ns"] = command["started_unix_ns"] + 3_000_000_000_000
@@ -993,6 +1152,8 @@ def test_clock_chronology_and_predeclared_budget_fail_closed(
         command["invocation_id"] = timing._command(
             unsealed_command,
             probe=controls["probe_contract"],
+            timing_plan_sha256=plan["plan_sha256"],
+            receipt_ordinal=0,
             image_id=plan["production_image_id"],
             sealed=False,
         )["invocation_id"]
@@ -1030,6 +1191,8 @@ def test_reused_monotonic_window_is_rejected_even_with_later_unix_window(
     command["invocation_id"] = timing._command(
         unsealed_command,
         probe=controls["probe_contract"],
+        timing_plan_sha256=plan["plan_sha256"],
+        receipt_ordinal=1,
         image_id=plan["production_image_id"],
         sealed=False,
     )["invocation_id"]
@@ -1119,9 +1282,7 @@ def test_post_publication_coherent_receipt_rewrite_fails_original_anchors(
                 controls=controls,
                 receipt_manifest=changed_manifest,
                 expected_receipt_manifest_file_sha256=_file_sha(manifest),
-                expected_receipt_manifest_sha256=manifest[
-                    "receipt_manifest_sha256"
-                ],
+                expected_receipt_manifest_sha256=manifest["receipt_manifest_sha256"],
                 receipt_bindings=changed,
             )
     finally:
@@ -1148,9 +1309,7 @@ def test_stored_margin_must_equal_exact_control_document(
             reviewer_identity="Jordan Margin",
             approved_at_utc="2026-07-30T00:01:00Z",
             frozen_before_capture=True,
-            multiplicative_margin={
-                metric: 1.5 for metric in timing._TIMING_METRICS
-            },
+            multiplicative_margin={metric: 1.5 for metric in timing._TIMING_METRICS},
             additive_margin_s={metric: 0.5 for metric in timing._TIMING_METRICS},
         )
         changed["margin_policy_file_sha256"] = _file_sha(changed["margin_policy"])
