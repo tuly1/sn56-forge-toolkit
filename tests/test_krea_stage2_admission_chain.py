@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import zipfile
 
 import pytest
@@ -490,6 +491,49 @@ def test_capture_rejects_pre_freeze_time_without_touching_seal(
             captured_at_utc="2026-08-01T18:18:00Z",
             remote_verifier=lambda: None,
         )
+
+
+def _git(repo: Path, *args: str, input_text: str | None = None) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+
+def test_remote_freeze_accepts_descendant_head_and_rejects_non_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "Stage2 Test")
+    _git(repo, "config", "user.email", "stage2@example.invalid")
+    (repo / "binding.txt").write_text("freeze\n", encoding="utf-8")
+    _git(repo, "add", "binding.txt")
+    _git(repo, "commit", "-m", "freeze")
+    freeze_commit = _git(repo, "rev-parse", "HEAD")
+    (repo / "descendant.txt").write_text("descendant\n", encoding="utf-8")
+    _git(repo, "add", "descendant.txt")
+    _git(repo, "commit", "-m", "descendant")
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    _git(repo, "remote", "add", "test", str(remote))
+    ref = "refs/heads/freeze-chain"
+    _git(repo, "push", "test", f"HEAD:{ref}")
+    monkeypatch.setattr(chain, "_PUBLIC_FREEZE_REPOSITORY", str(remote))
+    monkeypatch.setattr(chain, "_PUBLIC_FREEZE_REF", ref)
+    monkeypatch.setattr(chain, "_PUBLIC_FREEZE_COMMIT", freeze_commit)
+    chain._verify_remote_freeze(repository_root=repo)
+
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    unrelated = _git(repo, "commit-tree", tree, input_text="unrelated\n")
+    _git(repo, "push", "--force", "test", f"{unrelated}:{ref}")
+    with pytest.raises(ValueError, match="not a locally proven ancestor"):
+        chain._verify_remote_freeze(repository_root=repo)
 
 
 def test_full_tree_capture_and_post_capture_extra_file_are_fail_closed(

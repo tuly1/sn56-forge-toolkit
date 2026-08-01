@@ -451,7 +451,14 @@ def _verify_public_freeze_binding() -> dict[str, Any]:
     return value
 
 
-def _verify_remote_freeze() -> None:
+def _verify_remote_freeze(*, repository_root: str | Path | None = None) -> None:
+    """Prove the pushed freeze is an ancestor of the one live remote head."""
+
+    root = (
+        Path(__file__).resolve().parents[2]
+        if repository_root is None
+        else Path(repository_root).resolve(strict=True)
+    )
     try:
         result = subprocess.run(
             ["git", "ls-remote", "--exit-code", _PUBLIC_FREEZE_REPOSITORY, _PUBLIC_FREEZE_REF],
@@ -463,8 +470,43 @@ def _verify_remote_freeze() -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError("pushed freeze binding commit is not remotely reachable") from exc
     rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
-    if rows != [[_PUBLIC_FREEZE_COMMIT, _PUBLIC_FREEZE_REF]]:
-        raise ValueError("remote freeze ref does not point at the pinned binding commit")
+    if (
+        len(rows) != 1
+        or len(rows[0]) != 2
+        or rows[0][1] != _PUBLIC_FREEZE_REF
+        or _SHA1.fullmatch(rows[0][0]) is None
+    ):
+        raise ValueError("remote freeze ref did not resolve to exactly one commit")
+    remote_head = rows[0][0]
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{remote_head}^{{commit}}"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", _PUBLIC_FREEZE_COMMIT, remote_head],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(
+            "pushed freeze commit is not a locally proven ancestor of remote head"
+        ) from exc
+    if status.stdout:
+        raise ValueError("freeze ancestry proof requires a clean local repository")
 
 
 def _stable_file_identity(path: Path, label: str) -> dict[str, Any]:
