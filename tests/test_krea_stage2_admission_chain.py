@@ -532,7 +532,7 @@ def test_remote_freeze_accepts_descendant_head_and_rejects_non_descendant(
     tree = _git(repo, "rev-parse", "HEAD^{tree}")
     unrelated = _git(repo, "commit-tree", tree, input_text="unrelated\n")
     _git(repo, "push", "--force", "test", f"{unrelated}:{ref}")
-    with pytest.raises(ValueError, match="not a locally proven ancestor"):
+    with pytest.raises(ValueError, match="not a remotely proven ancestor"):
         chain._verify_remote_freeze(repository_root=repo)
 
 
