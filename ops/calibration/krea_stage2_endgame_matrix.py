@@ -20,20 +20,25 @@ import sys
 from typing import Any, Mapping, Sequence
 
 try:
+    from . import krea_fixture
     from . import krea_density_seedb_freeze
     from . import krea_provenance
     from . import krea_stage2_execution
     from . import krea_stage2_production_identity
+    from . import krea_stage2_training_evidence
 except ImportError:  # pragma: no cover - direct CLI execution.
+    import krea_fixture  # type: ignore[no-redef]
     import krea_density_seedb_freeze  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_stage2_execution  # type: ignore[no-redef]
     import krea_stage2_production_identity  # type: ignore[no-redef]
+    import krea_stage2_training_evidence  # type: ignore[no-redef]
 
 
 SCHEMA = 1
 MATRIX_KIND = "forge-krea-stage2-endgame-matrix"
 RECEIPT_KIND = "forge-krea-stage2-endgame-row-receipt"
+SCORE_HOOK_KIND = "forge-krea-stage2-score-stream-hook"
 
 # The fresh no-cache build/probe gate sealed this exact c000 subject.  The
 # adapter intentionally refuses another commit, tree, or image identity.
@@ -141,6 +146,21 @@ def _publish_new(path: str | Path, value: Mapping[str, Any]) -> None:
         os.close(descriptor)
 
 
+def _publish_or_replay(
+    path: str | Path, value: Mapping[str, Any], label: str
+) -> dict[str, Any]:
+    """Publish once, or require an interrupted prior publication to match."""
+
+    target = _safe_path(path, label, must_exist=os.path.lexists(path))
+    if os.path.lexists(target):
+        observed = _load_canonical(target, label)
+        if observed != value:
+            raise ValueError(f"{label} differs from the deterministic replay")
+        return observed
+    _publish_new(target, value)
+    return dict(value)
+
+
 def _validate_production_identity(value: Any) -> dict[str, Any]:
     identity = krea_stage2_production_identity.validate(value)
     forge = _object(identity["forge"], "production identity forge")
@@ -218,9 +238,7 @@ def _matrix_body(
                         "family_id": family,
                         "family_role": _family_role(family, active),
                         "candidate_policy_family_ids": (
-                            list(active)
-                            if family in REFERENCE_FAMILIES
-                            else [family]
+                            list(active) if family in REFERENCE_FAMILIES else [family]
                         ),
                         "gpu_device": FIXTURE_GPU[fixture],
                         "wave_id": confirmation_wave_for_family[family],
@@ -491,9 +509,48 @@ def validate_row_controls(
     return resolved_plan, resolved_approval, identity
 
 
+def _score_hook(
+    *, matrix: Mapping[str, Any], row: Mapping[str, Any], evidence: Mapping[str, Any]
+) -> dict[str, Any]:
+    body = {
+        "schema": SCHEMA,
+        "kind": SCORE_HOOK_KIND,
+        "matrix_sha256": matrix["matrix_sha256"],
+        "row_key": row["row_key"],
+        "phase": row["phase"],
+        "score_required": row["phase"] == "confirmation",
+        "run_evidence_sha256": evidence["evidence_sha256"],
+        "candidate_artifacts": evidence["candidate_artifacts"],
+        "state": "ready-for-exact-score",
+        "release_authorized": False,
+        "production_mutation_authorized": False,
+    }
+    return {**body, "hook_sha256": krea_provenance.canonical_sha256(body)}
+
+
+def validate_score_hook(
+    value: Any,
+    *,
+    matrix: Mapping[str, Any],
+    row: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    hook = _object(value, "Stage-2 score-stream hook")
+    expected = _score_hook(matrix=matrix, row=row, evidence=evidence)
+    if hook != expected:
+        raise ValueError("Stage-2 score-stream hook does not replay exactly")
+    return dict(hook)
+
+
 def _receipt(
-    *, matrix: Mapping[str, Any], row: Mapping[str, Any], plan: Mapping[str, Any],
-    approval: Mapping[str, Any], completion: Mapping[str, Any]
+    *,
+    matrix: Mapping[str, Any],
+    row: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    completion: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    score_hook: Mapping[str, Any],
 ) -> dict[str, Any]:
     body = {
         "schema": SCHEMA,
@@ -504,6 +561,8 @@ def _receipt(
         "execution_plan_sha256": plan["plan_sha256"],
         "execution_approval_sha256": approval["approval_sha256"],
         "completion_sha256": completion["completion_sha256"],
+        "run_evidence_sha256": evidence["evidence_sha256"],
+        "score_hook_sha256": score_hook["hook_sha256"],
         "production_image_id": PRODUCTION_IMAGE_ID,
         "strict_authority_replayed": True,
         "waiver_used": False,
@@ -514,16 +573,76 @@ def _receipt(
 
 
 def validate_receipt(
-    value: Any, *, matrix: Mapping[str, Any], row: Mapping[str, Any],
-    plan: Mapping[str, Any], approval: Mapping[str, Any], completion: Mapping[str, Any]
+    value: Any,
+    *,
+    matrix: Mapping[str, Any],
+    row: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    completion: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    score_hook: Mapping[str, Any],
 ) -> dict[str, Any]:
     receipt = _object(value, "Stage-2 row receipt")
     expected = _receipt(
-        matrix=matrix, row=row, plan=plan, approval=approval, completion=completion
+        matrix=matrix,
+        row=row,
+        plan=plan,
+        approval=approval,
+        completion=completion,
+        evidence=evidence,
+        score_hook=score_hook,
     )
     if receipt != expected:
         raise ValueError("Stage-2 row receipt does not replay exactly")
     return dict(receipt)
+
+
+def _replay_live_run(
+    *,
+    row: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    completion: Mapping[str, Any],
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    """Replay private receipts and rehash every artifact from its live path."""
+
+    if completion["gpu_device"] != row["gpu_device"]:
+        raise ValueError("completion GPU differs from the matrix row")
+    private = krea_stage2_execution.validate_private_run_receipts(plan)
+    if (
+        private["config_control"] != completion["config_control_receipt"]
+        or private["training_terminal"] != completion["training_terminal_receipt"]
+        or private["checkpoint_selection"] != completion["checkpoint_selection_receipt"]
+    ):
+        raise ValueError("private run receipts differ from the completion")
+    fixture_binding = _object(plan["fixture_manifest"], "fixture binding")
+    fixture_path = _safe_path(
+        fixture_binding["path"], "bound fixture manifest", must_exist=True
+    )
+    fixture = krea_fixture.validate_manifest(
+        _load_canonical(fixture_path, "bound fixture manifest")
+    )
+    if (
+        _canonical_file_sha(fixture) != fixture_binding["file_sha256"]
+        or fixture["manifest_sha256"] != fixture_binding["manifest_sha256"]
+    ):
+        raise ValueError("live fixture manifest differs from the execution plan")
+    return krea_stage2_training_evidence.build_run_evidence(
+        plan=dict(plan),
+        plan_file_sha256=_canonical_file_sha(plan),
+        approval=dict(approval),
+        approval_file_sha256=_canonical_file_sha(approval),
+        completion=dict(completion),
+        completion_file_sha256=_canonical_file_sha(completion),
+        run_output_root=Path(output_dir),
+        fixture_manifest={
+            "file_sha256": fixture_binding["file_sha256"],
+            "manifest_sha256": fixture_binding["manifest_sha256"],
+        },
+        emitted_at_utc=completion["ended_at_utc"],
+    )
 
 
 def run_row(
@@ -535,6 +654,8 @@ def run_row(
     authority_bundle: Mapping[str, Any],
     output_dir: str | Path,
     completion_path: str | Path,
+    run_evidence_path: str | Path,
+    score_hook_path: str | Path,
     receipt_path: str | Path,
     run_cell=krea_stage2_execution.run_cell,
 ) -> tuple[dict[str, Any], bool]:
@@ -553,12 +674,37 @@ def run_row(
     completion_target = _safe_path(
         completion_path, "row completion", must_exist=os.path.lexists(completion_path)
     )
-    if os.path.lexists(receipt_target):
+    evidence_target = _safe_path(
+        run_evidence_path, "row run evidence", must_exist=False
+    )
+    hook_target = _safe_path(score_hook_path, "row score hook", must_exist=False)
+    if os.path.lexists(receipt_target) or os.path.lexists(completion_target):
         completion = _load_canonical(completion_target, "existing row completion")
         completion = krea_stage2_execution.validate_completion(
             completion, plan=resolved_plan, approval=resolved_approval
         )
-        receipt = _load_canonical(receipt_target, "existing row receipt")
+        evidence = _replay_live_run(
+            row=row,
+            plan=resolved_plan,
+            approval=resolved_approval,
+            completion=completion,
+            output_dir=output_dir,
+        )
+        evidence = _publish_or_replay(evidence_target, evidence, "row run evidence")
+        hook = _score_hook(matrix=resolved_matrix, row=row, evidence=evidence)
+        hook = _publish_or_replay(hook_target, hook, "row score hook")
+        expected_receipt = _receipt(
+            matrix=resolved_matrix,
+            row=row,
+            plan=resolved_plan,
+            approval=resolved_approval,
+            completion=completion,
+            evidence=evidence,
+            score_hook=hook,
+        )
+        receipt = _publish_or_replay(
+            receipt_target, expected_receipt, "existing row receipt"
+        )
         return (
             validate_receipt(
                 receipt,
@@ -567,6 +713,8 @@ def run_row(
                 plan=resolved_plan,
                 approval=resolved_approval,
                 completion=completion,
+                evidence=evidence,
+                score_hook=hook,
             ),
             True,
         )
@@ -581,12 +729,24 @@ def run_row(
     completion = krea_stage2_execution.validate_completion(
         completion, plan=resolved_plan, approval=resolved_approval
     )
+    evidence = _replay_live_run(
+        row=row,
+        plan=resolved_plan,
+        approval=resolved_approval,
+        completion=completion,
+        output_dir=output_dir,
+    )
+    _publish_new(evidence_target, evidence)
+    hook = _score_hook(matrix=resolved_matrix, row=row, evidence=evidence)
+    _publish_new(hook_target, hook)
     receipt = _receipt(
         matrix=resolved_matrix,
         row=row,
         plan=resolved_plan,
         approval=resolved_approval,
         completion=completion,
+        evidence=evidence,
+        score_hook=hook,
     )
     _publish_new(receipt_target, receipt)
     return receipt, False
@@ -612,6 +772,8 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--authority-bundle", required=True, type=Path)
     run.add_argument("--output-dir", required=True, type=Path)
     run.add_argument("--completion", required=True, type=Path)
+    run.add_argument("--run-evidence", required=True, type=Path)
+    run.add_argument("--score-hook", required=True, type=Path)
     run.add_argument("--receipt", required=True, type=Path)
     return parser.parse_args(argv)
 
@@ -648,6 +810,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 output_dir=args.output_dir,
                 completion_path=args.completion,
+                run_evidence_path=args.run_evidence,
+                score_hook_path=args.score_hook,
                 receipt_path=args.receipt,
             )
             result = {"receipt": result, "replayed_existing": replayed}

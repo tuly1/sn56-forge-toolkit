@@ -197,9 +197,7 @@ def _row_controls(
     authority = {
         "waiver_finalist_freeze": freeze,
         "production_identity": identity,
-        "production_identity_file_sha256": value["production_identity"][
-            "file_sha256"
-        ],
+        "production_identity_file_sha256": value["production_identity"]["file_sha256"],
     }
     return row["row_key"], plan, approval, completion, authority
 
@@ -226,6 +224,13 @@ def test_run_row_is_fixed_gpu_create_only_and_replay_validates_before_skip(
         "validate_completion",
         lambda supplied, **_kwargs: supplied,
     )
+    evidence = {
+        "evidence_sha256": _sha("run-evidence"),
+        "candidate_artifacts": [
+            {"path": "checkpoints/last.safetensors", "bytes": 1, "sha256": _sha("last")}
+        ],
+    }
+    monkeypatch.setattr(matrix, "_replay_live_run", lambda **_kwargs: evidence)
     observed: list[int] = []
 
     def fake_run_cell(**kwargs):
@@ -237,6 +242,8 @@ def test_run_row_is_fixed_gpu_create_only_and_replay_validates_before_skip(
 
     completion_path = tmp_path / "completion.json"
     receipt_path = tmp_path / "receipt.json"
+    evidence_path = tmp_path / "run-evidence.json"
+    hook_path = tmp_path / "score-hook.json"
     receipt, replayed = matrix.run_row(
         matrix=value,
         row_key=row_key,
@@ -245,6 +252,8 @@ def test_run_row_is_fixed_gpu_create_only_and_replay_validates_before_skip(
         authority_bundle=authority,
         output_dir=tmp_path / "run",
         completion_path=completion_path,
+        run_evidence_path=evidence_path,
+        score_hook_path=hook_path,
         receipt_path=receipt_path,
         run_cell=fake_run_cell,
     )
@@ -261,6 +270,8 @@ def test_run_row_is_fixed_gpu_create_only_and_replay_validates_before_skip(
         authority_bundle=authority,
         output_dir=tmp_path / "must-not-run",
         completion_path=completion_path,
+        run_evidence_path=evidence_path,
+        score_hook_path=hook_path,
         receipt_path=receipt_path,
         run_cell=lambda **_kwargs: pytest.fail("existing row was rerun"),
     )
@@ -278,6 +289,129 @@ def test_run_row_is_fixed_gpu_create_only_and_replay_validates_before_skip(
             authority_bundle=authority,
             output_dir=tmp_path / "must-not-run-2",
             completion_path=completion_path,
+            run_evidence_path=evidence_path,
+            score_hook_path=hook_path,
             receipt_path=receipt_path,
             run_cell=lambda **_kwargs: pytest.fail("drifted receipt was rerun"),
+        )
+
+
+def test_live_replay_loads_bound_fixture_and_rehashes_real_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_body = {"schema": 1, "experimental_role": "C1"}
+    fixture = {
+        **fixture_body,
+        "manifest_sha256": krea_provenance.canonical_sha256(fixture_body),
+    }
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_bytes(krea_provenance.canonical_bytes(fixture) + b"\n")
+    checkpoint_root = tmp_path / "checkpoints" / "stage2-c1-a" / "stage2-c1-a-k1"
+    checkpoint_root.mkdir(parents=True)
+    artifact_path = checkpoint_root / "last.safetensors"
+    artifact_path.write_bytes(b"real-live-artifact")
+    artifact = {
+        "path": "checkpoints/last.safetensors",
+        "bytes": artifact_path.stat().st_size,
+        "sha256": krea_provenance.file_sha256(artifact_path),
+    }
+    private = {
+        "config_control": {"receipt_sha256": _sha("control")},
+        "training_terminal": {"receipt_sha256": _sha("terminal")},
+        "checkpoint_selection": {"receipt_sha256": _sha("selection")},
+    }
+    plan = {
+        "phase": "confirmation",
+        "cell_id": "C1-A",
+        "fixture_id": "C1",
+        "seed_role": "A",
+        "seed": 1,
+        "hours": "0.75",
+        "task_id": "stage2-c1-a",
+        "expected_repo_name": "stage2-c1-a-k1",
+        "training_candidate_id": "candidate",
+        "plan_sha256": _sha("plan"),
+        "fixture_manifest": {
+            "path": str(fixture_path),
+            "file_sha256": matrix._canonical_file_sha(fixture),
+            "manifest_sha256": fixture["manifest_sha256"],
+        },
+        "waiver_finalist_freeze": {
+            "file_sha256": _sha("freeze-file"),
+            "freeze_sha256": _sha("freeze"),
+        },
+        "confirmation_materialization": {
+            "file_sha256": _sha("mat-file"),
+            "materialization_sha256": _sha("mat"),
+        },
+        "owner_ratification": {
+            "file_sha256": _sha("rat-file"),
+            "ratification_sha256": _sha("rat"),
+        },
+        "gpu_execution_authorization": {
+            "file_sha256": _sha("gpu-file"),
+            "gpu_execution_authorization_sha256": _sha("gpu"),
+        },
+        "production_identity": {
+            "file_sha256": _sha("identity-file"),
+            "production_identity_sha256": _sha("identity"),
+        },
+        "production_image_id": matrix.PRODUCTION_IMAGE_ID,
+        "mounts": [
+            {"purpose": "checkpoints", "source": str(tmp_path / "checkpoints")},
+            {"purpose": "run_evidence", "source": str(tmp_path / "private")},
+        ],
+    }
+    approval = {"approval_sha256": _sha("approval")}
+    completion = {
+        "completion_sha256": _sha("completion"),
+        "gpu_device": 0,
+        "ended_at_utc": "2026-08-01T18:30:00Z",
+        "artifact_manifest": [artifact],
+        "mechanics": {"natural_completion": True},
+        "config_control_receipt": private["config_control"],
+        "training_terminal_receipt": private["training_terminal"],
+        "checkpoint_selection_receipt": private["checkpoint_selection"],
+    }
+    monkeypatch.setattr(matrix.krea_fixture, "validate_manifest", lambda value: value)
+    monkeypatch.setattr(
+        matrix.krea_stage2_execution, "validate_plan", lambda value: value
+    )
+    monkeypatch.setattr(
+        matrix.krea_stage2_execution,
+        "validate_approval",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        matrix.krea_stage2_execution,
+        "validate_completion",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        matrix.krea_stage2_execution,
+        "validate_private_run_receipts",
+        lambda _plan: private,
+    )
+
+    evidence = matrix._replay_live_run(
+        row={"gpu_device": 0},
+        plan=plan,
+        approval=approval,
+        completion=completion,
+        output_dir=tmp_path / "run",
+    )
+    assert evidence["fixture_manifest"] == {
+        "file_sha256": plan["fixture_manifest"]["file_sha256"],
+        "manifest_sha256": plan["fixture_manifest"]["manifest_sha256"],
+    }
+    assert evidence["candidate_artifacts"] == [artifact]
+
+    artifact_path.write_bytes(b"drifted")
+    with pytest.raises(ValueError, match="artifact bytes drifted"):
+        matrix._replay_live_run(
+            row={"gpu_device": 0},
+            plan=plan,
+            approval=approval,
+            completion=completion,
+            output_dir=tmp_path / "run",
         )
