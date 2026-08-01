@@ -1030,7 +1030,7 @@ def test_exact_thirty_matrix_envelopes_render_isolated_three_plus_one_commands(
                 mount_sources={
                     row["purpose"]: row["source_root"] for row in base["mounts"]
                 },
-                trigger_word="SN56",
+                trigger_word=None if role in timing._CONFIRMATION_ROLES else "SN56",
             )
             assert timing.validate_probe_contract(contract) == contract
             assert [
