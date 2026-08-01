@@ -97,7 +97,7 @@ _CONFIRMATION_ROLES = {f"C{index}" for index in range(1, 5)}
 _MEASUREMENT_RECEIPTS = 3
 _HELDOUT_RECEIPTS = 1
 _CLOCK_TOLERANCE_NS = 250_000_000
-_COMMAND_TEMPLATE_ID = "docker-nvidia-offline-stage2-timing-bootstrap-v2"
+_COMMAND_TEMPLATE_ID = "docker-nvidia-offline-stage2-timing-bootstrap-v3"
 _EXECUTABLE_ID = "docker-cli-v1"
 _EXECUTABLE_PATH = "/usr/bin/docker"
 _COMMAND_PLACEHOLDERS = {
@@ -120,6 +120,13 @@ _MOUNT_CONTRACT = {
 _COMMAND_TYPED_FIELDS = {
     "network_mode": "none",
     "runtime": "nvidia",
+    "shm_size": "8g",
+    "memory_limit": "110g",
+    "cpu_limit": "24",
+    "security_opt": "no-new-privileges",
+    "cap_drop": "ALL",
+    "resource_contract_source_commit": "b026da04",
+    "resource_contract_source_path": "trainer/runtime.py:222-250",
     "entrypoint_mode": "immutable_image_default",
     "in_image_program": "forge.cli",
     "model_type": "krea2",
@@ -468,6 +475,16 @@ def _probe_command_template(
         f"device={typed_fields['gpu_device']}",
         "--network",
         "none",
+        "--shm-size",
+        typed_fields["shm_size"],
+        "--memory",
+        typed_fields["memory_limit"],
+        "--cpus",
+        typed_fields["cpu_limit"],
+        "--security-opt",
+        typed_fields["security_opt"],
+        "--cap-drop",
+        typed_fields["cap_drop"],
     ]
     for mount in mounts:
         source = mount["source_root"]

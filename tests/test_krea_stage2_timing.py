@@ -951,6 +951,16 @@ def test_probe_command_is_exactly_rendered_and_substitutions_fail(
     ]
     assert all(not value.endswith((",rw", ",ro")) for value in mount_specs)
     assert sum(value.endswith(",readonly") for value in mount_specs) == 3
+    assert rendered[rendered.index("--shm-size") + 1] == "8g"
+    assert rendered[rendered.index("--memory") + 1] == "110g"
+    assert rendered[rendered.index("--cpus") + 1] == "24"
+    assert rendered[rendered.index("--security-opt") + 1] == "no-new-privileges"
+    assert rendered[rendered.index("--cap-drop") + 1] == "ALL"
+    assert probe["command_fields"]["resource_contract_source_commit"] == "b026da04"
+    assert (
+        probe["command_fields"]["resource_contract_source_path"]
+        == "trainer/runtime.py:222-250"
+    )
     assert "device=0" in rendered
     assert "/bin/true" not in probe["command_argv_template"]
     image_index = probe["command_argv_template"].index(image)
@@ -1085,6 +1095,22 @@ def test_host_collector_event_stream_is_real_three_save_plus_terminal_chain() ->
     assert len(samples["checkpoint_save"]) == 3
     assert len(samples["finalization"]) == 1
     assert len(samples["upload"]) == 1
+
+
+def test_host_collector_reads_bootstrap_steps_from_immutable_nested_control() -> None:
+    control = {
+        "checkpoint_selection": {"planned_steps": 34},
+        "effective_recipe": {"steps": 34},
+    }
+    terminal = {
+        "planned_steps": 34,
+        "checkpoint_selection": {"planned_steps": 34},
+    }
+    collector._validate_bootstrap_step_contract(control, terminal, 34)
+    changed = deepcopy(terminal)
+    changed["planned_steps"] = 33
+    with pytest.raises(ValueError, match="planned_steps differs"):
+        collector._validate_bootstrap_step_contract(control, changed, 34)
 
 
 def test_coherent_counter_inflation_fails_schedule_and_original_manifest(
