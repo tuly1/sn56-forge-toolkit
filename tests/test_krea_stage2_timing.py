@@ -442,7 +442,11 @@ def _controls(
             "checkpoints": "/test/checkpoints",
             "run_evidence": "/test/evidence",
         },
-        trigger_word=fixture["trigger_token"],
+        trigger_word=(
+            None
+            if fixture["experimental_role"] in timing._CONFIRMATION_ROLES
+            else fixture["trigger_token"]
+        ),
     )
     host = _host()
     gpu = _gpu()
@@ -689,6 +693,51 @@ def test_real_c1_and_boundary_chains_validate_without_monkeypatch(
     )
 
 
+def test_probe_preserves_legacy_null_trigger_and_boundary_trigger() -> None:
+    common = {
+        "created_at_utc": "2026-07-30T00:00:30Z",
+        "production_image_id": "sha256:" + "3" * 64,
+        "measurement_tool_sha256": _sha("measurement-tool"),
+        "collector_executable_sha256": _sha("collector"),
+        "executable_sha256": _sha("docker"),
+        "gpu_device": 0,
+        "fixture_manifest_sha256": _sha("fixture"),
+        "training_archive_sha256": _sha("archive"),
+        "training_archive_bytes": 123,
+        "profile_id": "K1",
+        "hard_budget_s": 2700.0,
+        "mount_sources": {
+            "base_model": "/test/base-model",
+            "text_encoder": "/test/text-encoder",
+            "dataset_cache": "/test/datasets",
+            "checkpoints": "/test/checkpoints",
+            "run_evidence": "/test/evidence",
+        },
+    }
+    confirmation = timing.seal_probe_contract(
+        **common,
+        fixture_role="C1",
+        trigger_word=None,
+    )
+    assert confirmation["command_fields"]["trigger_word"] is None
+    assert "--trigger-word" not in confirmation["command_argv_template"]
+    assert timing.validate_probe_contract(confirmation) == confirmation
+
+    boundary = timing.seal_probe_contract(
+        **common,
+        fixture_role="B-0p75-small",
+        trigger_word="SN56",
+    )
+    trigger_index = boundary["command_argv_template"].index("--trigger-word")
+    assert boundary["command_argv_template"][trigger_index + 1] == "SN56"
+    with pytest.raises(ValueError, match="trigger word"):
+        timing.seal_probe_contract(
+            **common,
+            fixture_role="B-0p75-small",
+            trigger_word=None,
+        )
+
+
 def test_canonical_fixture_schema_never_accepts_null_trigger(real_surface: dict) -> None:
     manifest = deepcopy(real_surface["B-0p5-small"])
     manifest["trigger_token"] = None
@@ -895,6 +944,13 @@ def test_probe_command_is_exactly_rendered_and_substitutions_fail(
     )
     assert rendered.count(image) == 1
     assert "--mount" in rendered
+    mount_specs = [
+        rendered[index + 1]
+        for index, value in enumerate(rendered[:-1])
+        if value == "--mount"
+    ]
+    assert all(not value.endswith((",rw", ",ro")) for value in mount_specs)
+    assert sum(value.endswith(",readonly") for value in mount_specs) == 3
     assert "device=0" in rendered
     assert "/bin/true" not in probe["command_argv_template"]
     image_index = probe["command_argv_template"].index(image)
@@ -981,7 +1037,9 @@ def test_exact_thirty_matrix_envelopes_render_isolated_three_plus_one_commands(
                 mount_sources={
                     row["purpose"]: row["source_root"] for row in base["mounts"]
                 },
-                trigger_word="SN56",
+                trigger_word=(
+                    None if role in timing._CONFIRMATION_ROLES else "SN56"
+                ),
             )
             assert timing.validate_probe_contract(contract) == contract
             assert [
@@ -1029,6 +1087,22 @@ def test_host_collector_event_stream_is_real_three_save_plus_terminal_chain() ->
     assert len(samples["checkpoint_save"]) == 3
     assert len(samples["finalization"]) == 1
     assert len(samples["upload"]) == 1
+
+
+def test_host_collector_reads_bootstrap_steps_from_immutable_nested_control() -> None:
+    control = {
+        "checkpoint_selection": {"planned_steps": 34},
+        "effective_recipe": {"steps": 34},
+    }
+    terminal = {
+        "planned_steps": 34,
+        "checkpoint_selection": {"planned_steps": 34},
+    }
+    collector._validate_bootstrap_step_contract(control, terminal, 34)
+    changed = deepcopy(terminal)
+    changed["planned_steps"] = 33
+    with pytest.raises(ValueError, match="planned_steps differs"):
+        collector._validate_bootstrap_step_contract(control, changed, 34)
 
 
 def test_coherent_counter_inflation_fails_schedule_and_original_manifest(

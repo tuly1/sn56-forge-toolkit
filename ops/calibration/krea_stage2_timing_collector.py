@@ -259,6 +259,21 @@ def _validate_semantic_receipt(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def _validate_bootstrap_step_contract(
+    control: Mapping[str, Any], terminal: Mapping[str, Any], expected_steps: int
+) -> None:
+    checkpoint_selection = control.get("checkpoint_selection")
+    if (
+        not isinstance(checkpoint_selection, dict)
+        or checkpoint_selection.get("planned_steps") != expected_steps
+        or terminal.get("planned_steps") != expected_steps
+        or terminal.get("checkpoint_selection") != checkpoint_selection
+        or not isinstance(control.get("effective_recipe"), dict)
+        or control["effective_recipe"].get("steps") != expected_steps
+    ):
+        raise ValueError("timing bootstrap receipt planned_steps differs")
+
+
 def _validate_run_outputs(
     *,
     plan: Mapping[str, Any],
@@ -280,13 +295,13 @@ def _validate_run_outputs(
         "probe_contract_sha256": probe["probe_contract_sha256"],
         "profile_id": fields["profile_id"],
         "training_seed": schedule["seed"],
-        "planned_steps": fields["bootstrap_steps"],
         "throughput_profile_sha256": None,
         "release_authorized": False,
     }
     for key, expected in common.items():
         if control.get(key) != expected or terminal.get(key) != expected:
             raise ValueError(f"timing bootstrap receipt {key} differs")
+    _validate_bootstrap_step_contract(control, terminal, fields["bootstrap_steps"])
     if (
         control.get("kind")
         != "forge-krea-stage2-timing-bootstrap-config-control-receipt"
@@ -493,9 +508,6 @@ def _run_one(
     evidence_watch.close()
     if timed_out:
         raise RuntimeError("timing bootstrap exceeded its hard budget")
-    events = stream.finish()
-    ended_monotonic_ns = time.monotonic_ns()
-    ended_unix_ns = time.time_ns()
     if returncode != 0:
         raise RuntimeError(f"timing bootstrap Docker command failed: {returncode}")
     _validate_run_outputs(
@@ -505,6 +517,9 @@ def _run_one(
         checkpoint_root=checkpoint_root,
         evidence_root=evidence_root,
     )
+    events = stream.finish()
+    ended_monotonic_ns = time.monotonic_ns()
+    ended_unix_ns = time.time_ns()
     artifact = _artifact_manifest(
         plan_sha256=plan["plan_sha256"],
         receipt_ordinal=receipt_ordinal,
