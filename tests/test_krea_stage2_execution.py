@@ -244,8 +244,6 @@ def test_trigger_scope_is_fail_closed_between_legacy_confirmation_and_boundary()
 
 def test_confirmation_plan_may_truthfully_omit_absent_trigger() -> None:
     payload = _payload()
-    payload["trigger_word"] = None
-    payload["entrypoint_argv"] = payload["entrypoint_argv"][:-2]
 
     plan = stage2.seal_plan(payload)
     assert plan["trigger_word"] is None
