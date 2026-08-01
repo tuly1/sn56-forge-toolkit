@@ -142,3 +142,14 @@ def test_shared_gpu_lock_fails_closed_on_overlap(tmp_path: Path) -> None:
                 tmp_path, 2
             ):
                 pass
+
+
+def test_shared_gpu_lock_rejects_symlink_root(tmp_path: Path) -> None:
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="not a real directory"):
+        with scoring.krea_stage2_endgame_orchestrator.gpu_execution_lock(alias, 0):
+            pass

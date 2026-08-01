@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any, Mapping, Sequence
 
@@ -122,9 +123,18 @@ def gpu_execution_lock(root: str | Path, gpu_device: int):
         raise ValueError("GPU execution lock device is outside 0-3")
     directory = Path(os.path.abspath(os.path.expanduser(str(root))))
     directory.mkdir(parents=True, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("GPU execution lock root is not a real directory")
     path = directory / f"gpu{gpu_device}.lock"
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
     try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("GPU execution lock is not one regular file")
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
