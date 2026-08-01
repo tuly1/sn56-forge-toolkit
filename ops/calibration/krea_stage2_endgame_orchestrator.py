@@ -32,6 +32,7 @@ try:
     from . import krea_provenance
     from . import krea_stage2_endgame_matrix
     from . import krea_stage2_execution
+    from . import krea_stage2_legacy_confirmation
     from . import krea_stage2_production_identity
     from . import krea_stage2_timing
     from . import krea_stage2_training_evidence
@@ -41,6 +42,7 @@ except ImportError:  # pragma: no cover - direct CLI execution.
     import krea_provenance  # type: ignore[no-redef]
     import krea_stage2_endgame_matrix  # type: ignore[no-redef]
     import krea_stage2_execution  # type: ignore[no-redef]
+    import krea_stage2_legacy_confirmation  # type: ignore[no-redef]
     import krea_stage2_production_identity  # type: ignore[no-redef]
     import krea_stage2_timing  # type: ignore[no-redef]
     import krea_stage2_training_evidence  # type: ignore[no-redef]
@@ -182,6 +184,8 @@ def _validate_authority_bundle(value: Any) -> dict[str, Any]:
         "production_identity",
         "production_identity_file_sha256",
         "waiver_finalist_freeze",
+        "sealed_inventory",
+        "sealed_inventory_file_sha256",
     }
     _exact(controls, required, "Stage-2 authority bundle")
     for name in (
@@ -191,6 +195,7 @@ def _validate_authority_bundle(value: Any) -> dict[str, Any]:
         "materialization",
         "gpu_execution_authorization",
         "production_identity",
+        "sealed_inventory",
     ):
         record = _object(controls[name], f"authority {name}")
         if _canonical_file_sha(record) != _sha(
@@ -290,15 +295,14 @@ def _timing_catalog(
         entry = _object(catalog[key], f"timing entry {key}")
         _exact(entry, {"bundle_root", "probe_contract"}, f"timing entry {key}")
         root = Path(os.path.abspath(os.path.expanduser(entry["bundle_root"])))
-        bundle = _load(root / "bundle.json", f"timing bundle {key}")
-        krea_stage2_timing.validate_bundle(bundle, root=root)
-        plan = _load(root / "timing-plan.json", f"timing plan {key}")
-        plan = krea_stage2_timing.validate_plan(plan)
+        loaded = krea_stage2_timing.load_timing_bundle(root)
+        bundle = loaded["bundle"]
+        plan = krea_stage2_timing.validate_plan(loaded["plan"])
         probe_path = Path(
             os.path.abspath(os.path.expanduser(str(entry["probe_contract"])))
         )
         probe = _load(probe_path, f"timing probe contract {key}")
-        probe = krea_stage2_timing.validate_probe_contract(probe)
+        probe = krea_stage2_timing.validate_probe_contract(probe, plan=plan)
         if (
             plan["probe_contract"]
             != {
@@ -351,13 +355,20 @@ def _timing_catalog(
 
 def _fixture_binding(path: str | Path, expected_role: str) -> tuple[dict, dict]:
     source = Path(os.path.abspath(os.path.expanduser(str(path))))
-    manifest = krea_fixture.validate_manifest(_load(source, f"fixture {expected_role}"))
-    if manifest["experimental_role"] != expected_role:
+    document = _load(source, f"fixture {expected_role}")
+    if expected_role in krea_stage2_legacy_confirmation.ROLES:
+        wrapper = krea_stage2_legacy_confirmation.validate_wrapper(document)
+        fixture = krea_stage2_legacy_confirmation.score_view(wrapper)
+        semantic = wrapper["wrapper_sha256"]
+    else:
+        fixture = krea_fixture.validate_manifest(document)
+        semantic = fixture["manifest_sha256"]
+    if fixture["experimental_role"] != expected_role:
         raise ValueError(f"fixture path for {expected_role} contains another role")
-    return manifest, {
+    return fixture, {
         "path": str(source),
-        "file_sha256": _canonical_file_sha(manifest),
-        "manifest_sha256": manifest["manifest_sha256"],
+        "file_sha256": _canonical_file_sha(document),
+        "manifest_sha256": semantic,
     }
 
 
@@ -418,7 +429,7 @@ def _plan_for_row(
     if family == "K0":
         planned_steps = recipe.size_scaled_steps(
             "krea2",
-            len(fixture["training_rows"]),
+            len(fixture["training_dataset_identity"]["rows"]),
             float(hours),
             template_steps=2000,
         )
@@ -775,6 +786,7 @@ def claim_next(
     claims_root: str | Path,
     claimed_at_utc: str,
     scheduler_instance_id: str,
+    gpu_devices: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     resolved = validate_plan_set(plan_set, matrix=matrix)
     root = Path(os.path.abspath(os.path.expanduser(str(claims_root))))
@@ -790,8 +802,14 @@ def claim_next(
     if first_open_wave is None:
         return []
     wave_keys = set(first_open_wave["row_keys"])
+    selected_gpus = tuple(GPU_IDS if gpu_devices is None else gpu_devices)
+    if (
+        len(selected_gpus) != len(set(selected_gpus))
+        or any(gpu not in GPU_IDS for gpu in selected_gpus)
+    ):
+        raise ValueError("training claim GPU subset is invalid")
     claims: list[dict[str, Any]] = []
-    for gpu in GPU_IDS:
+    for gpu in selected_gpus:
         queue = resolved["gpu_queues"][str(gpu)]
         active = [
             key
@@ -840,6 +858,31 @@ def run_claim(
     gpu_lock_root: str | Path,
 ) -> dict[str, Any]:
     resolved = validate_plan_set(plan_set, matrix=matrix)
+    record = _validate_claim(claim, plan_set=resolved, matrix=matrix)
+    row = next(row for row in resolved["rows"] if row["row_key"] == record["row_key"])
+    with gpu_execution_lock(gpu_lock_root, row["gpu_device"]):
+        receipt, replayed = krea_stage2_endgame_matrix.run_row(
+            matrix=matrix,
+            row_key=row["row_key"],
+            plan=_load(row["plan"]["path"], "claimed row plan"),
+            approval=_load(row["approval"]["path"], "claimed row approval"),
+            authority_bundle=authority_bundle,
+            output_dir=row["output_dir"],
+            completion_path=row["completion_path"],
+            run_evidence_path=row["run_evidence_path"],
+            score_hook_path=row["score_hook_path"],
+            receipt_path=row["receipt_path"],
+        )
+    return {"receipt": receipt, "replayed_existing": replayed}
+
+
+def _validate_claim(
+    claim: Mapping[str, Any],
+    *,
+    plan_set: Mapping[str, Any],
+    matrix: Mapping[str, Any],
+) -> dict[str, Any]:
+    resolved = validate_plan_set(plan_set, matrix=matrix)
     record = _object(claim, "GPU claim")
     _exact(
         record,
@@ -869,23 +912,13 @@ def run_claim(
     ):
         raise ValueError("GPU claim identity/authority differs")
     matches = [row for row in resolved["rows"] if row["row_key"] == record["row_key"]]
-    if len(matches) != 1 or matches[0]["gpu_device"] != record["gpu_device"]:
+    if (
+        len(matches) != 1
+        or matches[0]["gpu_device"] != record["gpu_device"]
+        or matches[0]["wave_id"] != record["wave_id"]
+    ):
         raise ValueError("GPU claim differs from its fixed row")
-    row = matches[0]
-    with gpu_execution_lock(gpu_lock_root, row["gpu_device"]):
-        receipt, replayed = krea_stage2_endgame_matrix.run_row(
-            matrix=matrix,
-            row_key=row["row_key"],
-            plan=_load(row["plan"]["path"], "claimed row plan"),
-            approval=_load(row["approval"]["path"], "claimed row approval"),
-            authority_bundle=authority_bundle,
-            output_dir=row["output_dir"],
-            completion_path=row["completion_path"],
-            run_evidence_path=row["run_evidence_path"],
-            score_hook_path=row["score_hook_path"],
-            receipt_path=row["receipt_path"],
-        )
-    return {"receipt": receipt, "replayed_existing": replayed}
+    return dict(record)
 
 
 def seal_exact60_gate(

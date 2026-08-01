@@ -454,12 +454,11 @@ def _run_control(row: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
 def _fixture_score_view(
     manifest_path: str | Path, dataset_path: str | Path, expected_role: str
 ) -> tuple[dict[str, Any], dict[str, Any], Path]:
-    """Load the score view; legacy-C wrapper support lands with admission code."""
+    """Load either exact legacy-C wrapper or canonical boundary manifest."""
 
     path = Path(os.path.abspath(os.path.expanduser(str(manifest_path))))
-    manifest = krea_fixture.validate_manifest(
-        _load(path, f"score fixture {expected_role}")
-    )
+    document = _load(path, f"score fixture {expected_role}")
+    manifest = krea_stage2_score._fixture_score_view(document)
     if manifest["experimental_role"] != expected_role:
         raise ValueError("score fixture role differs")
     dataset = Path(os.path.abspath(os.path.expanduser(str(dataset_path))))
@@ -469,7 +468,7 @@ def _fixture_score_view(
     return (
         manifest,
         {
-            "file_sha256": _file_sha(manifest),
+            "file_sha256": _file_sha(document),
             "manifest_sha256": manifest["manifest_sha256"],
         },
         dataset,
@@ -649,14 +648,14 @@ def _command(
     plan: Mapping[str, Any],
     job: Mapping[str, Any],
 ) -> list[str]:
+    fixture = krea_stage2_score._fixture_score_view(
+        _load(config["fixture_manifests"][plan["fixture_id"]], "score fixture")
+    )
     evaluator = {
         **surface,
         "_expected_dataset_identity": {
             "evaluator_order": [
-                row["image"]
-                for row in _load(
-                    config["fixture_manifests"][plan["fixture_id"]], "score fixture"
-                )["evaluation_dataset_identity"]["rows"]
+                row["image"] for row in fixture["evaluation_dataset_identity"]["rows"]
             ]
         },
     }
@@ -976,6 +975,7 @@ def claim_ready_groups(
     claims_root: str | Path,
     claimed_at_utc: str,
     scheduler_instance_id: str,
+    gpu_devices: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Assign ready groups to free GPUs without waiting for all training rows."""
 
@@ -997,8 +997,21 @@ def claim_ready_groups(
         and not os.path.lexists(row["aggregate_path"])
         and not os.path.lexists(root / f"{row['group_key']}.json")
     ]
+    selected_gpus = tuple(
+        krea_stage2_endgame_orchestrator.GPU_IDS
+        if gpu_devices is None
+        else gpu_devices
+    )
+    if (
+        len(selected_gpus) != len(set(selected_gpus))
+        or any(
+            gpu not in krea_stage2_endgame_orchestrator.GPU_IDS
+            for gpu in selected_gpus
+        )
+    ):
+        raise ValueError("score claim GPU subset is invalid")
     claims = []
-    for gpu in krea_stage2_endgame_orchestrator.GPU_IDS:
+    for gpu in selected_gpus:
         if gpu in active_gpus or not ready:
             continue
         group = ready.pop(0)

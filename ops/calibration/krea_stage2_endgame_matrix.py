@@ -24,6 +24,7 @@ try:
     from . import krea_density_seedb_freeze
     from . import krea_provenance
     from . import krea_stage2_execution
+    from . import krea_stage2_legacy_confirmation
     from . import krea_stage2_production_identity
     from . import krea_stage2_training_evidence
 except ImportError:  # pragma: no cover - direct CLI execution.
@@ -31,6 +32,7 @@ except ImportError:  # pragma: no cover - direct CLI execution.
     import krea_density_seedb_freeze  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_stage2_execution  # type: ignore[no-redef]
+    import krea_stage2_legacy_confirmation  # type: ignore[no-redef]
     import krea_stage2_production_identity  # type: ignore[no-redef]
     import krea_stage2_training_evidence  # type: ignore[no-redef]
 
@@ -616,12 +618,16 @@ def _replay_live_run(
     fixture_path = _safe_path(
         fixture_binding["path"], "bound fixture manifest", must_exist=True
     )
-    fixture = krea_fixture.validate_manifest(
-        _load_canonical(fixture_path, "bound fixture manifest")
-    )
+    fixture_document = _load_canonical(fixture_path, "bound fixture manifest")
+    if fixture_document.get("kind") == krea_stage2_legacy_confirmation.KIND:
+        wrapper = krea_stage2_legacy_confirmation.validate_wrapper(fixture_document)
+        fixture_semantic_sha256 = wrapper["wrapper_sha256"]
+    else:
+        fixture = krea_fixture.validate_manifest(fixture_document)
+        fixture_semantic_sha256 = fixture["manifest_sha256"]
     if (
-        _canonical_file_sha(fixture) != fixture_binding["file_sha256"]
-        or fixture["manifest_sha256"] != fixture_binding["manifest_sha256"]
+        _canonical_file_sha(fixture_document) != fixture_binding["file_sha256"]
+        or fixture_semantic_sha256 != fixture_binding["manifest_sha256"]
     ):
         raise ValueError("live fixture manifest differs from the execution plan")
     return krea_stage2_training_evidence.build_run_evidence(

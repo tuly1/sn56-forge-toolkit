@@ -88,6 +88,14 @@ _CHECKPOINT_MAPPING_RULE = "nearest_current_candidate_ties_choose_earlier_step"
 _TARGET_FRACTION_NUMERATOR_ENV = "FORGE_KREA_STAGE2_TARGET_FRACTION_NUMERATOR"
 _TARGET_FRACTION_DENOMINATOR_ENV = "FORGE_KREA_STAGE2_TARGET_FRACTION_DENOMINATOR"
 
+# Single-GPU image-trainer resource/security contract from G.O.D
+# b026da04b6179cf82945e8736590dd923114342b (trainer/runtime.py).  The Stage-2
+# harness remains offline, so it deliberately keeps ``--network none`` rather
+# than joining the validator's internal bridge.
+_VALIDATOR_IMAGE_TRAINER_SHM_SIZE = "8g"
+_VALIDATOR_IMAGE_TRAINER_MEMORY = "110g"
+_VALIDATOR_IMAGE_TRAINER_CPUS = "24"
+
 
 def _read_identity_file(path: Path, label: str) -> str:
     try:
@@ -2470,15 +2478,29 @@ def run_cell(
         "nvidia",
         "--gpus",
         f"device={gpu_device}",
+        "--shm-size",
+        _VALIDATOR_IMAGE_TRAINER_SHM_SIZE,
+        "--memory",
+        _VALIDATOR_IMAGE_TRAINER_MEMORY,
+        "--cpus",
+        _VALIDATOR_IMAGE_TRAINER_CPUS,
+        "--security-opt",
+        "no-new-privileges",
+        "--cap-drop",
+        "ALL",
         "--network",
         "none",
     ]
     for mount in live_mounts:
-        mode = "ro" if mount["read_only"] else "rw"
+        # Docker's long --mount grammar spells a read-only bind ``readonly``;
+        # writable is the default and has no trailing token.  ``,ro``/``,rw``
+        # are only valid in the short ``-v`` syntax.
+        read_only = ",readonly" if mount["read_only"] else ""
         command.extend(
             [
                 "--mount",
-                f"type=bind,src={mount['source']},dst={mount['destination']},{mode}",
+                f"type=bind,src={mount['source']},dst={mount['destination']}"
+                + read_only,
             ]
         )
     command.extend(

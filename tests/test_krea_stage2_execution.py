@@ -1548,6 +1548,36 @@ def test_run_cell_uses_exact_image_and_never_overrides_entrypoint(
     )
     assert observed[0:2] == ["docker", "run"]
     assert "--entrypoint" not in observed
+    for option, expected in (
+        ("--shm-size", "8g"),
+        ("--memory", "110g"),
+        ("--cpus", "24"),
+        ("--security-opt", "no-new-privileges"),
+        ("--cap-drop", "ALL"),
+        ("--network", "none"),
+    ):
+        assert observed[observed.index(option) + 1] == expected
+    mount_specs = [
+        observed[index + 1]
+        for index, token in enumerate(observed[:-1])
+        if token == "--mount"
+    ]
+    assert len(mount_specs) == 5
+    assert all(not spec.endswith((",ro", ",rw")) for spec in mount_specs)
+    read_only_destinations = {
+        "/cache/models/krea--Krea-2-Raw",
+        "/cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct",
+        "/cache/datasets",
+    }
+    for spec in mount_specs:
+        destination = next(
+            field.removeprefix("dst=")
+            for field in spec.split(",")
+            if field.startswith("dst=")
+        )
+        assert spec.endswith(",readonly") is (
+            destination in read_only_destinations
+        )
     assert plan["production_image_id"] in observed
     assert observed.index(plan["production_image_id"]) < observed.index("--task-id")
     assert "FORGE_KREA_CALIBRATION_PROFILE=K1" in observed
