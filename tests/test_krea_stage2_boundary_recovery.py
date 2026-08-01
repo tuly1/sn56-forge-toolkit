@@ -201,15 +201,28 @@ def test_postfreeze_inventory_is_metadata_only_and_fails_before_root_on_bad_gate
     )
     sealed = tmp_path / "sealed"
     (sealed).mkdir()
+    public = {}
+    wrappers = {}
     for role in admission._CONFIRMATION_ROLES:
-        path = sealed / role / "fixture-manifest.json"
-        path.parent.mkdir()
+        role_root = sealed / role
+        checksum = role_root / f"MANIFEST-{role}.sha256"
+        checksum.parent.mkdir()
+        checksum.write_text(f"legacy-{role}\n", encoding="ascii")
+        public[role] = hashlib.sha256(checksum.read_bytes()).hexdigest()
+        path = role_root / "legacy-fixture-wrapper.json"
+        path.parent.mkdir(exist_ok=True)
         path.write_bytes(
             krea_provenance.canonical_bytes(
-                {"schema": 99, "experimental_role": role, "secret": "fixture payload"}
+                {
+                    "schema": 99,
+                    "experimental_role": role,
+                    "public_commitment": public[role],
+                    "secret": "fixture payload",
+                }
             )
             + b"\n"
         )
+        wrappers[role] = hashlib.sha256(path.read_bytes()).hexdigest()
     for role_root in (derived / "sealed-boundary").iterdir():
         target = sealed / role_root.name
         target.mkdir()
@@ -218,12 +231,6 @@ def test_postfreeze_inventory_is_metadata_only_and_fails_before_root_on_bad_gate
                 destination = target / source.relative_to(role_root)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(source.read_bytes())
-    public = {
-        role: hashlib.sha256(
-            (sealed / role / "fixture-manifest.json").read_bytes()
-        ).hexdigest()
-        for role in admission._CONFIRMATION_ROLES
-    }
     boundary_semantic = {row["role"]: row["manifest_sha256"] for row in record["roles"]}
     boundary_files = {
         row["role"]: row["manifest_file_sha256"] for row in record["roles"]
@@ -233,16 +240,21 @@ def test_postfreeze_inventory_is_metadata_only_and_fails_before_root_on_bad_gate
         / Path(derivation.FREEZE_BINDING_PATH).name
     )
     output = tmp_path / "inventory.json"
-    real_validate = admission.krea_fixture.validate_manifest
     monkeypatch.setattr(
-        admission.krea_fixture,
-        "validate_manifest",
-        lambda value: value if value.get("schema") == 99 else real_validate(value),
+        admission.krea_stage2_legacy_confirmation,
+        "validate_wrapper_file",
+        lambda *, wrapper, role_root: {
+            "experimental_role": wrapper["experimental_role"],
+            "published_checksum_manifest": {
+                "file_sha256": wrapper["public_commitment"]
+            },
+        },
     )
     inventory = admission.materialize_postfreeze_inventory(
         public_freeze_binding_path=freeze_path,
         remote_reachable_commit_sha1=derivation.FREEZE_BINDING_COMMIT,
         public_commitment_sha256s=public,
+        confirmation_wrapper_file_sha256s=wrappers,
         boundary_fixture_manifest_sha256s=boundary_semantic,
         boundary_fixture_manifest_file_sha256s=boundary_files,
         sealed_root=sealed,
@@ -264,6 +276,7 @@ def test_postfreeze_inventory_is_metadata_only_and_fails_before_root_on_bad_gate
             public_freeze_binding_path=freeze_path,
             remote_reachable_commit_sha1="0" * 40,
             public_commitment_sha256s=public,
+            confirmation_wrapper_file_sha256s=wrappers,
             boundary_fixture_manifest_sha256s=boundary_semantic,
             boundary_fixture_manifest_file_sha256s=boundary_files,
             sealed_root=sealed,

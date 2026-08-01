@@ -34,6 +34,8 @@ try:
     from . import krea_fixture
     from . import krea_provenance
     from . import krea_stage2_production_identity
+    from . import krea_stage2_admission_chain
+    from . import krea_stage2_legacy_confirmation
     from . import krea_waiver_finalist_freeze
 except ImportError:  # pragma: no cover - direct CLI execution.
     import krea_confirmation_admission  # type: ignore[no-redef]
@@ -42,6 +44,8 @@ except ImportError:  # pragma: no cover - direct CLI execution.
     import krea_fixture  # type: ignore[no-redef]
     import krea_provenance  # type: ignore[no-redef]
     import krea_stage2_production_identity  # type: ignore[no-redef]
+    import krea_stage2_admission_chain  # type: ignore[no-redef]
+    import krea_stage2_legacy_confirmation  # type: ignore[no-redef]
     import krea_waiver_finalist_freeze  # type: ignore[no-redef]
 
 
@@ -672,12 +676,17 @@ def validate_plan(value: Any) -> dict[str, Any]:
     expected_repo_name = _safe_id(plan["expected_repo_name"], "expected_repo_name")
     if plan["model_type"] != "krea2" or plan["model"] != _KREA_MODEL:
         raise ValueError("Stage-2 production plan must target exact Krea-2-Raw")
-    if (
+    if phase == "confirmation":
+        if plan["trigger_word"] is not None:
+            raise ValueError(
+                "legacy C1-C4 confirmation must preserve the sealed null trigger"
+            )
+    elif (
         not isinstance(plan["trigger_word"], str)
         or not plan["trigger_word"]
         or plan["trigger_word"] != plan["trigger_word"].strip()
     ):
-        raise ValueError("trigger_word must be non-empty canonical text")
+        raise ValueError("boundary trigger_word must be non-empty canonical text")
     _sha(plan["base_model_identity_sha256"], "base model identity")
     asset_binding = _object(
         plan["base_asset_attestation"], "base asset attestation binding"
@@ -1159,17 +1168,46 @@ def _validate_fixture_and_archive(
     request: Mapping[str, Any],
 ) -> dict[str, Any]:
     binding = plan["fixture_manifest"]
-    manifest, file_sha = _canonical_json_file(
+    document, file_sha = _canonical_json_file(
         Path(binding["path"]), "Stage-2 fixture manifest"
     )
-    manifest = krea_fixture.validate_manifest(manifest)
-    if (
-        file_sha != binding["file_sha256"]
-        or manifest["manifest_sha256"] != binding["manifest_sha256"]
-        or manifest["experimental_role"] != plan["fixture_id"]
-        or manifest["trigger_token"] != plan["trigger_word"]
-    ):
-        raise ValueError("Stage-2 fixture manifest differs from its execution cell")
+    if plan["phase"] == "confirmation":
+        wrapper = krea_stage2_legacy_confirmation.validate_wrapper(document)
+        if (
+            file_sha != binding["file_sha256"]
+            or wrapper["wrapper_sha256"] != binding["manifest_sha256"]
+            or wrapper["experimental_role"] != plan["fixture_id"]
+            or wrapper["trigger_token"] is not None
+            or plan["trigger_word"] is not None
+        ):
+            raise ValueError("Stage-2 legacy wrapper differs from its execution cell")
+        fixture = {
+            "experimental_role": wrapper["experimental_role"],
+            "trigger_token": None,
+            "training_rows": [
+                {"relative_image_path": row["relative_path"]}
+                for row in wrapper["training_media_shapes"]
+            ],
+            "training_dataset_shape_sha256": wrapper[
+                "training_dataset_shape_sha256"
+            ],
+            "training_archive": {
+                key: wrapper["training_archive"][key]
+                for key in ("sha256", "bytes")
+            },
+        }
+    else:
+        manifest = krea_fixture.validate_manifest(document)
+        if (
+            file_sha != binding["file_sha256"]
+            or manifest["manifest_sha256"] != binding["manifest_sha256"]
+            or manifest["experimental_role"] != plan["fixture_id"]
+            or manifest["trigger_token"] != plan["trigger_word"]
+            or not isinstance(plan["trigger_word"], str)
+            or not plan["trigger_word"]
+        ):
+            raise ValueError("Stage-2 fixture manifest differs from its execution cell")
+        fixture = manifest
     committed = [
         row
         for row in materialization["files"]
@@ -1180,13 +1218,16 @@ def _validate_fixture_and_archive(
     if len(committed) != 1:
         raise ValueError("fixture manifest is absent from admitted materialization")
     if plan["phase"] == "confirmation":
-        if request["public_commitment_sha256s"][plan["fixture_id"]] != file_sha:
+        if (
+            request["public_commitment_sha256s"][plan["fixture_id"]]
+            != wrapper["published_checksum_manifest"]["file_sha256"]
+        ):
             raise ValueError(
-                "confirmation fixture file differs from its pre-finalist commitment"
+                "confirmation checksum differs from its pre-finalist commitment"
             )
     elif (
         request["boundary_fixture_manifest_sha256s"][plan["fixture_id"]]
-        != manifest["manifest_sha256"]
+        != fixture["manifest_sha256"]
     ):
         raise ValueError("boundary fixture differs from its public admitted manifest")
     mounts = {
@@ -1213,11 +1254,11 @@ def _validate_fixture_and_archive(
         ) from exc
     if (
         not stat.S_ISREG(archive_mode)
-        or archive_size != manifest["training_archive"]["bytes"]
-        or archive_sha != manifest["training_archive"]["sha256"]
+        or archive_size != fixture["training_archive"]["bytes"]
+        or archive_sha != fixture["training_archive"]["sha256"]
     ):
         raise ValueError("mounted training archive differs from the admitted fixture")
-    return manifest
+    return fixture
 
 
 def _validate_throughput_depth(
@@ -1484,6 +1525,8 @@ def validate_plan_with_authority(
         "production_identity",
         "production_identity_file_sha256",
         "waiver_finalist_freeze",
+        "sealed_inventory",
+        "sealed_inventory_file_sha256",
     }
     _exact(controls, keys, "Stage-2 authority bundle")
     record_names = (
@@ -1493,6 +1536,7 @@ def validate_plan_with_authority(
         "materialization",
         "gpu_execution_authorization",
         "production_identity",
+        "sealed_inventory",
     )
     records = {
         name: _object(controls[name], f"authority bundle {name}")
@@ -1519,6 +1563,20 @@ def validate_plan_with_authority(
         production_identity=records["production_identity"],
         production_identity_file_sha256=controls["production_identity_file_sha256"],
     )
+    inventory = krea_stage2_admission_chain.validate_inventory(
+        records["sealed_inventory"]
+    )
+    if (
+        controls["sealed_inventory_file_sha256"]
+        != krea_confirmation_admission.canonical_file_sha256(inventory)
+        or authorization["sealed_inventory_sha256"]
+        != inventory["inventory_sha256"]
+        or authorization["sealed_inventory_file_sha256"]
+        != controls["sealed_inventory_file_sha256"]
+        or records["materialization"]["files"]
+        != krea_stage2_admission_chain.inventory_sealed_files(inventory)
+    ):
+        raise ValueError("sealed inventory differs from exact owner authority")
     expected = {
         "waiver_finalist_freeze": {
             "file_sha256": authorization["waiver_freeze_file_sha256"],

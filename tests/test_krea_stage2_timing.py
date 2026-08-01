@@ -337,6 +337,8 @@ def _admission_chain(
             )
             for role in sorted(admission._BOUNDARY_ROLES)
         },
+        sealed_inventory_sha256=_sha("sealed-inventory"),
+        sealed_inventory_file_sha256=_sha("sealed-inventory-file"),
         sealed_root_locator_sha256=admission.sealed_root_locator_sha256(sealed_root),
         sealed_files=rows,
         prepared_at_utc="2026-07-30T00:02:00Z",
@@ -617,6 +619,15 @@ def test_real_c1_and_boundary_chains_validate_without_monkeypatch(
     assert boundary_plan["sealed_content_authority"]["fixture_commitment"]["mode"] == (
         "boundary_manifest_semantic_sha256"
     )
+
+
+def test_canonical_fixture_schema_never_accepts_null_trigger(real_surface: dict) -> None:
+    manifest = deepcopy(real_surface["B-0p5-small"])
+    manifest["trigger_token"] = None
+    body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    manifest["manifest_sha256"] = krea_provenance.canonical_sha256(body)
+    with pytest.raises(ValueError, match="trigger_token"):
+        krea_fixture.validate_manifest(manifest)
 
 
 def test_receipt_derived_bundle_replays_and_scrubs_sealed_canaries(
