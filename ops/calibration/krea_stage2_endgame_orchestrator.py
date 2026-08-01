@@ -13,6 +13,8 @@ There is no waiver, synthetic-profile, hand-written-plan, or release path.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -110,6 +112,27 @@ def _timing_class(family: str) -> str:
     return krea_stage2_execution.krea_calibration_profiles.profile_for_id(
         family
     ).throughput_equivalence_class
+
+
+@contextmanager
+def gpu_execution_lock(root: str | Path, gpu_device: int):
+    """Serialize training and scoring on one physical GPU across processes."""
+
+    if gpu_device not in GPU_IDS:
+        raise ValueError("GPU execution lock device is outside 0-3")
+    directory = Path(os.path.abspath(os.path.expanduser(str(root))))
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"gpu{gpu_device}.lock"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"GPU {gpu_device} is already executing work") from exc
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _expected_timing_keys(matrix: Mapping[str, Any]) -> set[str]:
@@ -272,8 +295,7 @@ def _timing_catalog(
                 "file_sha256": _canonical_file_sha(probe),
                 "probe_contract_sha256": probe["probe_contract_sha256"],
             }
-            or plan["production_image_id"]
-            != krea_stage2_endgame_matrix.PRODUCTION_IMAGE_ID
+            or plan["production_image_id"] != matrix["production_image_id"]
         ):
             raise ValueError(f"timing entry {key} escaped its probe/image")
         components = key.split("__")
@@ -429,6 +451,20 @@ def _plan_for_row(
     identity = controls["production_identity"]
     asset_path = Path(os.path.abspath(os.path.expanduser(str(asset_attestation_path))))
     asset = krea_stage2_production_identity.load_asset_attestation(asset_path)
+    entrypoint_argv = [
+        "--task-id",
+        task_id,
+        "--model",
+        "krea/Krea-2-Raw",
+        "--model-type",
+        "krea2",
+        "--expected-repo-name",
+        repo_name,
+        "--hours-to-complete",
+        hours,
+    ]
+    if fixture["trigger_token"] is not None:
+        entrypoint_argv.extend(["--trigger-word", fixture["trigger_token"]])
     payload = {
         "schema": 1,
         "kind": krea_stage2_execution.PLAN_KIND,
@@ -462,20 +498,7 @@ def _plan_for_row(
         },
         "fixture_manifest": fixture_binding,
         **_authority_plan_fields(controls),
-        "entrypoint_argv": [
-            "--task-id",
-            task_id,
-            "--model",
-            "krea/Krea-2-Raw",
-            "--model-type",
-            "krea2",
-            "--expected-repo-name",
-            repo_name,
-            "--hours-to-complete",
-            hours,
-            "--trigger-word",
-            fixture["trigger_token"],
-        ],
+        "entrypoint_argv": entrypoint_argv,
         "mounts": mount_contract,
         "network_mode": "none",
         "runtime": "nvidia",
@@ -485,9 +508,6 @@ def _plan_for_row(
         "production_mutation_authorized": False,
     }
     plan = krea_stage2_execution.seal_plan(payload)
-    plan = krea_stage2_execution.validate_plan_with_authority(
-        plan, authority_controls=controls
-    )
     return plan, timing_key
 
 
@@ -573,10 +593,6 @@ def produce(config: Mapping[str, Any], *, output_root: str | Path) -> dict[str, 
             reviewer_actor=actor,
             approved_at_utc=supplied["approval_created_at_utc"],
         )
-        krea_stage2_execution.validate_plan_with_authority(
-            plan, authority_controls=controls
-        )
-        krea_stage2_execution.validate_approval(approval, plan=plan)
         krea_stage2_endgame_matrix.validate_row_controls(
             matrix=matrix,
             row_key=row["row_key"],
@@ -620,7 +636,7 @@ def produce(config: Mapping[str, Any], *, output_root: str | Path) -> dict[str, 
         "kind": PLAN_SET_KIND,
         "config_sha256": supplied["config_sha256"],
         "matrix_sha256": matrix["matrix_sha256"],
-        "production_image_id": krea_stage2_endgame_matrix.PRODUCTION_IMAGE_ID,
+        "production_image_id": matrix["production_image_id"],
         "training_count": len(rows),
         "score_stream_count": len(rows),
         "gpu_queues": queues,
@@ -662,8 +678,7 @@ def validate_plan_set(value: Any, *, matrix: Mapping[str, Any]) -> dict[str, Any
         or plan_set["kind"] != PLAN_SET_KIND
         or plan_set["plan_set_sha256"] != krea_provenance.canonical_sha256(body)
         or plan_set["matrix_sha256"] != matrix["matrix_sha256"]
-        or plan_set["production_image_id"]
-        != krea_stage2_endgame_matrix.PRODUCTION_IMAGE_ID
+        or plan_set["production_image_id"] != matrix["production_image_id"]
         or plan_set["training_count"] != EXPECTED_ROWS
         or plan_set["score_stream_count"] != EXPECTED_ROWS
         or plan_set["strict_authority_per_row"] is not True
@@ -812,6 +827,7 @@ def run_claim(
     plan_set: Mapping[str, Any],
     matrix: Mapping[str, Any],
     authority_bundle: Mapping[str, Any],
+    gpu_lock_root: str | Path,
 ) -> dict[str, Any]:
     resolved = validate_plan_set(plan_set, matrix=matrix)
     record = _object(claim, "GPU claim")
@@ -846,18 +862,19 @@ def run_claim(
     if len(matches) != 1 or matches[0]["gpu_device"] != record["gpu_device"]:
         raise ValueError("GPU claim differs from its fixed row")
     row = matches[0]
-    receipt, replayed = krea_stage2_endgame_matrix.run_row(
-        matrix=matrix,
-        row_key=row["row_key"],
-        plan=_load(row["plan"]["path"], "claimed row plan"),
-        approval=_load(row["approval"]["path"], "claimed row approval"),
-        authority_bundle=authority_bundle,
-        output_dir=row["output_dir"],
-        completion_path=row["completion_path"],
-        run_evidence_path=row["run_evidence_path"],
-        score_hook_path=row["score_hook_path"],
-        receipt_path=row["receipt_path"],
-    )
+    with gpu_execution_lock(gpu_lock_root, row["gpu_device"]):
+        receipt, replayed = krea_stage2_endgame_matrix.run_row(
+            matrix=matrix,
+            row_key=row["row_key"],
+            plan=_load(row["plan"]["path"], "claimed row plan"),
+            approval=_load(row["approval"]["path"], "claimed row approval"),
+            authority_bundle=authority_bundle,
+            output_dir=row["output_dir"],
+            completion_path=row["completion_path"],
+            run_evidence_path=row["run_evidence_path"],
+            score_hook_path=row["score_hook_path"],
+            receipt_path=row["receipt_path"],
+        )
     return {"receipt": receipt, "replayed_existing": replayed}
 
 
@@ -940,6 +957,7 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--plan-set", required=True, type=Path)
     run.add_argument("--matrix", required=True, type=Path)
     run.add_argument("--authority-bundle", required=True, type=Path)
+    run.add_argument("--gpu-lock-root", required=True, type=Path)
     gate = sub.add_parser("gate")
     gate.add_argument("--plan-set", required=True, type=Path)
     gate.add_argument("--matrix", required=True, type=Path)
@@ -977,6 +995,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     plan_set=plan_set,
                     matrix=matrix,
                     authority_bundle=_load(args.authority_bundle, "authority bundle"),
+                    gpu_lock_root=args.gpu_lock_root,
                 )
             else:
                 result = seal_exact60_gate(

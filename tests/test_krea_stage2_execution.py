@@ -242,6 +242,25 @@ def test_trigger_scope_is_fail_closed_between_legacy_confirmation_and_boundary()
         stage2.seal_plan(boundary)
 
 
+def test_confirmation_plan_may_truthfully_omit_absent_trigger() -> None:
+    payload = _payload()
+    payload["trigger_word"] = None
+    payload["entrypoint_argv"] = payload["entrypoint_argv"][:-2]
+
+    plan = stage2.seal_plan(payload)
+    assert plan["trigger_word"] is None
+    assert "--trigger-word" not in plan["entrypoint_argv"]
+
+
+def test_boundary_plan_cannot_omit_trigger() -> None:
+    payload = _payload(boundary=True)
+    payload["trigger_word"] = None
+    payload["entrypoint_argv"] = payload["entrypoint_argv"][:-2]
+
+    with pytest.raises(ValueError, match="boundary trigger_word"):
+        stage2.seal_plan(payload)
+
+
 def _approval(plan: dict) -> dict:
     return stage2.build_approval(
         plan,

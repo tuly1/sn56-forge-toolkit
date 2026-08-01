@@ -79,6 +79,55 @@ def test_exact_scorer_environments_do_not_inherit_operator_controls(
     assert inspection["GIT_CONFIG_VALUE_0"] == "false"
 
 
+def test_contained_scorer_binds_one_gpu_in_its_minimal_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    class Process:
+        pid = 12345
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "stdout", "stderr"
+
+    def popen(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return Process()
+
+    monkeypatch.setattr(batch.subprocess, "Popen", popen)
+    monkeypatch.setattr(batch, "_validated_process_group", lambda _process: 12345)
+    monkeypatch.setattr(batch, "_scope_is_active", lambda *_args, **_kwargs: False)
+    result = batch._run_contained(
+        [sys.executable, "-c", "pass"],
+        timeout_s=5,
+        candidate_id="candidate-k1",
+        containment={
+            "mode": "systemd_transient_service",
+            "term_grace_s": 1,
+            "systemctl_path": "/usr/bin/systemctl",
+            "systemd_run_path": "/usr/bin/systemd-run",
+        },
+        gpu_device=3,
+    )
+
+    assert result.returncode == 0
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "3"
+    with pytest.raises(ValueError, match="outside"):
+        batch._run_contained(
+            [sys.executable, "-c", "pass"],
+            timeout_s=5,
+            candidate_id="candidate-invalid",
+            containment={
+                "mode": "systemd_transient_service",
+                "term_grace_s": 1,
+                "systemctl_path": "/usr/bin/systemctl",
+                "systemd_run_path": "/usr/bin/systemd-run",
+            },
+            gpu_device=True,
+        )
+
+
 def test_exact_scorer_binds_approved_order_across_filesystem_enumeration(
     tmp_path: Path,
 ) -> None:

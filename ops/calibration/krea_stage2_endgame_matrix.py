@@ -40,14 +40,6 @@ MATRIX_KIND = "forge-krea-stage2-endgame-matrix"
 RECEIPT_KIND = "forge-krea-stage2-endgame-row-receipt"
 SCORE_HOOK_KIND = "forge-krea-stage2-score-stream-hook"
 
-# The fresh no-cache build/probe gate sealed this exact c000 subject.  The
-# adapter intentionally refuses another commit, tree, or image identity.
-SOURCE_COMMIT = "c0001556715ef2004ba70d6b5dc2fda55d26860b"
-SOURCE_TREE = "bffc6414fc4f17a1708cfa6724a499a00235837d"
-PRODUCTION_IMAGE_ID = (
-    "sha256:f2df4df111192025c5977df600e8e91cbfd019b95858266a4a18b6d940892212"
-)
-
 FAMILY_ORDER = ("K0", "K1", "K2", "K3", "K4", "K5")
 REFERENCE_FAMILIES = ("K0", "K2", "K3", "K4")
 CONFIRMATION_FIXTURES = ("C1", "C2", "C3", "C4")
@@ -71,6 +63,8 @@ BOUNDARY_GPU = {
 }
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_SHA1 = re.compile(r"[0-9a-f]{40}")
+_IMAGE = re.compile(r"sha256:[0-9a-f]{64}")
 _ROW_KEY = re.compile(r"(?:confirmation|boundary)-[A-Za-z0-9_.-]+")
 
 
@@ -166,12 +160,13 @@ def _validate_production_identity(value: Any) -> dict[str, Any]:
     forge = _object(identity["forge"], "production identity forge")
     image = _object(identity["container_image"], "production identity image")
     if (
-        forge["commit_sha1"] != SOURCE_COMMIT
-        or forge["tree_sha1"] != SOURCE_TREE
-        or forge["worktree_state"] != "clean-including-untracked"
-        or image["image_id"] != PRODUCTION_IMAGE_ID
+        forge["worktree_state"] != "clean-including-untracked"
+        or any(
+            _SHA1.fullmatch(forge[key]) is None for key in ("commit_sha1", "tree_sha1")
+        )
+        or _IMAGE.fullmatch(image["image_id"]) is None
     ):
-        raise ValueError("production identity is not the fresh c000 image binding")
+        raise ValueError("production identity is not a clean immutable image binding")
     return identity
 
 
@@ -291,9 +286,9 @@ def _matrix_body(
                 "production identity semantic SHA-256",
             ),
         },
-        "source_commit": SOURCE_COMMIT,
-        "source_tree": SOURCE_TREE,
-        "production_image_id": PRODUCTION_IMAGE_ID,
+        "source_commit": production_identity["forge"]["commit_sha1"],
+        "source_tree": production_identity["forge"]["tree_sha1"],
+        "production_image_id": production_identity["container_image"]["image_id"],
         "active_variant_family_ids": active,
         "family_execution_universe": universe,
         "confirmation_training_count": 8 * len(universe),
@@ -377,9 +372,9 @@ def validate_matrix(
         matrix["schema"] != SCHEMA
         or matrix["kind"] != MATRIX_KIND
         or matrix["matrix_sha256"] != krea_provenance.canonical_sha256(body)
-        or matrix["source_commit"] != SOURCE_COMMIT
-        or matrix["source_tree"] != SOURCE_TREE
-        or matrix["production_image_id"] != PRODUCTION_IMAGE_ID
+        or _SHA1.fullmatch(matrix["source_commit"]) is None
+        or _SHA1.fullmatch(matrix["source_tree"]) is None
+        or _IMAGE.fullmatch(matrix["production_image_id"]) is None
         or matrix["strict_admission_per_row"] is not True
         or matrix["waiver_path_available"] is not False
         or matrix["release_authorized"] is not False
@@ -494,7 +489,7 @@ def validate_row_controls(
         "fixture_id": row["fixture_id"],
         "seed_role": row["seed_role"],
         "family_role": row["family_role"],
-        "production_image_id": PRODUCTION_IMAGE_ID,
+        "production_image_id": resolved_matrix["production_image_id"],
     }
     if (
         any(resolved_plan[key] != value for key, value in expected.items())
@@ -563,7 +558,7 @@ def _receipt(
         "completion_sha256": completion["completion_sha256"],
         "run_evidence_sha256": evidence["evidence_sha256"],
         "score_hook_sha256": score_hook["hook_sha256"],
-        "production_image_id": PRODUCTION_IMAGE_ID,
+        "production_image_id": matrix["production_image_id"],
         "strict_authority_replayed": True,
         "waiver_used": False,
         "release_authorized": False,

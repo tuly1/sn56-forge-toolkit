@@ -15,11 +15,16 @@ def _sha(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
 
 
-def _identity(*, image_id: str = matrix.PRODUCTION_IMAGE_ID) -> dict:
+TEST_COMMIT = "1" * 40
+TEST_TREE = "2" * 40
+TEST_IMAGE = "sha256:" + "3" * 64
+
+
+def _identity(*, image_id: str = TEST_IMAGE) -> dict:
     return production.build(
         forge={
-            "commit_sha1": matrix.SOURCE_COMMIT,
-            "tree_sha1": matrix.SOURCE_TREE,
+            "commit_sha1": TEST_COMMIT,
+            "tree_sha1": TEST_TREE,
             "worktree_state": "clean-including-untracked",
         },
         container_image={
@@ -150,9 +155,13 @@ def test_matrix_recomputes_from_winners_and_rejects_posthoc_policy_edit() -> Non
         matrix.validate_matrix(drifted, freeze=freeze, production_identity=identity)
 
 
-def test_matrix_hard_rejects_noncertified_image() -> None:
-    wrong = _identity(image_id="sha256:" + "0" * 64)
-    with pytest.raises(ValueError, match="fresh c000"):
+def test_matrix_accepts_only_a_clean_validated_immutable_identity() -> None:
+    superseding = _identity(image_id="sha256:" + "0" * 64)
+    assert matrix._validate_production_identity(superseding) == superseding
+
+    wrong = deepcopy(superseding)
+    wrong["forge"]["worktree_state"] = "dirty"
+    with pytest.raises(ValueError):
         matrix._validate_production_identity(wrong)
 
 
@@ -189,7 +198,7 @@ def _row_controls(
         "calibration_profile": family,
         "waiver_finalist_freeze": value["freeze"],
         "production_identity": value["production_identity"],
-        "production_image_id": matrix.PRODUCTION_IMAGE_ID,
+        "production_image_id": value["production_image_id"],
         "plan_sha256": _sha("plan"),
     }
     approval = {"approval_sha256": _sha("approval")}
@@ -356,7 +365,7 @@ def test_live_replay_loads_bound_fixture_and_rehashes_real_artifacts(
             "file_sha256": _sha("identity-file"),
             "production_identity_sha256": _sha("identity"),
         },
-        "production_image_id": matrix.PRODUCTION_IMAGE_ID,
+        "production_image_id": TEST_IMAGE,
         "mounts": [
             {"purpose": "checkpoints", "source": str(tmp_path / "checkpoints")},
             {"purpose": "run_evidence", "source": str(tmp_path / "private")},

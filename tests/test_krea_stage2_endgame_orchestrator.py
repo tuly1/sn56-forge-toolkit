@@ -21,7 +21,14 @@ def _matrix() -> dict:
         "D2_winner_family_id": "K5",
         "freeze_sha256": _sha("freeze"),
     }
-    identity = {"production_identity_sha256": _sha("identity")}
+    identity = {
+        "production_identity_sha256": _sha("identity"),
+        "forge": {
+            "commit_sha1": "1" * 40,
+            "tree_sha1": "2" * 40,
+        },
+        "container_image": {"image_id": "sha256:" + "3" * 64},
+    }
     body = matrix_module._matrix_body(
         freeze=freeze,
         freeze_file_sha256=_sha("freeze-file"),
@@ -72,7 +79,7 @@ def _plan_set(value: dict, tmp_path: Path) -> dict:
         "kind": orchestrator.PLAN_SET_KIND,
         "config_sha256": _sha("config"),
         "matrix_sha256": value["matrix_sha256"],
-        "production_image_id": matrix_module.PRODUCTION_IMAGE_ID,
+        "production_image_id": value["production_image_id"],
         "training_count": 60,
         "score_stream_count": 60,
         "gpu_queues": queues,

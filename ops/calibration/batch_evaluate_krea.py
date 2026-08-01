@@ -3839,6 +3839,7 @@ def _run_contained(
     timeout_s: float,
     candidate_id: str,
     containment: dict[str, Any],
+    gpu_device: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if containment["mode"] != "systemd_transient_service":
         raise RuntimeError("unsupported evaluator containment mode")
@@ -3882,6 +3883,14 @@ def _run_contained(
         evaluator_environment = _minimal_evaluator_environment(
             driver_python=command[0], isolated_root=Path(environment_root.name)
         )
+        if gpu_device is not None:
+            if (
+                isinstance(gpu_device, bool)
+                or not isinstance(gpu_device, int)
+                or not 0 <= gpu_device <= 31
+            ):
+                raise ValueError("exact scorer GPU device is outside [0,31]")
+            evaluator_environment["CUDA_VISIBLE_DEVICES"] = str(gpu_device)
         process = subprocess.Popen(
             wrapped,
             stdin=subprocess.DEVNULL,
