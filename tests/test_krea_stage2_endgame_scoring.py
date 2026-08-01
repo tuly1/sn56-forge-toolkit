@@ -126,6 +126,132 @@ def test_streaming_claims_only_materialized_groups_and_keeps_gpus_serial(
     )
 
 
+def test_materializer_publishes_one_group_as_soon_as_five_rows_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix = _matrix()
+    rows = []
+    ready = {f"confirmation-C1-A-K{index}" for index in range(5)}
+    for source in matrix["rows"]:
+        if source["phase"] != "confirmation":
+            continue
+        root = tmp_path / "training" / source["row_key"]
+        receipt = root / "receipt.json"
+        if source["row_key"] in ready:
+            root.mkdir(parents=True)
+            receipt.write_text("{}\n")
+        rows.append(
+            {
+                "row_key": source["row_key"],
+                "receipt_path": str(receipt),
+            }
+        )
+    training = {"plan_set_sha256": _sha("training"), "rows": rows}
+    fixture_path = tmp_path / "C1-wrapper.json"
+    fixture_path.write_text("{}\n")
+    dataset = tmp_path / "holdout"
+    dataset.mkdir()
+    config = {
+        "config_sha256": _sha("config"),
+        "matrix": str(tmp_path / "matrix.json"),
+        "training_plan_set": str(tmp_path / "training.json"),
+        "fixture_manifests": {"C1": str(fixture_path)},
+        "evaluation_datasets": {"C1": str(dataset)},
+        "evaluator_contract": {"contract": True},
+        "score_plan_created_at_utc": "2026-08-01T20:00:00Z",
+    }
+    monkeypatch.setattr(scoring, "_validate_config", lambda value: dict(value))
+    monkeypatch.setattr(
+        scoring,
+        "_load",
+        lambda path, _label: (matrix if Path(path).name == "matrix.json" else training),
+    )
+    monkeypatch.setattr(
+        scoring.krea_stage2_endgame_matrix, "validate_matrix", lambda value: value
+    )
+    monkeypatch.setattr(
+        scoring.krea_stage2_endgame_orchestrator,
+        "validate_plan_set",
+        lambda value, **_kwargs: value,
+    )
+
+    def run_control(row):
+        family = row["row_key"].rsplit("-", 1)[1]
+        candidate = tmp_path / f"{family}.safetensors"
+        candidate.write_bytes(family.encode())
+        plan = {
+            "seed": 42565431,
+            "hours": "0.75",
+            "waiver_finalist_freeze": {
+                "file_sha256": _sha("f"),
+                "freeze_sha256": _sha("fs"),
+            },
+            "confirmation_materialization": {
+                "file_sha256": _sha("m"),
+                "materialization_sha256": _sha("ms"),
+            },
+            "owner_ratification": {
+                "file_sha256": _sha("r"),
+                "ratification_sha256": _sha("rs"),
+            },
+            "gpu_execution_authorization": {
+                "file_sha256": _sha("g"),
+                "gpu_execution_authorization_sha256": _sha("gs"),
+            },
+            "production_identity": {
+                "file_sha256": _sha("p"),
+                "production_identity_sha256": _sha("ps"),
+            },
+            "production_image_id": "sha256:" + "3" * 64,
+        }
+        return {
+            "run_evidence_path": str(tmp_path / f"{family}-evidence.json"),
+            "execution_plan": plan,
+            "execution_approval": {},
+            "run_completion": {},
+            "candidate_path": candidate,
+        }, {}
+
+    monkeypatch.setattr(scoring, "_run_control", run_control)
+    monkeypatch.setattr(
+        scoring.krea_stage2_score,
+        "build_candidate_row",
+        lambda family_id, **_kwargs: {"family_id": family_id},
+    )
+    monkeypatch.setattr(
+        scoring.krea_stage2_score,
+        "seal_plan",
+        lambda payload: {
+            **payload,
+            "plan_sha256": krea_provenance.canonical_sha256(payload),
+        },
+    )
+    monkeypatch.setattr(
+        scoring.krea_stage2_score,
+        "validate_plan_with_run_controls",
+        lambda plan, **_kwargs: plan,
+    )
+    identity = {"sha256": _sha("eval"), "rows": [{"image": "a.jpg"}]}
+    monkeypatch.setattr(
+        scoring,
+        "_fixture_score_view",
+        lambda *_args: (
+            {"evaluation_dataset_identity": identity},
+            {"file_sha256": _sha("fixture-file"), "manifest_sha256": _sha("fixture")},
+            dataset,
+        ),
+    )
+
+    result = scoring.materialize_ready_score_plans(
+        config, output_root=tmp_path / "scores"
+    )
+
+    assert [row["group_key"] for row in result["materialized_groups"]] == [
+        "score-C1-A-K1"
+    ]
+    assert not Path(result["queue"]["groups"][1]["group_path"]).exists()
+
+
 def test_score_gate_never_launches_missing_work(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="cannot launch work"):
         scoring.seal_score_gate(
