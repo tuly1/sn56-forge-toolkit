@@ -662,7 +662,7 @@ def _validate_result(
     if runtime.get("custom_node_allowlist") != ["comfyui-tooling-nodes"]:
         raise RecoveryEvidenceError("exact-score custom-node allowlist drifted")
     history = runtime.get("comfy_history")
-    prompt_count = expected_rows * value["generations"]
+    prompt_count = expected_rows * value["generations"] * 2
     comfy_log = _safe_file(output / "comfy.log", "exact-score Comfy log")
     if (
         not isinstance(history, dict)

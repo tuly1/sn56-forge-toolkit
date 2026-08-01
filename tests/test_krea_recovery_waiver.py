@@ -201,7 +201,7 @@ def _result(
             "custom_node_allowlist": ["comfyui-tooling-nodes"],
             "comfy_log_sha256": comfy_log_sha256,
             "comfy_log_bytes": comfy_log_bytes,
-            "comfy_history": {"prompt_count": count * 5},
+            "comfy_history": {"prompt_count": count * 5 * 2},
         },
     }
 
@@ -378,12 +378,43 @@ def test_index_records_failures_and_only_rc0_exact_scores_are_eligible(tmp_path:
     assert index["coverage"]["selection_eligible"] == 1
     assert index["coverage"]["selection_gate_ready"] is False
     assert index["claims"] == recovery.FALSE_CLAIMS
+    selected_row = next(
+        row for row in index["artifacts"] if row["task_id"] == selected["task_id"]
+    )
+    assert selected_row["validated_artifact"]["result"]["prompt_count"] == 24 * 5 * 2
     failed_row = next(
         row for row in index["artifacts"] if row["task_id"] == failed["task_id"]
     )
     assert failed_row["selection_eligible"] is False
     assert failed_row["failures"] == ["coverage_or_receipt_incomplete:QUEUED:FAILED"]
     assert [row["name"] for row in failed_row["log_bindings"]] == ["comfy.log"]
+
+
+def test_recovery_result_rejects_single_channel_prompt_count(tmp_path: Path):
+    row = next(
+        item
+        for item in _task_rows(tmp_path, complete=False)
+        if item["task_id"] == "d1-k1-step10"
+    )
+    row["state"] = "COMPLETE"
+    _score_artifact(tmp_path, tmp_path / "receipts", row, weighted_loss=0.05)
+    output = tmp_path / "scores" / "D1" / row["task_id"]
+    result_path = output / "exact-score.json"
+    result = json.loads(result_path.read_bytes())
+    result["runtime"]["comfy_history"]["prompt_count"] = (
+        recovery.FIXTURE_ROWS["D1"] * result["generations"]
+    )
+    result_path.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(recovery.RecoveryEvidenceError, match="prompt count"):
+        recovery._validate_result(
+            output,
+            fixture="D1",
+            candidate_path=Path(row["expected_candidate"]),
+            candidate_sha256=row["candidate_sha256"],
+        )
 
 
 def test_freeze_and_fresh_agent_review_are_create_only_and_non_authorizing(
