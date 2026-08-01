@@ -547,6 +547,22 @@ def test_full_tree_capture_and_post_capture_extra_file_are_fail_closed(
     assert not output.exists()
 
 
+def test_sealed_tree_compares_normalized_relative_path_order(tmp_path: Path) -> None:
+    sealed = tmp_path / "sealed"
+    nested = sealed / "C1" / "training"
+    nested.mkdir(parents=True)
+    (nested / "image.jpg").write_bytes(b"image\n")
+    (sealed / "C1" / "training.zip").write_bytes(b"archive\n")
+
+    chain.admission._validate_sealed_tree(
+        sealed,
+        [
+            {"relative_path": "C1/training.zip"},
+            {"relative_path": "C1/training/image.jpg"},
+        ],
+    )
+
+
 def test_replay_rejects_materialized_fixture_corruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

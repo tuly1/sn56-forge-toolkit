@@ -966,6 +966,11 @@ def _validate_sealed_tree(root: Path, expected: Sequence[Mapping[str, Any]]) -> 
                 f"sealed root contains a special node: {path.relative_to(root)}"
             )
         observed.append(path.relative_to(root).as_posix())
+    # ``Path`` ordering compares path components, while the committed
+    # inventory is ordered by the complete POSIX relative-path string.  Sort
+    # the normalized strings so directory entries such as ``training/...``
+    # and sibling files such as ``training.zip`` use the same ordering.
+    observed.sort()
     committed = sorted(row["relative_path"] for row in expected)
     if observed != committed:
         raise ValueError("sealed root file set differs from its public commitment")
