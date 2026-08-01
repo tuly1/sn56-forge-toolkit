@@ -1115,6 +1115,28 @@ def test_host_collector_reads_bootstrap_steps_from_immutable_nested_control() ->
         collector._validate_bootstrap_step_contract(control, changed, 34)
 
 
+def test_runtime_artifact_loader_accepts_exact_a712_forms_only(tmp_path: Path) -> None:
+    value = {
+        "kind": "forge-public-run-recorder",
+        "events": [{"name": "run_complete"}],
+    }
+    canonical = krea_provenance.canonical_bytes(value)
+    path = tmp_path / "runtime.json"
+    path.write_bytes(canonical)
+    assert collector._load_runtime_artifact(path, "runtime") == value
+    path.write_bytes(canonical + b"\n")
+    assert collector._load_runtime_artifact(path, "runtime") == value
+    for invalid in (
+        json.dumps(value, indent=2, sort_keys=True).encode("utf-8"),
+        canonical + b" ",
+        canonical + b"\n\n",
+        canonical[:-1] + b"x",
+    ):
+        path.write_bytes(invalid)
+        with pytest.raises(ValueError, match="canonical runtime JSON|not JSON"):
+            collector._load_runtime_artifact(path, "runtime")
+
+
 def test_coherent_counter_inflation_fails_schedule_and_original_manifest(
     real_surface: dict,
 ) -> None:

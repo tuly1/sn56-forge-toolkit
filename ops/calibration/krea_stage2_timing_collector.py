@@ -78,6 +78,22 @@ def _load_canonical(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def _load_runtime_artifact(path: Path, label: str) -> dict[str, Any]:
+    """Load immutable runtime JSON whose producer intentionally omits a newline."""
+
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} is not a real file")
+    raw = path.read_bytes()
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not JSON") from exc
+    canonical = krea_provenance.canonical_bytes(value)
+    if not isinstance(value, dict) or raw not in (canonical, canonical + b"\n"):
+        raise ValueError(f"{label} is not canonical runtime JSON")
+    return value
+
+
 def _publish(path: Path, value: Mapping[str, Any], *, mode: int = 0o400) -> None:
     payload = krea_provenance.canonical_bytes(value) + b"\n"
     descriptor = os.open(
@@ -317,7 +333,7 @@ def _validate_run_outputs(
         or terminal.get("natural_completion") is not True
     ):
         raise ValueError("timing bootstrap did not naturally complete")
-    selection = _load_canonical(
+    selection = _load_runtime_artifact(
         evidence_root / "forge_checkpoint_selection.json",
         "checkpoint-selection receipt",
     )
@@ -352,7 +368,9 @@ def _validate_run_outputs(
         raise ValueError("timing bootstrap safetensors header is invalid") from exc
     if not isinstance(parsed_header, dict) or not parsed_header:
         raise ValueError("timing bootstrap safetensors header is empty")
-    recorder = _load_canonical(checkpoint_root / "forge_run.json", "public recorder")
+    recorder = _load_runtime_artifact(
+        checkpoint_root / "forge_run.json", "public recorder"
+    )
     names = [
         row.get("name") for row in recorder.get("events", []) if isinstance(row, dict)
     ]
