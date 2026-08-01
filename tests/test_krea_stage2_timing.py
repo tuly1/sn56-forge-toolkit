@@ -951,6 +951,16 @@ def test_probe_command_is_exactly_rendered_and_substitutions_fail(
     ]
     assert all(not value.endswith((",rw", ",ro")) for value in mount_specs)
     assert sum(value.endswith(",readonly") for value in mount_specs) == 3
+    assert rendered[rendered.index("--shm-size") + 1] == "8g"
+    assert rendered[rendered.index("--memory") + 1] == "110g"
+    assert rendered[rendered.index("--cpus") + 1] == "24"
+    assert rendered[rendered.index("--security-opt") + 1] == "no-new-privileges"
+    assert rendered[rendered.index("--cap-drop") + 1] == "ALL"
+    assert probe["command_fields"]["resource_contract_source_commit"] == "b026da04"
+    assert (
+        probe["command_fields"]["resource_contract_source_path"]
+        == "trainer/runtime.py:222-250"
+    )
     assert "device=0" in rendered
     assert "/bin/true" not in probe["command_argv_template"]
     image_index = probe["command_argv_template"].index(image)
