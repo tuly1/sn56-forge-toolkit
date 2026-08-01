@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+import zipfile
 
 import pytest
 
 from ops.calibration import krea_provenance
 from ops.calibration import krea_stage2_endgame_matrix as matrix_module
 from ops.calibration import krea_stage2_endgame_scoring as scoring
+from ops.calibration import krea_stage2_legacy_confirmation as legacy
 
 
 def _sha(label: str) -> str:
@@ -65,6 +68,51 @@ def _queue(tmp_path: Path) -> dict:
     return {**body, "score_queue_sha256": krea_provenance.canonical_sha256(body)}
 
 
+def _legacy_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, dict]:
+    from PIL import Image
+
+    role = "C1"
+    root = tmp_path / role
+    root.mkdir()
+    listed = []
+    shape = legacy.amendment.SHAPE_CONTRACT[role]
+    for holdout, count in (
+        (False, shape["training_pairs"]),
+        (True, shape["evaluation_rows"]),
+    ):
+        prefix = "holdout/" if holdout else ""
+        for index in range(1, count + 1):
+            image_name = f"{prefix}image-{index:03d}.jpg"
+            prompt_name = f"{prefix}image-{index:03d}.txt"
+            image_path = root / image_name
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (8 + index, 9 + index), (index, 1, 2)).save(
+                image_path, format="JPEG"
+            )
+            (root / prompt_name).write_text(f"natural C1 caption {index}\n")
+            for relative in (image_name, prompt_name):
+                raw = (root / relative).read_bytes()
+                listed.append((hashlib.sha256(raw).hexdigest(), relative))
+    checksum = root / "MANIFEST-C1.sha256"
+    checksum.write_text("".join(f"{digest}  {name}\n" for digest, name in listed))
+    with zipfile.ZipFile(root / "c1_tourn.zip", "w") as archive:
+        for _digest, relative in listed:
+            if "/" not in relative:
+                archive.write(root / relative, relative)
+    (root / "LICENSES.txt").write_text("test public-domain fixture\n")
+    patched = dict(legacy.amendment.MANIFEST_FILE_SHA256S)
+    patched[role] = hashlib.sha256(checksum.read_bytes()).hexdigest()
+    monkeypatch.setattr(legacy.amendment, "MANIFEST_FILE_SHA256S", patched)
+    wrapper = legacy.build_wrapper(
+        role_root=root,
+        role=role,
+        created_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    return root / legacy.WRAPPER_NAME, wrapper
+
+
 def test_score_groups_are_exactly_sixteen_five_family_plans() -> None:
     groups = scoring._groups(_matrix())
 
@@ -81,6 +129,80 @@ def test_score_groups_are_exactly_sixteen_five_family_plans() -> None:
         for row in groups
         if row["candidate_family_id"] == "K5"
     )
+
+
+def test_real_legacy_wrapper_dispatches_for_training_and_scoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapper_path, wrapper = _legacy_wrapper(tmp_path, monkeypatch)
+
+    training_view, training_binding = (
+        scoring.krea_stage2_endgame_orchestrator._fixture_binding(wrapper_path, "C1")
+    )
+    score_view, score_binding, dataset = scoring._fixture_score_view(
+        wrapper_path, wrapper_path.parent / "holdout", "C1"
+    )
+
+    assert training_view == score_view == legacy.score_view(wrapper)
+    assert training_view["trigger_token"] is None
+    assert training_binding["manifest_sha256"] == wrapper["wrapper_sha256"]
+    assert score_binding["manifest_sha256"] == wrapper["wrapper_sha256"]
+    assert training_binding["file_sha256"] == score_binding["file_sha256"]
+    assert dataset == wrapper_path.parent / "holdout"
+
+
+def test_live_row_replay_rehashes_real_legacy_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapper_path, wrapper = _legacy_wrapper(tmp_path, monkeypatch)
+    binding = {
+        "path": str(wrapper_path),
+        "file_sha256": scoring._file_sha(wrapper),
+        "manifest_sha256": wrapper["wrapper_sha256"],
+    }
+    receipts = {
+        "config_control": {"receipt": "config"},
+        "training_terminal": {"receipt": "terminal"},
+        "checkpoint_selection": {"receipt": "selection"},
+    }
+    plan = {"fixture_manifest": binding}
+    completion = {
+        "gpu_device": 0,
+        "config_control_receipt": receipts["config_control"],
+        "training_terminal_receipt": receipts["training_terminal"],
+        "checkpoint_selection_receipt": receipts["checkpoint_selection"],
+        "ended_at_utc": "2026-08-01T20:00:00Z",
+    }
+    monkeypatch.setattr(
+        matrix_module.krea_stage2_execution,
+        "validate_private_run_receipts",
+        lambda _plan: receipts,
+    )
+    captured = {}
+
+    def fake_build_run_evidence(**kwargs):
+        captured.update(kwargs)
+        return {"evidence": "ok"}
+
+    monkeypatch.setattr(
+        matrix_module.krea_stage2_training_evidence,
+        "build_run_evidence",
+        fake_build_run_evidence,
+    )
+
+    result = matrix_module._replay_live_run(
+        row={"gpu_device": 0},
+        plan=plan,
+        approval={},
+        completion=completion,
+        output_dir=tmp_path,
+    )
+
+    assert result == {"evidence": "ok"}
+    assert captured["fixture_manifest"] == {
+        "file_sha256": binding["file_sha256"],
+        "manifest_sha256": wrapper["wrapper_sha256"],
+    }
 
 
 def test_score_queue_rejects_family_drift(tmp_path: Path) -> None:
