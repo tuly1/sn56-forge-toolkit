@@ -108,6 +108,16 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     stage2_control = krea_calibration_profiles.selected_stage2_run_control(
         spec.model_type, stage2_profile
     )
+    timing_bootstrap = (
+        krea_calibration_profiles.selected_stage2_timing_bootstrap_control(
+            spec.model_type, stage2_profile
+        )
+    )
+    if stage2_control is not None and timing_bootstrap is not None:
+        raise RuntimeError("Stage-2 control modes are mutually exclusive")
+    active_stage2_control = (
+        stage2_control if stage2_control is not None else timing_bootstrap
+    )
     stage2_selection = cfg.get("meta", {}).get("forge_krea_checkpoint_selection")
     scope = checkpoints.set_planned_steps(
         spec.save_root,
@@ -115,11 +125,13 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         steps,
         model_type=spec.model_type,
         checkpoint_target=(
-            stage2_control.checkpoint_target if stage2_control is not None else None
+            active_stage2_control.checkpoint_target
+            if active_stage2_control is not None
+            else None
         ),
         checkpoint_selected_step=(
             stage2_selection["selected_step"]
-            if stage2_control is not None and isinstance(stage2_selection, dict)
+            if active_stage2_control is not None and isinstance(stage2_selection, dict)
             else None
         ),
     )

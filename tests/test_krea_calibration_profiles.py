@@ -52,6 +52,11 @@ def _selector_unset(monkeypatch):
     monkeypatch.delenv(profiles.STAGE2_RECEIPT_PATH_ENV, raising=False)
     monkeypatch.delenv(profiles.STAGE2_TARGET_NUMERATOR_ENV, raising=False)
     monkeypatch.delenv(profiles.STAGE2_TARGET_DENOMINATOR_ENV, raising=False)
+    monkeypatch.delenv(profiles.STAGE2_TIMING_PLAN_SHA_ENV, raising=False)
+    monkeypatch.delenv(profiles.STAGE2_TIMING_CONTRACT_SHA_ENV, raising=False)
+    monkeypatch.delenv(profiles.STAGE2_TIMING_STEPS_ENV, raising=False)
+    monkeypatch.delenv(profiles.STAGE2_TIMING_SEED_ENV, raising=False)
+    monkeypatch.delenv(profiles.STAGE2_TIMING_RECEIPT_PATH_ENV, raising=False)
 
 
 def _process(cfg: dict) -> dict:
@@ -250,6 +255,122 @@ def test_stage2_seed_plan_and_receipt_are_all_or_nothing_and_seed_process(
     assert selection["target_fraction"] == {"numerator": 7, "denominator": 8}
     assert selection["selected_step"] == 609
     assert selection["planned_steps"] == 691
+
+
+def _set_timing_bootstrap_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    profile_id: str = "K3",
+    plan_sha: str = "b" * 64,
+    contract_sha: str = "c" * 64,
+    steps: str = "34",
+) -> None:
+    monkeypatch.setenv(profiles.PROFILE_SELECTOR_ENV, profile_id)
+    monkeypatch.setenv(profiles.STAGE2_TIMING_PLAN_SHA_ENV, plan_sha)
+    monkeypatch.setenv(profiles.STAGE2_TIMING_CONTRACT_SHA_ENV, contract_sha)
+    monkeypatch.setenv(profiles.STAGE2_TIMING_STEPS_ENV, steps)
+    monkeypatch.setenv(profiles.STAGE2_TIMING_SEED_ENV, "42565431")
+    monkeypatch.setenv(
+        profiles.STAGE2_TIMING_RECEIPT_PATH_ENV,
+        f"/run-evidence/{plan_sha}/config-control.json",
+    )
+
+
+def test_timing_bootstrap_applies_exact_unmeasured_class_depth_and_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_timing_bootstrap_env(monkeypatch, profile_id="K3")
+
+    cfg = config.build_config(_spec(), num_images=24, hours_to_complete=0.5)
+    process = _process(cfg)
+    binding = cfg["meta"]["forge_krea_calibration_profile"]
+    selection = cfg["meta"]["forge_krea_checkpoint_selection"]
+
+    assert process["training_seed"] == 42565431
+    assert process["train"]["steps"] == 34
+    assert process["save"]["save_every"] == 5
+    assert process["train"]["loss_type"] == "mae"
+    assert process["train"]["differential_guidance_scale"] == 3
+    assert binding["depth_binding_status"] == "preprofile_timing_bootstrap"
+    assert binding["throughput_profile_sha256"] is None
+    assert binding["measured_stage2_per_class_throughput_bound"] is False
+    assert binding["release_selected"] is False
+    assert binding["timing_bootstrap"] == {
+        "timing_plan_sha256": "b" * 64,
+        "probe_contract_sha256": "c" * 64,
+        "release_authorized": False,
+    }
+    assert selection["target_fraction"] == {"numerator": 1, "denominator": 1}
+    assert selection["selected_step"] == 34
+
+
+@pytest.mark.parametrize("mode", ["partial", "k0", "mixed"])
+def test_timing_bootstrap_fails_closed_outside_its_exact_bundle(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    _set_timing_bootstrap_env(monkeypatch)
+    if mode == "partial":
+        monkeypatch.delenv(profiles.STAGE2_TIMING_SEED_ENV)
+        match = "requires plan, contract, steps, seed, and receipt"
+    elif mode == "k0":
+        monkeypatch.setenv(profiles.PROFILE_SELECTOR_ENV, "K0")
+        match = "explicit Krea K1-K5"
+    else:
+        monkeypatch.setenv(profiles.STAGE2_STEPS_ENV, "34")
+        monkeypatch.setenv(profiles.STAGE2_THROUGHPUT_SHA_ENV, "d" * 64)
+        match = "cannot mix"
+    with pytest.raises(profiles.KreaCalibrationProfileError, match=match):
+        config.build_config(_spec(), num_images=24, hours_to_complete=0.5)
+
+
+def test_timing_bootstrap_config_and_terminal_receipts_disclose_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_timing_bootstrap_env(monkeypatch, profile_id="K4")
+    cfg = config.build_config(_spec(), num_images=24, hours_to_complete=0.5)
+    evidence = tmp_path / "timing-evidence"
+    evidence.mkdir()
+    control = profiles.Stage2TimingBootstrapControl(
+        timing_plan_sha256="b" * 64,
+        probe_contract_sha256="c" * 64,
+        steps=34,
+        seed=42565431,
+        receipt_path=str(evidence / "config-control.json"),
+    )
+    monkeypatch.setattr(
+        profiles,
+        "selected_stage2_timing_bootstrap_control",
+        lambda *_args, **_kwargs: control,
+    )
+    config.write_config(cfg, str(tmp_path / "config.yaml"))
+    config_receipt = json.loads((evidence / "config-control.json").read_text())
+
+    assert config_receipt["mode"] == "preprofile_timing_bootstrap"
+    assert config_receipt["kind"] == (
+        "forge-krea-stage2-timing-bootstrap-config-control-receipt"
+    )
+    assert config_receipt["timing_plan_sha256"] == "b" * 64
+    assert config_receipt["probe_contract_sha256"] == "c" * 64
+    assert config_receipt["throughput_profile_sha256"] is None
+    assert config_receipt["production_mutation_authorized"] is False
+    assert config_receipt["release_authorized"] is False
+
+    terminal = profiles.write_stage2_terminal_receipt(
+        profile_id="K4",
+        planned_steps=34,
+        last_step=34,
+        returncode=0,
+        stopped_by_deadline=False,
+    )
+    assert terminal is not None
+    assert terminal["kind"] == ("forge-krea-stage2-timing-bootstrap-terminal-receipt")
+    assert terminal["mode"] == "preprofile_timing_bootstrap"
+    assert terminal["timing_plan_sha256"] == "b" * 64
+    assert terminal["probe_contract_sha256"] == "c" * 64
+    assert terminal["throughput_profile_sha256"] is None
+    assert terminal["natural_completion"] is True
+    assert terminal["production_mutation_authorized"] is False
+    assert terminal["release_authorized"] is False
 
 
 def test_k0_asserts_every_release_axis_before_preserving_config() -> None:

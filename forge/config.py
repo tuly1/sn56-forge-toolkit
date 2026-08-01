@@ -92,6 +92,11 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
     stage2_control = krea_calibration_profiles.selected_stage2_run_control(
         spec.model_type, calibration_profile
     )
+    timing_bootstrap = (
+        krea_calibration_profiles.selected_stage2_timing_bootstrap_control(
+            spec.model_type, calibration_profile
+        )
+    )
     if (
         stage2_control is not None
         and calibration_profile is not None
@@ -100,6 +105,12 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
     ):
         raise krea_calibration_profiles.KreaCalibrationProfileError(
             "Stage-2 non-control run controls require measured depth binding"
+        )
+    if timing_bootstrap is not None and (
+        stage2_control is not None or calibration_depth is not None
+    ):
+        raise krea_calibration_profiles.KreaCalibrationProfileError(
+            "timing bootstrap cannot mix with post-measurement Stage-2 controls"
         )
     cfg = load_template(spec.model_type)  # may raise → caller wraps
     try:
@@ -150,7 +161,12 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
         resolved = krea_calibration_profiles.apply_profile(
             resolved, calibration_profile, depth_override=calibration_depth
         )
-    return krea_calibration_profiles.apply_stage2_run_control(resolved, stage2_control)
+    resolved = krea_calibration_profiles.apply_stage2_run_control(
+        resolved, stage2_control
+    )
+    return krea_calibration_profiles.apply_stage2_timing_bootstrap_control(
+        resolved, timing_bootstrap
+    )
 
 
 def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
@@ -218,25 +234,37 @@ def _write_stage2_control_receipt(cfg: dict, config_bytes: bytes) -> None:
     """Emit the private, create-only proof that Stage-2 controls were consumed."""
 
     raw_profile = os.environ.get(krea_calibration_profiles.PROFILE_SELECTOR_ENV)
+    ordinary_names = (
+        krea_calibration_profiles.STAGE2_SEED_ENV,
+        krea_calibration_profiles.STAGE2_PLAN_SHA_ENV,
+        krea_calibration_profiles.STAGE2_RECEIPT_PATH_ENV,
+        krea_calibration_profiles.STAGE2_TARGET_NUMERATOR_ENV,
+        krea_calibration_profiles.STAGE2_TARGET_DENOMINATOR_ENV,
+    )
+    bootstrap_names = (
+        krea_calibration_profiles.STAGE2_TIMING_PLAN_SHA_ENV,
+        krea_calibration_profiles.STAGE2_TIMING_CONTRACT_SHA_ENV,
+        krea_calibration_profiles.STAGE2_TIMING_STEPS_ENV,
+        krea_calibration_profiles.STAGE2_TIMING_SEED_ENV,
+        krea_calibration_profiles.STAGE2_TIMING_RECEIPT_PATH_ENV,
+    )
     if raw_profile is None and all(
-        os.environ.get(name) is None
-        for name in (
-            krea_calibration_profiles.STAGE2_SEED_ENV,
-            krea_calibration_profiles.STAGE2_PLAN_SHA_ENV,
-            krea_calibration_profiles.STAGE2_RECEIPT_PATH_ENV,
-            krea_calibration_profiles.STAGE2_TARGET_NUMERATOR_ENV,
-            krea_calibration_profiles.STAGE2_TARGET_DENOMINATOR_ENV,
-        )
+        os.environ.get(name) is None for name in (*ordinary_names, *bootstrap_names)
     ):
         return
     profile = krea_calibration_profiles.profile_for_id(raw_profile or "")
     control = krea_calibration_profiles.selected_stage2_run_control("krea2", profile)
-    if (
-        control is None
-    ):  # pragma: no cover - explicit variables above make this impossible.
-        raise krea_calibration_profiles.KreaCalibrationProfileError(
-            "Stage-2 receipt lacks a validated run control"
+    timing_bootstrap = (
+        krea_calibration_profiles.selected_stage2_timing_bootstrap_control(
+            "krea2", profile
         )
+    )
+    if (control is None) == (timing_bootstrap is None):
+        raise krea_calibration_profiles.KreaCalibrationProfileError(
+            "Stage-2 receipt requires exactly one validated control mode"
+        )
+    active_control = control if control is not None else timing_bootstrap
+    assert active_control is not None
     process = cfg["config"]["process"][0]
     train = process["train"]
     network = process["network"]
@@ -250,11 +278,22 @@ def _write_stage2_control_receipt(cfg: dict, config_bytes: bytes) -> None:
         )
     raw_steps = os.environ.get(krea_calibration_profiles.STAGE2_STEPS_ENV)
     raw_throughput = os.environ.get(krea_calibration_profiles.STAGE2_THROUGHPUT_SHA_ENV)
-    if process.get("training_seed") != control.seed:
+    if process.get("training_seed") != active_control.seed:
         raise krea_calibration_profiles.KreaCalibrationProfileError(
             "Stage-2 process did not consume its training seed"
         )
-    if profile.profile_id == "K0":
+    if timing_bootstrap is not None:
+        if (
+            raw_steps is not None
+            or raw_throughput is not None
+            or str(train.get("steps"))
+            != os.environ.get(krea_calibration_profiles.STAGE2_TIMING_STEPS_ENV)
+        ):
+            raise krea_calibration_profiles.KreaCalibrationProfileError(
+                "timing bootstrap depth differs from the effective config"
+            )
+        throughput_sha = None
+    elif profile.profile_id == "K0":
         if raw_steps is not None or raw_throughput is not None:
             raise krea_calibration_profiles.KreaCalibrationProfileError(
                 "K0 receipt cannot carry a Stage-2 depth override"
@@ -297,14 +336,10 @@ def _write_stage2_control_receipt(cfg: dict, config_bytes: bytes) -> None:
         "compile": model.get("compile"),
         "dataloader_workers": dataset.get("num_workers", 0),
     }
-    body = {
-        "schema": 1,
-        "kind": "forge-krea-stage2-config-control-receipt",
-        "execution_plan_sha256": control.execution_plan_sha256,
+    common = {
         "profile_id": profile.profile_id,
         "profile_sha256": profile.profile_sha256,
-        "training_seed": control.seed,
-        "throughput_profile_sha256": throughput_sha,
+        "training_seed": active_control.seed,
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "effective_config_file": {
             "path": "effective-config.yaml",
@@ -318,12 +353,31 @@ def _write_stage2_control_receipt(cfg: dict, config_bytes: bytes) -> None:
         "checkpoint_selection": checkpoint_selection,
         "release_authorized": False,
     }
+    if timing_bootstrap is None:
+        body = {
+            "schema": 1,
+            "kind": "forge-krea-stage2-config-control-receipt",
+            "execution_plan_sha256": control.execution_plan_sha256,
+            "throughput_profile_sha256": throughput_sha,
+            **common,
+        }
+    else:
+        body = {
+            "schema": 1,
+            "kind": "forge-krea-stage2-timing-bootstrap-config-control-receipt",
+            "mode": "preprofile_timing_bootstrap",
+            "timing_plan_sha256": timing_bootstrap.timing_plan_sha256,
+            "probe_contract_sha256": timing_bootstrap.probe_contract_sha256,
+            "throughput_profile_sha256": None,
+            "production_mutation_authorized": False,
+            **common,
+        }
     receipt = {
         **body,
         "receipt_sha256": hashlib.sha256(_canonical_bytes(body)).hexdigest(),
     }
     payload = _canonical_bytes(receipt) + b"\n"
-    parent = os.path.dirname(control.receipt_path)
+    parent = os.path.dirname(active_control.receipt_path)
     if os.path.realpath(parent) != parent or not os.path.isdir(parent):
         raise krea_calibration_profiles.KreaCalibrationProfileError(
             "Stage-2 receipt parent is not the precreated real directory"
@@ -340,7 +394,7 @@ def _write_stage2_control_receipt(cfg: dict, config_bytes: bytes) -> None:
             os.fsync(handle.fileno())
     finally:
         os.close(config_fd)
-    fd = os.open(control.receipt_path, flags, 0o444)
+    fd = os.open(active_control.receipt_path, flags, 0o444)
     try:
         with os.fdopen(fd, "wb", closefd=False) as handle:
             handle.write(payload)

@@ -36,6 +36,11 @@ STAGE2_PLAN_SHA_ENV = "FORGE_KREA_STAGE2_EXECUTION_PLAN_SHA256"
 STAGE2_RECEIPT_PATH_ENV = "FORGE_KREA_STAGE2_CONTROL_RECEIPT_PATH"
 STAGE2_TARGET_NUMERATOR_ENV = "FORGE_KREA_STAGE2_TARGET_FRACTION_NUMERATOR"
 STAGE2_TARGET_DENOMINATOR_ENV = "FORGE_KREA_STAGE2_TARGET_FRACTION_DENOMINATOR"
+STAGE2_TIMING_PLAN_SHA_ENV = "FORGE_KREA_STAGE2_TIMING_PLAN_SHA256"
+STAGE2_TIMING_CONTRACT_SHA_ENV = "FORGE_KREA_STAGE2_TIMING_PROBE_CONTRACT_SHA256"
+STAGE2_TIMING_STEPS_ENV = "FORGE_KREA_STAGE2_TIMING_STEPS"
+STAGE2_TIMING_SEED_ENV = "FORGE_KREA_STAGE2_TIMING_SEED"
+STAGE2_TIMING_RECEIPT_PATH_ENV = "FORGE_KREA_STAGE2_TIMING_RECEIPT_PATH"
 STAGE2_CHECKPOINT_MAPPING_RULE = "nearest_current_candidate_ties_choose_earlier_step"
 MAX_STAGE2_STEPS = 5000
 SOURCE_FREEZE_FILE_SHA256 = (
@@ -97,6 +102,47 @@ class Stage2RunControl:
             "fraction_denominator": self.target_fraction_denominator,
             "selection_rule": STAGE2_CHECKPOINT_MAPPING_RULE,
         }
+
+
+@dataclass(frozen=True)
+class Stage2TimingBootstrapControl:
+    """Pre-profile control used only to measure one frozen Krea class.
+
+    This is deliberately a different type and environment bundle from the
+    post-measurement Stage-2 run control.  In particular it has no throughput
+    profile field: substituting a timing-plan digest for a profile digest would
+    create false evidence and hide the bootstrap dependency cycle.
+    """
+
+    timing_plan_sha256: str
+    probe_contract_sha256: str
+    steps: int
+    seed: int
+    receipt_path: str
+
+    @property
+    def execution_plan_sha256(self) -> str:
+        """Compatibility name for the checkpoint journal's run binding."""
+
+        return self.timing_plan_sha256
+
+    @property
+    def checkpoint_target(self) -> dict[str, Any]:
+        # Timing measures the class, not a finalist checkpoint policy.  Exact
+        # final keeps the held-out natural-completion artifact unambiguous.
+        return {
+            "fraction_numerator": 1,
+            "fraction_denominator": 1,
+            "selection_rule": STAGE2_CHECKPOINT_MAPPING_RULE,
+        }
+
+    @property
+    def target_fraction_numerator(self) -> int:
+        return 1
+
+    @property
+    def target_fraction_denominator(self) -> int:
+        return 1
 
 
 @dataclass(frozen=True)
@@ -427,6 +473,103 @@ def selected_stage2_run_control(
     )
 
 
+def selected_stage2_timing_bootstrap_control(
+    model_type: str,
+    profile: KreaCalibrationProfile | None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> Stage2TimingBootstrapControl | None:
+    """Resolve the all-or-nothing pre-profile timing control bundle.
+
+    The ordinary tournament path and post-measurement Stage-2 path never set
+    these names.  The bundle cannot be used for K0, another model type, or in
+    combination with the ordinary depth/run-control variables.
+    """
+
+    env = os.environ if environ is None else environ
+    raw = {
+        "timing_plan": env.get(STAGE2_TIMING_PLAN_SHA_ENV),
+        "probe_contract": env.get(STAGE2_TIMING_CONTRACT_SHA_ENV),
+        "steps": env.get(STAGE2_TIMING_STEPS_ENV),
+        "seed": env.get(STAGE2_TIMING_SEED_ENV),
+        "receipt": env.get(STAGE2_TIMING_RECEIPT_PATH_ENV),
+    }
+    present = {key for key, value in raw.items() if value is not None}
+    if not present:
+        return None
+
+    def reject(reason: str, message: str) -> None:
+        telemetry.event(
+            "krea_stage2_timing_bootstrap_rejected",
+            reason=reason,
+            timing_plan_present=raw["timing_plan"] is not None,
+            probe_contract_present=raw["probe_contract"] is not None,
+            steps_present=raw["steps"] is not None,
+            seed_present=raw["seed"] is not None,
+            receipt_present=raw["receipt"] is not None,
+        )
+        raise KreaCalibrationProfileError(message)
+
+    if present != set(raw):
+        reject(
+            "partial_bootstrap_bundle",
+            "Stage-2 timing bootstrap requires plan, contract, steps, seed, and "
+            "receipt together",
+        )
+    if model_type != "krea2" or profile is None or profile.profile_id == "K0":
+        reject(
+            "explicit_noncontrol_profile_required",
+            "Stage-2 timing bootstrap requires explicit Krea K1-K5",
+        )
+    ordinary_names = (
+        STAGE2_STEPS_ENV,
+        STAGE2_THROUGHPUT_SHA_ENV,
+        STAGE2_SEED_ENV,
+        STAGE2_PLAN_SHA_ENV,
+        STAGE2_RECEIPT_PATH_ENV,
+        STAGE2_TARGET_NUMERATOR_ENV,
+        STAGE2_TARGET_DENOMINATOR_ENV,
+    )
+    if any(env.get(name) is not None for name in ordinary_names):
+        reject(
+            "ordinary_stage2_controls_present",
+            "Stage-2 timing bootstrap cannot mix with post-measurement controls",
+        )
+    assert all(value is not None for value in raw.values())
+    if re.fullmatch(r"[0-9a-f]{64}", str(raw["timing_plan"])) is None:
+        reject("invalid_timing_plan", "timing plan must be a lowercase SHA-256")
+    if re.fullmatch(r"[0-9a-f]{64}", str(raw["probe_contract"])) is None:
+        reject(
+            "invalid_probe_contract",
+            "timing probe contract must be a lowercase SHA-256",
+        )
+    if raw["timing_plan"] == raw["probe_contract"]:
+        reject("collapsed_plan_contract", "timing plan and contract must be distinct")
+    if re.fullmatch(r"[1-9][0-9]*", str(raw["steps"])) is None:
+        reject("invalid_steps", "timing bootstrap steps must be canonical positive")
+    steps = int(str(raw["steps"]))
+    if steps > MAX_STAGE2_STEPS:
+        reject("steps_above_ceiling", "timing bootstrap steps exceed the ceiling")
+    if re.fullmatch(r"(?:0|[1-9][0-9]*)", str(raw["seed"])) is None:
+        reject("invalid_seed", "timing bootstrap seed must be canonical uint32")
+    seed = int(str(raw["seed"]))
+    if seed >= 2**32:
+        reject("invalid_seed", "timing bootstrap seed must be canonical uint32")
+    expected_receipt = f"/run-evidence/{raw['timing_plan']}/config-control.json"
+    if raw["receipt"] != expected_receipt:
+        reject(
+            "invalid_receipt_path",
+            "timing bootstrap receipt must be timing-plan namespaced",
+        )
+    return Stage2TimingBootstrapControl(
+        timing_plan_sha256=str(raw["timing_plan"]),
+        probe_contract_sha256=str(raw["probe_contract"]),
+        steps=steps,
+        seed=seed,
+        receipt_path=str(raw["receipt"]),
+    )
+
+
 def apply_stage2_run_control(
     cfg: dict[str, Any], control: Stage2RunControl | None
 ) -> dict[str, Any]:
@@ -469,8 +612,80 @@ def apply_stage2_run_control(
     return resolved
 
 
+def apply_stage2_timing_bootstrap_control(
+    cfg: dict[str, Any], control: Stage2TimingBootstrapControl | None
+) -> dict[str, Any]:
+    """Apply a pre-profile measurement depth/seed with explicit disclosure."""
+
+    if control is None:
+        return cfg
+    if not isinstance(control, Stage2TimingBootstrapControl):
+        raise KreaCalibrationProfileError(
+            "Stage-2 timing bootstrap control is not validated"
+        )
+    resolved = copy.deepcopy(cfg)
+    root = _mapping(resolved, "config document")
+    config = _mapping(root.get("config"), "config")
+    processes = config.get("process")
+    if not isinstance(processes, list) or len(processes) != 1:
+        raise KreaCalibrationProfileError("Krea config must contain one process")
+    process = _mapping(processes[0], "Krea process")
+    model = _mapping(process.get("model"), "Krea model")
+    if model.get("arch") != "krea2":
+        raise KreaCalibrationProfileError("timing bootstrap target is not Krea 2")
+    binding = _mapping(
+        _mapping(root.get("meta"), "config metadata").get(
+            "forge_krea_calibration_profile"
+        ),
+        "Krea profile binding",
+    )
+    if (
+        binding.get("profile_id") == "K0"
+        or binding.get("depth_binding_status")
+        != "pending_measured_stage2_per_class_throughput"
+        or binding.get("throughput_profile_sha256") is not None
+    ):
+        raise KreaCalibrationProfileError(
+            "timing bootstrap requires one unmeasured K1-K5 profile"
+        )
+    train = _mapping(process.get("train"), "Krea train config")
+    save = _mapping(process.get("save"), "Krea save config")
+    process["training_seed"] = control.seed
+    train["steps"] = control.steps
+    save["save_every"] = (control.steps + 7) // 8
+    selection = stage2_checkpoint_selection_binding(
+        control,
+        planned_steps=control.steps,
+        save_every=save["save_every"],
+    )
+    root["meta"]["forge_krea_checkpoint_selection"] = selection
+    binding.update(
+        planned_steps=control.steps,
+        save_every=save["save_every"],
+        planned_steps_source="explicit_preprofile_timing_probe",
+        depth_binding_status="preprofile_timing_bootstrap",
+        throughput_profile_sha256=None,
+        measured_stage2_per_class_throughput_bound=False,
+        timing_bootstrap={
+            "timing_plan_sha256": control.timing_plan_sha256,
+            "probe_contract_sha256": control.probe_contract_sha256,
+            "release_authorized": False,
+        },
+    )
+    telemetry.event(
+        "krea_stage2_timing_bootstrap_applied",
+        timing_plan_sha256=control.timing_plan_sha256,
+        probe_contract_sha256=control.probe_contract_sha256,
+        profile_id=binding["profile_id"],
+        steps=control.steps,
+        seed=control.seed,
+        release_authorized=False,
+    )
+    return resolved
+
+
 def stage2_checkpoint_selection_binding(
-    control: Stage2RunControl,
+    control: Stage2RunControl | Stage2TimingBootstrapControl,
     *,
     planned_steps: int,
     save_every: int,
@@ -481,7 +696,7 @@ def stage2_checkpoint_selection_binding(
     the earlier current-run checkpoint, matching the frozen decision rule.
     """
 
-    if not isinstance(control, Stage2RunControl):
+    if not isinstance(control, (Stage2RunControl, Stage2TimingBootstrapControl)):
         raise KreaCalibrationProfileError("Stage-2 run control is not validated")
     planned = _positive_int(planned_steps, "planned steps")
     cadence = _positive_int(save_every, "save_every")
@@ -522,7 +737,11 @@ def write_stage2_terminal_receipt(
 
     profile = profile_for_id(profile_id)
     control = selected_stage2_run_control("krea2", profile)
-    if control is None:
+    timing_bootstrap = selected_stage2_timing_bootstrap_control("krea2", profile)
+    if control is not None and timing_bootstrap is not None:
+        raise KreaCalibrationProfileError("Stage-2 control modes are not exclusive")
+    active_control = control if control is not None else timing_bootstrap
+    if active_control is None:
         return None
     if (
         isinstance(planned_steps, bool)
@@ -540,8 +759,8 @@ def write_stage2_terminal_receipt(
         raise KreaCalibrationProfileError("Stage-2 trainer returncode is invalid")
     if not isinstance(stopped_by_deadline, bool):
         raise KreaCalibrationProfileError("Stage-2 deadline state is invalid")
-    parent = os.path.dirname(control.receipt_path)
-    control_receipt = control.receipt_path
+    parent = os.path.dirname(active_control.receipt_path)
+    control_receipt = active_control.receipt_path
     if os.path.realpath(parent) != parent or not os.path.isdir(parent):
         raise KreaCalibrationProfileError(
             "Stage-2 terminal receipt parent is not a real directory"
@@ -563,13 +782,10 @@ def write_stage2_terminal_receipt(
     naturally_completed = (
         returncode == 0 and stopped_by_deadline is False and last_step == planned_steps
     )
-    body = {
-        "schema": 1,
-        "kind": "forge-krea-stage2-training-terminal-receipt",
-        "execution_plan_sha256": control.execution_plan_sha256,
+    common = {
         "profile_id": profile.profile_id,
         "profile_sha256": profile.profile_sha256,
-        "training_seed": control.seed,
+        "training_seed": active_control.seed,
         "planned_steps": planned_steps,
         "last_step": last_step,
         "trainer_returncode": returncode,
@@ -580,6 +796,24 @@ def write_stage2_terminal_receipt(
         "checkpoint_selection": checkpoint_selection,
         "release_authorized": False,
     }
+    if timing_bootstrap is None:
+        body = {
+            "schema": 1,
+            "kind": "forge-krea-stage2-training-terminal-receipt",
+            "execution_plan_sha256": control.execution_plan_sha256,
+            **common,
+        }
+    else:
+        body = {
+            "schema": 1,
+            "kind": "forge-krea-stage2-timing-bootstrap-terminal-receipt",
+            "mode": "preprofile_timing_bootstrap",
+            "timing_plan_sha256": timing_bootstrap.timing_plan_sha256,
+            "probe_contract_sha256": timing_bootstrap.probe_contract_sha256,
+            "throughput_profile_sha256": None,
+            "production_mutation_authorized": False,
+            **common,
+        }
     receipt = {
         **body,
         "receipt_sha256": hashlib.sha256(
@@ -632,7 +866,11 @@ def preserve_stage2_checkpoint_selection(
 
     profile = profile_for_id(profile_id)
     control = selected_stage2_run_control("krea2", profile)
-    if control is None:
+    timing_bootstrap = selected_stage2_timing_bootstrap_control("krea2", profile)
+    if control is not None and timing_bootstrap is not None:
+        raise KreaCalibrationProfileError("Stage-2 control modes are not exclusive")
+    active_control = control if control is not None else timing_bootstrap
+    if active_control is None:
         return None
     if not isinstance(record, Mapping):
         raise KreaCalibrationProfileError("Stage-2 checkpoint record is invalid")
@@ -652,7 +890,7 @@ def preserve_stage2_checkpoint_selection(
             "Stage-2 checkpoint-selection source differs from finalization"
         )
     try:
-        with open(control.receipt_path, "rb") as handle:
+        with open(active_control.receipt_path, "rb") as handle:
             config_control = json.load(handle)
         expected = config_control["checkpoint_selection"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -671,7 +909,7 @@ def preserve_stage2_checkpoint_selection(
         or output_file != "last.safetensors"
         or parsed.get("selected_step") != expected.get("selected_step")
         or parsed.get("planned_steps") != expected.get("planned_steps")
-        or parsed.get("checkpoint_target") != control.checkpoint_target
+        or parsed.get("checkpoint_target") != active_control.checkpoint_target
     ):
         raise KreaCalibrationProfileError(
             "Stage-2 checkpoint selection differs from its frozen target"
@@ -696,7 +934,7 @@ def preserve_stage2_checkpoint_selection(
         raise KreaCalibrationProfileError(
             "Stage-2 promoted checkpoint bytes differ from the selected source"
         )
-    parent = os.path.dirname(control.receipt_path)
+    parent = os.path.dirname(active_control.receipt_path)
     target = os.path.join(parent, "forge_checkpoint_selection.json")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
