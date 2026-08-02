@@ -3849,6 +3849,20 @@ def _run_contained(
         raise RuntimeError("generated an unsafe systemd unit name")
     grace = float(containment["term_grace_s"])
     systemctl_path = containment["systemctl_path"]
+    service_environment: list[str] = []
+    if gpu_device is not None:
+        if (
+            isinstance(gpu_device, bool)
+            or not isinstance(gpu_device, int)
+            or not 0 <= gpu_device <= 31
+        ):
+            raise ValueError("exact scorer GPU device is outside [0,31]")
+        # systemd-run does not propagate the client's process environment into
+        # the transient service.  Bind the physical device in the unit itself;
+        # setting only Popen(env=...) constrains systemd-run, not the evaluator.
+        service_environment.append(
+            f"--setenv=CUDA_VISIBLE_DEVICES={gpu_device}"
+        )
     wrapped = [
         containment["systemd_run_path"],
         "--quiet",
@@ -3865,6 +3879,7 @@ def _run_contained(
         # interfaces; the AF allowlist remains explicit and reviewable.
         "--property=PrivateNetwork=yes",
         "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        *service_environment,
         "--",
         *command,
     ]
@@ -3884,12 +3899,6 @@ def _run_contained(
             driver_python=command[0], isolated_root=Path(environment_root.name)
         )
         if gpu_device is not None:
-            if (
-                isinstance(gpu_device, bool)
-                or not isinstance(gpu_device, int)
-                or not 0 <= gpu_device <= 31
-            ):
-                raise ValueError("exact scorer GPU device is outside [0,31]")
             evaluator_environment["CUDA_VISIBLE_DEVICES"] = str(gpu_device)
         process = subprocess.Popen(
             wrapped,

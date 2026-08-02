@@ -92,6 +92,7 @@ def test_contained_scorer_binds_one_gpu_in_its_minimal_environment(
             return "stdout", "stderr"
 
     def popen(*args, **kwargs):
+        captured["command"] = args[0]
         captured["env"] = kwargs["env"]
         return Process()
 
@@ -113,6 +114,10 @@ def test_contained_scorer_binds_one_gpu_in_its_minimal_environment(
 
     assert result.returncode == 0
     assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "3"
+    assert "--setenv=CUDA_VISIBLE_DEVICES=3" in captured["command"]
+    assert captured["command"].index("--setenv=CUDA_VISIBLE_DEVICES=3") < (
+        captured["command"].index("--")
+    )
     with pytest.raises(ValueError, match="outside"):
         batch._run_contained(
             [sys.executable, "-c", "pass"],
