@@ -8,7 +8,7 @@ dependencies = ["pyyaml", "Pillow", "numpy", "safetensors"]
 include = ["forge*"]
 
 [tool.setuptools.package-data]
-forge = ["templates/*.yaml"]
+forge = ["templates/*.yaml", "policies/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

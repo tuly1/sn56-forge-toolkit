@@ -25,6 +25,10 @@ class Deadline:
     hard_stop: float
     export_reserve_s: float
     _step_costs: list[float] = field(default_factory=list)
+    # Original validator grant.  Recipe code still uses the live remaining
+    # clock; the evidence-bound Krea boundary policy needs the discrete grant
+    # (0.5/0.75/1.0h) whose startup and reserves were measured end-to-end.
+    granted_hours: float | None = None
 
     @classmethod
     def from_hours(
@@ -33,6 +37,7 @@ class Deadline:
         return cls(
             hard_stop=started_monotonic + hours * 3600.0,
             export_reserve_s=export_reserve_s,
+            granted_hours=hours,
         )
 
     @property

@@ -15,7 +15,7 @@ import os
 
 import yaml
 
-from forge import recipe
+from forge import krea_release_policy, recipe, telemetry
 
 # Templates are shipped INSIDE the package (forge/templates/*.yaml) so they are
 # present under any deployment (source COPY, `pip install .` wheel, or local test)
@@ -78,10 +78,19 @@ def resolve_base_model(cached_model_dir: str) -> str:
     return cached_model_dir
 
 
-def build_config(spec, num_images, hours_to_complete) -> dict:
+def build_config(
+    spec,
+    num_images,
+    hours_to_complete,
+    *,
+    holdout_pairs=None,
+    granted_hours=None,
+) -> dict:
     cfg = load_template(spec.model_type)  # may raise → caller wraps
+    override_complete = False
     try:
-        return _apply_overrides(cfg, spec, num_images, hours_to_complete)
+        resolved = _apply_overrides(cfg, spec, num_images, hours_to_complete)
+        override_complete = True
     except Exception:
         # Degrade to the template with only the load-bearing name/paths patched so
         # an override bug can't forfeit (INV-1). name==repo is non-negotiable.
@@ -115,7 +124,31 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
             )
         except Exception:
             pass
-        return cfg
+        resolved = cfg
+
+    selection = (
+        krea_release_policy.select(
+            spec.model_type,
+            training_pair_count=num_images,
+            holdout_pairs=holdout_pairs,
+            granted_hours=granted_hours,
+        )
+        if override_complete
+        else None
+    )
+    if selection is not None:
+        try:
+            return krea_release_policy.apply(resolved, selection)
+        except Exception as exc:
+            # The tournament contract is never-forfeit. A bad release binding
+            # preserves the already-built K0 config rather than emitting a
+            # partially mutated candidate or crashing the task.
+            telemetry.event(
+                "krea_production_policy_inactive",
+                reason="application_failed",
+                error_type=type(exc).__name__,
+            )
+    return resolved
 
 
 def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
