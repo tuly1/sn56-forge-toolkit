@@ -151,6 +151,84 @@ def test_real_legacy_wrapper_dispatches_for_training_and_scoring(
     assert dataset == wrapper_path.parent / "holdout"
 
 
+def test_receipt_result_validation_gets_full_legacy_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wrapper_path, wrapper = _legacy_wrapper(tmp_path, monkeypatch)
+    candidate_path = tmp_path / "last.safetensors"
+    candidate_path.write_bytes(b"candidate")
+    candidate_sha = krea_provenance.file_sha256(candidate_path)
+    result_path = tmp_path / "result.json"
+    result_path.write_text("{}\n")
+    identity = wrapper["evaluation_dataset_identity"]
+    plan = {
+        "plan_sha256": _sha("plan"),
+        "phase": "confirmation",
+        "cell_id": "C1-A",
+        "fixture_id": "C1",
+        "seed_role": "A",
+        "candidates": [
+            {
+                "family_id": "K0",
+                "candidate_id": "c1-a-k0",
+                "candidate_sha256": candidate_sha,
+            }
+        ],
+        "fixture_manifest": {
+            "file_sha256": scoring._file_sha(wrapper),
+            "manifest_sha256": wrapper["wrapper_sha256"],
+        },
+        "evaluation_dataset_sha256": identity["sha256"],
+        "evaluation_row_count": len(identity["rows"]),
+        "evaluator_contract": {},
+        "evaluation_dataset_path": str(tmp_path / "holdout"),
+    }
+    monkeypatch.setattr(
+        scoring.krea_stage2_score, "validate_plan", lambda _value: plan
+    )
+    monkeypatch.setattr(
+        scoring.krea_stage2_score,
+        "validate_receipt",
+        lambda value, **_kwargs: value,
+    )
+    observed = {}
+
+    def validate_result(_result, *, fixture_manifest, **_kwargs):
+        # This is the production nesting: result validation resolves the
+        # fixture again.  Passing legacy.score_view(wrapper) here raises the
+        # exact live key-mismatch; passing the original wrapper is correct.
+        observed["fixture"] = fixture_manifest
+        resolved = scoring.krea_stage2_score._fixture_score_view(fixture_manifest)
+        return {
+            "weighted_loss": 0.1,
+            "text_mean": 0.1,
+            "blank_mean": 0.1,
+            "row_identity_sha256": _sha("rows"),
+            "evaluator_contract_sha256": _sha("contract"),
+            "dataset_sha256": resolved["evaluation_dataset_identity"]["sha256"],
+            "row_count": len(resolved["evaluation_dataset_identity"]["rows"]),
+            "prompt_count": len(resolved["evaluation_dataset_identity"]["rows"]) * 10,
+        }
+
+    monkeypatch.setattr(
+        scoring.krea_stage2_score, "_validate_result", validate_result
+    )
+
+    scoring.krea_stage2_score.build_receipt(
+        plan=plan,
+        family_id="K0",
+        candidate_path=candidate_path,
+        fixture_manifest=wrapper,
+        fixture_manifest_file_sha256=scoring._file_sha(wrapper),
+        result_path=result_path,
+        status_file_sha256=_sha("status"),
+        evidence_manifest_file_sha256=_sha("evidence"),
+        completed_at_utc="2026-08-02T02:29:02Z",
+    )
+
+    assert observed["fixture"] == wrapper
+
+
 def test_live_row_replay_rehashes_real_legacy_wrapper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

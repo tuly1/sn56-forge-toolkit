@@ -1056,7 +1056,7 @@ def build_receipt(
         result,
         candidate_path=candidate_path,
         candidate=candidates[family],
-        fixture_manifest=manifest,
+        fixture_manifest=fixture_manifest,
         evaluator_contract=resolved["evaluator_contract"],
         evaluation_dataset_path=resolved["evaluation_dataset_path"],
     )
@@ -1223,7 +1223,7 @@ def validate_receipt_with_score_files(
         result,
         candidate_path=candidate_path,
         candidate=candidates[receipt["family_id"]],
-        fixture_manifest=manifest,
+        fixture_manifest=fixture_manifest,
         evaluator_contract=resolved["evaluator_contract"],
         evaluation_dataset_path=resolved["evaluation_dataset_path"],
     )
