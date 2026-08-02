@@ -357,9 +357,17 @@ def finalize(
         state = None
     candidates = current_loras(save_root, state)
     valid = [path for path in candidates if valid_safetensors(path)]
+    frozen_target_unavailable = False
+    selection = None
 
     if valid:
         selection = select(valid, repo, save_root, state)
+        if selection is None:
+            # A frozen production target is authoritative. Valid bytes outside
+            # its planned schedule are not eligible for legacy selection.
+            frozen_target_unavailable = True
+
+    if selection is not None:
         last = os.path.join(save_root, "last.safetensors")
         promoted_sha256 = _atomic_copy(selection.path, last)
         record = _selection_record(
@@ -398,8 +406,16 @@ def finalize(
             path=last,
             source="previous_run_fallback",
             reason=(
-                "current run produced no valid checkpoint; retained the valid "
-                "last.safetensors that existed before this run"
+                (
+                    "current run produced no checkpoint eligible under the frozen "
+                    "production target; retained the valid last.safetensors that "
+                    "existed before this run"
+                )
+                if frozen_target_unavailable
+                else (
+                    "current run produced no valid checkpoint; retained the valid "
+                    "last.safetensors that existed before this run"
+                )
             ),
             step=None,
         )
@@ -410,7 +426,7 @@ def finalize(
             status="preserved_previous_run",
             context=context,
             discovered=len(candidates),
-            valid=0,
+            valid=len(valid),
         )
         _write_selection(save_root, record)
         _event(
@@ -434,14 +450,14 @@ def select(
     repo: str,
     save_root: str,
     state: dict[str, Any] | None,
-) -> Selection:
+) -> Selection | None:
     """Choose among already integrity-checked current-run candidates."""
+    if (state or {}).get("checkpoint_target") is not None:
+        # Presence of a validated frozen target suppresses every legacy selector,
+        # including when no current candidate falls within its planned schedule.
+        return _select_from_frozen_fraction(valid, state)
+
     default = _default_selection(valid, repo, state)
-
-    frozen = _select_from_frozen_fraction(valid, state)
-    if frozen is not None:
-        return frozen
-
     heldout = _select_from_holdout(valid, save_root, state, default)
     if heldout is not None:
         return heldout
@@ -465,6 +481,14 @@ def _select_from_frozen_fraction(
     planned = _planned_steps(state)
     if planned is None:
         raise ValueError("frozen checkpoint target requires planned steps")
+    expected_step = (state or {}).get("checkpoint_selected_step")
+    if (
+        isinstance(expected_step, bool)
+        or not isinstance(expected_step, int)
+        or expected_step <= 0
+        or expected_step > planned
+    ):
+        raise ValueError("frozen checkpoint target lacks its selected step")
     rows: list[tuple[int, str]] = []
     for path in valid:
         step = _step_of(path)
@@ -476,15 +500,13 @@ def _select_from_frozen_fraction(
             continue
         rows.append((step, path))
     if not rows:
+        _event(
+            "frozen_checkpoint_no_eligible_current",
+            expected_step=expected_step,
+            planned_steps=planned,
+            valid_current_candidates=len(valid),
+        )
         return None
-    expected_step = (state or {}).get("checkpoint_selected_step")
-    if (
-        isinstance(expected_step, bool)
-        or not isinstance(expected_step, int)
-        or expected_step <= 0
-        or expected_step > planned
-    ):
-        raise ValueError("frozen checkpoint target lacks its selected step")
     exact = [row for row in rows if row[0] == expected_step]
     numerator = target["fraction_numerator"]
     denominator = target["fraction_denominator"]

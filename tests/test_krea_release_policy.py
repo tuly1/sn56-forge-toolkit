@@ -197,7 +197,7 @@ def test_exact_pair_boundary_routes_profile_depth_and_checkpoint(
     assert binding["family"] == family
     assert binding["regime"] == regime
     assert binding["planned_steps"] == steps
-    assert binding["legacy_k0_step_plan_cap_applied"] is False
+    assert binding["remaining_time_step_cap_applied"] is False
     assert process["train"]["steps"] == steps
     assert process["save"]["save_every"] == (steps + 7) // 8
     assert process["train"]["lr"] == (0.0001 if family == "K1" else 0.0002)
@@ -211,6 +211,40 @@ def test_exact_pair_boundary_routes_profile_depth_and_checkpoint(
         "selection_rule": policy.CHECKPOINT_MAPPING_RULE,
     }
     assert control[1] == selected_step
+
+
+@pytest.mark.parametrize(
+    ("granted_hours", "remaining_hours", "boundary_cell", "steps", "selected_step"),
+    [
+        (0.5, 0.49, "B-0p5-small", 136, 119),
+        (0.75, 0.74, "B-0p75-small", 209, 189),
+        (1.0, 0.99, "B-1-small", 295, 259),
+    ],
+)
+def test_exact_18_pair_boundary_anchor_is_not_truncated_by_k0_size_law(
+    monkeypatch: pytest.MonkeyPatch,
+    granted_hours: float,
+    remaining_hours: float,
+    boundary_cell: str,
+    steps: int,
+    selected_step: int,
+) -> None:
+    cfg = _build(
+        monkeypatch,
+        18,
+        remaining_hours=remaining_hours,
+        granted_hours=granted_hours,
+    )
+    binding = cfg["meta"]["forge_krea_production_policy"]
+
+    assert binding["boundary_cell"] == boundary_cell
+    assert binding["boundary_planned_steps"] == steps
+    assert binding["remaining_time_step_cap"] >= steps
+    assert binding["remaining_time_step_cap_applied"] is False
+    assert _process(cfg)["train"]["steps"] == steps
+    assert cfg["meta"]["forge_krea_checkpoint_selection"]["selected_step"] == (
+        selected_step
+    )
 
 
 def test_original_grant_selects_anchor_while_remaining_time_caps_depth(
@@ -236,7 +270,7 @@ def test_original_grant_selects_anchor_while_remaining_time_caps_depth(
     delayed_binding = delayed["meta"]["forge_krea_production_policy"]
     assert delayed_binding["boundary_cell"] == "B-0p75-small"
     assert 1 <= _process(delayed)["train"]["steps"] < 209
-    assert delayed_binding["legacy_k0_step_plan_cap_applied"] is True
+    assert delayed_binding["remaining_time_step_cap_applied"] is True
 
 
 @pytest.mark.parametrize("pairs", [None, True, 0, -1, "18", 18.0])
@@ -448,4 +482,35 @@ def test_no_current_candidate_preserves_prior_last_under_policy(tmp_path: Path) 
 
     assert record is not None
     assert record["source"] == "previous_run_fallback"
+    assert (tmp_path / "last.safetensors").read_bytes() == expected
+
+
+def test_out_of_schedule_current_candidate_cannot_override_prior_last(
+    tmp_path: Path,
+) -> None:
+    expected = _write_safetensors(tmp_path / "last.safetensors", 3.0)
+    state = checkpoints.begin_run(str(tmp_path), "repo")
+    state = checkpoints.set_planned_steps(
+        str(tmp_path),
+        state,
+        136,
+        model_type="krea2",
+        checkpoint_target={
+            "fraction_numerator": 9,
+            "fraction_denominator": 10,
+            "selection_rule": policy.CHECKPOINT_MAPPING_RULE,
+        },
+        checkpoint_selected_step=119,
+    )
+    _write_safetensors(tmp_path / "repo_000000200.safetensors", 4.0)
+
+    record = checkpoints.finalize(str(tmp_path), "repo", state)
+
+    assert record is not None
+    assert record["status"] == "preserved_previous_run"
+    assert record["source"] == "previous_run_fallback"
+    assert (
+        "no checkpoint eligible under the frozen production target" in record["reason"]
+    )
+    assert record["current_candidates_valid"] == 1
     assert (tmp_path / "last.safetensors").read_bytes() == expected

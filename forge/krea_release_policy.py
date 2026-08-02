@@ -23,7 +23,7 @@ import math
 import re
 from typing import Any, Mapping
 
-from forge import telemetry
+from forge import recipe, telemetry
 
 
 POLICY_ID = "week5-krea-two-regime-v1"
@@ -119,9 +119,17 @@ _POLICY_BODY = {
             "below_0.5h_preserve_K0"
         ),
         "interpolation": False,
-        "legacy_K0_step_plan_cap": (
-            "minimum(boundary_anchor,current_K0_size_and_remaining_time_plan)"
-        ),
+        "remaining_time_step_cap": {
+            "rule": (
+                "minimum(boundary_anchor,max(1,floor((remaining_hard_seconds*"
+                "MARGIN-STARTUP_S-EXPORT_RESERVE_S)/SEC_PER_IT[krea2])))"
+            ),
+            "source": "release-c654c4b recipe time constants",
+            "margin": recipe.MARGIN,
+            "startup_seconds": recipe.STARTUP_S,
+            "export_reserve_seconds": recipe.EXPORT_RESERVE_S,
+            "seconds_per_iteration": recipe.SEC_PER_IT["krea2"],
+        },
         "steps": {
             "B-0p5-small": 136,
             "B-0p5-large": 139,
@@ -197,9 +205,11 @@ class Selection:
     family: str
     pair_count: int
     granted_hours: str
+    remaining_hours: str
     certified_hours: str
     boundary_cell: str
     planned_steps: int
+    remaining_time_step_cap: int
     target_numerator: int
     target_denominator: int
     boundary_plan_sha256: str
@@ -315,12 +325,37 @@ def _certified_budget(hours: Any) -> Decimal | None:
     return max(eligible) if eligible else None
 
 
+def _remaining_time_step_cap(hours: Any) -> tuple[str, int] | None:
+    """Return the pure wall-time cap, independent of the legacy size law."""
+
+    try:
+        if isinstance(hours, bool):
+            return None
+        remaining = Decimal(str(hours))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not remaining.is_finite():
+        return None
+    budget_s = max(Decimal(0), remaining * Decimal(3600))
+    train_s = (
+        budget_s * Decimal(str(recipe.MARGIN))
+        - Decimal(str(recipe.STARTUP_S))
+        - Decimal(str(recipe.EXPORT_RESERVE_S))
+    )
+    if train_s <= 0:
+        cap = 1
+    else:
+        cap = int(train_s / Decimal(str(recipe.SEC_PER_IT["krea2"])))
+    return str(remaining.normalize()), max(1, cap)
+
+
 def select(
     model_type: str,
     *,
     training_pair_count: Any,
     holdout_pairs: Any,
     granted_hours: Any,
+    remaining_hours: Any,
     activation: Mapping[str, Any] | None = None,
 ) -> Selection | None:
     """Resolve the env-unset policy or return ``None`` for exact K0 behavior."""
@@ -334,8 +369,10 @@ def select(
         return None
     regime = _pair_regime(training_pair_count)
     budget = _certified_budget(granted_hours)
-    if regime is None or budget is None:
+    time_cap = _remaining_time_step_cap(remaining_hours)
+    if regime is None or budget is None or time_cap is None:
         return None
+    remaining_hours_string, remaining_time_step_cap = time_cap
     label, source_fixture, family = regime
     outcomes = active["policy_outcomes"]
     if outcomes == {"K1": "PASS", "K5": "PASS"}:
@@ -357,9 +394,11 @@ def select(
         family=family,
         pair_count=training_pair_count,
         granted_hours=str(Decimal(str(granted_hours)).normalize()),
+        remaining_hours=remaining_hours_string,
         certified_hours=str(budget),
         boundary_cell=boundary_cell,
         planned_steps=_BOUNDARY_STEPS[(label, budget)],
+        remaining_time_step_cap=remaining_time_step_cap,
         target_numerator=numerator,
         target_denominator=denominator,
         boundary_plan_sha256=active["boundary_plan_sha256s"][family][boundary_cell],
@@ -423,17 +462,10 @@ def apply(cfg: dict[str, Any], selection: Selection) -> dict[str, Any]:
     train["differential_guidance_scale"] = recipe["guidance"]
     train["ema_config"] = {"use_ema": recipe["ema"], "ema_decay": 0.99}
     dataset["caption_dropout_rate"] = recipe["dropout"]
-    baseline_steps = train.get("steps")
-    if (
-        isinstance(baseline_steps, bool)
-        or not isinstance(baseline_steps, int)
-        or baseline_steps <= 0
-    ):
-        raise ValueError("K0 remaining-time step cap is invalid")
     # The sealed boundary anchor comes from the original grant.  Preserve the
-    # current release planner as a conservative size-and-remaining-time cap so
-    # a slow setup or an extreme out-of-fixture size cannot over-schedule it.
-    planned_steps = min(selection.planned_steps, baseline_steps)
+    # existing conservative timing constants as a pure remaining-time safety
+    # cap.  The legacy K0 dataset-size law must not truncate measured anchors.
+    planned_steps = min(selection.planned_steps, selection.remaining_time_step_cap)
     train["steps"] = planned_steps
     save["save_every"] = (planned_steps + 7) // 8
     checkpoint = _checkpoint_binding(
@@ -455,12 +487,14 @@ def apply(cfg: dict[str, Any], selection: Selection) -> dict[str, Any]:
         "family": selection.family,
         "source_stage2_profile_sha256": SOURCE_STAGE2_PROFILE_SHA256[selection.family],
         "granted_hours": selection.granted_hours,
+        "remaining_hours": selection.remaining_hours,
         "certified_hours": selection.certified_hours,
         "boundary_cell": selection.boundary_cell,
         "boundary_plan_sha256": selection.boundary_plan_sha256,
         "boundary_planned_steps": selection.planned_steps,
+        "remaining_time_step_cap": selection.remaining_time_step_cap,
         "planned_steps": planned_steps,
-        "legacy_k0_step_plan_cap_applied": planned_steps < selection.planned_steps,
+        "remaining_time_step_cap_applied": planned_steps < selection.planned_steps,
         "holdout_disabled": True,
         "release_selected": True,
     }
@@ -473,7 +507,8 @@ def apply(cfg: dict[str, Any], selection: Selection) -> dict[str, Any]:
         planned_steps=planned_steps,
         target_numerator=selection.target_numerator,
         target_denominator=selection.target_denominator,
-        legacy_k0_step_plan_cap_applied=planned_steps < selection.planned_steps,
+        remaining_time_step_cap=selection.remaining_time_step_cap,
+        remaining_time_step_cap_applied=planned_steps < selection.planned_steps,
     )
     return resolved
 

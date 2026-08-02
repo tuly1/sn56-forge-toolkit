@@ -132,6 +132,7 @@ def build_config(
             training_pair_count=num_images,
             holdout_pairs=holdout_pairs,
             granted_hours=granted_hours,
+            remaining_hours=hours_to_complete,
         )
         if override_complete
         else None
