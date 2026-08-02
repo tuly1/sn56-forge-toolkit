@@ -33,7 +33,7 @@ _BODY = {
     "schema": 1,
     "kind": "forge-krea-stage1-scorer-extension-policy",
     "base_execution_surface_policy_sha256": (
-        "7024e1fc4bde6c41897d84b967bd4280558fa09d51e4893c41b6619bb76d534c"
+        "8b0feacdfd9a6972c1e76471c22fffe6e5b8cc52a16ba1520b6a3a8e83ca4c33"
     ),
     "scope": "offline_stage1_exact_scoring_only",
     "changes": {

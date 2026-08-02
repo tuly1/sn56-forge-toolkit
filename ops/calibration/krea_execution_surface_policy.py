@@ -63,7 +63,7 @@ _BODY = {
         "comfy_commit": "091b70edda0c062fc9338a1d7e8e2f94f4c0ad0b",
         "tooling_commit": "5d3194f4d4158ab31df7a060e1e4c56fa03f320c",
         "evaluator_script_sha256": (
-            "6204384b44c846c2ae545a3f365c7489d829353bb34b96ffd11c28a92d3c40c0"
+            "6ba85ccd8fc51a5e4a946da1be5c4f9d241b1868d14ab19430d353e89508122f"
         ),
         "dataset_identity_module_sha256": (
             "632f6ca7d58a0bdb38519bef510d621bef09405bd87f5479fe3bad68d69e955f"

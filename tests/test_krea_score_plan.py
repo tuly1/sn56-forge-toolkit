@@ -63,6 +63,22 @@ def test_exact_scorer_environments_do_not_inherit_operator_controls(
             assert name not in environment
         assert environment["HF_HUB_OFFLINE"] == "1"
         assert environment["HF_HOME"].startswith(str(tmp_path))
+        assert "CUDA_VISIBLE_DEVICES" not in environment
+
+    bound_root = tmp_path / "bound-inner"
+    bound_root.mkdir()
+    bound = evaluate_krea_local._comfy_child_environment(
+        comfy_python=Path(sys.executable),
+        isolation_root=bound_root,
+        cuda_visible_devices="3",
+    )
+    assert bound["CUDA_VISIBLE_DEVICES"] == "3"
+    with pytest.raises(ValueError, match="one GPU"):
+        evaluate_krea_local._comfy_child_environment(
+            comfy_python=Path(sys.executable),
+            isolation_root=bound_root,
+            cuda_visible_devices="0,1",
+        )
 
     inspection = evaluate_krea_local._inspection_environment()
     for name in (

@@ -63,13 +63,13 @@ _FORBIDDEN_OUTPUT = "forge_holdout_scores.json"
 _COMFY_LORA_PLACEHOLDER = "put_loras_here"
 _SCORER_SUPPORT_MODULE_SHA256 = {
     "krea_execution_surface_policy.py": (
-        "597e5047e419a5007e5dd7e9c80c3d771ac21995028899edaac38ba47bf02722"
+        "2ef82f30f32cff280336ff07f4fe95c0110b9d4076a77bb840586dc3b8ccd8b4"
     ),
     "krea_historical_training_evidence.py": (
         "6734200163e856a14a2d41a370e98e1b4b801091e5f828c37817ff9d4435f3d0"
     ),
     "krea_scorer_extension_policy.py": (
-        "b0c033025dc35f0cdc3e348234507c24f17ac636f522eaff3a392cd3e74a062b"
+        "6ffeedd2c3255a7ed1c1664480b5eb36667cb36fad1edfafe85be6dd21a96d31"
     ),
 }
 _FIXTURE_KIND = "forge-krea-fixture-split"

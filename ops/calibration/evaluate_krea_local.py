@@ -51,7 +51,10 @@ _TOOLING_NODE = "comfyui-tooling-nodes"
 
 
 def _comfy_child_environment(
-    *, comfy_python: Path, isolation_root: Path
+    *,
+    comfy_python: Path,
+    isolation_root: Path,
+    cuda_visible_devices: str | None = None,
 ) -> dict[str, str]:
     """Construct a scorer-child environment without operator inheritance."""
 
@@ -67,6 +70,14 @@ def _comfy_child_environment(
     }
     for directory in directories.values():
         directory.mkdir(parents=True, exist_ok=True)
+    gpu_environment: dict[str, str] = {}
+    if cuda_visible_devices is not None:
+        if (
+            not re.fullmatch(r"0|[1-9][0-9]?", cuda_visible_devices)
+            or not 0 <= int(cuda_visible_devices) <= 31
+        ):
+            raise ValueError("Comfy child CUDA_VISIBLE_DEVICES must name one GPU")
+        gpu_environment["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     return {
         "PATH": f"{comfy_python.parent}:/usr/bin:/bin",
         "LANG": "C",
@@ -80,6 +91,7 @@ def _comfy_child_environment(
         "DIFFUSERS_OFFLINE": "1",
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "TOKENIZERS_PARALLELISM": "false",
+        **gpu_environment,
         **{name: str(path) for name, path in directories.items()},
     }
 
@@ -870,6 +882,7 @@ def main() -> int:
             child_environment = _comfy_child_environment(
                 comfy_python=comfy_python,
                 isolation_root=isolation_root,
+                cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
             )
 
             with comfy_log.open("xb") as log_handle:
