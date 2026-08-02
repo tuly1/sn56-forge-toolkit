@@ -131,9 +131,30 @@ _POLICY_BODY = {
 }
 POLICY_SHA256 = hashlib.sha256(_canonical_bytes(_POLICY_BODY)).hexdigest()
 
-# Populated only by the release commit after the exact-score decision closes.
-# There is intentionally no environment-variable activation path.
-PRODUCTION_ACTIVATION: Mapping[str, Any] | None = None
+# Literal release activation bound to the completed exact-score record.  The
+# predeclared clear-win gate was null (the paired interval crossed zero); the
+# owner explicitly authorized the I-J20 port on the documented null-result
+# override branch.  There is intentionally no environment-variable path.
+PRODUCTION_ACTIVATION: Mapping[str, Any] | None = {
+    "schema": 1,
+    "kind": "forge-ideogram-week5-production-activation",
+    "policy_sha256": "21f782e80d79dd6ef348be3b1dd42b8bc1a0db5b33da96edef8f2d2d3f52e23a",
+    "formal_ideogram_decision_sha256": (
+        "deb5bc3dc6590aa4a9ef0a234a5efc5bc25c40c04327810eb3c997c32dc30af4"
+    ),
+    "scored_exact_final_sha256": (
+        "8d5ab294da5440ed7338ea912144056b7a13a8729d14c3cc05aeebc2cc2a1fde"
+    ),
+    "selected_arm": "I-J20",
+    "selection_basis": "null_result_owner_override",
+    "owner_override": True,
+    "production_mutation_authorized": True,
+    "release_authorized": True,
+    "deployment_authorized": False,
+    "activation_sha256": (
+        "0ae20f8d2e1f98be906a7d94231c8721c3f891708c9b6f0e4273b603152d08b7"
+    ),
+}
 
 
 def _validated_activation(value: Any) -> dict[str, Any] | None:

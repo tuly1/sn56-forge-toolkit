@@ -141,6 +141,7 @@ def _write_loss_db(path: Path, state: dict, losses: list[float]) -> None:
 def test_policy_is_dormant_and_non_ideogram_is_exact_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(policy, "PRODUCTION_ACTIVATION", None)
     assert policy.PRODUCTION_ACTIVATION is None
     baseline = config._apply_overrides(
         config.load_template("ideogram4"), _spec(), 36, 0.75
@@ -157,6 +158,22 @@ def test_policy_is_dormant_and_non_ideogram_is_exact_noop(
 
     monkeypatch.setattr(policy, "PRODUCTION_ACTIVATION", {"schema": 1})
     assert config.build_config(_spec(), 36, 0.75) == baseline
+
+
+def test_literal_production_activation_is_hash_bound_owner_override() -> None:
+    active = policy._validated_activation(policy.PRODUCTION_ACTIVATION)
+    assert active is not None
+    assert active["formal_ideogram_decision_sha256"] == (
+        "deb5bc3dc6590aa4a9ef0a234a5efc5bc25c40c04327810eb3c997c32dc30af4"
+    )
+    assert active["scored_exact_final_sha256"] == (
+        "8d5ab294da5440ed7338ea912144056b7a13a8729d14c3cc05aeebc2cc2a1fde"
+    )
+    assert active["selection_basis"] == "null_result_owner_override"
+    assert active["owner_override"] is True
+    assert active["activation_sha256"] == (
+        "0ae20f8d2e1f98be906a7d94231c8721c3f891708c9b6f0e4273b603152d08b7"
+    )
 
 
 def test_active_recipe_matches_the_scored_production_projection(
