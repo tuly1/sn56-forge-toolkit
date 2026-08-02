@@ -15,7 +15,7 @@ import os
 
 import yaml
 
-from forge import recipe
+from forge import ideogram_release_policy, recipe, telemetry
 
 # Templates are shipped INSIDE the package (forge/templates/*.yaml) so they are
 # present under any deployment (source COPY, `pip install .` wheel, or local test)
@@ -81,7 +81,7 @@ def resolve_base_model(cached_model_dir: str) -> str:
 def build_config(spec, num_images, hours_to_complete) -> dict:
     cfg = load_template(spec.model_type)  # may raise → caller wraps
     try:
-        return _apply_overrides(cfg, spec, num_images, hours_to_complete)
+        resolved = _apply_overrides(cfg, spec, num_images, hours_to_complete)
     except Exception:
         # Degrade to the template with only the load-bearing name/paths patched so
         # an override bug can't forfeit (INV-1). name==repo is non-negotiable.
@@ -115,7 +115,22 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
             )
         except Exception:
             pass
+        # A degraded config deliberately stays on the known Week-4 path.  The
+        # production policy is allowed to run only after the complete ordinary
+        # override contract has succeeded.
         return cfg
+
+    try:
+        return ideogram_release_policy.apply(resolved, spec.model_type)
+    except Exception as exc:
+        # Never emit a partial candidate.  An invalid release binding preserves
+        # the already-built Week-4 config and records why it stayed inactive.
+        telemetry.event(
+            "ideogram_production_policy_inactive",
+            reason="application_failed",
+            error_type=type(exc).__name__,
+        )
+        return resolved
 
 
 def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
