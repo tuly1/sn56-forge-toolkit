@@ -36,7 +36,7 @@ STEP_TABLE = {
     # - krea2: near-flat score across 8..128 steps at both tested LRs (arch
     #   trains very slowly from a near-converged objective) — fewer steps =
     #   same score, faster finish, less over-train risk.
-    "krea2": dict(base=300, n_ref=_N_REF, p=0.50, min=100, max=400),
+    "krea2": dict(base=1200, n_ref=_N_REF, p=0.50, min=100, max=2000),
     "ideogram4": dict(base=140, n_ref=_N_REF, p=0.50, min=48, max=400),
     # z-image/qwen: straight from the champion's published power laws
     # (z-image base~1100 p~0.5; qwen base~1000 p~0.5). qwen's template is 3000
@@ -51,7 +51,7 @@ STEP_TABLE = {
 # per step → highest. These are guesses to be replaced by measured per_step().
 # z-image/qwen train quantized (qfloat8/uint3, low_vram) → slower per it;
 # conservative until measured.
-SEC_PER_IT = {"flux": 2.5, "krea2": 3.5, "ideogram4": 3.0,
+SEC_PER_IT = {"flux": 2.5, "krea2": 2.0, "ideogram4": 3.0,
               "z-image": 3.0, "qwen-image": 4.0}
 STARTUP_S = 300.0  # big base-model load + latent/text-embed warmup
 EXPORT_RESERVE_S = 180.0  # mirrors cli._EXPORT_RESERVE_SECONDS
