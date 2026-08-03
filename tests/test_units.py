@@ -262,17 +262,17 @@ def test_recipe_step_scaling():
 def test_recipe_budget_cap_example():
     # krea2 @ 24 imgs scales to the owner-ordered field-depth base.
     v = recipe.size_scaled_steps("krea2", 24, 1.0, 2000)
-    assert v == 1200
+    assert v == 1172
     # the clock still binds on a tight budget
     v = recipe.size_scaled_steps("krea2", 24, 0.2, 2000)
-    assert v == 66
+    assert v == 59
 
 
 @pytest.mark.parametrize(
     ("hours", "expected"),
     [
-        (0.75, (775, 907, 907, 907, 907, 907)),
-        (1.0, (775, 1200, 1290, 1290, 1290, 1290)),
+        (0.75, (775, 824, 824, 824, 824, 824)),
+        (1.0, (775, 1172, 1172, 1172, 1172, 1172)),
     ],
 )
 def test_krea_emergency_materialization_table(hours, expected):
@@ -292,10 +292,10 @@ def test_recipe_save_every():
     assert (86 - 1) // recipe.kill_safe_save_every(86, 250) == 3
     assert recipe.kill_safe_save_every(367, 200) == 74
     assert (367 - 1) // recipe.kill_safe_save_every(367, 200) == 4
-    # A ~950-step Krea run retains four periodic recovery points; at 2 s/it,
-    # a deadline stop loses at most about 6.4 minutes of in-memory progress.
-    assert recipe.kill_safe_save_every(950, 250) == 191
-    assert (950 - 1) // recipe.kill_safe_save_every(950, 250) == 4
+    # The owner-ordered 824-step Krea run retains four periodic recovery points;
+    # at 2.2 s/it, a deadline stop loses about six minutes of in-memory progress.
+    assert recipe.kill_safe_save_every(824, 250) == 165
+    assert (824 - 1) // recipe.kill_safe_save_every(824, 250) == 4
     assert recipe.kill_safe_save_every(24, 250) == 12  # one mid-run recovery point
     assert recipe.kill_safe_save_every(2, 250) == 1
 
