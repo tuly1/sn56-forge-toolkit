@@ -730,7 +730,7 @@ def test_dormant_holdout_preserves_exact_recipe_budget_and_step_caps(monkeypatch
 
     cases = (
         ("ideogram4", "black-forest-labs/FLUX.1-Krea-dev", 9, 0.25, 86),
-        ("krea2", "krea/Krea-2-Raw", 24, 0.5, 525),
+        ("krea2", "krea/Krea-2-Raw", 24, 0.5, 477),
     )
     for model_type, model, images, hours, expected_steps in cases:
         assert not holdout.enabled_for(model_type)

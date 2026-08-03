@@ -51,7 +51,7 @@ STEP_TABLE = {
 # per step → highest. These are guesses to be replaced by measured per_step().
 # z-image/qwen train quantized (qfloat8/uint3, low_vram) → slower per it;
 # conservative until measured.
-SEC_PER_IT = {"flux": 2.5, "krea2": 2.0, "ideogram4": 3.0,
+SEC_PER_IT = {"flux": 2.5, "krea2": 2.2, "ideogram4": 3.0,
               "z-image": 3.0, "qwen-image": 4.0}
 STARTUP_S = 300.0  # big base-model load + latent/text-embed warmup
 EXPORT_RESERVE_S = 180.0  # mirrors cli._EXPORT_RESERVE_SECONDS
