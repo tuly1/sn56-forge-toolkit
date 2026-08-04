@@ -193,6 +193,7 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         total_budget_s=hours * 3600.0,
         export_reserve_s=recipe.EXPORT_RESERVE_S,
         timing_safety=recipe.MARGIN,
+        timing_record_required=(bundle != krea_runtime.INCUMBENT_BUNDLE),
     )
     if scoring_budget_ready:
         holdout.produce(
@@ -244,6 +245,7 @@ def _run_toolkit(
     total_budget_s: float | None = None,
     export_reserve_s: float = recipe.EXPORT_RESERVE_S,
     timing_safety: float = recipe.MARGIN,
+    timing_record_required: bool = False,
 ) -> bool:
     # Run ai-toolkit's run.py with the CURRENT interpreter, not a bare `python3`:
     # in the validator's Docker image sys.executable IS the env python with torch,
@@ -324,8 +326,10 @@ def _run_toolkit(
                 export_reserve_s=export_reserve_s,
                 safety=timing_safety,
             )
-            krea_runtime.persist_first_checkpoint_observation(
-                cfg_path, observation
+            _persist_first_checkpoint_observation(
+                cfg_path,
+                observation,
+                required=timing_record_required,
             )
             first_checkpoint_observed = True
 
@@ -458,6 +462,36 @@ def _first_durable_current_checkpoint(
         if step > 0:
             candidates.append((step, path))
     return min(candidates) if candidates else None
+
+
+def _persist_first_checkpoint_observation(
+    config_path: str,
+    observation,
+    *,
+    required: bool,
+) -> bool:
+    """Persist timing evidence strictly for experiments, best-effort for incumbent."""
+
+    try:
+        updated = krea_runtime.persist_first_checkpoint_observation(
+            config_path, observation
+        )
+    except Exception as error:
+        if required:
+            raise
+        telemetry.event(
+            "krea_first_checkpoint_observation_persist_failed",
+            error_type=type(error).__name__,
+        )
+        return False
+    telemetry.event(
+        "krea_first_checkpoint_observation_persisted",
+        record_sha256=updated["record_sha256"],
+    )
+    telemetry.set_meta(
+        krea_effective_runtime_record_sha256=updated["record_sha256"],
+    )
+    return True
 
 
 def _toolkit_log_path(spec: ImageSpec) -> str:

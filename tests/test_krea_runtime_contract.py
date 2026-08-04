@@ -527,6 +527,12 @@ def test_first_durable_checkpoint_is_observed_once_and_persisted(
         krea_runtime.load_capability_manifest(),
         throughput_profile=profile,
     )
+    meta_updates = []
+    monkeypatch.setattr(
+        aitoolkit.telemetry,
+        "set_meta",
+        lambda **kwargs: meta_updates.append(kwargs),
+    )
     Path(spec.save_root).mkdir(parents=True)
     scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
     planned = cfg["config"]["process"][0]["train"]["steps"]
@@ -566,6 +572,7 @@ def test_first_durable_checkpoint_is_observed_once_and_persisted(
         active_planned_steps=planned,
         future_target_steps=recipe.size_target_steps("krea2", 18, planned),
         total_budget_s=2700.0,
+        timing_record_required=True,
     )
 
     record = json.loads(
@@ -578,4 +585,37 @@ def test_first_durable_checkpoint_is_observed_once_and_persisted(
     assert record["first_checkpoint_observation"]["checkpoint_step"] == 200
     assert record["first_checkpoint_observation"]["active_planned_steps"] == planned
     assert record["first_checkpoint_observation"]["active_plan_mutable"] is False
+    assert meta_updates[-1] == {
+        "krea_effective_runtime_record_sha256": record["record_sha256"]
+    }
     assert hashlib.sha256(Path(spec.config_path).read_bytes()).hexdigest() == config_before
+
+
+def test_incumbent_timing_observation_persistence_is_best_effort(monkeypatch):
+    observation = object()
+    events = []
+    monkeypatch.setattr(
+        krea_runtime,
+        "persist_first_checkpoint_observation",
+        lambda *_args: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        aitoolkit.telemetry,
+        "event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert aitoolkit._persist_first_checkpoint_observation(
+        "/missing/config.yaml", observation, required=False
+    ) is False
+    assert events == [
+        (
+            "krea_first_checkpoint_observation_persist_failed",
+            {"error_type": "OSError"},
+        )
+    ]
+
+    with pytest.raises(OSError, match="disk full"):
+        aitoolkit._persist_first_checkpoint_observation(
+            "/missing/config.yaml", observation, required=True
+        )
