@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -9,9 +10,8 @@ import pytest
 from forge import adaptive_timing, krea_runtime, recipe
 
 
-BUNDLE_SHA = "a" * 64
-SOURCE_SHA = "b" * 64
-RUNTIME_COMMIT = "c" * 40
+BUNDLE_SHA = krea_runtime.bundle_contract_sha256(krea_runtime.LEADER_BUNDLE)
+RUNTIME_COMMIT = krea_runtime.OWNED_RUNTIME_COMMIT
 DATASET_SIZE = 24
 DATASET_REGIME = "small-11-24"
 ACCELERATOR_IDENTITY = "NVIDIA H100 PCIe|81559-MiB"
@@ -35,8 +35,11 @@ def _nvidia_runner(identity: str = ACCELERATOR_IDENTITY):
 def _write_source_record(
     tmp_path, *, bundle=krea_runtime.LEADER_BUNDLE, **overrides
 ):
+    artifact = _write_training_artifact(
+        tmp_path / f"{bundle}-terminal.safetensors", step=1000
+    )
     record = {
-        "schema": 3,
+        "schema": 4,
         "runtime_contract_id": krea_runtime.RUNTIME_CONTRACT_ID,
         "source_run_id": SOURCE_RUN_ID,
         "model_type": "krea2",
@@ -67,22 +70,30 @@ def _write_source_record(
                 bundle
             )["normalized_config_projection"],
         },
+        "lifecycle": "terminal",
         "first_checkpoint_observation": {
             "bundle_id": bundle,
             "timing_profile_sha256": None,
             "observation_mode": "bootstrap_raw_first_checkpoint",
             "checkpoint_step": 200,
-            "elapsed_since_launch_s": 300.0,
+            "elapsed_since_launch_s": 260.0,
             "active_planned_steps": 1000,
             "active_plan_mutable": False,
             "active_plan_action": "observe_only_fixed_subprocess",
         },
         "training_completion_observation": {
-            "reported_last_step": 1000,
-            "training_elapsed_seconds": 1500.0,
+            "training_elapsed_seconds": 1300.0,
             "returncode": 0,
             "stopped_by_deadline": False,
             "natural_completion": True,
+            "artifact_path": str(artifact.resolve()),
+            "artifact_name": artifact.name,
+            "artifact_size_bytes": artifact.stat().st_size,
+            "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "artifact_loadable": True,
+            "artifact_checkpoint_step": 1000,
+            "completed_steps": 1000,
+            "scope_attempt_nonce": "a" * 32,
         },
     }
     for key, value in overrides.items():
@@ -102,39 +113,42 @@ def _write_source_record(
     return path
 
 
-def _profile_document(**overrides):
-    value = {
-        "schema": adaptive_timing.PROFILE_SCHEMA,
-        "kind": adaptive_timing.PROFILE_KIND,
-        "bundle_id": "leader-v1",
-        "bundle_sha256": BUNDLE_SHA,
-        "model_type": "krea2",
-        "measured_dataset_size": DATASET_SIZE,
-        "dataset_regime": DATASET_REGIME,
-        "seconds_per_step": 1.3,
-        "startup_seconds": 120.0,
-        "measurement": {
-            "completed_steps": 824,
-            "training_elapsed_seconds": 1195.0,
-            "first_checkpoint_step": 165,
-            "first_checkpoint_elapsed_seconds": 345.0,
-        },
-        "provenance": {
-            "source_run_id": SOURCE_RUN_ID,
-            "source_record_sha256": SOURCE_SHA,
-            "runtime_commit": RUNTIME_COMMIT,
-            "measured_at_utc": "2026-08-03T16:30:00Z",
-            "accelerator_identity": ACCELERATOR_IDENTITY,
-        },
-    }
-    value.update(overrides)
-    return adaptive_timing._seal_profile_document(value)
+def _write_training_artifact(path, *, step: int):
+    metadata = {"training_info": json.dumps({"step": step, "epoch": 1})}
+    header = json.dumps(
+        {
+            "__metadata__": metadata,
+            "weight": {
+                "dtype": "F32",
+                "shape": [1],
+                "data_offsets": [0, 4],
+            },
+        }
+    ).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0))
+    return path
+
+
+def _source_path(tmp_path, bundle=krea_runtime.LEADER_BUNDLE):
+    return tmp_path / f"{bundle}.probe.effective-runtime.json"
 
 
 def _write_profile(tmp_path, **overrides):
+    source = _write_source_record(tmp_path)
+    value = adaptive_timing.produce_profile_document(
+        str(source),
+        source_run_id=SOURCE_RUN_ID,
+        bundle_id=krea_runtime.LEADER_BUNDLE,
+        model_type="krea2",
+        measured_dataset_size=DATASET_SIZE,
+        measured_at_utc="2026-08-03T16:30:00Z",
+        runner=_nvidia_runner(),
+    )
+    value.update(overrides)
+    value = adaptive_timing._seal_profile_document(value)
     path = tmp_path / "leader-v1-throughput.json"
     path.write_text(
-        json.dumps(_profile_document(**overrides), sort_keys=True),
+        json.dumps(value, sort_keys=True),
         encoding="utf-8",
     )
     return path
@@ -143,6 +157,7 @@ def _write_profile(tmp_path, **overrides):
 def _load(path):
     return adaptive_timing.load_profile(
         str(path),
+        source_record_path=str(_source_path(path.parent)),
         expected_bundle_id="leader-v1",
         expected_bundle_sha256=BUNDLE_SHA,
         expected_model_type="krea2",
@@ -201,6 +216,7 @@ def test_profile_producer_hashes_and_crosschecks_raw_completed_run(tmp_path):
     profile_path.write_text(json.dumps(document), encoding="utf-8")
     profile = adaptive_timing.load_profile(
         str(profile_path),
+        source_record_path=str(source),
         expected_bundle_id=krea_runtime.LEADER_BUNDLE,
         expected_bundle_sha256=krea_runtime.bundle_contract_sha256(
             krea_runtime.LEADER_BUNDLE
@@ -217,7 +233,7 @@ def test_profile_producer_hashes_and_crosschecks_raw_completed_run(tmp_path):
     assert profile.source_run_id == SOURCE_RUN_ID
     assert profile.completed_steps == 1000
     assert profile.first_checkpoint_step == 200
-    assert profile.seconds_per_step == pytest.approx(1.5)
+    assert profile.seconds_per_step == pytest.approx(1.3)
     assert profile.startup_seconds == 0.0
 
 
@@ -320,6 +336,107 @@ def test_profile_producer_rejects_source_record_symlink(tmp_path):
         )
 
 
+def test_profile_consumption_requires_and_reproduces_exact_raw_record(
+    tmp_path, monkeypatch
+):
+    profile_path = _write_profile(tmp_path)
+    source_path = _source_path(tmp_path)
+    monkeypatch.setenv(adaptive_timing.PROFILE_ENV, str(profile_path))
+    monkeypatch.delenv(adaptive_timing.SOURCE_RECORD_ENV, raising=False)
+
+    with pytest.raises(
+        adaptive_timing.TimingProfileError, match="raw source runtime record required"
+    ):
+        adaptive_timing.load_bundle_profile(
+            bundle_id=krea_runtime.LEADER_BUNDLE,
+            bundle_sha256=BUNDLE_SHA,
+            model_type="krea2",
+            current_dataset_size=DATASET_SIZE,
+            dataset_regime=DATASET_REGIME,
+            required=True,
+            expected_accelerator_identity=ACCELERATOR_IDENTITY,
+        )
+
+    monkeypatch.setenv(adaptive_timing.SOURCE_RECORD_ENV, str(source_path))
+    profile = adaptive_timing.load_bundle_profile(
+        bundle_id=krea_runtime.LEADER_BUNDLE,
+        bundle_sha256=BUNDLE_SHA,
+        model_type="krea2",
+        current_dataset_size=DATASET_SIZE,
+        dataset_regime=DATASET_REGIME,
+        required=True,
+        expected_accelerator_identity=ACCELERATOR_IDENTITY,
+    )
+    assert profile is not None
+    assert profile.source_record_sha256 == hashlib.sha256(
+        source_path.read_bytes()
+    ).hexdigest()
+
+
+def test_profile_consumption_rejects_self_consistent_forged_source_record(tmp_path):
+    profile_path = _write_profile(tmp_path)
+    source_path = _source_path(tmp_path)
+    forged = json.loads(source_path.read_text(encoding="utf-8"))
+    forged["training_completion_observation"]["training_elapsed_seconds"] = 1400.0
+    forged.pop("record_sha256")
+    forged["record_sha256"] = adaptive_timing._runtime_record_semantic_sha256(
+        forged
+    )
+    source_path.write_text(
+        json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        adaptive_timing.TimingProfileError,
+        match="not reproduced by source runtime record",
+    ):
+        _load(profile_path)
+
+
+def test_auditor_forged_record_with_phantom_artifact_is_rejected(tmp_path):
+    source_path = _write_source_record(tmp_path)
+    forged = json.loads(source_path.read_text(encoding="utf-8"))
+    completion = forged["training_completion_observation"]
+    forged["effective"]["planned_steps"] = 2000
+    forged["first_checkpoint_observation"]["active_planned_steps"] = 2000
+    forged["first_checkpoint_observation"]["elapsed_since_launch_s"] = 0.5
+    completion.update(
+        {
+            "training_elapsed_seconds": 1.0,
+            "artifact_path": str(tmp_path / "nonexistent-terminal.safetensors"),
+            "artifact_name": "nonexistent-terminal.safetensors",
+            "artifact_size_bytes": 1024,
+            "artifact_sha256": "9" * 64,
+            "artifact_loadable": True,
+            "artifact_checkpoint_step": 2000,
+            "completed_steps": 2000,
+        }
+    )
+    forged.pop("record_sha256")
+    forged["record_sha256"] = adaptive_timing._runtime_record_semantic_sha256(
+        forged
+    )
+    source_path.write_text(
+        json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        adaptive_timing.TimingProfileError,
+        match="terminal artifact is unavailable",
+    ):
+        adaptive_timing.produce_profile_document(
+            str(source_path),
+            source_run_id=SOURCE_RUN_ID,
+            bundle_id=krea_runtime.LEADER_BUNDLE,
+            model_type="krea2",
+            measured_dataset_size=24,
+            measured_at_utc="2026-08-04T18:00:00Z",
+            runner=_nvidia_runner(),
+        )
+
+
 def test_valid_profile_is_bound_and_changes_only_explicit_recipe_call(tmp_path):
     profile = _load(_write_profile(tmp_path))
 
@@ -334,13 +451,16 @@ def test_valid_profile_is_bound_and_changes_only_explicit_recipe_call(tmp_path):
 
     assert incumbent == 824
     assert measured == 1200
-    assert profile.source_record_sha256 == SOURCE_SHA
+    assert profile.source_record_sha256 == hashlib.sha256(
+        _source_path(tmp_path).read_bytes()
+    ).hexdigest()
     assert profile.runtime_commit == RUNTIME_COMMIT
 
 
 def test_profile_reuse_is_regime_bound_not_exact_pair_count(tmp_path):
     profile = adaptive_timing.load_profile(
         str(_write_profile(tmp_path)),
+        source_record_path=str(_source_path(tmp_path)),
         expected_bundle_id="leader-v1",
         expected_bundle_sha256=BUNDLE_SHA,
         expected_model_type="krea2",
@@ -408,6 +528,7 @@ def test_profile_rejects_cross_bundle_or_model_reuse(
     with pytest.raises(adaptive_timing.TimingProfileError, match=message):
         adaptive_timing.load_profile(
             str(path),
+            source_record_path=str(_source_path(tmp_path)),
             expected_bundle_id=expected_bundle,
             expected_bundle_sha256=expected_sha,
             expected_model_type=expected_model,
@@ -425,7 +546,7 @@ def test_profile_rejects_tampering_and_unknown_fields(tmp_path):
     with pytest.raises(adaptive_timing.TimingProfileError, match="digest mismatch"):
         _load(path)
 
-    value = _profile_document()
+    value = json.loads(_write_profile(tmp_path).read_text(encoding="utf-8"))
     value["provenance"]["unreviewed_note"] = "not in schema"
     path.write_text(json.dumps(adaptive_timing._seal_profile_document(value)))
     with pytest.raises(adaptive_timing.TimingProfileError, match="fields differ"):
@@ -455,7 +576,7 @@ def test_profile_rejects_symlink(tmp_path):
     link = tmp_path / "profile-link.json"
     link.symlink_to(source)
 
-    with pytest.raises(adaptive_timing.TimingProfileError, match="regular file"):
+    with pytest.raises(adaptive_timing.TimingProfileError, match="timing profile unavailable"):
         _load(link)
 
 
@@ -469,7 +590,7 @@ def test_first_checkpoint_correction_is_future_only_and_emits_telemetry(tmp_path
         active_planned_steps=824,
         future_target_steps=1200,
         checkpoint_step=165,
-        elapsed_since_launch_s=285.0,
+        elapsed_since_launch_s=165.0,
         total_budget_s=2700.0,
         export_reserve_s=180.0,
         safety=0.85,
@@ -496,7 +617,7 @@ def test_slower_first_checkpoint_recommends_less_only_for_future_run(tmp_path):
         active_planned_steps=1200,
         future_target_steps=1200,
         checkpoint_step=200,
-        elapsed_since_launch_s=520.0,
+        elapsed_since_launch_s=400.0,
         total_budget_s=2700.0,
         export_reserve_s=180.0,
         safety=0.85,
@@ -507,22 +628,22 @@ def test_slower_first_checkpoint_recommends_less_only_for_future_run(tmp_path):
     assert observation.active_planned_steps == 1200
     assert observation.active_plan_mutable is False
     assert observation.active_plan_exceeds_observed_budget is True
-    assert observation.future_budget_cap_steps == 997
-    assert observation.future_recommended_steps == 997
+    assert observation.future_budget_cap_steps == 1057
+    assert observation.future_recommended_steps == 1057
 
 
-def test_first_checkpoint_rejects_impossible_observation(tmp_path):
+def test_first_checkpoint_rejects_nonpositive_observation(tmp_path):
     profile = _load(_write_profile(tmp_path))
 
     with pytest.raises(
-        adaptive_timing.TimingProfileError, match="before profiled startup"
+        adaptive_timing.TimingProfileError, match="elapsed since launch is invalid"
     ):
         adaptive_timing.observe_first_checkpoint(
             profile,
             active_planned_steps=824,
             future_target_steps=1200,
             checkpoint_step=165,
-            elapsed_since_launch_s=100.0,
+            elapsed_since_launch_s=0.0,
             total_budget_s=2700.0,
             export_reserve_s=180.0,
             safety=0.85,

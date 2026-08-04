@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import struct
 import subprocess
 import time
 from types import SimpleNamespace
@@ -15,6 +16,24 @@ from forge.data.schema import ImageSpec
 
 
 SOURCE_RUN_ID = "runtime-contract:" + "a" * 32
+
+
+def _write_training_safetensor(path: Path, *, step: int) -> Path:
+    metadata = {"training_info": json.dumps({"step": step, "epoch": 1})}
+    header = json.dumps(
+        {
+            "__metadata__": metadata,
+            "weight": {
+                "dtype": "F32",
+                "shape": [1],
+                "data_offsets": [0, 4],
+            },
+        }
+    ).encode("utf-8")
+    path.write_bytes(
+        struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0)
+    )
+    return path
 
 
 def _spec(model_type: str = "krea2") -> ImageSpec:
@@ -463,8 +482,11 @@ def test_bootstrap_emitter_persistence_and_profile_producer_are_schema_compatibl
     cfg = config.build_config(_spec(), num_images=18, hours_to_complete=0.75)
     config_path = tmp_path / "bootstrap.yaml"
     config.write_config(cfg, str(config_path))
-    source_run_id = SOURCE_RUN_ID
     planned = cfg["config"]["process"][0]["train"]["steps"]
+    save_root = tmp_path / "bootstrap-save"
+    scope = checkpoints.begin_run(str(save_root), "contract-repo")
+    scope = checkpoints.set_planned_steps(str(save_root), scope, planned)
+    source_run_id = f"runtime-contract:{scope['attempt_nonce']}"
     krea_runtime.emit_effective_runtime_record(
         cfg,
         "krea2",
@@ -485,9 +507,14 @@ def test_bootstrap_emitter_persistence_and_profile_producer_are_schema_compatibl
     krea_runtime.persist_first_checkpoint_observation(
         str(config_path), observation
     )
+    artifact = _write_training_safetensor(
+        save_root / "contract-repo.safetensors", step=planned
+    )
     krea_runtime.persist_training_completion_observation(
         str(config_path),
-        reported_last_step=planned,
+        artifact_path=str(artifact),
+        save_root=str(save_root),
+        scope=scope,
         training_elapsed_seconds=float(planned * 2),
         returncode=0,
         stopped_by_deadline=False,
@@ -513,6 +540,178 @@ def test_bootstrap_emitter_persistence_and_profile_producer_are_schema_compatibl
     assert profile["provenance"]["source_record_sha256"] == hashlib.sha256(
         source_path.read_bytes()
     ).hexdigest()
+
+
+def test_effective_record_lifecycle_is_ordered_and_terminal_immutable(
+    tmp_path, monkeypatch
+):
+    _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
+    spec = _spec()
+    cfg = config.build_config(spec, num_images=18, hours_to_complete=0.75)
+    config_path = tmp_path / "lifecycle.yaml"
+    config.write_config(cfg, str(config_path))
+    planned = cfg["config"]["process"][0]["train"]["steps"]
+    save_root = tmp_path / "lifecycle-save"
+    scope = checkpoints.begin_run(str(save_root), spec.expected_repo_name)
+    scope = checkpoints.set_planned_steps(str(save_root), scope, planned)
+    krea_runtime.emit_effective_runtime_record(
+        cfg,
+        "krea2",
+        str(config_path),
+        krea_runtime.load_capability_manifest(),
+        source_run_id=f"{spec.task_id}:{scope['attempt_nonce']}",
+        timing_probe=True,
+        current_dataset_size=18,
+        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+    )
+    artifact = _write_training_safetensor(
+        save_root / f"{spec.expected_repo_name}.safetensors",
+        step=planned,
+    )
+    record_path = Path(str(config_path) + ".effective-runtime.json")
+    bootstrap_bytes = record_path.read_bytes()
+
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError, match="out of order"
+    ):
+        krea_runtime.persist_training_completion_observation(
+            str(config_path),
+            artifact_path=str(artifact),
+            save_root=str(save_root),
+            scope=scope,
+            training_elapsed_seconds=1000.0,
+            returncode=0,
+            stopped_by_deadline=False,
+        )
+    assert record_path.read_bytes() == bootstrap_bytes
+
+    observation = adaptive_timing.emit_bootstrap_first_checkpoint_observation(
+        bundle_id=krea_runtime.LEADER_BUNDLE,
+        checkpoint_step=200,
+        elapsed_since_launch_s=300.0,
+        active_planned_steps=planned,
+        event_sink=lambda *_args, **_kwargs: None,
+    )
+    krea_runtime.persist_first_checkpoint_observation(
+        str(config_path), observation
+    )
+    completed = krea_runtime.persist_training_completion_observation(
+        str(config_path),
+        artifact_path=str(artifact),
+        save_root=str(save_root),
+        scope=scope,
+        training_elapsed_seconds=1000.0,
+        returncode=0,
+        stopped_by_deadline=False,
+    )
+    assert completed["lifecycle"] == "terminal"
+    assert completed["training_completion_observation"]["natural_completion"] is True
+    terminal_bytes = record_path.read_bytes()
+
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError, match="out of order"
+    ):
+        krea_runtime.persist_training_completion_observation(
+            str(config_path),
+            artifact_path=str(artifact),
+            save_root=str(save_root),
+            scope=scope,
+            training_elapsed_seconds=1001.0,
+            returncode=0,
+            stopped_by_deadline=False,
+        )
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError, match="out of order"
+    ):
+        krea_runtime.persist_first_checkpoint_observation(
+            str(config_path), observation
+        )
+    assert record_path.read_bytes() == terminal_bytes
+
+
+def test_terminal_artifact_symlink_and_wrong_scope_abort(tmp_path, monkeypatch):
+    _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
+    spec = _spec()
+    cfg = config.build_config(spec, num_images=18, hours_to_complete=0.75)
+    config_path = tmp_path / "artifact-scope.yaml"
+    config.write_config(cfg, str(config_path))
+    planned = cfg["config"]["process"][0]["train"]["steps"]
+    save_root = tmp_path / "artifact-scope-save"
+    scope = checkpoints.begin_run(str(save_root), spec.expected_repo_name)
+    scope = checkpoints.set_planned_steps(str(save_root), scope, planned)
+    krea_runtime.emit_effective_runtime_record(
+        cfg,
+        "krea2",
+        str(config_path),
+        krea_runtime.load_capability_manifest(),
+        source_run_id=f"{spec.task_id}:{scope['attempt_nonce']}",
+        timing_probe=True,
+        current_dataset_size=18,
+        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+    )
+    observation = adaptive_timing.emit_bootstrap_first_checkpoint_observation(
+        bundle_id=krea_runtime.LEADER_BUNDLE,
+        checkpoint_step=200,
+        elapsed_since_launch_s=300.0,
+        active_planned_steps=planned,
+        event_sink=lambda *_args, **_kwargs: None,
+    )
+    krea_runtime.persist_first_checkpoint_observation(
+        str(config_path), observation
+    )
+    target = _write_training_safetensor(
+        tmp_path / "outside-terminal.safetensors", step=planned
+    )
+    link = save_root / f"{spec.expected_repo_name}.safetensors"
+    link.symlink_to(target)
+
+    with pytest.raises(krea_runtime.KreaRuntimeContractError):
+        krea_runtime.persist_training_completion_observation(
+            str(config_path),
+            artifact_path=str(link),
+            save_root=str(save_root),
+            scope=scope,
+            training_elapsed_seconds=1000.0,
+            returncode=0,
+            stopped_by_deadline=False,
+        )
+
+    link.unlink()
+    artifact = _write_training_safetensor(link, step=planned)
+    wrong_scope = {**scope, "attempt_nonce": "b" * 32}
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError, match="scope identity mismatch"
+    ):
+        krea_runtime.persist_training_completion_observation(
+            str(config_path),
+            artifact_path=str(artifact),
+            save_root=str(save_root),
+            scope=wrong_scope,
+            training_elapsed_seconds=1000.0,
+            returncode=0,
+            stopped_by_deadline=False,
+        )
+
+
+def test_terminal_artifact_stale_same_process_scope_aborts(tmp_path):
+    save_root = tmp_path / "same-process-scope"
+    scope_a = checkpoints.begin_run(str(save_root), "contract-repo")
+    scope_a = checkpoints.set_planned_steps(str(save_root), scope_a, 1000)
+    scope_b = checkpoints.begin_run(str(save_root), "contract-repo")
+    scope_b = checkpoints.set_planned_steps(str(save_root), scope_b, 1000)
+    artifact = _write_training_safetensor(
+        save_root / "contract-repo.safetensors", step=1000
+    )
+
+    from forge.tasks.integrity import inspect_training_artifact
+
+    evidence = inspect_training_artifact(str(artifact))
+    assert not checkpoints.descriptor_is_current_lora(
+        str(save_root), str(artifact), scope_a, evidence.file_identity
+    )
+    assert checkpoints.descriptor_is_current_lora(
+        str(save_root), str(artifact), scope_b, evidence.file_identity
+    )
 
 
 def test_experimental_record_emission_is_mandatory(tmp_path, monkeypatch):
@@ -881,15 +1080,6 @@ def test_integrated_fake_process_persists_first_and_terminal_observations(
     )
     Path(spec.config_path).parent.mkdir(parents=True)
     config.write_config(cfg, spec.config_path)
-    krea_runtime.emit_effective_runtime_record(
-        cfg,
-        "krea2",
-        spec.config_path,
-        krea_runtime.load_capability_manifest(),
-        source_run_id=SOURCE_RUN_ID,
-        throughput_profile=profile,
-        current_dataset_size=18,
-    )
     meta_updates = []
     monkeypatch.setattr(
         aitoolkit.telemetry,
@@ -900,12 +1090,24 @@ def test_integrated_fake_process_persists_first_and_terminal_observations(
     scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
     planned = cfg["config"]["process"][0]["train"]["steps"]
     scope = checkpoints.set_planned_steps(spec.save_root, scope, planned)
+    source_run_id = aitoolkit._timing_source_run_id(spec, scope)
+    krea_runtime.emit_effective_runtime_record(
+        cfg,
+        "krea2",
+        spec.config_path,
+        krea_runtime.load_capability_manifest(),
+        source_run_id=source_run_id,
+        throughput_profile=profile,
+        current_dataset_size=18,
+    )
     config_before = hashlib.sha256(Path(spec.config_path).read_bytes()).hexdigest()
 
     checkpoint_path = Path(spec.save_root) / (
         f"{spec.expected_repo_name}_000000200.safetensors"
     )
-    fake_script = f'''import json, struct, time\nfrom pathlib import Path\ntime.sleep(0.08)\nheader = json.dumps({{"weight": {{"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}}}).encode()\nPath({str(checkpoint_path)!r}).write_bytes(struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0))\ntime.sleep(0.15)\nprint("{planned - 1}/{planned} loss=0.1", flush=True)\nprint("Saved checkpoint to final.safetensors", flush=True)\n'''
+    terminal_path = Path(spec.save_root) / f"{spec.expected_repo_name}.safetensors"
+    env_marker = tmp_path / "python-bytecode-env.txt"
+    fake_script = f'''import json, os, struct, time\nfrom pathlib import Path\ndef write(path, step):\n    metadata = {{"training_info": json.dumps({{"step": step, "epoch": 1}})}}\n    header = json.dumps({{"__metadata__": metadata, "weight": {{"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}}}).encode()\n    Path(path).write_bytes(struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0))\nPath({str(env_marker)!r}).write_text(os.environ.get("PYTHONDONTWRITEBYTECODE", ""))\ntime.sleep(0.08)\nwrite({str(checkpoint_path)!r}, 200)\ntime.sleep(0.15)\nwrite({str(terminal_path)!r}, {planned})\nprint("{planned}/{planned} loss=0.1", flush=True)\nprint("Saved checkpoint to {str(terminal_path)}", flush=True)\n'''
     (toolkit_dir / "run.py").write_text(fake_script, encoding="utf-8")
     monkeypatch.setattr(aitoolkit, "_AI_TOOLKIT_DIR", str(toolkit_dir))
     monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
@@ -954,15 +1156,98 @@ def test_integrated_fake_process_persists_first_and_terminal_observations(
     assert record["first_checkpoint_observation"]["active_planned_steps"] == planned
     assert record["first_checkpoint_observation"]["active_plan_mutable"] is False
     completion = record["training_completion_observation"]
-    assert completion["reported_last_step"] == planned
+    assert record["lifecycle"] == "terminal"
     assert completion["training_elapsed_seconds"] > 0
     assert completion["returncode"] == 0
     assert completion["stopped_by_deadline"] is False
     assert completion["natural_completion"] is True
+    assert completion["artifact_path"] == str(terminal_path.resolve())
+    assert completion["artifact_name"] == terminal_path.name
+    assert completion["artifact_size_bytes"] == terminal_path.stat().st_size
+    assert completion["artifact_sha256"] == hashlib.sha256(
+        terminal_path.read_bytes()
+    ).hexdigest()
+    assert completion["artifact_loadable"] is True
+    assert completion["artifact_checkpoint_step"] == planned
+    assert completion["completed_steps"] == planned
+    assert completion["scope_attempt_nonce"] == scope["attempt_nonce"]
+    assert env_marker.read_text(encoding="utf-8") == "1"
     assert meta_updates[-1] == {
         "krea_effective_runtime_record_sha256": record["record_sha256"]
     }
     assert hashlib.sha256(Path(spec.config_path).read_bytes()).hexdigest() == config_before
+
+
+def test_clean_log_with_phantom_terminal_artifact_aborts(tmp_path, monkeypatch):
+    spec = _spec()
+    _localize_spec(monkeypatch, tmp_path, spec)
+    toolkit_dir = tmp_path / "phantom-toolkit"
+    toolkit_dir.mkdir()
+    _activate(monkeypatch, toolkit_dir, krea_runtime.LEADER_BUNDLE)
+    profile = _timing_profile(krea_runtime.LEADER_BUNDLE, startup_seconds=0.0)
+    cfg = config.build_config(spec, 18, 0.75, throughput_profile=profile)
+    Path(spec.config_path).parent.mkdir(parents=True)
+    config.write_config(cfg, spec.config_path)
+    Path(spec.save_root).mkdir(parents=True)
+    scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+    planned = cfg["config"]["process"][0]["train"]["steps"]
+    scope = checkpoints.set_planned_steps(spec.save_root, scope, planned)
+    krea_runtime.emit_effective_runtime_record(
+        cfg,
+        "krea2",
+        spec.config_path,
+        krea_runtime.load_capability_manifest(),
+        source_run_id=aitoolkit._timing_source_run_id(spec, scope),
+        throughput_profile=profile,
+        current_dataset_size=18,
+    )
+    _write_training_safetensor(
+        Path(spec.save_root)
+        / f"{spec.expected_repo_name}_000000200.safetensors",
+        step=200,
+    )
+    (toolkit_dir / "run.py").write_text(
+        f'print("{planned - 1}/{planned} loss=0.1")\n'
+        'print("Saved checkpoint to /phantom/final.safetensors")\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        krea_runtime,
+        "verify_selected_runtime",
+        lambda *_args, **_kwargs: str(toolkit_dir),
+    )
+
+    class Deadline:
+        def remaining(self):
+            return 10_000.0
+
+    with pytest.raises(
+        adaptive_timing.TimingProfileError,
+        match="did not produce a current-run terminal artifact",
+    ):
+        aitoolkit._run_toolkit(
+            spec.config_path,
+            Deadline(),
+            spec,
+            scope,
+            throughput_profile=profile,
+            active_planned_steps=planned,
+            future_target_steps=planned,
+            total_budget_s=2700.0,
+            timing_record_required=True,
+            timing_bundle=krea_runtime.LEADER_BUNDLE,
+            toolkit_dir=str(toolkit_dir),
+        )
+
+    record = json.loads(
+        Path(spec.config_path + ".effective-runtime.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert record["lifecycle"] == "first_checkpoint"
+    assert record["first_checkpoint_observation"] is not None
+    assert record["training_completion_observation"] is None
 
 
 def test_experimental_profile_requires_post_run_checkpoint_observation(

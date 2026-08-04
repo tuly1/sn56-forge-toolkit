@@ -20,14 +20,16 @@ import json
 import math
 import os
 import re
-import stat
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
+from forge.file_evidence import RegularFileError, read_regular_bytes
+
 
 PROFILE_ENV = "FORGE_KREA_THROUGHPUT_PROFILE"
+SOURCE_RECORD_ENV = "FORGE_KREA_THROUGHPUT_SOURCE_RECORD"
 PROFILE_KIND = "forge-measured-throughput-profile"
 PROFILE_SCHEMA = 3
 FIRST_CHECKPOINT_EVENT = "first_checkpoint_timing_observed"
@@ -82,6 +84,7 @@ _SOURCE_RECORD_FIELDS = {
     "runtime_manifest_capability_aliases",
     "timing",
     "effective",
+    "lifecycle",
     "first_checkpoint_observation",
     "training_completion_observation",
     "record_sha256",
@@ -106,11 +109,18 @@ _FIRST_OBSERVATION_FIELDS = {
     "active_plan_action",
 }
 _COMPLETION_OBSERVATION_FIELDS = {
-    "reported_last_step",
     "training_elapsed_seconds",
     "returncode",
     "stopped_by_deadline",
     "natural_completion",
+    "artifact_path",
+    "artifact_name",
+    "artifact_size_bytes",
+    "artifact_sha256",
+    "artifact_loadable",
+    "artifact_checkpoint_step",
+    "completed_steps",
+    "scope_attempt_nonce",
 }
 _SOURCE_EFFECTIVE_FIELDS = {
     "planned_steps",
@@ -314,6 +324,7 @@ def produce_profile_document(
     measured_dataset_size: int,
     measured_at_utc: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
+    expected_accelerator_identity: str | None = None,
 ) -> dict[str, Any]:
     """Derive a timing profile from one completed raw runtime record.
 
@@ -338,10 +349,15 @@ def produce_profile_document(
     expected_runtime_repository = krea_runtime.runtime_repository_for_bundle(
         expected_bundle
     )
-    accelerator_identity = current_accelerator_identity(runner=runner)
+    accelerator_identity = expected_accelerator_identity
+    if accelerator_identity is None:
+        accelerator_identity = current_accelerator_identity(runner=runner)
+    accelerator_identity = _text(
+        accelerator_identity, "accelerator identity", maximum=256
+    )
     raw, record = _read_source_record(source_record_path)
     document = _exact_object(record, _SOURCE_RECORD_FIELDS, "source runtime record")
-    if document["schema"] != 3:
+    if document["schema"] != 4:
         raise TimingProfileError("unsupported source runtime record schema")
 
     declared_record_sha = _sha256(
@@ -379,6 +395,8 @@ def produce_profile_document(
         != expected_contract["runtime_manifest_capability_aliases"]
     ):
         raise TimingProfileError("source runtime contract evidence mismatch")
+    if document["lifecycle"] != "terminal":
+        raise TimingProfileError("source runtime lifecycle is incomplete")
     _sha256(document["generated_config_sha256"], "generated config sha256")
     if expected_bundle != krea_runtime.INCUMBENT_BUNDLE:
         _sha256(
@@ -446,8 +464,46 @@ def produce_profile_document(
         "training elapsed seconds",
         maximum=604800.0,
     )
+    artifact_path = _text(
+        completion["artifact_path"], "terminal artifact path", maximum=4096
+    )
+    artifact_name = _text(
+        completion["artifact_name"], "terminal artifact name", maximum=255
+    )
+    artifact_size = _positive_int(
+        completion["artifact_size_bytes"], "terminal artifact size"
+    )
+    artifact_sha = _sha256(
+        completion["artifact_sha256"], "terminal artifact sha256"
+    )
+    artifact_step = _nonnegative_int(
+        completion["artifact_checkpoint_step"], "terminal artifact checkpoint step"
+    )
+    completed_steps = _positive_int(
+        completion["completed_steps"], "terminal completed steps"
+    )
+    scope_attempt_nonce = _attempt_nonce(completion["scope_attempt_nonce"])
+    if not expected_run_id.endswith(f":{scope_attempt_nonce}"):
+        raise TimingProfileError("source terminal artifact scope mismatch")
+    try:
+        from forge.tasks.integrity import inspect_training_artifact
+
+        artifact = inspect_training_artifact(artifact_path)
+    except Exception as exc:
+        raise TimingProfileError("source terminal artifact is unavailable") from exc
     if (
-        completion["reported_last_step"] != planned_steps
+        artifact.path != os.path.abspath(artifact_path)
+        or artifact_name != os.path.basename(artifact.path)
+        or artifact.size_bytes != artifact_size
+        or artifact.sha256 != artifact_sha
+        or artifact.checkpoint_step != artifact_step
+        or completion["artifact_loadable"] is not True
+        or completed_steps != artifact_step
+    ):
+        raise TimingProfileError("source terminal artifact evidence mismatch")
+    if (
+        completed_steps != planned_steps
+        or artifact_name != os.path.basename(artifact_path)
         or completion["returncode"] != 0
         or completion["stopped_by_deadline"] is not False
         or completion["natural_completion"] is not True
@@ -474,7 +530,7 @@ def produce_profile_document(
             "seconds_per_step": elapsed / planned_steps,
             "startup_seconds": 0.0,
             "measurement": {
-                "completed_steps": planned_steps,
+                "completed_steps": completed_steps,
                 "training_elapsed_seconds": elapsed,
                 "first_checkpoint_step": first_step,
                 "first_checkpoint_elapsed_seconds": first_elapsed,
@@ -512,6 +568,7 @@ def load_bundle_profile(
     expected_accelerator_identity: str | None = None,
     environ: Mapping[str, str] | None = None,
     path: str | None = None,
+    source_record_path: str | None = None,
 ) -> ThroughputProfile | None:
     """Load the explicitly configured profile for one bundle.
 
@@ -530,11 +587,19 @@ def load_bundle_profile(
                 f"measured throughput profile required for bundle {bundle_id!r}"
             )
         return None
+    selected_source_path = source_record_path
+    if selected_source_path is None:
+        selected_source_path = str(env.get(SOURCE_RECORD_ENV, "")).strip() or None
+    if selected_source_path is None:
+        raise TimingProfileError(
+            f"raw source runtime record required for bundle {bundle_id!r}"
+        )
     accelerator_identity = expected_accelerator_identity
     if accelerator_identity is None:
         accelerator_identity = current_accelerator_identity(environ=env)
     return load_profile(
         selected_path,
+        source_record_path=selected_source_path,
         expected_bundle_id=bundle_id,
         expected_bundle_sha256=bundle_sha256,
         expected_model_type=model_type,
@@ -547,6 +612,7 @@ def load_bundle_profile(
 def load_profile(
     path: str,
     *,
+    source_record_path: str,
     expected_bundle_id: str,
     expected_bundle_sha256: str,
     expected_model_type: str,
@@ -554,25 +620,23 @@ def load_profile(
     expected_dataset_regime: str,
     expected_accelerator_identity: str,
 ) -> ThroughputProfile:
-    """Load and validate one exact profile, rejecting all binding drift."""
+    """Load a profile and reproduce it from its mandatory exact raw record."""
 
     try:
-        path_stat = os.lstat(path)
-        if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
-            raise TimingProfileError("timing profile must be a regular file")
-        if path_stat.st_size <= 0 or path_stat.st_size > _MAX_PROFILE_BYTES:
-            raise TimingProfileError("timing profile size is invalid")
-        with open(path, "rb") as fh:
-            raw = fh.read(_MAX_PROFILE_BYTES + 1)
-        if len(raw) > _MAX_PROFILE_BYTES:
-            raise TimingProfileError("timing profile is too large")
+        raw = read_regular_bytes(
+            path,
+            label="timing profile",
+            maximum_size=_MAX_PROFILE_BYTES,
+        )
         value = json.loads(raw.decode("utf-8"))
     except TimingProfileError:
         raise
+    except RegularFileError as exc:
+        raise TimingProfileError(str(exc)) from exc
     except Exception as exc:
         raise TimingProfileError(f"timing profile unavailable: {path}") from exc
 
-    return validate_profile(
+    profile = validate_profile(
         value,
         expected_bundle_id=expected_bundle_id,
         expected_bundle_sha256=expected_bundle_sha256,
@@ -581,6 +645,20 @@ def load_profile(
         expected_dataset_regime=expected_dataset_regime,
         expected_accelerator_identity=expected_accelerator_identity,
     )
+    reproduced = produce_profile_document(
+        source_record_path,
+        source_run_id=profile.source_run_id,
+        bundle_id=profile.bundle_id,
+        model_type=profile.model_type,
+        measured_dataset_size=profile.measured_dataset_size,
+        measured_at_utc=profile.measured_at_utc,
+        expected_accelerator_identity=expected_accelerator_identity,
+    )
+    if reproduced != value:
+        raise TimingProfileError(
+            "timing profile is not reproduced by source runtime record"
+        )
+    return profile
 
 
 def validate_profile(
@@ -861,30 +939,17 @@ def emit_bootstrap_first_checkpoint_observation(
 def _read_source_record(path: str) -> tuple[bytes, Any]:
     """Read a bounded regular source record without following a symlink."""
 
-    fd = None
     try:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags)
-        path_stat = os.fstat(fd)
-        if (
-            not stat.S_ISREG(path_stat.st_mode)
-            or path_stat.st_size <= 0
-            or path_stat.st_size > _MAX_SOURCE_RECORD_BYTES
-        ):
-            raise ValueError
-        raw = os.read(fd, _MAX_SOURCE_RECORD_BYTES + 1)
-        if len(raw) > _MAX_SOURCE_RECORD_BYTES:
-            raise ValueError
+        raw = read_regular_bytes(
+            path,
+            label="source runtime record",
+            maximum_size=_MAX_SOURCE_RECORD_BYTES,
+        )
         return raw, json.loads(raw.decode("utf-8"))
     except Exception as exc:
         raise TimingProfileError(
             f"source runtime record unavailable: {path}"
         ) from exc
-    finally:
-        if fd is not None:
-            os.close(fd)
 
 
 def _runtime_record_semantic_sha256(value: Any) -> str:
@@ -954,6 +1019,19 @@ def _positive_int(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise TimingProfileError(f"{label} is invalid")
     return value
+
+
+def _nonnegative_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TimingProfileError(f"{label} is invalid")
+    return value
+
+
+def _attempt_nonce(value: Any) -> str:
+    text = _text(value, "scope attempt nonce", maximum=32)
+    if re.fullmatch(r"[0-9a-f]{32}", text) is None:
+        raise TimingProfileError("scope attempt nonce is invalid")
+    return text
 
 
 def _finite_positive(value: Any, label: str, *, maximum: float) -> float:
