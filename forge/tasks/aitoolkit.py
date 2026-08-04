@@ -177,7 +177,10 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
             krea_runtime.requested_bundle(spec.model_type)
             != krea_runtime.INCUMBENT_BUNDLE
         ):
-            manifest = krea_runtime.load_capability_manifest()
+            manifest = krea_runtime.load_capability_manifest(
+                model_type=spec.model_type,
+                bundle=bundle,
+            )
         krea_runtime.emit_effective_runtime_record(
             cfg,
             spec.model_type,
@@ -185,6 +188,7 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
             manifest,
             throughput_profile=throughput_profile,
             timing_probe=timing_probe,
+            source_run_id=_timing_source_run_id(spec, scope),
             current_dataset_size=pairs,
             current_accelerator_identity=timing_accelerator_identity,
         )
@@ -246,6 +250,22 @@ def _recipe_hours(deadline: Deadline, scoring_reserve_s: float) -> float:
     ) / 3600.0
 
 
+def _timing_source_run_id(spec: ImageSpec, scope: dict) -> str:
+    """Bind one timing source to the exact checkpoint attempt, not only task."""
+
+    nonce = scope.get("attempt_nonce")
+    if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+        raise krea_runtime.KreaRuntimeContractError(
+            "timing source attempt nonce is invalid"
+        )
+    source_run_id = f"{spec.task_id}:{nonce}"
+    if len(source_run_id) > 256:
+        raise krea_runtime.KreaRuntimeContractError(
+            "timing source run id is too long"
+        )
+    return source_run_id
+
+
 def _run_toolkit(
     cfg_path: str,
     deadline: Deadline,
@@ -273,8 +293,6 @@ def _run_toolkit(
     # uploaded repo and make the name run-specific so concurrent/retried jobs
     # cannot truncate one another or leak another run's tail into telemetry.
     log_path = _toolkit_log_path(spec)
-    telemetry.event("toolkit_start")
-    started = time.monotonic()
     if throughput_profile is not None and any(
         value is None
         for value in (
@@ -286,12 +304,31 @@ def _run_toolkit(
         raise adaptive_timing.TimingProfileError(
             "measured timing observation inputs are incomplete"
         )
-    if timing_probe and (
-        active_planned_steps is None or timing_bundle is None
-    ):
+    selected_bundle = krea_runtime.requested_bundle(spec.model_type)
+    if timing_bundle is not None and timing_bundle != selected_bundle:
+        raise krea_runtime.KreaRuntimeContractError(
+            "timing bundle differs from the selected runtime bundle"
+        )
+    if timing_probe and active_planned_steps is None:
         raise adaptive_timing.TimingProfileError(
             "bootstrap timing observation inputs are incomplete"
         )
+    selected_toolkit_dir = toolkit_dir or _AI_TOOLKIT_DIR
+    if (
+        spec.model_type == "krea2"
+        and selected_bundle != krea_runtime.INCUMBENT_BUNDLE
+    ):
+        verified_toolkit_dir = krea_runtime.verify_selected_runtime(
+            spec.model_type,
+            selected_bundle,
+        )
+        if os.path.realpath(selected_toolkit_dir) != verified_toolkit_dir:
+            raise krea_runtime.KreaRuntimeContractError(
+                "attested Krea runtime differs from the selected executable tree"
+            )
+        selected_toolkit_dir = verified_toolkit_dir
+    telemetry.event("toolkit_start")
+    started = time.monotonic()
 
     # GPU peak sampler: torch.max_memory_allocated is 0 in the parent (ai-toolkit
     # is a subprocess), so poll nvidia-smi in a daemon thread. Fully wrapped.
@@ -327,7 +364,7 @@ def _run_toolkit(
         # DataLoader workers can't outlive the kill holding GPU memory while
         # _finalize runs.
         proc = subprocess.Popen(
-            cmd, cwd=toolkit_dir or _AI_TOOLKIT_DIR,
+            cmd, cwd=selected_toolkit_dir,
             stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -356,7 +393,7 @@ def _run_toolkit(
             else:
                 observation = (
                     adaptive_timing.emit_bootstrap_first_checkpoint_observation(
-                        bundle_id=timing_bundle,
+                        bundle_id=selected_bundle,
                         active_planned_steps=active_planned_steps,
                         checkpoint_step=checkpoint_step,
                         elapsed_since_launch_s=time.monotonic() - started,
@@ -415,6 +452,7 @@ def _run_toolkit(
                 _terminate(proc)
             raise
     rc = proc.returncode
+    elapsed_seconds = time.monotonic() - started
 
     try:
         gpu_stop.set()
@@ -427,8 +465,9 @@ def _run_toolkit(
 
     telemetry.event(
         "toolkit_end", returncode=rc, stopped_by_deadline=stopped_by_deadline,
-        elapsed_s=round(time.monotonic() - started, 1),
+        elapsed_s=round(elapsed_seconds, 1),
     )
+    loss = step = None
     try:
         loss, step = _parse_toolkit_log(log_path)
         telemetry.event("toolkit_metrics", loss=loss, last_step=step)
@@ -445,6 +484,17 @@ def _run_toolkit(
     ):
         raise adaptive_timing.TimingProfileError(
             "required first-checkpoint timing observation was not produced"
+        )
+    if (
+        (throughput_profile is not None or timing_probe)
+        and timing_record_required
+    ):
+        _persist_training_completion_observation(
+            cfg_path,
+            reported_last_step=step,
+            training_elapsed_seconds=elapsed_seconds,
+            returncode=rc,
+            stopped_by_deadline=stopped_by_deadline,
         )
 
     # A clean exit (0) or a deadline stop are both success: a checkpoint should be
@@ -539,6 +589,35 @@ def _persist_first_checkpoint_observation(
     return True
 
 
+def _persist_training_completion_observation(
+    config_path: str,
+    *,
+    reported_last_step: int | None,
+    training_elapsed_seconds: float,
+    returncode: int | None,
+    stopped_by_deadline: bool,
+) -> None:
+    """Persist the terminal timing postcondition or abort the experiment."""
+
+    updated = krea_runtime.persist_training_completion_observation(
+        config_path,
+        reported_last_step=reported_last_step,
+        training_elapsed_seconds=training_elapsed_seconds,
+        returncode=returncode,
+        stopped_by_deadline=stopped_by_deadline,
+    )
+    telemetry.event(
+        "krea_training_completion_observation_persisted",
+        natural_completion=updated["training_completion_observation"][
+            "natural_completion"
+        ],
+        record_sha256=updated["record_sha256"],
+    )
+    telemetry.set_meta(
+        krea_effective_runtime_record_sha256=updated["record_sha256"],
+    )
+
+
 def _toolkit_log_path(spec: ImageSpec) -> str:
     log_dir = os.path.join(os.path.dirname(spec.config_path), "forge-logs")
     os.makedirs(log_dir, exist_ok=True)
@@ -564,18 +643,30 @@ def _parse_toolkit_log(log_path: str):
         losses = re.findall(rf"loss[=:]\s*({number})", text, re.IGNORECASE)
         if losses:
             loss = float(losses[-1])
-        progress = re.findall(r"(\d+)\s*/\s*(\d+)", text)
+        progress = list(re.finditer(r"(\d+)\s*/\s*(\d+)", text))
         if progress:
-            current, total = (int(value) for value in progress[-1])
+            last_progress = progress[-1]
+            current, total = (
+                int(last_progress.group(index)) for index in (1, 2)
+            )
             step = current
             # ai-toolkit's tqdm counter is zero-based in the final visible loss
             # line (35/36 for the 36th update).  Its subsequent unnumbered
             # terminal save is the durable proof that all planned steps landed.
-            saves = re.findall(
-                r"Saved checkpoint to\s+([^\r\n]+\.safetensors)", text
+            saves = list(
+                re.finditer(
+                    r"Saved checkpoint to\s+([^\r\n]+\.safetensors)", text
+                )
             )
-            if saves and not re.search(
-                r"_\d{9}\.safetensors$", os.path.basename(saves[-1].strip())
+            terminal_save = saves[-1] if saves else None
+            if (
+                current in {total - 1, total}
+                and terminal_save is not None
+                and terminal_save.start() > last_progress.end()
+                and not re.search(
+                    r"_\d{9}\.safetensors$",
+                    os.path.basename(terminal_save.group(1).strip()),
+                )
             ):
                 step = total
     except Exception:

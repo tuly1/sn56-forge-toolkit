@@ -3,13 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from forge import adaptive_timing, config, krea_runtime, recipe
 from forge.tasks import aitoolkit, checkpoints
 from forge.data.schema import ImageSpec
+
+
+SOURCE_RUN_ID = "runtime-contract:" + "a" * 32
 
 
 def _spec(model_type: str = "krea2") -> ImageSpec:
@@ -24,9 +29,14 @@ def _spec(model_type: str = "krea2") -> ImageSpec:
 
 
 def _manifest(tmp_path: Path, *, false_capability: str | None = None) -> Path:
-    capabilities = {name: True for name in krea_runtime.REQUIRED_CAPABILITIES}
+    capabilities = {
+        name: True for name in krea_runtime.RUNTIME_MANIFEST_CAPABILITIES
+    }
     if false_capability is not None:
-        capabilities[false_capability] = False
+        wire_name = krea_runtime._RUNTIME_CAPABILITY_WIRE_ALIASES.get(
+            false_capability, false_capability
+        )
+        capabilities[wire_name] = False
     value = {
         "schema": 1,
         "runtime_contract_id": krea_runtime.RUNTIME_CONTRACT_ID,
@@ -34,10 +44,10 @@ def _manifest(tmp_path: Path, *, false_capability: str | None = None) -> Path:
         "capabilities": capabilities,
         "evidence": {
             name: f"tests/{name}.py"
-            for name in krea_runtime.REQUIRED_CAPABILITIES
+            for name in krea_runtime.RUNTIME_MANIFEST_CAPABILITIES
         },
     }
-    path = tmp_path / "capabilities.json"
+    path = tmp_path / krea_runtime.CAPABILITY_MANIFEST_FILENAME
     path.write_text(json.dumps(value), encoding="utf-8")
     identity = {
         "schema": 1,
@@ -50,22 +60,21 @@ def _manifest(tmp_path: Path, *, false_capability: str | None = None) -> Path:
 
 
 def _identity_path(manifest_path: Path) -> Path:
-    return manifest_path.with_name("runtime-identity.json")
+    return manifest_path.with_name(krea_runtime.RUNTIME_IDENTITY_FILENAME)
 
 
 def _activate(monkeypatch, tmp_path: Path, bundle: str) -> Path:
     path = _manifest(tmp_path)
     monkeypatch.setenv(krea_runtime.BUNDLE_ENV, bundle)
-    monkeypatch.setenv(krea_runtime.CAPABILITY_MANIFEST_ENV, str(path))
     monkeypatch.setenv(
-        krea_runtime.RUNTIME_IDENTITY_ENV, str(_identity_path(path))
+        krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV, str(tmp_path)
     )
     return path
 
 
 def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
     bundle_sha = krea_runtime.bundle_contract_sha256(bundle)
-    document = adaptive_timing.seal_profile_document(
+    document = adaptive_timing._seal_profile_document(
         {
             "schema": adaptive_timing.PROFILE_SCHEMA,
             "kind": adaptive_timing.PROFILE_KIND,
@@ -83,7 +92,7 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
                 "first_checkpoint_elapsed_seconds": startup_seconds + 260.0,
             },
             "provenance": {
-                "source_run_id": "week6-bootstrap",
+                "source_run_id": SOURCE_RUN_ID,
                 "source_record_sha256": "b" * 64,
                 "runtime_commit": krea_runtime.OWNED_RUNTIME_COMMIT,
                 "measured_at_utc": "2026-08-04T12:00:00Z",
@@ -104,9 +113,7 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
 
 def test_incumbent_path_is_the_same_object_and_never_reads_manifest(monkeypatch):
     monkeypatch.delenv(krea_runtime.BUNDLE_ENV, raising=False)
-    monkeypatch.setenv(
-        krea_runtime.CAPABILITY_MANIFEST_ENV, "/does/not/exist/capabilities.json"
-    )
+    monkeypatch.setenv("FORGE_KREA_CAPABILITY_MANIFEST", "/does/not/exist.json")
     original = {"sentinel": [1, 2, 3]}
 
     observed, manifest = krea_runtime.apply(original, "krea2")
@@ -174,12 +181,92 @@ def test_only_experimental_krea_uses_owned_runtime(monkeypatch):
     assert incumbent_contract["runtime_commit"] == krea_runtime.PINNED_BASE_COMMIT
 
 
+def test_attestation_paths_are_derived_from_selected_runtime_and_ignore_legacy_env(
+    tmp_path, monkeypatch
+):
+    path = _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
+    monkeypatch.setenv(
+        "FORGE_KREA_CAPABILITY_MANIFEST", "/parallel/attestation.json"
+    )
+    monkeypatch.setenv(
+        "FORGE_KREA_RUNTIME_IDENTITY", "/parallel/identity.json"
+    )
+
+    runtime_dir, manifest_path, identity_path = (
+        krea_runtime.runtime_attestation_paths(
+            "krea2", krea_runtime.LEADER_BUNDLE
+        )
+    )
+
+    assert runtime_dir == str(tmp_path)
+    assert manifest_path == str(path)
+    assert identity_path == str(_identity_path(path))
+    assert krea_runtime.load_capability_manifest(
+        model_type="krea2", bundle=krea_runtime.LEADER_BUNDLE
+    )["runtime_contract_id"] == krea_runtime.RUNTIME_CONTRACT_ID
+
+
+def test_git_verifier_rejects_a_dirty_selected_runtime_tree(tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    subprocess.run(["git", "init", "-q", str(runtime_dir)], check=True)
+    subprocess.run(
+        ["git", "-C", str(runtime_dir), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(runtime_dir), "config", "user.name", "Test"],
+        check=True,
+    )
+    (runtime_dir / "run.py").write_text("print('clean')\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(runtime_dir), "add", "run.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(runtime_dir), "commit", "-qm", "runtime"],
+        check=True,
+    )
+    repository = "https://github.com/example/runtime.git"
+    subprocess.run(
+        ["git", "-C", str(runtime_dir), "remote", "add", "origin", repository],
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(runtime_dir), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    krea_runtime._verify_git_checkout(
+        str(runtime_dir),
+        expected_commit=commit,
+        expected_repository=repository,
+        runner=subprocess.run,
+    )
+    (runtime_dir / "run.py").write_text("print('mutated')\n", encoding="utf-8")
+
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError, match="working tree"
+    ):
+        krea_runtime._verify_git_checkout(
+            str(runtime_dir),
+            expected_commit=commit,
+            expected_repository=repository,
+            runner=subprocess.run,
+        )
+
+
 def test_stable_bundle_ids_carry_honest_source_derived_claims():
     rank1 = krea_runtime.bundle_claim_document(krea_runtime.LEADER_BUNDLE)
     rank3 = krea_runtime.bundle_claim_document(krea_runtime.MAE_BUNDLE)
 
     assert rank1["source_config_sha256"] == krea_runtime.PUBLIC_RANK1_CONFIG_SHA256
     assert rank3["source_config_sha256"] == krea_runtime.PUBLIC_RANK3_CONFIG_SHA256
+    assert rank1["source_repository"] == krea_runtime.PUBLIC_RANK1_REPOSITORY
+    assert rank1["source_revision"] == krea_runtime.PUBLIC_RANK1_REVISION
+    assert rank1["source_config_path"] == krea_runtime.PUBLIC_CONFIG_PATH
+    assert rank3["source_repository"] == krea_runtime.PUBLIC_RANK3_REPOSITORY
+    assert rank3["source_revision"] == krea_runtime.PUBLIC_RANK3_REVISION
+    assert rank3["source_config_path"] == krea_runtime.PUBLIC_CONFIG_PATH
     assert rank1["byte_equivalent_to_source_config"] is False
     assert rank3["byte_equivalent_to_source_config"] is False
     assert "source-derived" in rank1["classification"]
@@ -209,9 +296,8 @@ def test_leader_fails_closed_for_each_missing_runtime_capability(
 ):
     path = _manifest(tmp_path, false_capability=missing)
     monkeypatch.setenv(krea_runtime.BUNDLE_ENV, krea_runtime.LEADER_BUNDLE)
-    monkeypatch.setenv(krea_runtime.CAPABILITY_MANIFEST_ENV, str(path))
     monkeypatch.setenv(
-        krea_runtime.RUNTIME_IDENTITY_ENV, str(_identity_path(path))
+        krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV, str(tmp_path)
     )
 
     with pytest.raises(krea_runtime.KreaRuntimeContractError, match=missing):
@@ -223,7 +309,8 @@ def test_capability_manifest_rejects_unknown_claim(tmp_path, monkeypatch):
     value = json.loads(path.read_text(encoding="utf-8"))
     value["capabilities"]["magic_yaml_key"] = True
     path.write_text(json.dumps(value), encoding="utf-8")
-    monkeypatch.setenv(krea_runtime.CAPABILITY_MANIFEST_ENV, str(path))
+    monkeypatch.setenv(krea_runtime.BUNDLE_ENV, krea_runtime.LEADER_BUNDLE)
+    monkeypatch.setenv(krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV, str(tmp_path))
 
     with pytest.raises(krea_runtime.KreaRuntimeContractError, match="differ"):
         krea_runtime.load_capability_manifest()
@@ -282,8 +369,7 @@ def test_leader_overlay_never_partially_mutates_incumbent(tmp_path, monkeypatch)
     path = _manifest(tmp_path, false_capability="ema_checkpoint_resume")
     env = {
         krea_runtime.BUNDLE_ENV: krea_runtime.LEADER_BUNDLE,
-        krea_runtime.CAPABILITY_MANIFEST_ENV: str(path),
-        krea_runtime.RUNTIME_IDENTITY_ENV: str(_identity_path(path)),
+        krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV: str(tmp_path),
     }
 
     with pytest.raises(krea_runtime.KreaRuntimeContractError):
@@ -324,6 +410,7 @@ def test_effective_runtime_record_hash_binds_exact_generated_config(
         "krea2",
         str(config_path),
         manifest,
+        source_run_id=SOURCE_RUN_ID,
         timing_probe=True,
         current_dataset_size=18,
         current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
@@ -352,6 +439,13 @@ def test_effective_runtime_record_hash_binds_exact_generated_config(
     assert record["runtime_commit"] == krea_runtime.OWNED_RUNTIME_COMMIT
     assert record["timing"]["runtime_commit"] == krea_runtime.OWNED_RUNTIME_COMMIT
     assert record["bundle_claim"]["byte_equivalent_to_source_config"] is False
+    assert record["source_run_id"] == SOURCE_RUN_ID
+    assert record["model_type"] == "krea2"
+    assert krea_runtime.COMPONENT_RECOVERY_CAPABILITY in record["capabilities"]
+    assert "ema_checkpoint_resume" not in record["capabilities"]
+    assert record["runtime_manifest_capability_aliases"] == {
+        krea_runtime.COMPONENT_RECOVERY_CAPABILITY: "ema_checkpoint_resume"
+    }
     assert record["capability_manifest_file_sha256"] == hashlib.sha256(
         manifest_path.read_bytes()
     ).hexdigest()
@@ -360,6 +454,65 @@ def test_effective_runtime_record_hash_binds_exact_generated_config(
     )
     # Task paths, trigger strings, and credentials do not enter this sidecar.
     assert "AetherTest" not in json.dumps(record)
+
+
+def test_bootstrap_emitter_persistence_and_profile_producer_are_schema_compatible(
+    tmp_path, monkeypatch
+):
+    _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
+    cfg = config.build_config(_spec(), num_images=18, hours_to_complete=0.75)
+    config_path = tmp_path / "bootstrap.yaml"
+    config.write_config(cfg, str(config_path))
+    source_run_id = SOURCE_RUN_ID
+    planned = cfg["config"]["process"][0]["train"]["steps"]
+    krea_runtime.emit_effective_runtime_record(
+        cfg,
+        "krea2",
+        str(config_path),
+        krea_runtime.load_capability_manifest(),
+        source_run_id=source_run_id,
+        timing_probe=True,
+        current_dataset_size=18,
+        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+    )
+    observation = adaptive_timing.emit_bootstrap_first_checkpoint_observation(
+        bundle_id=krea_runtime.LEADER_BUNDLE,
+        checkpoint_step=200,
+        elapsed_since_launch_s=400.0,
+        active_planned_steps=planned,
+        event_sink=lambda *_args, **_kwargs: None,
+    )
+    krea_runtime.persist_first_checkpoint_observation(
+        str(config_path), observation
+    )
+    krea_runtime.persist_training_completion_observation(
+        str(config_path),
+        reported_last_step=planned,
+        training_elapsed_seconds=float(planned * 2),
+        returncode=0,
+        stopped_by_deadline=False,
+    )
+    source_path = Path(str(config_path) + ".effective-runtime.json")
+
+    profile = adaptive_timing.produce_profile_document(
+        str(source_path),
+        source_run_id=source_run_id,
+        bundle_id=krea_runtime.LEADER_BUNDLE,
+        model_type="krea2",
+        measured_dataset_size=18,
+        measured_at_utc="2026-08-04T18:00:00Z",
+        runner=lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="NVIDIA H100 PCIe, 81559\n",
+            stderr="",
+        ),
+    )
+
+    assert profile["measurement"]["completed_steps"] == planned
+    assert profile["seconds_per_step"] == pytest.approx(2.0)
+    assert profile["provenance"]["source_record_sha256"] == hashlib.sha256(
+        source_path.read_bytes()
+    ).hexdigest()
 
 
 def test_experimental_record_emission_is_mandatory(tmp_path, monkeypatch):
@@ -378,6 +531,7 @@ def test_experimental_record_emission_is_mandatory(tmp_path, monkeypatch):
             "krea2",
             str(config_path),
             krea_runtime.load_capability_manifest(),
+            source_run_id=SOURCE_RUN_ID,
             timing_probe=True,
             current_dataset_size=18,
             current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
@@ -403,6 +557,7 @@ def test_measured_profile_is_bound_to_bundle_in_effective_record(
         "krea2",
         str(config_path),
         krea_runtime.load_capability_manifest(),
+        source_run_id=SOURCE_RUN_ID,
         throughput_profile=profile,
         current_dataset_size=18,
     )
@@ -436,6 +591,7 @@ def test_effective_record_preserves_measured_and_current_regime_sizes(
         "krea2",
         str(config_path),
         krea_runtime.load_capability_manifest(),
+        source_run_id=SOURCE_RUN_ID,
         throughput_profile=profile,
         current_dataset_size=20,
     )
@@ -471,6 +627,7 @@ def test_effective_record_rejects_profile_from_another_runtime(
             "krea2",
             str(config_path),
             krea_runtime.load_capability_manifest(),
+            source_run_id=SOURCE_RUN_ID,
             throughput_profile=foreign_profile,
             current_dataset_size=18,
         )
@@ -490,6 +647,7 @@ def test_experimental_effective_record_rejects_unlabeled_static_timing(
             "krea2",
             str(config_path),
             krea_runtime.load_capability_manifest(),
+            source_run_id=SOURCE_RUN_ID,
         )
 
 
@@ -531,6 +689,7 @@ def test_timing_contract_rejects_throughput_semantic_drift(
             "krea2",
             str(config_path),
             krea_runtime.load_capability_manifest(),
+            source_run_id=SOURCE_RUN_ID,
             throughput_profile=profile,
             current_dataset_size=18,
         )
@@ -542,8 +701,8 @@ def test_runtime_identity_must_match_exact_owned_commit(tmp_path, monkeypatch):
     identity = json.loads(identity_path.read_text(encoding="utf-8"))
     identity["runtime_commit"] = "f" * 40
     identity_path.write_text(json.dumps(identity), encoding="utf-8")
-    monkeypatch.setenv(krea_runtime.CAPABILITY_MANIFEST_ENV, str(path))
-    monkeypatch.setenv(krea_runtime.RUNTIME_IDENTITY_ENV, str(identity_path))
+    monkeypatch.setenv(krea_runtime.BUNDLE_ENV, krea_runtime.LEADER_BUNDLE)
+    monkeypatch.setenv(krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV, str(tmp_path))
 
     with pytest.raises(krea_runtime.KreaRuntimeContractError, match="identity"):
         krea_runtime.load_capability_manifest()
@@ -615,12 +774,105 @@ def test_default_incumbent_runner_does_not_emit_record(
     assert not Path(spec.config_path + ".effective-runtime.json").exists()
 
 
-def test_first_durable_checkpoint_is_observed_once_and_persisted(
+def test_attested_tree_different_from_executed_tree_aborts_before_launch(
     tmp_path, monkeypatch
 ):
     spec = _spec()
     _localize_spec(monkeypatch, tmp_path, spec)
-    _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
+    attested = tmp_path / "attested-runtime"
+    executed = tmp_path / "executed-runtime"
+    attested.mkdir()
+    executed.mkdir()
+    _activate(monkeypatch, attested, krea_runtime.LEADER_BUNDLE)
+    (attested / "run.py").write_text("pass\n", encoding="utf-8")
+    (executed / "run.py").write_text("pass\n", encoding="utf-8")
+    monkeypatch.setattr(
+        krea_runtime,
+        "_verify_git_checkout",
+        lambda runtime_dir, **_kwargs: (
+            None
+            if runtime_dir == str(attested)
+            else pytest.fail("verifier received a parallel runtime path")
+        ),
+    )
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "subprocess launched after runtime identity mismatch"
+        ),
+    )
+    Path(spec.save_root).mkdir(parents=True)
+    scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+
+    class Deadline:
+        def remaining(self):
+            return 10_000.0
+
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError,
+        match="attested.*differs.*executable",
+    ):
+        aitoolkit._run_toolkit(
+            str(tmp_path / "unused.yaml"),
+            Deadline(),
+            spec,
+            scope,
+            timing_bundle=krea_runtime.LEADER_BUNDLE,
+            toolkit_dir=str(executed),
+        )
+
+
+def test_caller_cannot_downgrade_experimental_runtime_verification(
+    tmp_path, monkeypatch
+):
+    spec = _spec()
+    _localize_spec(monkeypatch, tmp_path, spec)
+    monkeypatch.setenv(krea_runtime.BUNDLE_ENV, krea_runtime.LEADER_BUNDLE)
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "subprocess launched after bundle inconsistency"
+        ),
+    )
+    Path(spec.save_root).mkdir(parents=True)
+    scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+
+    class Deadline:
+        def remaining(self):
+            return 10_000.0
+
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError,
+        match="timing bundle differs.*selected runtime bundle",
+    ):
+        aitoolkit._run_toolkit(
+            str(tmp_path / "unused.yaml"),
+            Deadline(),
+            spec,
+            scope,
+            timing_bundle=krea_runtime.INCUMBENT_BUNDLE,
+            toolkit_dir=str(tmp_path / "arbitrary-runtime"),
+        )
+
+
+def test_timing_source_run_id_includes_exact_attempt_nonce():
+    nonce = "a" * 32
+
+    assert aitoolkit._timing_source_run_id(
+        _spec(), {"attempt_nonce": nonce}
+    ) == f"runtime-contract:{nonce}"
+
+
+def test_integrated_fake_process_persists_first_and_terminal_observations(
+    tmp_path, monkeypatch
+):
+    spec = _spec()
+    _localize_spec(monkeypatch, tmp_path, spec)
+    toolkit_dir = tmp_path / "fake-toolkit"
+    toolkit_dir.mkdir()
+    _activate(monkeypatch, toolkit_dir, krea_runtime.LEADER_BUNDLE)
     profile = _timing_profile(
         krea_runtime.LEADER_BUNDLE, startup_seconds=0.0
     )
@@ -634,6 +886,7 @@ def test_first_durable_checkpoint_is_observed_once_and_persisted(
         "krea2",
         spec.config_path,
         krea_runtime.load_capability_manifest(),
+        source_run_id=SOURCE_RUN_ID,
         throughput_profile=profile,
         current_dataset_size=18,
     )
@@ -649,15 +902,18 @@ def test_first_durable_checkpoint_is_observed_once_and_persisted(
     scope = checkpoints.set_planned_steps(spec.save_root, scope, planned)
     config_before = hashlib.sha256(Path(spec.config_path).read_bytes()).hexdigest()
 
-    toolkit_dir = tmp_path / "fake-toolkit"
-    toolkit_dir.mkdir()
     checkpoint_path = Path(spec.save_root) / (
         f"{spec.expected_repo_name}_000000200.safetensors"
     )
-    fake_script = f'''import json, struct, time\nfrom pathlib import Path\ntime.sleep(0.08)\nheader = json.dumps({{"weight": {{"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}}}).encode()\nPath({str(checkpoint_path)!r}).write_bytes(struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0))\ntime.sleep(0.15)\n'''
+    fake_script = f'''import json, struct, time\nfrom pathlib import Path\ntime.sleep(0.08)\nheader = json.dumps({{"weight": {{"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}}}).encode()\nPath({str(checkpoint_path)!r}).write_bytes(struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0))\ntime.sleep(0.15)\nprint("{planned - 1}/{planned} loss=0.1", flush=True)\nprint("Saved checkpoint to final.safetensors", flush=True)\n'''
     (toolkit_dir / "run.py").write_text(fake_script, encoding="utf-8")
     monkeypatch.setattr(aitoolkit, "_AI_TOOLKIT_DIR", str(toolkit_dir))
     monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        krea_runtime,
+        "verify_selected_runtime",
+        lambda *_args, **_kwargs: str(toolkit_dir),
+    )
     calls = []
     original_emit = adaptive_timing.emit_first_checkpoint_observation
 
@@ -683,6 +939,8 @@ def test_first_durable_checkpoint_is_observed_once_and_persisted(
         future_target_steps=recipe.size_target_steps("krea2", 18, planned),
         total_budget_s=2700.0,
         timing_record_required=True,
+        timing_bundle=krea_runtime.LEADER_BUNDLE,
+        toolkit_dir=str(toolkit_dir),
     )
 
     record = json.loads(
@@ -695,6 +953,12 @@ def test_first_durable_checkpoint_is_observed_once_and_persisted(
     assert record["first_checkpoint_observation"]["checkpoint_step"] == 200
     assert record["first_checkpoint_observation"]["active_planned_steps"] == planned
     assert record["first_checkpoint_observation"]["active_plan_mutable"] is False
+    completion = record["training_completion_observation"]
+    assert completion["reported_last_step"] == planned
+    assert completion["training_elapsed_seconds"] > 0
+    assert completion["returncode"] == 0
+    assert completion["stopped_by_deadline"] is False
+    assert completion["natural_completion"] is True
     assert meta_updates[-1] == {
         "krea_effective_runtime_record_sha256": record["record_sha256"]
     }
@@ -716,6 +980,7 @@ def test_experimental_profile_requires_post_run_checkpoint_observation(
         "krea2",
         spec.config_path,
         krea_runtime.load_capability_manifest(),
+        source_run_id=SOURCE_RUN_ID,
         throughput_profile=profile,
         current_dataset_size=18,
     )
@@ -727,6 +992,11 @@ def test_experimental_profile_requires_post_run_checkpoint_observation(
     toolkit_dir.mkdir()
     (toolkit_dir / "run.py").write_text("pass\n", encoding="utf-8")
     monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        krea_runtime,
+        "verify_selected_runtime",
+        lambda *_args, **_kwargs: str(toolkit_dir),
+    )
 
     class Deadline:
         def remaining(self):
@@ -748,6 +1018,7 @@ def test_experimental_profile_requires_post_run_checkpoint_observation(
             ),
             total_budget_s=2700.0,
             timing_record_required=True,
+            timing_bundle=krea_runtime.LEADER_BUNDLE,
             toolkit_dir=str(toolkit_dir),
         )
 
@@ -757,6 +1028,7 @@ def test_bootstrap_probe_requires_post_run_checkpoint_observation(
 ):
     spec = _spec()
     _localize_spec(monkeypatch, tmp_path, spec)
+    monkeypatch.setenv(krea_runtime.BUNDLE_ENV, krea_runtime.LEADER_BUNDLE)
     Path(spec.config_path).parent.mkdir(parents=True)
     Path(spec.config_path).write_text("{}\n", encoding="utf-8")
     Path(spec.save_root).mkdir(parents=True)
@@ -766,6 +1038,11 @@ def test_bootstrap_probe_requires_post_run_checkpoint_observation(
     toolkit_dir.mkdir()
     (toolkit_dir / "run.py").write_text("pass\n", encoding="utf-8")
     monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        krea_runtime,
+        "verify_selected_runtime",
+        lambda *_args, **_kwargs: str(toolkit_dir),
+    )
 
     class Deadline:
         def remaining(self):

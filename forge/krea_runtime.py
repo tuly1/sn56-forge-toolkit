@@ -20,7 +20,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
+import stat
+import subprocess
 import tempfile
 from typing import Any
 
@@ -30,8 +33,6 @@ from forge import telemetry
 
 
 BUNDLE_ENV = "FORGE_KREA_BUNDLE"
-CAPABILITY_MANIFEST_ENV = "FORGE_KREA_CAPABILITY_MANIFEST"
-RUNTIME_IDENTITY_ENV = "FORGE_KREA_RUNTIME_IDENTITY"
 TIMING_PROBE_ENV = "FORGE_KREA_TIMING_PROBE"
 INCUMBENT_RUNTIME_DIR_ENV = "AI_TOOLKIT_DIR"
 OWNED_KREA_RUNTIME_DIR_ENV = "FORGE_KREA_AI_TOOLKIT_DIR"
@@ -55,12 +56,9 @@ OWNED_RUNTIME_REPOSITORY = "https://github.com/tuly1/sn56-ai-toolkit-mirror.git"
 INCUMBENT_RUNTIME_REPOSITORY = "https://github.com/ostris/ai-toolkit.git"
 DEFAULT_INCUMBENT_RUNTIME_DIR = "/app/ai-toolkit"
 DEFAULT_OWNED_KREA_RUNTIME_DIR = "/opt/sn56/krea-ai-toolkit"
-DEFAULT_CAPABILITY_MANIFEST = (
-    DEFAULT_OWNED_KREA_RUNTIME_DIR + "/sn56_krea_runtime_capabilities.json"
-)
-DEFAULT_RUNTIME_IDENTITY = (
-    DEFAULT_OWNED_KREA_RUNTIME_DIR + "/.sn56-runtime-identity.json"
-)
+CAPABILITY_MANIFEST_FILENAME = "sn56_krea_runtime_capabilities.json"
+RUNTIME_IDENTITY_FILENAME = ".sn56-runtime-identity.json"
+_MAX_ATTESTATION_BYTES = 256 * 1024
 
 PUBLIC_RANK1_CONFIG_SHA256 = (
     "50fe6eec02281d0e8acf0ea7d3d3b15b3b320a1ad0b6b6d450e17930dbd5dc1c"
@@ -68,17 +66,36 @@ PUBLIC_RANK1_CONFIG_SHA256 = (
 PUBLIC_RANK3_CONFIG_SHA256 = (
     "eceb74aef768cb1cd62212abd4e05c6fd012da6bfb866106ea75f1af66e72307"
 )
+PUBLIC_RANK1_REPOSITORY = (
+    "https://huggingface.co/gradients-io-tournaments/"
+    "tournament-tourn_c54bb970b5d0aa91_20260803-"
+    "41025fb5-8473-40c6-a88d-20c0bb303edc-5EACrayt"
+)
+PUBLIC_RANK1_REVISION = "a28c6a0f64c06bf81e191515a1d80e04fc793b44"
+PUBLIC_RANK3_REPOSITORY = (
+    "https://huggingface.co/gradients-io-tournaments/"
+    "tournament-tourn_c54bb970b5d0aa91_20260803-"
+    "41025fb5-8473-40c6-a88d-20c0bb303edc-5FBmn1ax"
+)
+PUBLIC_RANK3_REVISION = "63f94211664970831c9e3575a3e373a7720f4254"
+PUBLIC_CONFIG_PATH = "checkpoints/config.yaml"
 
 _BUNDLE_CLAIMS = {
     INCUMBENT_BUNDLE: {
         "classification": "incumbent-production-control",
         "source_relationship": "deployed-config-and-runtime-control",
+        "source_repository": None,
+        "source_revision": None,
+        "source_config_path": None,
         "source_config_sha256": None,
         "byte_equivalent_to_source_config": True,
     },
     LEADER_BUNDLE: {
         "classification": "source-derived-public-rank1-positive-control",
         "source_relationship": "selected-fields-derived-from-public-config",
+        "source_repository": PUBLIC_RANK1_REPOSITORY,
+        "source_revision": PUBLIC_RANK1_REVISION,
+        "source_config_path": PUBLIC_CONFIG_PATH,
         "source_config_sha256": PUBLIC_RANK1_CONFIG_SHA256,
         "byte_equivalent_to_source_config": False,
     },
@@ -87,18 +104,27 @@ _BUNDLE_CLAIMS = {
         "source_relationship": (
             "selected-fields-derived-from-public-config-plus-owned-export-extension"
         ),
+        "source_repository": PUBLIC_RANK1_REPOSITORY,
+        "source_revision": PUBLIC_RANK1_REVISION,
+        "source_config_path": PUBLIC_CONFIG_PATH,
         "source_config_sha256": PUBLIC_RANK1_CONFIG_SHA256,
         "byte_equivalent_to_source_config": False,
     },
     MAE_BUNDLE: {
         "classification": "source-derived-public-rank3-positive-control",
         "source_relationship": "selected-fields-derived-from-public-config",
+        "source_repository": PUBLIC_RANK3_REPOSITORY,
+        "source_revision": PUBLIC_RANK3_REVISION,
+        "source_config_path": PUBLIC_CONFIG_PATH,
         "source_config_sha256": PUBLIC_RANK3_CONFIG_SHA256,
         "byte_equivalent_to_source_config": False,
     },
 }
 
 # One named assertion per silent-runtime failure found in the Week-6 audit.
+COMPONENT_RECOVERY_CAPABILITY = (
+    "component_consistent_ema_optimizer_recovery"
+)
 REQUIRED_CAPABILITIES = (
     "qwen3vl_text_encoder_lora",
     "optimizer_group_lr_split",
@@ -106,8 +132,19 @@ REQUIRED_CAPABILITIES = (
     "cosine_by_group",
     "multires_noise",
     "ungated_differential_guidance",
-    "ema_checkpoint_resume",
+    COMPONENT_RECOVERY_CAPABILITY,
     "strict_unknown_train_field_rejection",
+)
+
+# The immutable schema-v1 runtime tag predates the corrected guarantee name.
+# Forge exposes only the honest semantic name; this one explicit translation is
+# retained at the wire boundary until a future runtime-schema revision.
+_RUNTIME_CAPABILITY_WIRE_ALIASES = {
+    COMPONENT_RECOVERY_CAPABILITY: "ema_checkpoint_resume",
+}
+RUNTIME_MANIFEST_CAPABILITIES = tuple(
+    _RUNTIME_CAPABILITY_WIRE_ALIASES.get(name, name)
+    for name in REQUIRED_CAPABILITIES
 )
 
 _BUNDLE_CAPABILITIES = {
@@ -152,11 +189,29 @@ def runtime_directory(
         and resolved != INCUMBENT_BUNDLE
     )
     if is_experimental_krea:
-        return str(
-            env.get(OWNED_KREA_RUNTIME_DIR_ENV, DEFAULT_OWNED_KREA_RUNTIME_DIR)
-        )
-    return str(
-        env.get(INCUMBENT_RUNTIME_DIR_ENV, DEFAULT_INCUMBENT_RUNTIME_DIR)
+        raw = env.get(OWNED_KREA_RUNTIME_DIR_ENV, DEFAULT_OWNED_KREA_RUNTIME_DIR)
+    else:
+        raw = env.get(INCUMBENT_RUNTIME_DIR_ENV, DEFAULT_INCUMBENT_RUNTIME_DIR)
+    if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
+        raise KreaRuntimeContractError("selected runtime directory is invalid")
+    if not os.path.isabs(raw):
+        raise KreaRuntimeContractError("selected runtime directory must be absolute")
+    return os.path.realpath(raw)
+
+
+def runtime_attestation_paths(
+    model_type: str,
+    bundle: str,
+    *,
+    environ: dict[str, str] | None = None,
+) -> tuple[str, str, str]:
+    """Derive every attestation path from the checkout that will execute."""
+
+    runtime_dir = runtime_directory(model_type, bundle, environ=environ)
+    return (
+        runtime_dir,
+        os.path.join(runtime_dir, CAPABILITY_MANIFEST_FILENAME),
+        os.path.join(runtime_dir, RUNTIME_IDENTITY_FILENAME),
     )
 
 
@@ -211,7 +266,11 @@ def apply(
     if bundle == INCUMBENT_BUNDLE:
         return cfg, None
 
-    manifest = load_capability_manifest(environ=environ)
+    manifest = load_capability_manifest(
+        model_type=model_type,
+        bundle=bundle,
+        environ=environ,
+    )
     require_capabilities(manifest, _BUNDLE_CAPABILITIES[bundle])
     candidate = copy.deepcopy(cfg)
     if bundle in {LEADER_BUNDLE, LEADER_COMFY_TE_BUNDLE}:
@@ -235,13 +294,20 @@ def apply(
 
 
 def load_capability_manifest(
-    *, environ: dict[str, str] | None = None
+    *,
+    model_type: str = "krea2",
+    bundle: str | None = None,
+    environ: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     env = os.environ if environ is None else environ
-    path = env.get(CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST)
+    resolved = requested_bundle(model_type, env) if bundle is None else bundle
+    runtime_dir, path, identity_path = runtime_attestation_paths(
+        model_type,
+        resolved,
+        environ=env,
+    )
     try:
-        with open(path, "rb") as fh:
-            manifest_bytes = fh.read()
+        manifest_bytes = _read_regular_attestation(path, "capability manifest")
         manifest = json.loads(manifest_bytes.decode("utf-8"))
     except Exception as exc:
         raise KreaRuntimeContractError(
@@ -266,33 +332,33 @@ def load_capability_manifest(
     capabilities = manifest.get("capabilities")
     if not isinstance(capabilities, dict):
         raise KreaRuntimeContractError("Krea capability map is missing")
-    if set(capabilities) != set(REQUIRED_CAPABILITIES):
+    if set(capabilities) != set(RUNTIME_MANIFEST_CAPABILITIES):
         raise KreaRuntimeContractError(
             "Krea runtime capability names differ from the contract"
         )
     evidence = manifest.get("evidence")
     if (
         not isinstance(evidence, dict)
-        or set(evidence) != set(REQUIRED_CAPABILITIES)
+        or set(evidence) != set(RUNTIME_MANIFEST_CAPABILITIES)
         or any(not isinstance(value, str) or not value for value in evidence.values())
     ):
         raise KreaRuntimeContractError("Krea capability evidence map is invalid")
     _load_runtime_identity(
-        env,
+        identity_path,
         capability_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
     )
     return manifest
 
 
 def _load_runtime_identity(
-    env: Any,
+    path: str,
     *,
     capability_manifest_sha256: str,
 ) -> dict[str, Any]:
-    path = env.get(RUNTIME_IDENTITY_ENV, DEFAULT_RUNTIME_IDENTITY)
     try:
-        with open(path, encoding="utf-8") as fh:
-            identity = json.load(fh)
+        identity = json.loads(
+            _read_regular_attestation(path, "runtime identity").decode("utf-8")
+        )
     except Exception as exc:
         raise KreaRuntimeContractError(
             f"Krea runtime identity unavailable: {path}"
@@ -310,11 +376,160 @@ def _load_runtime_identity(
 
 def require_capabilities(manifest: dict[str, Any], required: tuple[str, ...]) -> None:
     capabilities = manifest.get("capabilities", {})
-    missing = [name for name in required if capabilities.get(name) is not True]
+    missing = [
+        name
+        for name in required
+        if capabilities.get(
+            _RUNTIME_CAPABILITY_WIRE_ALIASES.get(name, name)
+        )
+        is not True
+    ]
     if missing:
         raise KreaRuntimeContractError(
             "Krea runtime lacks required capabilities: " + ", ".join(missing)
         )
+
+
+def canonical_capabilities(manifest: dict[str, Any]) -> list[str]:
+    """Expose semantic capability names, never legacy schema-v1 wire aliases."""
+
+    capabilities = manifest.get("capabilities", {})
+    return sorted(
+        name
+        for name in REQUIRED_CAPABILITIES
+        if capabilities.get(_RUNTIME_CAPABILITY_WIRE_ALIASES.get(name, name))
+        is True
+    )
+
+
+def verify_selected_runtime(
+    model_type: str,
+    bundle: str,
+    *,
+    environ: dict[str, str] | None = None,
+    runner: Any = subprocess.run,
+) -> str:
+    """Fail before launch unless attestation and executable checkout coincide."""
+
+    runtime_dir = runtime_directory(model_type, bundle, environ=environ)
+    is_experimental_krea = (
+        (model_type or "").strip().lower() == "krea2"
+        and bundle != INCUMBENT_BUNDLE
+    )
+    if not is_experimental_krea:
+        return runtime_dir
+
+    manifest = load_capability_manifest(
+        model_type=model_type,
+        bundle=bundle,
+        environ=environ,
+    )
+    require_capabilities(manifest, _BUNDLE_CAPABILITIES[bundle])
+    _verify_git_checkout(
+        runtime_dir,
+        expected_commit=OWNED_RUNTIME_COMMIT,
+        expected_repository=OWNED_RUNTIME_REPOSITORY,
+        runner=runner,
+    )
+    return runtime_dir
+
+
+def _verify_git_checkout(
+    runtime_dir: str,
+    *,
+    expected_commit: str,
+    expected_repository: str,
+    runner: Any,
+) -> None:
+    """Verify commit, tracked tree, origin, entrypoint, and untracked surface."""
+
+    try:
+        directory_stat = os.lstat(runtime_dir)
+        run_path = os.path.join(runtime_dir, "run.py")
+        run_stat = os.lstat(run_path)
+    except OSError as exc:
+        raise KreaRuntimeContractError(
+            "selected runtime checkout is unavailable"
+        ) from exc
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise KreaRuntimeContractError("selected runtime checkout is not a directory")
+    if stat.S_ISLNK(run_stat.st_mode) or not stat.S_ISREG(run_stat.st_mode):
+        raise KreaRuntimeContractError("selected runtime run.py is not a regular file")
+
+    def git(*arguments: str) -> str:
+        try:
+            completed = runner(
+                ["git", "-C", runtime_dir, *arguments],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except Exception as exc:
+            raise KreaRuntimeContractError(
+                "selected runtime git verification failed"
+            ) from exc
+        if completed.returncode != 0:
+            raise KreaRuntimeContractError(
+                "selected runtime git verification failed"
+            )
+        return completed.stdout.strip()
+
+    head = git("rev-parse", "--verify", "HEAD^{commit}")
+    expected = git("rev-parse", "--verify", f"{expected_commit}^{{commit}}")
+    if head != expected_commit or expected != expected_commit:
+        raise KreaRuntimeContractError("selected runtime commit mismatch")
+    if os.path.realpath(git("rev-parse", "--show-toplevel")) != runtime_dir:
+        raise KreaRuntimeContractError("selected runtime is not the repository root")
+    if git("rev-parse", "HEAD^{tree}") != git(
+        "rev-parse", f"{expected_commit}^{{tree}}"
+    ):
+        raise KreaRuntimeContractError("selected runtime tree mismatch")
+    origin = git("remote", "get-url", "origin").removesuffix("/")
+    if origin.removesuffix(".git") != expected_repository.removesuffix(".git"):
+        raise KreaRuntimeContractError("selected runtime repository mismatch")
+
+    status_rows = [
+        row
+        for row in git(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ).splitlines()
+        if row
+    ]
+    allowed_identity_rows = {
+        f"?? {RUNTIME_IDENTITY_FILENAME}",
+        f"!! {RUNTIME_IDENTITY_FILENAME}",
+    }
+    if any(row not in allowed_identity_rows for row in status_rows):
+        raise KreaRuntimeContractError("selected runtime working tree is not exact")
+
+
+def _read_regular_attestation(path: str, label: str) -> bytes:
+    """Read one small in-tree attestation without following a symlink."""
+
+    fd = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError
+        if file_stat.st_size <= 0 or file_stat.st_size > _MAX_ATTESTATION_BYTES:
+            raise ValueError
+        raw = os.read(fd, _MAX_ATTESTATION_BYTES + 1)
+        if len(raw) > _MAX_ATTESTATION_BYTES:
+            raise ValueError
+        return raw
+    except Exception as exc:
+        raise KreaRuntimeContractError(f"Krea {label} is not a regular file") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def bundle_contract_document(bundle: str) -> dict[str, Any]:
@@ -335,6 +550,11 @@ def bundle_contract_document(bundle: str) -> dict[str, Any]:
         "runtime_repository": runtime_repository_for_bundle(bundle),
         "runtime_commit": runtime_commit_for_bundle(bundle),
         "required_capabilities": list(_BUNDLE_CAPABILITIES.get(bundle, ())),
+        "runtime_manifest_capability_aliases": {
+            name: _RUNTIME_CAPABILITY_WIRE_ALIASES[name]
+            for name in _BUNDLE_CAPABILITIES.get(bundle, ())
+            if name in _RUNTIME_CAPABILITY_WIRE_ALIASES
+        },
         "normalized_config_projection": _reference_bundle_projection(bundle),
     }
 
@@ -366,6 +586,7 @@ def emit_effective_runtime_record(
     *,
     throughput_profile=None,
     timing_probe: bool = False,
+    source_run_id: str | None = None,
     current_dataset_size: int | None = None,
     current_accelerator_identity: str | None = None,
     environ: dict[str, str] | None = None,
@@ -378,6 +599,18 @@ def emit_effective_runtime_record(
     incumbent so a calibration run cannot proceed with an unrecorded runtime.
     """
     bundle = requested_bundle(model_type, environ)
+    if not isinstance(source_run_id, str):
+        raise KreaRuntimeContractError("effective runtime source run id is invalid")
+    source_run_id = source_run_id.strip()
+    task_identity, separator, attempt_nonce = source_run_id.rpartition(":")
+    if (
+        not separator
+        or not task_identity
+        or len(source_run_id) > 256
+        or len(attempt_nonce) != 32
+        or any(character not in "0123456789abcdef" for character in attempt_nonce)
+    ):
+        raise KreaRuntimeContractError("effective runtime source run id is invalid")
     expected_projection = bundle_contract_document(bundle)[
         "normalized_config_projection"
     ]
@@ -455,7 +688,10 @@ def emit_effective_runtime_record(
     try:
         config_sha = _sha256_file(config_path)
         manifest_file_sha, manifest_semantic_sha = _capability_manifest_hashes(
-            manifest, environ=environ
+            manifest,
+            model_type=model_type,
+            bundle=bundle,
+            environ=environ,
         )
     except Exception as exc:
         if bundle != INCUMBENT_BUNDLE:
@@ -467,10 +703,12 @@ def emit_effective_runtime_record(
             bundle=bundle,
             error_type=type(exc).__name__,
         )
-        return {"schema": 2, "bundle": bundle, "emission_failed": True}
+        return {"schema": 3, "bundle": bundle, "emission_failed": True}
     record: dict[str, Any] = {
-        "schema": 2,
+        "schema": 3,
         "runtime_contract_id": RUNTIME_CONTRACT_ID,
+        "source_run_id": source_run_id,
+        "model_type": (model_type or "").strip().lower(),
         "runtime_repository": runtime_repository_for_bundle(bundle),
         "runtime_commit": runtime_commit_for_bundle(bundle),
         "bundle": bundle,
@@ -480,13 +718,19 @@ def emit_effective_runtime_record(
         "capability_manifest_file_sha256": manifest_file_sha,
         "capability_manifest_semantic_sha256": manifest_semantic_sha,
         "capabilities": (
-            sorted(name for name, value in manifest["capabilities"].items() if value)
+            canonical_capabilities(manifest)
             if manifest is not None
             else []
         ),
+        "runtime_manifest_capability_aliases": {
+            name: wire
+            for name, wire in _RUNTIME_CAPABILITY_WIRE_ALIASES.items()
+            if name in _BUNDLE_CAPABILITIES.get(bundle, ())
+        },
         "timing": timing,
         "effective": _effective_fields(cfg, bundle=bundle),
         "first_checkpoint_observation": None,
+        "training_completion_observation": None,
     }
     record_sha = _canonical_sha256(record)
     record["record_sha256"] = record_sha
@@ -526,8 +770,10 @@ def _apply_source_derived_rank1(cfg: dict[str, Any]) -> None:
     dataset["caption_dropout_rate"] = 0.05
     p["network"] = {"type": "lora", "linear": 32, "linear_alpha": 32}
     p["save"]["save_every"] = 200
-    # Retain the complete 200-step curve through the 2,000-step ceiling. This
-    # changes evidence retention only, not optimizer numerics or the final LoRA.
+    # Retain every periodic checkpoint emitted at the source-derived 200-step
+    # interval through our 2,000-step ceiling.  The owned cap of 12 is enough
+    # for at most ten periodic checkpoints; it is not a promise of 12 saves.
+    # This changes evidence retention only, not optimizer numerics or final LoRA.
     p["save"]["max_step_saves_to_keep"] = 12
     steps = p["train"]["steps"]
     # Replace rather than update: otherwise innocuous-looking template keys can
@@ -656,7 +902,9 @@ def timing_contract_projection(
     count are abstracted. Every throughput- or optimizer-relevant value remains
     in the projection, including resolution, cache behavior, batch size,
     optimizer parameters, dtype, checkpointing, noise, guidance, EMA, scheduler,
-    save cadence, and all untouched template fields.
+    and all untouched template fields. Experimental bundle save cadence remains
+    exact; incumbent cadence is explicitly normalized because it is derived
+    from the independently budgeted step count.
     """
 
     if bundle not in KNOWN_BUNDLES:
@@ -740,8 +988,11 @@ def persist_first_checkpoint_observation(
 
     path = config_path + ".effective-runtime.json"
     try:
-        with open(path, encoding="utf-8") as fh:
-            record = json.load(fh)
+        record = json.loads(
+            _read_regular_attestation(
+                path, "effective runtime record"
+            ).decode("utf-8")
+        )
         if not isinstance(record, dict):
             raise ValueError("record is not an object")
         declared_sha = record.pop("record_sha256")
@@ -762,6 +1013,79 @@ def persist_first_checkpoint_observation(
         ) from exc
 
 
+def persist_training_completion_observation(
+    config_path: str,
+    *,
+    reported_last_step: int | None,
+    training_elapsed_seconds: float,
+    returncode: int | None,
+    stopped_by_deadline: bool,
+) -> dict[str, Any]:
+    """Bind the subprocess terminal state into the raw timing record.
+
+    Failed and deadline-stopped probes are recorded rather than disguised as
+    measurements. Profile production accepts only a clean natural completion
+    whose observed terminal step equals the config-bound plan.
+    """
+
+    path = config_path + ".effective-runtime.json"
+    try:
+        record = json.loads(
+            _read_regular_attestation(
+                path, "effective runtime record"
+            ).decode("utf-8")
+        )
+        if not isinstance(record, dict):
+            raise ValueError("record is not an object")
+        declared_sha = record.pop("record_sha256")
+        if declared_sha != _canonical_sha256(record):
+            raise ValueError("record digest mismatch")
+        if record.get("generated_config_sha256") != _sha256_file(config_path):
+            raise ValueError("generated config binding mismatch")
+        if record.get("training_completion_observation") is not None:
+            raise ValueError("training completion observation already recorded")
+        planned_steps = record.get("effective", {}).get("planned_steps")
+        if reported_last_step is not None and (
+            isinstance(reported_last_step, bool)
+            or not isinstance(reported_last_step, int)
+            or reported_last_step < 0
+        ):
+            raise ValueError("reported last step is invalid")
+        if (
+            isinstance(training_elapsed_seconds, bool)
+            or not isinstance(training_elapsed_seconds, (int, float))
+            or not math.isfinite(float(training_elapsed_seconds))
+            or float(training_elapsed_seconds) <= 0
+        ):
+            raise ValueError("training elapsed seconds is invalid")
+        if returncode is not None and (
+            isinstance(returncode, bool) or not isinstance(returncode, int)
+        ):
+            raise ValueError("return code is invalid")
+        if not isinstance(stopped_by_deadline, bool):
+            raise ValueError("deadline state is invalid")
+        natural_completion = bool(
+            returncode == 0
+            and not stopped_by_deadline
+            and isinstance(planned_steps, int)
+            and reported_last_step == planned_steps
+        )
+        record["training_completion_observation"] = {
+            "reported_last_step": reported_last_step,
+            "training_elapsed_seconds": round(float(training_elapsed_seconds), 6),
+            "returncode": returncode,
+            "stopped_by_deadline": stopped_by_deadline,
+            "natural_completion": natural_completion,
+        }
+        record["record_sha256"] = _canonical_sha256(record)
+        _atomic_json(path, record)
+        return record
+    except Exception as exc:
+        raise KreaRuntimeContractError(
+            "training-completion observation could not be persisted"
+        ) from exc
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -772,16 +1096,20 @@ def _canonical_bytes(value: Any) -> bytes:
 def _capability_manifest_hashes(
     manifest: dict[str, Any] | None,
     *,
+    model_type: str,
+    bundle: str,
     environ: dict[str, str] | None = None,
 ) -> tuple[str | None, str | None]:
     """Return explicit file-byte and canonical-semantic manifest digests."""
 
     if manifest is None:
         return None, None
-    env = os.environ if environ is None else environ
-    path = env.get(CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST)
-    with open(path, "rb") as fh:
-        raw = fh.read()
+    _runtime_dir, path, _identity_path = runtime_attestation_paths(
+        model_type,
+        bundle,
+        environ=environ,
+    )
+    raw = _read_regular_attestation(path, "capability manifest")
     if json.loads(raw.decode("utf-8")) != manifest:
         raise KreaRuntimeContractError(
             "capability manifest object differs from its recorded file bytes"
