@@ -82,12 +82,7 @@ def size_scaled_steps(
             raise TimingProfileError("recipe timing profile model type mismatch")
     try:
         mt = (model_type or "").strip().lower()
-        row = STEP_TABLE.get(mt)
-        if row is None:
-            return int(template_steps)
-        n = max(1, int(num_images))
-        scaled = row["base"] * (n / row["n_ref"]) ** row["p"]
-        scaled = int(round(max(row["min"], min(row["max"], scaled))))
+        scaled = size_target_steps(mt, num_images, template_steps)
 
         sit = (
             throughput_profile.seconds_per_step
@@ -104,10 +99,27 @@ def size_scaled_steps(
         budget_cap = int(train_s / sit) if train_s > 0 else 1
         return max(1, min(scaled, budget_cap))  # cap may push below `min`
     except Exception:
+        # A supplied measurement is part of an evidence-bearing experiment.
+        # Never turn a malformed measured invocation into a plausible-looking
+        # template run; only the historical no-profile path may degrade.
+        if throughput_profile is not None:
+            raise
         try:
             return int(template_steps)
         except Exception:
             return 1000
+
+
+def size_target_steps(model_type, num_images, template_steps):
+    """Return the size-law target before any wall-clock budget is applied."""
+
+    mt = (model_type or "").strip().lower()
+    row = STEP_TABLE.get(mt)
+    if row is None:
+        return int(template_steps)
+    n = max(1, int(num_images))
+    scaled = row["base"] * (n / row["n_ref"]) ** row["p"]
+    return int(round(max(row["min"], min(row["max"], scaled))))
 
 
 def kill_safe_save_every(steps, template_save_every):
