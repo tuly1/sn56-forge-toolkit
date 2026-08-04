@@ -1,20 +1,88 @@
 """Descriptor-bound reads for evidence files.
 
 Evidence must be read from the object that was opened, not from a path checked
-before a second path lookup.  These helpers reject symlinks, non-regular files,
-size drift, and mutation while a descriptor is being consumed.
+before a second path lookup.  Linux uses ``openat2(RESOLVE_NO_SYMLINKS)`` to
+reject symlinks in every path component.  The portable fallback can protect
+only the final component with ``O_NOFOLLOW``; descriptor identity, file type,
+size drift, and mutation checks still apply to the object actually opened.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
+import ctypes
+import errno
 import os
 import stat
+import sys
 from typing import Iterator
 
 
 class RegularFileError(RuntimeError):
     """A purported evidence path is not one stable regular file."""
+
+
+_AT_FDCWD = -100
+_OPENAT2_SYSCALL = 437
+_RESOLVE_NO_SYMLINKS = 0x04
+_OPENAT2_MACHINES = frozenset(
+    {"aarch64", "arm64", "riscv64", "x86_64", "amd64"}
+)
+
+
+class _OpenHow(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint64),
+        ("mode", ctypes.c_uint64),
+        ("resolve", ctypes.c_uint64),
+    ]
+
+
+def _openat2_no_symlinks(path: str, flags: int) -> int:
+    """Open ``path`` while rejecting symlinks in every component on Linux."""
+
+    encoded_path = os.fsencode(path)
+    if b"\x00" in encoded_path:
+        raise ValueError("evidence path contains an embedded NUL")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    how = _OpenHow(
+        flags=flags,
+        mode=0,
+        resolve=_RESOLVE_NO_SYMLINKS,
+    )
+    result = libc.syscall(
+        ctypes.c_long(_OPENAT2_SYSCALL),
+        ctypes.c_int(_AT_FDCWD),
+        ctypes.c_char_p(encoded_path),
+        ctypes.byref(how),
+        ctypes.c_size_t(ctypes.sizeof(how)),
+    )
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    return int(result)
+
+
+def _open_evidence_path(path: str, flags: int) -> int:
+    """Prefer a full-path guard; fall back only when the API is unavailable."""
+
+    path = os.fspath(path)
+    machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
+    if sys.platform.startswith("linux") and machine in _OPENAT2_MACHINES:
+        try:
+            return _openat2_no_symlinks(path, flags)
+        except OSError as exc:
+            if exc.errno != errno.ENOSYS:
+                raise
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError(
+            errno.ENOTSUP,
+            "final-component symlink protection is unavailable",
+            path,
+        )
+    return os.open(path, flags | nofollow)
 
 
 def stat_identity(value: os.stat_result) -> dict[str, int]:
@@ -37,14 +105,12 @@ def open_regular_file(
     minimum_size: int = 1,
     maximum_size: int | None = None,
 ) -> Iterator[tuple[int, os.stat_result]]:
-    """Open one stable regular file without following its final path component."""
+    """Open one stable file with full-path Linux or final-component protection."""
 
     fd: int | None = None
     try:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags)
+        fd = _open_evidence_path(path, flags)
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):
             raise RegularFileError(f"{label} must be a regular file")

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from forge import adaptive_timing, krea_runtime, recipe
+from forge.tasks.integrity import inspect_training_artifact
 
 
 BUNDLE_SHA = krea_runtime.bundle_contract_sha256(krea_runtime.LEADER_BUNDLE)
@@ -94,6 +95,7 @@ def _write_source_record(
             "artifact_checkpoint_step": 1000,
             "completed_steps": 1000,
             "scope_attempt_nonce": "a" * 32,
+            "artifact_file_identity": _file_identity(artifact),
         },
     }
     for key, value in overrides.items():
@@ -111,6 +113,10 @@ def _write_source_record(
         encoding="utf-8",
     )
     return path
+
+
+def _file_identity(path):
+    return inspect_training_artifact(str(path)).file_identity
 
 
 def _write_training_artifact(path, *, step: int):
@@ -235,6 +241,7 @@ def test_profile_producer_hashes_and_crosschecks_raw_completed_run(tmp_path):
     assert profile.first_checkpoint_step == 200
     assert profile.seconds_per_step == pytest.approx(1.3)
     assert profile.startup_seconds == 0.0
+    assert document["kind"] == "forge-operator-attested-throughput-profile"
 
 
 def test_profile_producer_accepts_mae_bundle_capability_subset(tmp_path):
@@ -373,6 +380,20 @@ def test_profile_consumption_requires_and_reproduces_exact_raw_record(
     ).hexdigest()
 
 
+def test_profile_consumption_uses_canonical_semantic_equality(tmp_path):
+    profile_path = _write_profile(tmp_path)
+    value = json.loads(profile_path.read_text(encoding="utf-8"))
+    reordered = {key: value[key] for key in reversed(tuple(value))}
+    profile_path.write_text(
+        json.dumps(reordered, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    profile = _load(profile_path)
+
+    assert profile.profile_sha256 == value["profile_sha256"]
+
+
 def test_profile_consumption_rejects_self_consistent_forged_source_record(tmp_path):
     profile_path = _write_profile(tmp_path)
     source_path = _source_path(tmp_path)
@@ -389,9 +410,73 @@ def test_profile_consumption_rejects_self_consistent_forged_source_record(tmp_pa
 
     with pytest.raises(
         adaptive_timing.TimingProfileError,
-        match="not reproduced by source runtime record",
+        match="canonical semantic reproduction mismatch",
     ):
         _load(profile_path)
+
+
+def test_operator_attested_elapsed_claim_is_not_independently_authenticated(
+    tmp_path,
+):
+    source_path = _write_source_record(tmp_path)
+    claimed = json.loads(source_path.read_text(encoding="utf-8"))
+    claimed["first_checkpoint_observation"]["elapsed_since_launch_s"] = 0.1
+    claimed["training_completion_observation"][
+        "training_elapsed_seconds"
+    ] = 1.0
+    claimed.pop("record_sha256")
+    claimed["record_sha256"] = adaptive_timing._runtime_record_semantic_sha256(
+        claimed
+    )
+    source_path.write_text(
+        json.dumps(claimed, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    profile = adaptive_timing.produce_profile_document(
+        str(source_path),
+        source_run_id=SOURCE_RUN_ID,
+        bundle_id=krea_runtime.LEADER_BUNDLE,
+        model_type="krea2",
+        measured_dataset_size=DATASET_SIZE,
+        measured_at_utc="2026-08-04T18:00:00Z",
+        runner=_nvidia_runner(),
+    )
+    profile_path = tmp_path / "operator-attested-profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    loaded = _load(profile_path)
+
+    assert loaded.seconds_per_step == pytest.approx(0.001)
+
+
+def test_profile_producer_rejects_resealed_artifact_identity_tamper(tmp_path):
+    source_path = _write_source_record(tmp_path)
+    forged = json.loads(source_path.read_text(encoding="utf-8"))
+    forged["training_completion_observation"]["artifact_file_identity"][
+        "inode"
+    ] += 1
+    forged.pop("record_sha256")
+    forged["record_sha256"] = adaptive_timing._runtime_record_semantic_sha256(
+        forged
+    )
+    source_path.write_text(
+        json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        adaptive_timing.TimingProfileError,
+        match="terminal artifact evidence mismatch",
+    ):
+        adaptive_timing.produce_profile_document(
+            str(source_path),
+            source_run_id=SOURCE_RUN_ID,
+            bundle_id=krea_runtime.LEADER_BUNDLE,
+            model_type="krea2",
+            measured_dataset_size=DATASET_SIZE,
+            measured_at_utc="2026-08-04T18:00:00Z",
+            runner=_nvidia_runner(),
+        )
 
 
 def test_auditor_forged_record_with_phantom_artifact_is_rejected(tmp_path):
@@ -411,6 +496,13 @@ def test_auditor_forged_record_with_phantom_artifact_is_rejected(tmp_path):
             "artifact_loadable": True,
             "artifact_checkpoint_step": 2000,
             "completed_steps": 2000,
+            "artifact_file_identity": {
+                "device": 1,
+                "inode": 1,
+                "size": 1024,
+                "mtime_ns": 1,
+                "ctime_ns": 1,
+            },
         }
     )
     forged.pop("record_sha256")
@@ -553,11 +645,12 @@ def test_profile_rejects_tampering_and_unknown_fields(tmp_path):
         _load(path)
 
 
-def test_profile_rejects_a_self_hashed_but_unmeasured_rate(tmp_path):
+def test_profile_rejects_a_self_hashed_but_internally_inconsistent_rate(tmp_path):
     path = _write_profile(tmp_path, seconds_per_step=0.7)
 
     with pytest.raises(
-        adaptive_timing.TimingProfileError, match="recorded measurement"
+        adaptive_timing.TimingProfileError,
+        match="operator-attested elapsed values",
     ):
         _load(path)
 

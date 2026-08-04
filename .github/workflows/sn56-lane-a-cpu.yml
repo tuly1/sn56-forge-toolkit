@@ -32,6 +32,9 @@ jobs:
         run: |
           python -m py_compile \
             forge/adaptive_timing.py \
+            forge/file_evidence.py \
             forge/krea_runtime.py \
             forge/tasks/aitoolkit.py \
+            forge/tasks/checkpoints.py \
+            forge/tasks/integrity.py \
             forge/tasks/publication.py

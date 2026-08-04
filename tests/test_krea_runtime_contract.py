@@ -737,7 +737,7 @@ def test_experimental_record_emission_is_mandatory(tmp_path, monkeypatch):
         )
 
 
-def test_measured_profile_is_bound_to_bundle_in_effective_record(
+def test_operator_attested_profile_is_bound_to_bundle_in_effective_record(
     tmp_path, monkeypatch
 ):
     _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
@@ -762,7 +762,7 @@ def test_measured_profile_is_bound_to_bundle_in_effective_record(
     )
 
     assert record["timing"] == {
-        "mode": "measured_profile",
+        "mode": "operator_attested_profile",
         "profile_sha256": profile.profile_sha256,
         "runtime_commit": profile.runtime_commit,
         "measured_dataset_size": 18,
@@ -840,7 +840,10 @@ def test_experimental_effective_record_rejects_unlabeled_static_timing(
     config_path = tmp_path / "static.yaml"
     config.write_config(cfg, str(config_path))
 
-    with pytest.raises(krea_runtime.KreaRuntimeContractError, match="measured timing"):
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError,
+        match="operator-attested timing",
+    ):
         krea_runtime.emit_effective_runtime_record(
             cfg,
             "krea2",
@@ -1171,6 +1174,14 @@ def test_integrated_fake_process_persists_first_and_terminal_observations(
     assert completion["artifact_checkpoint_step"] == planned
     assert completion["completed_steps"] == planned
     assert completion["scope_attempt_nonce"] == scope["attempt_nonce"]
+    terminal_stat = terminal_path.stat()
+    assert completion["artifact_file_identity"] == {
+        "device": terminal_stat.st_dev,
+        "inode": terminal_stat.st_ino,
+        "size": terminal_stat.st_size,
+        "mtime_ns": terminal_stat.st_mtime_ns,
+        "ctime_ns": terminal_stat.st_ctime_ns,
+    }
     assert env_marker.read_text(encoding="utf-8") == "1"
     assert meta_updates[-1] == {
         "krea_effective_runtime_record_sha256": record["record_sha256"]
