@@ -1,6 +1,7 @@
 FROM diagonalge/ai-toolkit:latest@sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8
 
 ENV AI_TOOLKIT_DIR=/app/ai-toolkit
+ENV FORGE_KREA_AI_TOOLKIT_DIR=/opt/sn56/krea-ai-toolkit
 ENV FORGE_TEMPLATES_DIR=/app/forge/templates
 
 # This is the exact 185-entry version/VCS metadata inventory observed in both
@@ -31,18 +32,24 @@ RUN retry_network() { \
             attempt=$((attempt + 1)); \
         done; \
     }; \
-    git remote set-url origin https://github.com/tuly1/sn56-ai-toolkit-mirror.git && \
-    retry_network git fetch origin c465e700019c4bcbac633c5fe279b2446e2e77a5 && \
-    git checkout c465e700019c4bcbac633c5fe279b2446e2e77a5 && \
-    test "$(git rev-parse HEAD)" = c465e700019c4bcbac633c5fe279b2446e2e77a5 && \
-    test -f sn56_krea_runtime_capabilities.json && \
-    python3 -c 'import hashlib,json,pathlib; p=pathlib.Path("sn56_krea_runtime_capabilities.json"); v={"schema":1,"runtime_repository":"https://github.com/tuly1/sn56-ai-toolkit-mirror.git","runtime_commit":"c465e700019c4bcbac633c5fe279b2446e2e77a5","capability_manifest_sha256":hashlib.sha256(p.read_bytes()).hexdigest()}; pathlib.Path(".sn56-runtime-identity.json").write_text(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")' && \
+    retry_network git fetch origin 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+    git checkout 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+    test "$(git rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
     retry_network pip install --no-cache-dir \
         --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
         --requirement requirements.txt && \
     retry_network pip install --no-cache-dir \
         torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-        --index-url https://download.pytorch.org/whl/cu124
+        --index-url https://download.pytorch.org/whl/cu124 && \
+    install -d -m 0755 /opt/sn56/krea-ai-toolkit && \
+    cd /opt/sn56/krea-ai-toolkit && \
+    git init && \
+    git remote add origin https://github.com/tuly1/sn56-ai-toolkit-mirror.git && \
+    retry_network git fetch --depth=1 origin 71e133b4e73a716d1094f22355a46be07953b828 && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = 71e133b4e73a716d1094f22355a46be07953b828 && \
+    test -f sn56_krea_runtime_capabilities.json && \
+    python3 -c 'import hashlib,json,pathlib; p=pathlib.Path("sn56_krea_runtime_capabilities.json"); v={"schema":1,"runtime_repository":"https://github.com/tuly1/sn56-ai-toolkit-mirror.git","runtime_commit":"71e133b4e73a716d1094f22355a46be07953b828","capability_manifest_sha256":hashlib.sha256(p.read_bytes()).hexdigest()}; pathlib.Path(".sn56-runtime-identity.json").write_text(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")'
 
 # ai-toolkit currently pins torchcodec 0.9.1, whose compiled extension targets
 # Torch 2.9.  G.O.D deliberately pins this image to Torch 2.6/cu124; the official
@@ -91,7 +98,9 @@ RUN retry_network() { \
         --requirement /opt/sn56/image-runtime-lock.txt && \
     python3 /opt/sn56/verify-image-runtime.py \
         --lock /opt/sn56/image-runtime-lock.txt \
-        --constraints /opt/sn56/image-runtime-phase1-constraints.txt
+        --constraints /opt/sn56/image-runtime-phase1-constraints.txt && \
+    test "$(git -C /app/ai-toolkit rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+    test "$(git -C /opt/sn56/krea-ai-toolkit rev-parse HEAD)" = 71e133b4e73a716d1094f22355a46be07953b828
 
 WORKDIR /app
 # Templates ship inside the package (forge/templates/*.yaml), so this one COPY

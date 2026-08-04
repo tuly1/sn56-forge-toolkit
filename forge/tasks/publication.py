@@ -9,8 +9,11 @@ for same-process calibration, preserves every model artifact byte-for-byte, and
 writes only the strict public flight-recorder projection into the upload root.
 
 Every operation is best effort and this module never raises into the trainer's
-never-forfeit exit path.  A failed archive is reported in private telemetry and
-the returned audit rather than being mistaken for a successful scrub.
+never-forfeit exit path.  This is an explicitly accepted fail-open tradeoff: a
+scrub failure can leave private sidecars in the recursive upload, but it cannot
+turn an otherwise valid model into a tournament forfeit.  A failed archive is
+reported in private telemetry and the returned audit rather than being mistaken
+for a successful scrub.
 """
 
 from __future__ import annotations
@@ -48,6 +51,8 @@ _PRIVATE_SIDECARS = (
     "forge_run.full.json",
 )
 _LAST_FILE = "last.safetensors"
+SCRUB_FAILURE_POLICY = "accepted-fail-open-never-forfeit"
+SCRUB_RESIDUAL_RISK = "private-sidecars-may-remain-after-terminal-scrub-failure"
 _UPLOADER_IGNORED_BASENAMES = frozenset(
     {
         "trainer_state.json",
@@ -75,8 +80,27 @@ def finalize_public_bundle(save_root: str) -> dict[str, Any]:
         "archived": [],
         "removed": [],
         "errors": [],
+        "scrub_failure_policy": {
+            "mode": SCRUB_FAILURE_POLICY,
+            "accepted_tradeoff": True,
+            "residual_risk": SCRUB_RESIDUAL_RISK,
+        },
     }
     try:
+        try:
+            telemetry.set_meta(
+                public_bundle_scrub_failure_policy=SCRUB_FAILURE_POLICY,
+                public_bundle_scrub_residual_risk=SCRUB_RESIDUAL_RISK,
+            )
+            telemetry.event(
+                "public_bundle_scrub_fail_open_policy_recorded",
+                policy=SCRUB_FAILURE_POLICY,
+                accepted_tradeoff=True,
+                residual_risk=SCRUB_RESIDUAL_RISK,
+            )
+        except BaseException:
+            # Policy telemetry is evidence only; never let it change the model.
+            pass
         root = os.path.abspath(save_root)
         if not os.path.isdir(root):
             result["errors"].append("upload_root_missing")

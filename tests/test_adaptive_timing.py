@@ -10,15 +10,20 @@ from forge import adaptive_timing, recipe
 BUNDLE_SHA = "a" * 64
 SOURCE_SHA = "b" * 64
 RUNTIME_COMMIT = "c" * 40
+DATASET_SIZE = 24
+DATASET_REGIME = "small-11-24"
+ACCELERATOR_IDENTITY = "NVIDIA H100 PCIe|81559-MiB"
 
 
 def _profile_document(**overrides):
     value = {
-        "schema": 1,
+        "schema": adaptive_timing.PROFILE_SCHEMA,
         "kind": adaptive_timing.PROFILE_KIND,
         "bundle_id": "leader-v1",
         "bundle_sha256": BUNDLE_SHA,
         "model_type": "krea2",
+        "measured_dataset_size": DATASET_SIZE,
+        "dataset_regime": DATASET_REGIME,
         "seconds_per_step": 1.3,
         "startup_seconds": 120.0,
         "measurement": {
@@ -32,7 +37,7 @@ def _profile_document(**overrides):
             "source_record_sha256": SOURCE_SHA,
             "runtime_commit": RUNTIME_COMMIT,
             "measured_at_utc": "2026-08-03T16:30:00Z",
-            "accelerator": "NVIDIA H100 PCIe",
+            "accelerator_identity": ACCELERATOR_IDENTITY,
         },
     }
     value.update(overrides)
@@ -54,6 +59,9 @@ def _load(path):
         expected_bundle_id="leader-v1",
         expected_bundle_sha256=BUNDLE_SHA,
         expected_model_type="krea2",
+        current_dataset_size=DATASET_SIZE,
+        expected_dataset_regime=DATASET_REGIME,
+        expected_accelerator_identity=ACCELERATOR_IDENTITY,
     )
 
 
@@ -64,6 +72,8 @@ def test_no_profile_preserves_incumbent_recipe_outputs(monkeypatch):
         bundle_id="incumbent-v1",
         bundle_sha256="d" * 64,
         model_type="krea2",
+        current_dataset_size=DATASET_SIZE,
+        dataset_regime=DATASET_REGIME,
         required=False,
     )
 
@@ -82,6 +92,8 @@ def test_experimental_bundle_requires_profile(monkeypatch):
             bundle_id="leader-v1",
             bundle_sha256=BUNDLE_SHA,
             model_type="krea2",
+            current_dataset_size=DATASET_SIZE,
+            dataset_regime=DATASET_REGIME,
             required=True,
         )
 
@@ -102,6 +114,21 @@ def test_valid_profile_is_bound_and_changes_only_explicit_recipe_call(tmp_path):
     assert measured == 1200
     assert profile.source_record_sha256 == SOURCE_SHA
     assert profile.runtime_commit == RUNTIME_COMMIT
+
+
+def test_profile_reuse_is_regime_bound_not_exact_pair_count(tmp_path):
+    profile = adaptive_timing.load_profile(
+        str(_write_profile(tmp_path)),
+        expected_bundle_id="leader-v1",
+        expected_bundle_sha256=BUNDLE_SHA,
+        expected_model_type="krea2",
+        current_dataset_size=18,
+        expected_dataset_regime=adaptive_timing.dataset_regime(18),
+        expected_accelerator_identity=ACCELERATOR_IDENTITY,
+    )
+
+    assert profile.measured_dataset_size == 24
+    assert profile.dataset_regime == adaptive_timing.dataset_regime(18)
 
 
 def test_explicit_recipe_profile_fails_closed_on_wrong_contract(tmp_path):
@@ -126,15 +153,33 @@ def test_explicit_recipe_profile_fails_closed_on_wrong_contract(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("expected_bundle", "expected_sha", "expected_model", "message"),
+    (
+        "expected_bundle",
+        "expected_sha",
+        "expected_model",
+        "expected_size",
+        "expected_regime",
+        "expected_accelerator",
+        "message",
+    ),
     [
-        ("mae-g3-v1", BUNDLE_SHA, "krea2", "bundle id mismatch"),
-        ("leader-v1", "d" * 64, "krea2", "bundle digest mismatch"),
-        ("leader-v1", BUNDLE_SHA, "ideogram4", "model type mismatch"),
+        ("mae-g3-v1", BUNDLE_SHA, "krea2", DATASET_SIZE, DATASET_REGIME, ACCELERATOR_IDENTITY, "bundle id mismatch"),
+        ("leader-v1", "d" * 64, "krea2", DATASET_SIZE, DATASET_REGIME, ACCELERATOR_IDENTITY, "bundle digest mismatch"),
+        ("leader-v1", BUNDLE_SHA, "ideogram4", DATASET_SIZE, DATASET_REGIME, ACCELERATOR_IDENTITY, "model type mismatch"),
+        ("leader-v1", BUNDLE_SHA, "krea2", 25, "medium-25-50", ACCELERATOR_IDENTITY, "dataset regime mismatch"),
+        ("leader-v1", BUNDLE_SHA, "krea2", DATASET_SIZE, "medium-25-50", ACCELERATOR_IDENTITY, "current dataset regime is inconsistent"),
+        ("leader-v1", BUNDLE_SHA, "krea2", DATASET_SIZE, DATASET_REGIME, "NVIDIA H100 SXM|81559-MiB", "accelerator identity mismatch"),
     ],
 )
 def test_profile_rejects_cross_bundle_or_model_reuse(
-    tmp_path, expected_bundle, expected_sha, expected_model, message
+    tmp_path,
+    expected_bundle,
+    expected_sha,
+    expected_model,
+    expected_size,
+    expected_regime,
+    expected_accelerator,
+    message,
 ):
     path = _write_profile(tmp_path)
 
@@ -144,6 +189,9 @@ def test_profile_rejects_cross_bundle_or_model_reuse(
             expected_bundle_id=expected_bundle,
             expected_bundle_sha256=expected_sha,
             expected_model_type=expected_model,
+            current_dataset_size=expected_size,
+            expected_dataset_regime=expected_regime,
+            expected_accelerator_identity=expected_accelerator,
         )
 
 
@@ -257,3 +305,24 @@ def test_first_checkpoint_rejects_impossible_observation(tmp_path):
             export_reserve_s=180.0,
             safety=0.85,
         )
+
+
+def test_bootstrap_first_checkpoint_emits_raw_persistable_evidence():
+    events = []
+
+    observation = adaptive_timing.emit_bootstrap_first_checkpoint_observation(
+        bundle_id="leader-v1",
+        checkpoint_step=200,
+        elapsed_since_launch_s=341.25,
+        active_planned_steps=1000,
+        event_sink=lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert observation.observation_mode == "bootstrap_raw_first_checkpoint"
+    assert observation.telemetry_fields()["timing_profile_sha256"] is None
+    assert events == [
+        (
+            adaptive_timing.FIRST_CHECKPOINT_EVENT,
+            observation.telemetry_fields(),
+        )
+    ]

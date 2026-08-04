@@ -1,0 +1,37 @@
+name: SN56 Lane A CPU conformance
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - codex/week6-krea-runtime-conformance
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  forge-contract:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+      - name: Run Forge contract suite
+        run: python -m pytest -q
+      - name: Compile changed Forge surfaces
+        run: |
+          python -m py_compile \
+            forge/adaptive_timing.py \
+            forge/krea_runtime.py \
+            forge/tasks/aitoolkit.py \
+            forge/tasks/publication.py

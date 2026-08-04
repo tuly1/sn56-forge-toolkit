@@ -1,11 +1,13 @@
 """Fail-closed Week-6 Krea runtime bundles and effective-runtime records.
 
-The public August-3 leader config contains several keys that the incumbent
+The public August-3 rank-1 config contains several keys that the incumbent
 ai-toolkit silently ignores.  Copying that YAML onto the incumbent runtime
-would therefore run a different experiment while claiming the leader recipe.
-This module keeps the deployed ``incumbent-v1`` path byte-equivalent and makes
-every experimental bundle conditional on a capability manifest produced by the
-owned, conformance-tested runtime fork.
+would therefore run a different experiment while claiming byte equivalence.
+The stable ``leader-*`` identifiers below are compatibility IDs for
+source-derived candidates, not claims that Forge reproduced every public byte.
+This module keeps the deployed ``incumbent-v1`` runtime isolated and makes every
+experimental bundle conditional on a capability manifest produced by the
+owned, conformance-tested Krea-only runtime fork.
 
 Nothing in this module selects a production winner.  ``leader-v1``,
 ``leader-comfy-te-v1``, and ``mae-g3-v1`` are calibration candidates only; the
@@ -31,6 +33,8 @@ BUNDLE_ENV = "FORGE_KREA_BUNDLE"
 CAPABILITY_MANIFEST_ENV = "FORGE_KREA_CAPABILITY_MANIFEST"
 RUNTIME_IDENTITY_ENV = "FORGE_KREA_RUNTIME_IDENTITY"
 TIMING_PROBE_ENV = "FORGE_KREA_TIMING_PROBE"
+INCUMBENT_RUNTIME_DIR_ENV = "AI_TOOLKIT_DIR"
+OWNED_KREA_RUNTIME_DIR_ENV = "FORGE_KREA_AI_TOOLKIT_DIR"
 INCUMBENT_BUNDLE = "incumbent-v1"
 LEADER_BUNDLE = "leader-v1"
 LEADER_COMFY_TE_BUNDLE = "leader-comfy-te-v1"
@@ -46,10 +50,53 @@ KNOWN_BUNDLES = frozenset(
 
 RUNTIME_CONTRACT_ID = "sn56-krea-runtime-v1"
 PINNED_BASE_COMMIT = "99be3d96a2468d3a5228a4eb05ba67e63c586b4e"
-OWNED_RUNTIME_COMMIT = "c465e700019c4bcbac633c5fe279b2446e2e77a5"
+OWNED_RUNTIME_COMMIT = "71e133b4e73a716d1094f22355a46be07953b828"
 OWNED_RUNTIME_REPOSITORY = "https://github.com/tuly1/sn56-ai-toolkit-mirror.git"
-DEFAULT_CAPABILITY_MANIFEST = "/app/ai-toolkit/sn56_krea_runtime_capabilities.json"
-DEFAULT_RUNTIME_IDENTITY = "/app/ai-toolkit/.sn56-runtime-identity.json"
+INCUMBENT_RUNTIME_REPOSITORY = "https://github.com/ostris/ai-toolkit.git"
+DEFAULT_INCUMBENT_RUNTIME_DIR = "/app/ai-toolkit"
+DEFAULT_OWNED_KREA_RUNTIME_DIR = "/opt/sn56/krea-ai-toolkit"
+DEFAULT_CAPABILITY_MANIFEST = (
+    DEFAULT_OWNED_KREA_RUNTIME_DIR + "/sn56_krea_runtime_capabilities.json"
+)
+DEFAULT_RUNTIME_IDENTITY = (
+    DEFAULT_OWNED_KREA_RUNTIME_DIR + "/.sn56-runtime-identity.json"
+)
+
+PUBLIC_RANK1_CONFIG_SHA256 = (
+    "50fe6eec02281d0e8acf0ea7d3d3b15b3b320a1ad0b6b6d450e17930dbd5dc1c"
+)
+PUBLIC_RANK3_CONFIG_SHA256 = (
+    "eceb74aef768cb1cd62212abd4e05c6fd012da6bfb866106ea75f1af66e72307"
+)
+
+_BUNDLE_CLAIMS = {
+    INCUMBENT_BUNDLE: {
+        "classification": "incumbent-production-control",
+        "source_relationship": "deployed-config-and-runtime-control",
+        "source_config_sha256": None,
+        "byte_equivalent_to_source_config": True,
+    },
+    LEADER_BUNDLE: {
+        "classification": "source-derived-public-rank1-positive-control",
+        "source_relationship": "selected-fields-derived-from-public-config",
+        "source_config_sha256": PUBLIC_RANK1_CONFIG_SHA256,
+        "byte_equivalent_to_source_config": False,
+    },
+    LEADER_COMFY_TE_BUNDLE: {
+        "classification": "source-derived-rank1-plus-export-hypothesis",
+        "source_relationship": (
+            "selected-fields-derived-from-public-config-plus-owned-export-extension"
+        ),
+        "source_config_sha256": PUBLIC_RANK1_CONFIG_SHA256,
+        "byte_equivalent_to_source_config": False,
+    },
+    MAE_BUNDLE: {
+        "classification": "source-derived-public-rank3-positive-control",
+        "source_relationship": "selected-fields-derived-from-public-config",
+        "source_config_sha256": PUBLIC_RANK3_CONFIG_SHA256,
+        "byte_equivalent_to_source_config": False,
+    },
+}
 
 # One named assertion per silent-runtime failure found in the Week-6 audit.
 REQUIRED_CAPABILITIES = (
@@ -88,6 +135,55 @@ def requested_bundle(model_type: str, environ: dict[str, str] | None = None) -> 
     return value
 
 
+def runtime_directory(
+    model_type: str,
+    bundle: str | None = None,
+    *,
+    environ: dict[str, str] | None = None,
+) -> str:
+    """Select the owned fork only for an explicit experimental Krea bundle."""
+
+    env = os.environ if environ is None else environ
+    resolved = requested_bundle(model_type, env) if bundle is None else bundle
+    if resolved not in KNOWN_BUNDLES:
+        raise KreaRuntimeContractError(f"unknown Krea bundle: {resolved!r}")
+    is_experimental_krea = (
+        (model_type or "").strip().lower() == "krea2"
+        and resolved != INCUMBENT_BUNDLE
+    )
+    if is_experimental_krea:
+        return str(
+            env.get(OWNED_KREA_RUNTIME_DIR_ENV, DEFAULT_OWNED_KREA_RUNTIME_DIR)
+        )
+    return str(
+        env.get(INCUMBENT_RUNTIME_DIR_ENV, DEFAULT_INCUMBENT_RUNTIME_DIR)
+    )
+
+
+def runtime_commit_for_bundle(bundle: str) -> str:
+    if bundle not in KNOWN_BUNDLES:
+        raise KreaRuntimeContractError(f"unknown Krea bundle: {bundle!r}")
+    return PINNED_BASE_COMMIT if bundle == INCUMBENT_BUNDLE else OWNED_RUNTIME_COMMIT
+
+
+def runtime_repository_for_bundle(bundle: str) -> str:
+    if bundle not in KNOWN_BUNDLES:
+        raise KreaRuntimeContractError(f"unknown Krea bundle: {bundle!r}")
+    return (
+        INCUMBENT_RUNTIME_REPOSITORY
+        if bundle == INCUMBENT_BUNDLE
+        else OWNED_RUNTIME_REPOSITORY
+    )
+
+
+def bundle_claim_document(bundle: str) -> dict[str, Any]:
+    """Return an honest source relationship while preserving stable bundle IDs."""
+
+    if bundle not in KNOWN_BUNDLES:
+        raise KreaRuntimeContractError(f"unknown Krea bundle: {bundle!r}")
+    return copy.deepcopy(_BUNDLE_CLAIMS[bundle])
+
+
 def timing_probe_enabled(environ: dict[str, str] | None = None) -> bool:
     """Allow one explicitly labeled bootstrap run before a profile exists."""
     env = os.environ if environ is None else environ
@@ -119,7 +215,7 @@ def apply(
     require_capabilities(manifest, _BUNDLE_CAPABILITIES[bundle])
     candidate = copy.deepcopy(cfg)
     if bundle in {LEADER_BUNDLE, LEADER_COMFY_TE_BUNDLE}:
-        _apply_leader(candidate)
+        _apply_source_derived_rank1(candidate)
         if bundle == LEADER_COMFY_TE_BUNDLE:
             candidate["config"]["process"][0]["train"][
                 "sn56_krea_comfy_text_encoder_export"
@@ -231,12 +327,13 @@ def bundle_contract_document(bundle: str) -> dict[str, Any]:
     if bundle not in KNOWN_BUNDLES:
         raise KreaRuntimeContractError(f"unknown Krea bundle: {bundle!r}")
     return {
-        "schema": 1,
+        "schema": 2,
         "runtime_contract_id": RUNTIME_CONTRACT_ID,
         "bundle": bundle,
+        "claim": bundle_claim_document(bundle),
         "base_commit": PINNED_BASE_COMMIT,
-        "runtime_repository": OWNED_RUNTIME_REPOSITORY,
-        "runtime_commit": OWNED_RUNTIME_COMMIT,
+        "runtime_repository": runtime_repository_for_bundle(bundle),
+        "runtime_commit": runtime_commit_for_bundle(bundle),
         "required_capabilities": list(_BUNDLE_CAPABILITIES.get(bundle, ())),
         "normalized_config_projection": _reference_bundle_projection(bundle),
     }
@@ -269,6 +366,8 @@ def emit_effective_runtime_record(
     *,
     throughput_profile=None,
     timing_probe: bool = False,
+    current_dataset_size: int | None = None,
+    current_accelerator_identity: str | None = None,
     environ: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Atomically emit the exact effective training contract beside config YAML.
@@ -292,28 +391,60 @@ def emit_effective_runtime_record(
         )
     timing: dict[str, Any]
     if throughput_profile is not None:
-        from forge.adaptive_timing import ThroughputProfile
+        from forge.adaptive_timing import ThroughputProfile, dataset_regime
 
         if not isinstance(throughput_profile, ThroughputProfile):
             raise KreaRuntimeContractError("invalid measured timing profile")
         expected_digest = bundle_contract_sha256(bundle)
+        expected_runtime_commit = runtime_commit_for_bundle(bundle)
         if (
             throughput_profile.bundle_id != bundle
             or throughput_profile.bundle_sha256 != expected_digest
             or throughput_profile.model_type != "krea2"
-            or throughput_profile.runtime_commit != OWNED_RUNTIME_COMMIT
+            or throughput_profile.runtime_commit != expected_runtime_commit
         ):
             raise KreaRuntimeContractError("measured timing profile binding drifted")
+        if (
+            isinstance(current_dataset_size, bool)
+            or not isinstance(current_dataset_size, int)
+            or current_dataset_size <= 0
+            or dataset_regime(current_dataset_size)
+            != throughput_profile.dataset_regime
+        ):
+            raise KreaRuntimeContractError(
+                "measured timing profile dataset regime drifted"
+            )
         timing = {
             "mode": "measured_profile",
             "profile_sha256": throughput_profile.profile_sha256,
             "runtime_commit": throughput_profile.runtime_commit,
+            "measured_dataset_size": throughput_profile.measured_dataset_size,
+            "current_dataset_size": current_dataset_size,
+            "dataset_regime": throughput_profile.dataset_regime,
+            "accelerator_identity": throughput_profile.accelerator_identity,
         }
     elif timing_probe:
+        from forge.adaptive_timing import dataset_regime
+
+        if (
+            isinstance(current_dataset_size, bool)
+            or not isinstance(current_dataset_size, int)
+            or current_dataset_size <= 0
+            or not isinstance(current_accelerator_identity, str)
+            or not current_accelerator_identity.strip()
+            or len(current_accelerator_identity) > 256
+        ):
+            raise KreaRuntimeContractError(
+                "bootstrap timing run identity is incomplete"
+            )
         timing = {
             "mode": "bootstrap_probe_unmeasured",
             "profile_sha256": None,
-            "runtime_commit": OWNED_RUNTIME_COMMIT,
+            "runtime_commit": runtime_commit_for_bundle(bundle),
+            "measured_dataset_size": None,
+            "current_dataset_size": current_dataset_size,
+            "dataset_regime": dataset_regime(current_dataset_size),
+            "accelerator_identity": current_accelerator_identity.strip(),
         }
     else:
         timing = {
@@ -323,7 +454,9 @@ def emit_effective_runtime_record(
         }
     try:
         config_sha = _sha256_file(config_path)
-        manifest_sha = _canonical_sha256(manifest) if manifest is not None else None
+        manifest_file_sha, manifest_semantic_sha = _capability_manifest_hashes(
+            manifest, environ=environ
+        )
     except Exception as exc:
         if bundle != INCUMBENT_BUNDLE:
             raise KreaRuntimeContractError(
@@ -334,16 +467,18 @@ def emit_effective_runtime_record(
             bundle=bundle,
             error_type=type(exc).__name__,
         )
-        return {"schema": 1, "bundle": bundle, "emission_failed": True}
+        return {"schema": 2, "bundle": bundle, "emission_failed": True}
     record: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "runtime_contract_id": RUNTIME_CONTRACT_ID,
-        "runtime_repository": OWNED_RUNTIME_REPOSITORY,
-        "runtime_commit": OWNED_RUNTIME_COMMIT,
+        "runtime_repository": runtime_repository_for_bundle(bundle),
+        "runtime_commit": runtime_commit_for_bundle(bundle),
         "bundle": bundle,
+        "bundle_claim": bundle_claim_document(bundle),
         "bundle_contract_sha256": bundle_contract_sha256(bundle),
         "generated_config_sha256": config_sha,
-        "capability_manifest_sha256": manifest_sha,
+        "capability_manifest_file_sha256": manifest_file_sha,
+        "capability_manifest_semantic_sha256": manifest_semantic_sha,
         "capabilities": (
             sorted(name for name, value in manifest["capabilities"].items() if value)
             if manifest is not None
@@ -374,7 +509,8 @@ def emit_effective_runtime_record(
         bundle=bundle,
         record_sha256=record_sha,
         generated_config_sha256=config_sha,
-        capability_manifest_sha256=manifest_sha,
+        capability_manifest_file_sha256=manifest_file_sha,
+        capability_manifest_semantic_sha256=manifest_semantic_sha,
     )
     telemetry.set_meta(
         krea_bundle=bundle,
@@ -383,7 +519,7 @@ def emit_effective_runtime_record(
     return record
 
 
-def _apply_leader(cfg: dict[str, Any]) -> None:
+def _apply_source_derived_rank1(cfg: dict[str, Any]) -> None:
     p = _process(cfg)
     dataset = p["datasets"][0]
     dataset["cache_latents_to_disk"] = True
@@ -569,7 +705,7 @@ def _reference_bundle_projection(bundle: str) -> dict[str, Any]:
         p["train"]["steps"] = 1234
         p["save"]["save_every"] = 247
         if bundle in {LEADER_BUNDLE, LEADER_COMFY_TE_BUNDLE}:
-            _apply_leader(cfg)
+            _apply_source_derived_rank1(cfg)
             if bundle == LEADER_COMFY_TE_BUNDLE:
                 p["train"]["sn56_krea_comfy_text_encoder_export"] = True
         elif bundle == MAE_BUNDLE:
@@ -631,6 +767,26 @@ def _canonical_bytes(value: Any) -> bytes:
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         + "\n"
     ).encode("utf-8")
+
+
+def _capability_manifest_hashes(
+    manifest: dict[str, Any] | None,
+    *,
+    environ: dict[str, str] | None = None,
+) -> tuple[str | None, str | None]:
+    """Return explicit file-byte and canonical-semantic manifest digests."""
+
+    if manifest is None:
+        return None, None
+    env = os.environ if environ is None else environ
+    path = env.get(CAPABILITY_MANIFEST_ENV, DEFAULT_CAPABILITY_MANIFEST)
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if json.loads(raw.decode("utf-8")) != manifest:
+        raise KreaRuntimeContractError(
+            "capability manifest object differs from its recorded file bytes"
+        )
+    return hashlib.sha256(raw).hexdigest(), _canonical_sha256(manifest)
 
 
 def _canonical_sha256(value: Any) -> str:
