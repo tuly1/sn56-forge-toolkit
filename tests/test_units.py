@@ -105,6 +105,33 @@ def test_toolkit_log_parser_preserves_exponent_and_terminal_step(tmp_path):
     assert step == 36
 
 
+def test_toolkit_log_parser_never_promotes_an_early_final_save(tmp_path):
+    log = tmp_path / "early-final.log"
+    log.write_text(
+        "krea: 10%|#| 100/1000 [loss: 1.0e-01]\n"
+        "Saved checkpoint to /outputs/final.safetensors\n",
+        encoding="utf-8",
+    )
+
+    loss, step = aitoolkit._parse_toolkit_log(str(log))
+
+    assert loss == pytest.approx(0.1)
+    assert step == 100
+
+
+def test_toolkit_log_parser_requires_terminal_save_after_last_progress(tmp_path):
+    log = tmp_path / "out-of-order-final.log"
+    log.write_text(
+        "Saved checkpoint to /outputs/final.safetensors\n"
+        "krea: 99%|#########9| 999/1000 [loss: 1.0e-01]\n",
+        encoding="utf-8",
+    )
+
+    _loss, step = aitoolkit._parse_toolkit_log(str(log))
+
+    assert step == 999
+
+
 def test_schema_model_type_normalized():
     s = _spec(model_type="  FLUX ")
     assert s.model_type == "flux"

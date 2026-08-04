@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from forge import adaptive_timing, recipe
+from forge import adaptive_timing, krea_runtime, recipe
 
 
 BUNDLE_SHA = "a" * 64
@@ -13,6 +15,91 @@ RUNTIME_COMMIT = "c" * 40
 DATASET_SIZE = 24
 DATASET_REGIME = "small-11-24"
 ACCELERATOR_IDENTITY = "NVIDIA H100 PCIe|81559-MiB"
+SOURCE_RUN_ID = "week6-timing-probe:" + "a" * 32
+
+
+def _nvidia_runner(identity: str = ACCELERATOR_IDENTITY):
+    name, memory = identity.split("|", 1)
+    memory = memory.removesuffix("-MiB")
+
+    def run(*_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=f"{name}, {memory}\n",
+            stderr="",
+        )
+
+    return run
+
+
+def _write_source_record(
+    tmp_path, *, bundle=krea_runtime.LEADER_BUNDLE, **overrides
+):
+    record = {
+        "schema": 3,
+        "runtime_contract_id": krea_runtime.RUNTIME_CONTRACT_ID,
+        "source_run_id": SOURCE_RUN_ID,
+        "model_type": "krea2",
+        "runtime_repository": krea_runtime.OWNED_RUNTIME_REPOSITORY,
+        "runtime_commit": krea_runtime.OWNED_RUNTIME_COMMIT,
+        "bundle": bundle,
+        "bundle_claim": krea_runtime.bundle_claim_document(bundle),
+        "bundle_contract_sha256": krea_runtime.bundle_contract_sha256(bundle),
+        "generated_config_sha256": "d" * 64,
+        "capability_manifest_file_sha256": "e" * 64,
+        "capability_manifest_semantic_sha256": "f" * 64,
+        "capabilities": sorted(krea_runtime.REQUIRED_CAPABILITIES),
+        "runtime_manifest_capability_aliases": krea_runtime.bundle_contract_document(
+            bundle
+        )["runtime_manifest_capability_aliases"],
+        "timing": {
+            "mode": "bootstrap_probe_unmeasured",
+            "profile_sha256": None,
+            "runtime_commit": krea_runtime.OWNED_RUNTIME_COMMIT,
+            "measured_dataset_size": None,
+            "current_dataset_size": 24,
+            "dataset_regime": "small-11-24",
+            "accelerator_identity": ACCELERATOR_IDENTITY,
+        },
+        "effective": {
+            "planned_steps": 1000,
+            "normalized_config_projection": krea_runtime.bundle_contract_document(
+                bundle
+            )["normalized_config_projection"],
+        },
+        "first_checkpoint_observation": {
+            "bundle_id": bundle,
+            "timing_profile_sha256": None,
+            "observation_mode": "bootstrap_raw_first_checkpoint",
+            "checkpoint_step": 200,
+            "elapsed_since_launch_s": 300.0,
+            "active_planned_steps": 1000,
+            "active_plan_mutable": False,
+            "active_plan_action": "observe_only_fixed_subprocess",
+        },
+        "training_completion_observation": {
+            "reported_last_step": 1000,
+            "training_elapsed_seconds": 1500.0,
+            "returncode": 0,
+            "stopped_by_deadline": False,
+            "natural_completion": True,
+        },
+    }
+    for key, value in overrides.items():
+        if "." in key:
+            section, field = key.split(".", 1)
+            record[section][field] = value
+        else:
+            record[key] = value
+    record["record_sha256"] = adaptive_timing._runtime_record_semantic_sha256(
+        record
+    )
+    path = tmp_path / f"{bundle}.probe.effective-runtime.json"
+    path.write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _profile_document(**overrides):
@@ -33,7 +120,7 @@ def _profile_document(**overrides):
             "first_checkpoint_elapsed_seconds": 345.0,
         },
         "provenance": {
-            "source_run_id": "week5-r1-krea-task",
+            "source_run_id": SOURCE_RUN_ID,
             "source_record_sha256": SOURCE_SHA,
             "runtime_commit": RUNTIME_COMMIT,
             "measured_at_utc": "2026-08-03T16:30:00Z",
@@ -41,7 +128,7 @@ def _profile_document(**overrides):
         },
     }
     value.update(overrides)
-    return adaptive_timing.seal_profile_document(value)
+    return adaptive_timing._seal_profile_document(value)
 
 
 def _write_profile(tmp_path, **overrides):
@@ -95,6 +182,141 @@ def test_experimental_bundle_requires_profile(monkeypatch):
             current_dataset_size=DATASET_SIZE,
             dataset_regime=DATASET_REGIME,
             required=True,
+        )
+
+
+def test_profile_producer_hashes_and_crosschecks_raw_completed_run(tmp_path):
+    source = _write_source_record(tmp_path)
+
+    document = adaptive_timing.produce_profile_document(
+        str(source),
+        source_run_id=SOURCE_RUN_ID,
+        bundle_id=krea_runtime.LEADER_BUNDLE,
+        model_type="krea2",
+        measured_dataset_size=24,
+        measured_at_utc="2026-08-04T18:00:00Z",
+        runner=_nvidia_runner(),
+    )
+    profile_path = tmp_path / "produced-profile.json"
+    profile_path.write_text(json.dumps(document), encoding="utf-8")
+    profile = adaptive_timing.load_profile(
+        str(profile_path),
+        expected_bundle_id=krea_runtime.LEADER_BUNDLE,
+        expected_bundle_sha256=krea_runtime.bundle_contract_sha256(
+            krea_runtime.LEADER_BUNDLE
+        ),
+        expected_model_type="krea2",
+        current_dataset_size=24,
+        expected_dataset_regime="small-11-24",
+        expected_accelerator_identity=ACCELERATOR_IDENTITY,
+    )
+
+    assert profile.source_record_sha256 == hashlib.sha256(
+        source.read_bytes()
+    ).hexdigest()
+    assert profile.source_run_id == SOURCE_RUN_ID
+    assert profile.completed_steps == 1000
+    assert profile.first_checkpoint_step == 200
+    assert profile.seconds_per_step == pytest.approx(1.5)
+    assert profile.startup_seconds == 0.0
+
+
+def test_profile_producer_accepts_mae_bundle_capability_subset(tmp_path):
+    source = _write_source_record(
+        tmp_path, bundle=krea_runtime.MAE_BUNDLE
+    )
+
+    document = adaptive_timing.produce_profile_document(
+        str(source),
+        source_run_id=SOURCE_RUN_ID,
+        bundle_id=krea_runtime.MAE_BUNDLE,
+        model_type="krea2",
+        measured_dataset_size=24,
+        measured_at_utc="2026-08-04T18:00:00Z",
+        runner=_nvidia_runner(),
+    )
+
+    assert document["bundle_id"] == krea_runtime.MAE_BUNDLE
+    assert document["provenance"]["runtime_commit"] == (
+        krea_runtime.OWNED_RUNTIME_COMMIT
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "kwargs", "message"),
+    [
+        (
+            {"source_run_id": "another-run:" + "b" * 32},
+            {},
+            "run id mismatch",
+        ),
+        (
+            {"timing.current_dataset_size": 25},
+            {},
+            "timing identity mismatch",
+        ),
+        (
+            {"first_checkpoint_observation.checkpoint_step": 1001},
+            {},
+            "first-checkpoint observation mismatch",
+        ),
+        (
+            {"training_completion_observation.natural_completion": False},
+            {},
+            "did not complete naturally",
+        ),
+        (
+            {"timing.accelerator_identity": "NVIDIA H100 SXM|81559-MiB"},
+            {},
+            "timing identity mismatch",
+        ),
+    ],
+)
+def test_profile_producer_rejects_cross_record_provenance(
+    tmp_path, overrides, kwargs, message
+):
+    source = _write_source_record(tmp_path, **overrides)
+
+    with pytest.raises(adaptive_timing.TimingProfileError, match=message):
+        adaptive_timing.produce_profile_document(
+            str(source),
+            source_run_id=SOURCE_RUN_ID,
+            bundle_id=krea_runtime.LEADER_BUNDLE,
+            model_type="krea2",
+            measured_dataset_size=24,
+            measured_at_utc="2026-08-04T18:00:00Z",
+            runner=_nvidia_runner(),
+            **kwargs,
+        )
+
+
+def test_accelerator_environment_cannot_override_live_observation(monkeypatch):
+    monkeypatch.setenv(
+        "FORGE_KREA_ACCELERATOR_IDENTITY", "spoofed-gpu|1-MiB"
+    )
+
+    assert adaptive_timing.current_accelerator_identity(
+        runner=_nvidia_runner()
+    ) == ACCELERATOR_IDENTITY
+
+
+def test_profile_producer_rejects_source_record_symlink(tmp_path):
+    source = _write_source_record(tmp_path)
+    link = tmp_path / "source-record-link.json"
+    link.symlink_to(source)
+
+    with pytest.raises(
+        adaptive_timing.TimingProfileError,
+        match="source runtime record unavailable",
+    ):
+        adaptive_timing.produce_profile_document(
+            str(link),
+            source_run_id=SOURCE_RUN_ID,
+            bundle_id=krea_runtime.LEADER_BUNDLE,
+            model_type="krea2",
+            measured_dataset_size=24,
+            measured_at_utc="2026-08-04T18:00:00Z",
+            runner=_nvidia_runner(),
         )
 
 
@@ -205,7 +427,7 @@ def test_profile_rejects_tampering_and_unknown_fields(tmp_path):
 
     value = _profile_document()
     value["provenance"]["unreviewed_note"] = "not in schema"
-    path.write_text(json.dumps(adaptive_timing.seal_profile_document(value)))
+    path.write_text(json.dumps(adaptive_timing._seal_profile_document(value)))
     with pytest.raises(adaptive_timing.TimingProfileError, match="fields differ"):
         _load(path)
 

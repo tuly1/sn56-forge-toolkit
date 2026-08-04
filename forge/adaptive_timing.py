@@ -28,14 +28,15 @@ from typing import Any, Callable, Mapping
 
 
 PROFILE_ENV = "FORGE_KREA_THROUGHPUT_PROFILE"
-ACCELERATOR_IDENTITY_ENV = "FORGE_KREA_ACCELERATOR_IDENTITY"
 PROFILE_KIND = "forge-measured-throughput-profile"
-PROFILE_SCHEMA = 2
+PROFILE_SCHEMA = 3
 FIRST_CHECKPOINT_EVENT = "first_checkpoint_timing_observed"
 _MAX_PROFILE_BYTES = 64 * 1024
+_MAX_SOURCE_RECORD_BYTES = 1024 * 1024
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _BUNDLE_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_SOURCE_RUN_ID_RE = re.compile(r".+:[0-9a-f]{32}")
 
 _PROFILE_FIELDS = {
     "schema",
@@ -64,6 +65,57 @@ _PROVENANCE_FIELDS = {
     "measured_at_utc",
     "accelerator_identity",
 }
+_SOURCE_RECORD_FIELDS = {
+    "schema",
+    "runtime_contract_id",
+    "source_run_id",
+    "model_type",
+    "runtime_repository",
+    "runtime_commit",
+    "bundle",
+    "bundle_claim",
+    "bundle_contract_sha256",
+    "generated_config_sha256",
+    "capability_manifest_file_sha256",
+    "capability_manifest_semantic_sha256",
+    "capabilities",
+    "runtime_manifest_capability_aliases",
+    "timing",
+    "effective",
+    "first_checkpoint_observation",
+    "training_completion_observation",
+    "record_sha256",
+}
+_PROBE_TIMING_FIELDS = {
+    "mode",
+    "profile_sha256",
+    "runtime_commit",
+    "measured_dataset_size",
+    "current_dataset_size",
+    "dataset_regime",
+    "accelerator_identity",
+}
+_FIRST_OBSERVATION_FIELDS = {
+    "bundle_id",
+    "timing_profile_sha256",
+    "observation_mode",
+    "checkpoint_step",
+    "elapsed_since_launch_s",
+    "active_planned_steps",
+    "active_plan_mutable",
+    "active_plan_action",
+}
+_COMPLETION_OBSERVATION_FIELDS = {
+    "reported_last_step",
+    "training_elapsed_seconds",
+    "returncode",
+    "stopped_by_deadline",
+    "natural_completion",
+}
+_SOURCE_EFFECTIVE_FIELDS = {
+    "planned_steps",
+    "normalized_config_projection",
+}
 
 
 class TimingProfileError(RuntimeError):
@@ -75,8 +127,9 @@ class ThroughputProfile:
     """A validated measurement for one exact experimental bundle.
 
     ``training_elapsed_seconds`` and ``first_checkpoint_elapsed_seconds`` are
-    measured from subprocess launch.  ``startup_seconds`` is the measured
-    pre-optimizer portion.  The declared rate must equal
+    measured from subprocess launch.  Schema 3 conservatively includes startup
+    in the rate and therefore records ``startup_seconds`` as zero. The declared
+    rate must equal
     ``(training_elapsed_seconds - startup_seconds) / completed_steps`` within
     two percent, so a self-consistent JSON hash cannot turn a guess into a
     claimed measurement.
@@ -188,8 +241,8 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def seal_profile_document(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a copy with its canonical, self-binding profile digest."""
+def _seal_profile_document(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Seal a profile already derived from verified raw evidence."""
 
     document = dict(value)
     document.pop("profile_sha256", None)
@@ -217,15 +270,12 @@ def current_accelerator_identity(
 ) -> str:
     """Return a portable GPU-class identity or fail before profile reuse.
 
-    The explicit environment value is intended for a measured harness.  The
-    live fallback binds model name and total memory while deliberately omitting
-    per-device UUID, allowing the same measured profile on an equivalent card.
+    Model name and total memory are read from the device while deliberately
+    omitting per-device UUID, allowing reuse on an equivalent card. Environment
+    variables are not an identity source and cannot override this observation.
     """
 
-    env = os.environ if environ is None else environ
-    explicit = str(env.get(ACCELERATOR_IDENTITY_ENV, "")).strip()
-    if explicit:
-        return _text(explicit, "accelerator identity", maximum=256)
+    del environ
     try:
         completed = runner(
             [
@@ -253,6 +303,202 @@ def current_accelerator_identity(
         raise TimingProfileError(
             "current accelerator identity could not be established"
         ) from exc
+
+
+def produce_profile_document(
+    source_record_path: str,
+    *,
+    source_run_id: str,
+    bundle_id: str,
+    model_type: str,
+    measured_dataset_size: int,
+    measured_at_utc: str | None = None,
+    runner: Callable[..., Any] = subprocess.run,
+) -> dict[str, Any]:
+    """Derive a timing profile from one completed raw runtime record.
+
+    The producer—not the operator—derives the recipe/runtime digests, observes
+    the accelerator, hashes the source bytes, and cross-checks the declared run,
+    dataset, first durable checkpoint, and natural terminal observation.  A
+    plausible-looking JSON document without those source observations cannot
+    become a schema-3 profile.
+    """
+
+    from forge import krea_runtime
+
+    expected_run_id = _source_run_id(source_run_id)
+    expected_bundle = _bundle_id(bundle_id)
+    expected_model = _text(model_type, "model type", maximum=64).lower()
+    expected_size = _positive_int(measured_dataset_size, "measured dataset size")
+    expected_regime = dataset_regime(expected_size)
+    expected_bundle_sha = krea_runtime.bundle_contract_sha256(expected_bundle)
+    expected_runtime_commit = krea_runtime.runtime_commit_for_bundle(
+        expected_bundle
+    )
+    expected_runtime_repository = krea_runtime.runtime_repository_for_bundle(
+        expected_bundle
+    )
+    accelerator_identity = current_accelerator_identity(runner=runner)
+    raw, record = _read_source_record(source_record_path)
+    document = _exact_object(record, _SOURCE_RECORD_FIELDS, "source runtime record")
+    if document["schema"] != 3:
+        raise TimingProfileError("unsupported source runtime record schema")
+
+    declared_record_sha = _sha256(
+        document["record_sha256"], "source record semantic sha256"
+    )
+    body = dict(document)
+    body.pop("record_sha256")
+    if _runtime_record_semantic_sha256(body) != declared_record_sha:
+        raise TimingProfileError("source runtime record digest mismatch")
+    if document["runtime_contract_id"] != krea_runtime.RUNTIME_CONTRACT_ID:
+        raise TimingProfileError("source runtime contract id mismatch")
+    if document["source_run_id"] != expected_run_id:
+        raise TimingProfileError("source runtime run id mismatch")
+    if document["model_type"] != expected_model:
+        raise TimingProfileError("source runtime model type mismatch")
+    if document["bundle"] != expected_bundle:
+        raise TimingProfileError("source runtime bundle id mismatch")
+    if document["bundle_contract_sha256"] != expected_bundle_sha:
+        raise TimingProfileError("source runtime bundle digest mismatch")
+    if (
+        document["runtime_repository"] != expected_runtime_repository
+        or document["runtime_commit"] != expected_runtime_commit
+    ):
+        raise TimingProfileError("source runtime identity mismatch")
+    expected_contract = krea_runtime.bundle_contract_document(expected_bundle)
+    expected_capabilities = (
+        []
+        if expected_bundle == krea_runtime.INCUMBENT_BUNDLE
+        else sorted(krea_runtime.REQUIRED_CAPABILITIES)
+    )
+    if (
+        document["bundle_claim"] != expected_contract["claim"]
+        or document["capabilities"] != expected_capabilities
+        or document["runtime_manifest_capability_aliases"]
+        != expected_contract["runtime_manifest_capability_aliases"]
+    ):
+        raise TimingProfileError("source runtime contract evidence mismatch")
+    _sha256(document["generated_config_sha256"], "generated config sha256")
+    if expected_bundle != krea_runtime.INCUMBENT_BUNDLE:
+        _sha256(
+            document["capability_manifest_file_sha256"],
+            "capability manifest file sha256",
+        )
+        _sha256(
+            document["capability_manifest_semantic_sha256"],
+            "capability manifest semantic sha256",
+        )
+
+    timing = _exact_object(
+        document["timing"], _PROBE_TIMING_FIELDS, "source timing identity"
+    )
+    if (
+        timing["mode"] != "bootstrap_probe_unmeasured"
+        or timing["profile_sha256"] is not None
+        or timing["runtime_commit"] != expected_runtime_commit
+        or timing["measured_dataset_size"] is not None
+        or timing["current_dataset_size"] != expected_size
+        or timing["dataset_regime"] != expected_regime
+        or timing["accelerator_identity"] != accelerator_identity
+    ):
+        raise TimingProfileError("source timing identity mismatch")
+
+    effective = _exact_object(
+        document["effective"], _SOURCE_EFFECTIVE_FIELDS, "source effective runtime"
+    )
+    if (
+        effective["normalized_config_projection"]
+        != expected_contract["normalized_config_projection"]
+    ):
+        raise TimingProfileError("source effective runtime projection mismatch")
+    planned_steps = effective["planned_steps"]
+    planned_steps = _positive_int(planned_steps, "source planned steps")
+    first = _exact_object(
+        document["first_checkpoint_observation"],
+        _FIRST_OBSERVATION_FIELDS,
+        "source first-checkpoint observation",
+    )
+    first_step = _positive_int(first["checkpoint_step"], "first checkpoint step")
+    first_elapsed = _finite_positive(
+        first["elapsed_since_launch_s"],
+        "first checkpoint elapsed seconds",
+        maximum=604800.0,
+    )
+    if (
+        first["bundle_id"] != expected_bundle
+        or first["timing_profile_sha256"] is not None
+        or first["observation_mode"] != "bootstrap_raw_first_checkpoint"
+        or first["active_planned_steps"] != planned_steps
+        or first["active_plan_mutable"] is not False
+        or first["active_plan_action"] != "observe_only_fixed_subprocess"
+        or first_step > planned_steps
+    ):
+        raise TimingProfileError("source first-checkpoint observation mismatch")
+
+    completion = _exact_object(
+        document["training_completion_observation"],
+        _COMPLETION_OBSERVATION_FIELDS,
+        "source training-completion observation",
+    )
+    elapsed = _finite_positive(
+        completion["training_elapsed_seconds"],
+        "training elapsed seconds",
+        maximum=604800.0,
+    )
+    if (
+        completion["reported_last_step"] != planned_steps
+        or completion["returncode"] != 0
+        or completion["stopped_by_deadline"] is not False
+        or completion["natural_completion"] is not True
+        or first_elapsed > elapsed
+    ):
+        raise TimingProfileError("source training did not complete naturally")
+
+    measured_at = measured_at_utc
+    if measured_at is None:
+        measured_at = datetime.now(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+    measured_at = _utc(measured_at)
+    result = _seal_profile_document(
+        {
+            "schema": PROFILE_SCHEMA,
+            "kind": PROFILE_KIND,
+            "bundle_id": expected_bundle,
+            "bundle_sha256": expected_bundle_sha,
+            "model_type": expected_model,
+            "measured_dataset_size": expected_size,
+            "dataset_regime": expected_regime,
+            # Conservatively include startup and terminal-save time in the rate.
+            "seconds_per_step": elapsed / planned_steps,
+            "startup_seconds": 0.0,
+            "measurement": {
+                "completed_steps": planned_steps,
+                "training_elapsed_seconds": elapsed,
+                "first_checkpoint_step": first_step,
+                "first_checkpoint_elapsed_seconds": first_elapsed,
+            },
+            "provenance": {
+                "source_run_id": expected_run_id,
+                "source_record_sha256": hashlib.sha256(raw).hexdigest(),
+                "runtime_commit": expected_runtime_commit,
+                "measured_at_utc": measured_at,
+                "accelerator_identity": accelerator_identity,
+            },
+        }
+    )
+    # Reuse the normal loader's complete semantic validation before returning.
+    validate_profile(
+        result,
+        expected_bundle_id=expected_bundle,
+        expected_bundle_sha256=expected_bundle_sha,
+        expected_model_type=expected_model,
+        current_dataset_size=expected_size,
+        expected_dataset_regime=expected_regime,
+        expected_accelerator_identity=accelerator_identity,
+    )
+    return result
 
 
 def load_bundle_profile(
@@ -439,9 +685,7 @@ def validate_profile(
     provenance = _exact_object(
         document["provenance"], _PROVENANCE_FIELDS, "timing provenance"
     )
-    source_run_id = _text(
-        provenance["source_run_id"], "source run id", maximum=256
-    )
+    source_run_id = _source_run_id(provenance["source_run_id"])
     source_record_sha256 = _sha256(
         provenance["source_record_sha256"], "source record sha256"
     )
@@ -614,6 +858,45 @@ def emit_bootstrap_first_checkpoint_observation(
     return observation
 
 
+def _read_source_record(path: str) -> tuple[bytes, Any]:
+    """Read a bounded regular source record without following a symlink."""
+
+    fd = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        path_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_size <= 0
+            or path_stat.st_size > _MAX_SOURCE_RECORD_BYTES
+        ):
+            raise ValueError
+        raw = os.read(fd, _MAX_SOURCE_RECORD_BYTES + 1)
+        if len(raw) > _MAX_SOURCE_RECORD_BYTES:
+            raise ValueError
+        return raw, json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise TimingProfileError(
+            f"source runtime record unavailable: {path}"
+        ) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _runtime_record_semantic_sha256(value: Any) -> str:
+    """Match the effective-runtime record's newline-terminated hash domain."""
+
+    payload = (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _exact_object(value: Any, fields: set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != fields:
         raise TimingProfileError(f"{label} fields differ from schema")
@@ -630,6 +913,13 @@ def _bundle_id(value: Any) -> str:
     text = _text(value, "bundle id", maximum=64)
     if _BUNDLE_ID_RE.fullmatch(text) is None:
         raise TimingProfileError("bundle id is invalid")
+    return text
+
+
+def _source_run_id(value: Any) -> str:
+    text = _text(value, "source run id", maximum=256)
+    if _SOURCE_RUN_ID_RE.fullmatch(text) is None:
+        raise TimingProfileError("source run id is invalid")
     return text
 
 
