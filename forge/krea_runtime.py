@@ -7,8 +7,9 @@ This module keeps the deployed ``incumbent-v1`` path byte-equivalent and makes
 every experimental bundle conditional on a capability manifest produced by the
 owned, conformance-tested runtime fork.
 
-Nothing in this module selects a production winner.  ``leader-v1`` and
-``mae-g3-v1`` are calibration candidates only; the environment must request one
+Nothing in this module selects a production winner.  ``leader-v1``,
+``leader-comfy-te-v1``, and ``mae-g3-v1`` are calibration candidates only; the
+environment must request one
 explicitly.  Unknown bundles and incomplete manifests are fatal by design.
 """
 
