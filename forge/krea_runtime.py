@@ -703,9 +703,9 @@ def emit_effective_runtime_record(
             bundle=bundle,
             error_type=type(exc).__name__,
         )
-        return {"schema": 3, "bundle": bundle, "emission_failed": True}
+        return {"schema": 4, "bundle": bundle, "emission_failed": True}
     record: dict[str, Any] = {
-        "schema": 3,
+        "schema": 4,
         "runtime_contract_id": RUNTIME_CONTRACT_ID,
         "source_run_id": source_run_id,
         "model_type": (model_type or "").strip().lower(),
@@ -729,6 +729,7 @@ def emit_effective_runtime_record(
         },
         "timing": timing,
         "effective": _effective_fields(cfg, bundle=bundle),
+        "lifecycle": "bootstrap",
         "first_checkpoint_observation": None,
         "training_completion_observation": None,
     }
@@ -1000,23 +1001,32 @@ def persist_first_checkpoint_observation(
             raise ValueError("record digest mismatch")
         if record.get("generated_config_sha256") != _sha256_file(config_path):
             raise ValueError("generated config binding mismatch")
-        if record.get("first_checkpoint_observation") is not None:
-            raise ValueError("first checkpoint observation already recorded")
+        if record.get("schema") != 4:
+            raise ValueError("effective runtime record schema is unsupported")
+        if (
+            record.get("lifecycle") != "bootstrap"
+            or record.get("first_checkpoint_observation") is not None
+            or record.get("training_completion_observation") is not None
+        ):
+            raise ValueError("first checkpoint observation is out of order")
         fields = observation.telemetry_fields()
         record["first_checkpoint_observation"] = fields
+        record["lifecycle"] = "first_checkpoint"
         record["record_sha256"] = _canonical_sha256(record)
         _atomic_json(path, record)
         return record
     except Exception as exc:
         raise KreaRuntimeContractError(
-            "first-checkpoint observation could not be persisted"
+            f"first-checkpoint observation could not be persisted: {exc}"
         ) from exc
 
 
 def persist_training_completion_observation(
     config_path: str,
     *,
-    reported_last_step: int | None,
+    artifact_path: str,
+    save_root: str,
+    scope: dict[str, Any],
     training_elapsed_seconds: float,
     returncode: int | None,
     stopped_by_deadline: bool,
@@ -1024,8 +1034,10 @@ def persist_training_completion_observation(
     """Bind the subprocess terminal state into the raw timing record.
 
     Failed and deadline-stopped probes are recorded rather than disguised as
-    measurements. Profile production accepts only a clean natural completion
-    whose observed terminal step equals the config-bound plan.
+    measurements.  The checkpoint step, bytes, and hash come from one opened
+    current-run safetensors descriptor; log text is never completion evidence.
+    Profile production accepts only a clean natural completion whose artifact
+    records the runtime's completed-step count for the config-bound plan.
     """
 
     path = config_path + ".effective-runtime.json"
@@ -1042,15 +1054,21 @@ def persist_training_completion_observation(
             raise ValueError("record digest mismatch")
         if record.get("generated_config_sha256") != _sha256_file(config_path):
             raise ValueError("generated config binding mismatch")
-        if record.get("training_completion_observation") is not None:
-            raise ValueError("training completion observation already recorded")
-        planned_steps = record.get("effective", {}).get("planned_steps")
-        if reported_last_step is not None and (
-            isinstance(reported_last_step, bool)
-            or not isinstance(reported_last_step, int)
-            or reported_last_step < 0
+        if record.get("schema") != 4:
+            raise ValueError("effective runtime record schema is unsupported")
+        if (
+            record.get("lifecycle") != "first_checkpoint"
+            or record.get("first_checkpoint_observation") is None
+            or record.get("training_completion_observation") is not None
         ):
-            raise ValueError("reported last step is invalid")
+            raise ValueError("training completion observation is out of order")
+        planned_steps = record.get("effective", {}).get("planned_steps")
+        if (
+            isinstance(planned_steps, bool)
+            or not isinstance(planned_steps, int)
+            or planned_steps <= 0
+        ):
+            raise ValueError("planned steps are invalid")
         if (
             isinstance(training_elapsed_seconds, bool)
             or not isinstance(training_elapsed_seconds, (int, float))
@@ -1064,25 +1082,62 @@ def persist_training_completion_observation(
             raise ValueError("return code is invalid")
         if not isinstance(stopped_by_deadline, bool):
             raise ValueError("deadline state is invalid")
+
+        from forge.tasks import checkpoints
+        from forge.tasks.integrity import inspect_training_artifact
+
+        if not isinstance(scope, dict):
+            raise ValueError("checkpoint scope is invalid")
+        attempt_nonce = scope.get("attempt_nonce")
+        if (
+            not isinstance(attempt_nonce, str)
+            or len(attempt_nonce) != 32
+            or any(character not in "0123456789abcdef" for character in attempt_nonce)
+            or not str(record.get("source_run_id") or "").endswith(
+                f":{attempt_nonce}"
+            )
+        ):
+            raise ValueError("terminal artifact scope identity mismatch")
+        artifact = inspect_training_artifact(artifact_path)
+        if not checkpoints.descriptor_is_current_lora(
+            save_root,
+            artifact.path,
+            scope,
+            artifact.file_identity,
+        ):
+            raise ValueError("terminal artifact is not from the current run")
+        artifact_name = os.path.basename(artifact.path)
+        exact_final_name = f"{scope.get('repo')}.safetensors"
+        # ai-toolkit increments ``step_num`` at the end of each loop iteration
+        # and writes that completed-step count into final-save metadata.
+        completed_steps = artifact.checkpoint_step
         natural_completion = bool(
             returncode == 0
             and not stopped_by_deadline
-            and isinstance(planned_steps, int)
-            and reported_last_step == planned_steps
+            and artifact_name == exact_final_name
+            and completed_steps == planned_steps
         )
         record["training_completion_observation"] = {
-            "reported_last_step": reported_last_step,
             "training_elapsed_seconds": round(float(training_elapsed_seconds), 6),
             "returncode": returncode,
             "stopped_by_deadline": stopped_by_deadline,
             "natural_completion": natural_completion,
+            "artifact_path": artifact.path,
+            "artifact_name": artifact_name,
+            "artifact_size_bytes": artifact.size_bytes,
+            "artifact_sha256": artifact.sha256,
+            "artifact_loadable": True,
+            "artifact_checkpoint_step": artifact.checkpoint_step,
+            "completed_steps": completed_steps,
+            "scope_attempt_nonce": attempt_nonce,
         }
+        record["lifecycle"] = "terminal"
         record["record_sha256"] = _canonical_sha256(record)
         _atomic_json(path, record)
         return record
     except Exception as exc:
         raise KreaRuntimeContractError(
-            "training-completion observation could not be persisted"
+            f"training-completion observation could not be persisted: {exc}"
         ) from exc
 
 

@@ -359,6 +359,8 @@ def _run_toolkit(
     stopped_by_deadline = False
     scoring_decision: bool | None = None
     first_checkpoint_observed = False
+    launch_env = os.environ.copy()
+    launch_env["PYTHONDONTWRITEBYTECODE"] = "1"
     with open(log_path, "w", encoding="utf-8") as log:
         # New session → we can signal the whole process GROUP, so ai-toolkit's
         # DataLoader workers can't outlive the kill holding GPU memory while
@@ -367,6 +369,7 @@ def _run_toolkit(
             cmd, cwd=selected_toolkit_dir,
             stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=launch_env,
         )
 
         def observe_first_checkpoint_if_ready() -> None:
@@ -489,9 +492,16 @@ def _run_toolkit(
         (throughput_profile is not None or timing_probe)
         and timing_record_required
     ):
+        terminal_artifact = _terminal_current_artifact_path(
+            spec,
+            scope,
+            require_exact_final=(rc == 0 and not stopped_by_deadline),
+        )
         _persist_training_completion_observation(
             cfg_path,
-            reported_last_step=step,
+            artifact_path=terminal_artifact,
+            save_root=spec.save_root,
+            scope=scope,
             training_elapsed_seconds=elapsed_seconds,
             returncode=rc,
             stopped_by_deadline=stopped_by_deadline,
@@ -559,6 +569,40 @@ def _first_durable_current_checkpoint(
     return min(candidates) if candidates else None
 
 
+def _terminal_current_artifact_path(
+    spec: ImageSpec,
+    scope: dict,
+    *,
+    require_exact_final: bool,
+) -> str:
+    """Resolve a real current-run terminal artifact without trusting log text."""
+
+    candidates = checkpoints.current_loras(spec.save_root, scope)
+    exact_final = os.path.join(
+        spec.save_root, f"{spec.expected_repo_name}.safetensors"
+    )
+    if exact_final in candidates:
+        return exact_final
+    if require_exact_final:
+        raise adaptive_timing.TimingProfileError(
+            "clean training exit did not produce a current-run terminal artifact"
+        )
+    if not candidates:
+        raise adaptive_timing.TimingProfileError(
+            "training terminal state has no current-run artifact"
+        )
+    numbered = []
+    for path in candidates:
+        match = re.search(r"(?:_|-step)(\d+)\.safetensors$", path)
+        if match is not None:
+            numbered.append((int(match.group(1)), path))
+    if not numbered:
+        raise adaptive_timing.TimingProfileError(
+            "training terminal state has no numbered current-run artifact"
+        )
+    return max(numbered)[1]
+
+
 def _persist_first_checkpoint_observation(
     config_path: str,
     observation,
@@ -592,7 +636,9 @@ def _persist_first_checkpoint_observation(
 def _persist_training_completion_observation(
     config_path: str,
     *,
-    reported_last_step: int | None,
+    artifact_path: str,
+    save_root: str,
+    scope: dict,
     training_elapsed_seconds: float,
     returncode: int | None,
     stopped_by_deadline: bool,
@@ -601,7 +647,9 @@ def _persist_training_completion_observation(
 
     updated = krea_runtime.persist_training_completion_observation(
         config_path,
-        reported_last_step=reported_last_step,
+        artifact_path=artifact_path,
+        save_root=save_root,
+        scope=scope,
         training_elapsed_seconds=training_elapsed_seconds,
         returncode=returncode,
         stopped_by_deadline=stopped_by_deadline,
