@@ -66,7 +66,7 @@ def size_scaled_steps(
     *,
     throughput_profile=None,
 ):
-    """Materialize the size law under a static or explicit measured budget.
+    """Materialize the size law under a static or operator-attested budget.
 
     With no profile this retains the historical never-raise fallback and exact
     incumbent outputs.  Supplying a profile is an experimental, fail-closed
@@ -99,8 +99,8 @@ def size_scaled_steps(
         budget_cap = int(train_s / sit) if train_s > 0 else 1
         return max(1, min(scaled, budget_cap))  # cap may push below `min`
     except Exception:
-        # A supplied measurement is part of an evidence-bearing experiment.
-        # Never turn a malformed measured invocation into a plausible-looking
+        # A supplied operator-attested claim is evidence-bearing experiment input.
+        # Never turn a malformed profiled invocation into a plausible-looking
         # template run; only the historical no-profile path may degrade.
         if throughput_profile is not None:
             raise

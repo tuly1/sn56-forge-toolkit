@@ -1,4 +1,4 @@
-"""Measured, bundle-bound timing profiles for opt-in training experiments.
+"""Operator-attested, bundle-bound timing profiles for opt-in experiments.
 
 The incumbent recipe continues to use :mod:`forge.recipe`'s literal timing
 constants unless a caller explicitly loads and supplies one of these profiles.
@@ -30,7 +30,7 @@ from forge.file_evidence import RegularFileError, read_regular_bytes
 
 PROFILE_ENV = "FORGE_KREA_THROUGHPUT_PROFILE"
 SOURCE_RECORD_ENV = "FORGE_KREA_THROUGHPUT_SOURCE_RECORD"
-PROFILE_KIND = "forge-measured-throughput-profile"
+PROFILE_KIND = "forge-operator-attested-throughput-profile"
 PROFILE_SCHEMA = 3
 FIRST_CHECKPOINT_EVENT = "first_checkpoint_timing_observed"
 _MAX_PROFILE_BYTES = 64 * 1024
@@ -121,6 +121,14 @@ _COMPLETION_OBSERVATION_FIELDS = {
     "artifact_checkpoint_step",
     "completed_steps",
     "scope_attempt_nonce",
+    "artifact_file_identity",
+}
+_ARTIFACT_FILE_IDENTITY_FIELDS = {
+    "device",
+    "inode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
 }
 _SOURCE_EFFECTIVE_FIELDS = {
     "planned_steps",
@@ -129,20 +137,21 @@ _SOURCE_EFFECTIVE_FIELDS = {
 
 
 class TimingProfileError(RuntimeError):
-    """A measured timing profile is absent, invalid, or bound elsewhere."""
+    """An operator-attested timing profile is absent, invalid, or misbound."""
 
 
 @dataclass(frozen=True)
 class ThroughputProfile:
-    """A validated measurement for one exact experimental bundle.
+    """An operator-attested timing claim for one experimental bundle.
 
     ``training_elapsed_seconds`` and ``first_checkpoint_elapsed_seconds`` are
-    measured from subprocess launch.  Schema 3 conservatively includes startup
-    in the rate and therefore records ``startup_seconds`` as zero. The declared
-    rate must equal
+    declared relative to subprocess launch. Schema 3 conservatively includes
+    startup in the rate and therefore records ``startup_seconds`` as zero. The
+    declared rate must equal
     ``(training_elapsed_seconds - startup_seconds) / completed_steps`` within
-    two percent, so a self-consistent JSON hash cannot turn a guess into a
-    claimed measurement.
+    two percent. Validation proves internal consistency, artifact binding, and
+    dataset-regime/accelerator scoping; it does not independently prove that
+    the declared elapsed times were measured on the named hardware.
     """
 
     bundle_id: str
@@ -218,7 +227,7 @@ class FirstCheckpointCorrection:
 
 @dataclass(frozen=True)
 class BootstrapFirstCheckpointObservation:
-    """Raw durable-checkpoint timing evidence collected before a profile exists."""
+    """Operator-attested checkpoint timing recorded before a profile exists."""
 
     bundle_id: str
     checkpoint_step: int
@@ -239,20 +248,25 @@ class BootstrapFirstCheckpointObservation:
         }
 
 
-def canonical_sha256(value: Any) -> str:
-    """Hash a JSON value using the project's canonical JSON convention."""
+def _canonical_json_bytes(value: Any) -> bytes:
+    """Return the canonical JSON representation used for semantic equality."""
 
-    payload = json.dumps(
+    return json.dumps(
         value,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+
+
+def canonical_sha256(value: Any) -> str:
+    """Hash a JSON value using the project's canonical JSON convention."""
+
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
 def _seal_profile_document(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Seal a profile already derived from verified raw evidence."""
+    """Seal an internally checked operator-attested profile document."""
 
     document = dict(value)
     document.pop("profile_sha256", None)
@@ -326,13 +340,14 @@ def produce_profile_document(
     runner: Callable[..., Any] = subprocess.run,
     expected_accelerator_identity: str | None = None,
 ) -> dict[str, Any]:
-    """Derive a timing profile from one completed raw runtime record.
+    """Derive an operator-attested profile from one completed runtime record.
 
-    The producer—not the operator—derives the recipe/runtime digests, observes
-    the accelerator, hashes the source bytes, and cross-checks the declared run,
-    dataset, first durable checkpoint, and natural terminal observation.  A
-    plausible-looking JSON document without those source observations cannot
-    become a schema-3 profile.
+    The producer derives recipe/runtime digests, observes the current
+    accelerator identity, hashes the source bytes, and cross-checks the declared
+    run, dataset, first durable checkpoint, and natural terminal artifact. This
+    establishes internal consistency, artifact binding, and regime/accelerator
+    scope. The raw elapsed values remain operator-attested and are not an
+    independently authenticated hardware measurement.
     """
 
     from forge import krea_runtime
@@ -482,6 +497,18 @@ def produce_profile_document(
     completed_steps = _positive_int(
         completion["completed_steps"], "terminal completed steps"
     )
+    artifact_file_identity = _exact_object(
+        completion["artifact_file_identity"],
+        _ARTIFACT_FILE_IDENTITY_FIELDS,
+        "terminal artifact filesystem identity",
+    )
+    for field in _ARTIFACT_FILE_IDENTITY_FIELDS:
+        _nonnegative_int(
+            artifact_file_identity[field],
+            f"terminal artifact filesystem identity {field}",
+        )
+    if artifact_file_identity["size"] != artifact_size:
+        raise TimingProfileError("terminal artifact filesystem size mismatch")
     scope_attempt_nonce = _attempt_nonce(completion["scope_attempt_nonce"])
     if not expected_run_id.endswith(f":{scope_attempt_nonce}"):
         raise TimingProfileError("source terminal artifact scope mismatch")
@@ -497,6 +524,7 @@ def produce_profile_document(
         or artifact.size_bytes != artifact_size
         or artifact.sha256 != artifact_sha
         or artifact.checkpoint_step != artifact_step
+        or artifact.file_identity != artifact_file_identity
         or completion["artifact_loadable"] is not True
         or completed_steps != artifact_step
     ):
@@ -584,7 +612,7 @@ def load_bundle_profile(
     if selected_path is None:
         if required:
             raise TimingProfileError(
-                f"measured throughput profile required for bundle {bundle_id!r}"
+                f"operator-attested timing profile required for bundle {bundle_id!r}"
             )
         return None
     selected_source_path = source_record_path
@@ -620,7 +648,7 @@ def load_profile(
     expected_dataset_regime: str,
     expected_accelerator_identity: str,
 ) -> ThroughputProfile:
-    """Load a profile and reproduce it from its mandatory exact raw record."""
+    """Load a profile and canonically reproduce it from its exact raw record."""
 
     try:
         raw = read_regular_bytes(
@@ -654,9 +682,9 @@ def load_profile(
         measured_at_utc=profile.measured_at_utc,
         expected_accelerator_identity=expected_accelerator_identity,
     )
-    if reproduced != value:
+    if _canonical_json_bytes(reproduced) != _canonical_json_bytes(value):
         raise TimingProfileError(
-            "timing profile is not reproduced by source runtime record"
+            "timing profile canonical semantic reproduction mismatch"
         )
     return profile
 
@@ -671,7 +699,7 @@ def validate_profile(
     expected_dataset_regime: str,
     expected_accelerator_identity: str,
 ) -> ThroughputProfile:
-    """Validate schema, provenance, self-hash, and exact bundle binding."""
+    """Validate internal consistency, artifact provenance, and exact binding."""
 
     document = _exact_object(value, _PROFILE_FIELDS, "timing profile")
     if (
@@ -746,7 +774,7 @@ def validate_profile(
     if first_checkpoint_step > completed_steps:
         raise TimingProfileError("first checkpoint exceeds completed steps")
     if first_checkpoint_elapsed_seconds > training_elapsed_seconds:
-        raise TimingProfileError("first checkpoint exceeds measured run time")
+        raise TimingProfileError("first checkpoint exceeds declared run time")
     if first_checkpoint_elapsed_seconds <= startup_seconds:
         raise TimingProfileError("first checkpoint does not follow startup")
     effective_seconds_per_step = (
@@ -757,7 +785,7 @@ def validate_profile(
     ) / seconds_per_step
     if relative_rate_error > 0.02:
         raise TimingProfileError(
-            "seconds per step does not match the recorded measurement"
+            "seconds per step does not match the operator-attested elapsed values"
         )
 
     provenance = _exact_object(
@@ -813,7 +841,7 @@ def observe_first_checkpoint(
     export_reserve_s: float,
     safety: float,
 ) -> FirstCheckpointCorrection:
-    """Measure current effective throughput and recommend a future-run cap.
+    """Observe effective throughput and recommend a future-run cap.
 
     The observation happens after the checkpoint is durable, so the derived
     seconds/step conservatively includes that checkpoint's write overhead.

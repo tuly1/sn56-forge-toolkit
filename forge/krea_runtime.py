@@ -30,6 +30,7 @@ from typing import Any
 import yaml
 
 from forge import telemetry
+from forge.file_evidence import RegularFileError, read_regular_bytes
 
 
 BUNDLE_ENV = "FORGE_KREA_BUNDLE"
@@ -508,28 +509,16 @@ def _verify_git_checkout(
 
 
 def _read_regular_attestation(path: str, label: str) -> bytes:
-    """Read one small in-tree attestation without following a symlink."""
+    """Read one bounded attestation through the shared path-safe reader."""
 
-    fd = None
     try:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags)
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError
-        if file_stat.st_size <= 0 or file_stat.st_size > _MAX_ATTESTATION_BYTES:
-            raise ValueError
-        raw = os.read(fd, _MAX_ATTESTATION_BYTES + 1)
-        if len(raw) > _MAX_ATTESTATION_BYTES:
-            raise ValueError
-        return raw
-    except Exception as exc:
+        return read_regular_bytes(
+            path,
+            label=f"Krea {label}",
+            maximum_size=_MAX_ATTESTATION_BYTES,
+        )
+    except RegularFileError as exc:
         raise KreaRuntimeContractError(f"Krea {label} is not a regular file") from exc
-    finally:
-        if fd is not None:
-            os.close(fd)
 
 
 def bundle_contract_document(bundle: str) -> dict[str, Any]:
@@ -620,14 +609,17 @@ def emit_effective_runtime_record(
         )
     if bundle != INCUMBENT_BUNDLE and throughput_profile is None and not timing_probe:
         raise KreaRuntimeContractError(
-            "experimental Krea execution needs measured timing or explicit probe mode"
+            "experimental Krea execution needs operator-attested timing "
+            "or explicit probe mode"
         )
     timing: dict[str, Any]
     if throughput_profile is not None:
         from forge.adaptive_timing import ThroughputProfile, dataset_regime
 
         if not isinstance(throughput_profile, ThroughputProfile):
-            raise KreaRuntimeContractError("invalid measured timing profile")
+            raise KreaRuntimeContractError(
+                "invalid operator-attested timing profile"
+            )
         expected_digest = bundle_contract_sha256(bundle)
         expected_runtime_commit = runtime_commit_for_bundle(bundle)
         if (
@@ -636,7 +628,9 @@ def emit_effective_runtime_record(
             or throughput_profile.model_type != "krea2"
             or throughput_profile.runtime_commit != expected_runtime_commit
         ):
-            raise KreaRuntimeContractError("measured timing profile binding drifted")
+            raise KreaRuntimeContractError(
+                "operator-attested timing profile binding drifted"
+            )
         if (
             isinstance(current_dataset_size, bool)
             or not isinstance(current_dataset_size, int)
@@ -645,10 +639,10 @@ def emit_effective_runtime_record(
             != throughput_profile.dataset_regime
         ):
             raise KreaRuntimeContractError(
-                "measured timing profile dataset regime drifted"
+                "operator-attested timing profile dataset regime drifted"
             )
         timing = {
-            "mode": "measured_profile",
+            "mode": "operator_attested_profile",
             "profile_sha256": throughput_profile.profile_sha256,
             "runtime_commit": throughput_profile.runtime_commit,
             "measured_dataset_size": throughput_profile.measured_dataset_size,
@@ -1034,8 +1028,9 @@ def persist_training_completion_observation(
     """Bind the subprocess terminal state into the raw timing record.
 
     Failed and deadline-stopped probes are recorded rather than disguised as
-    measurements.  The checkpoint step, bytes, and hash come from one opened
-    current-run safetensors descriptor; log text is never completion evidence.
+    completed timing claims. The checkpoint step, bytes, hash, and filesystem
+    identity come from one opened current-run safetensors descriptor; log text
+    is never completion evidence.
     Profile production accepts only a clean natural completion whose artifact
     records the runtime's completed-step count for the config-bound plan.
     """
@@ -1130,6 +1125,7 @@ def persist_training_completion_observation(
             "artifact_checkpoint_step": artifact.checkpoint_step,
             "completed_steps": completed_steps,
             "scope_attempt_nonce": attempt_nonce,
+            "artifact_file_identity": artifact.file_identity,
         }
         record["lifecycle"] = "terminal"
         record["record_sha256"] = _canonical_sha256(record)

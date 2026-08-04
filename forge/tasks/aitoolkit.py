@@ -130,7 +130,7 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
             telemetry.event(
                 "krea_timing_bootstrap_probe",
                 bundle=bundle,
-                measured_profile=False,
+                operator_attested_profile=False,
             )
     cfg = build_config(
         spec,
@@ -302,7 +302,7 @@ def _run_toolkit(
         )
     ):
         raise adaptive_timing.TimingProfileError(
-            "measured timing observation inputs are incomplete"
+            "operator-attested timing observation inputs are incomplete"
         )
     selected_bundle = krea_runtime.requested_bundle(spec.model_type)
     if timing_bundle is not None and timing_bundle != selected_bundle:
