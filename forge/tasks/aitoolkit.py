@@ -110,17 +110,23 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     bundle = krea_runtime.requested_bundle(spec.model_type)
     timing_probe = False
     throughput_profile = None
+    timing_accelerator_identity = None
     if spec.model_type == "krea2":
         timing_probe = krea_runtime.timing_probe_enabled()
         throughput_profile = adaptive_timing.load_bundle_profile(
             bundle_id=bundle,
             bundle_sha256=krea_runtime.bundle_contract_sha256(bundle),
             model_type=spec.model_type,
+            current_dataset_size=pairs,
+            dataset_regime=adaptive_timing.dataset_regime(pairs),
             required=(
                 bundle != krea_runtime.INCUMBENT_BUNDLE and not timing_probe
             ),
         )
         if timing_probe and throughput_profile is None:
+            timing_accelerator_identity = (
+                adaptive_timing.current_accelerator_identity()
+            )
             telemetry.event(
                 "krea_timing_bootstrap_probe",
                 bundle=bundle,
@@ -179,8 +185,11 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
             manifest,
             throughput_profile=throughput_profile,
             timing_probe=timing_probe,
+            current_dataset_size=pairs,
+            current_accelerator_identity=timing_accelerator_identity,
         )
 
+    toolkit_dir = krea_runtime.runtime_directory(spec.model_type, bundle)
     scoring_budget_ready = _run_toolkit(
         spec.config_path,
         deadline,
@@ -193,7 +202,12 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         total_budget_s=hours * 3600.0,
         export_reserve_s=recipe.EXPORT_RESERVE_S,
         timing_safety=recipe.MARGIN,
-        timing_record_required=(bundle != krea_runtime.INCUMBENT_BUNDLE),
+        timing_record_required=(
+            bundle != krea_runtime.INCUMBENT_BUNDLE or timing_probe
+        ),
+        timing_probe=timing_probe,
+        timing_bundle=bundle,
+        toolkit_dir=toolkit_dir,
     )
     if scoring_budget_ready:
         holdout.produce(
@@ -246,6 +260,9 @@ def _run_toolkit(
     export_reserve_s: float = recipe.EXPORT_RESERVE_S,
     timing_safety: float = recipe.MARGIN,
     timing_record_required: bool = False,
+    timing_probe: bool = False,
+    timing_bundle: str | None = None,
+    toolkit_dir: str | None = None,
 ) -> bool:
     # Run ai-toolkit's run.py with the CURRENT interpreter, not a bare `python3`:
     # in the validator's Docker image sys.executable IS the env python with torch,
@@ -268,6 +285,12 @@ def _run_toolkit(
     ):
         raise adaptive_timing.TimingProfileError(
             "measured timing observation inputs are incomplete"
+        )
+    if timing_probe and (
+        active_planned_steps is None or timing_bundle is None
+    ):
+        raise adaptive_timing.TimingProfileError(
+            "bootstrap timing observation inputs are incomplete"
         )
 
     # GPU peak sampler: torch.max_memory_allocated is 0 in the parent (ai-toolkit
@@ -304,28 +327,41 @@ def _run_toolkit(
         # DataLoader workers can't outlive the kill holding GPU memory while
         # _finalize runs.
         proc = subprocess.Popen(
-            cmd, cwd=_AI_TOOLKIT_DIR, stdout=log, stderr=subprocess.STDOUT,
+            cmd, cwd=toolkit_dir or _AI_TOOLKIT_DIR,
+            stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
 
         def observe_first_checkpoint_if_ready() -> None:
             nonlocal first_checkpoint_observed
-            if first_checkpoint_observed or throughput_profile is None:
+            if first_checkpoint_observed or (
+                throughput_profile is None and not timing_probe
+            ):
                 return
             first_checkpoint = _first_durable_current_checkpoint(spec, scope)
             if first_checkpoint is None:
                 return
             checkpoint_step, _checkpoint_path = first_checkpoint
-            observation = adaptive_timing.emit_first_checkpoint_observation(
-                throughput_profile,
-                active_planned_steps=active_planned_steps,
-                future_target_steps=future_target_steps,
-                checkpoint_step=checkpoint_step,
-                elapsed_since_launch_s=time.monotonic() - started,
-                total_budget_s=total_budget_s,
-                export_reserve_s=export_reserve_s,
-                safety=timing_safety,
-            )
+            if throughput_profile is not None:
+                observation = adaptive_timing.emit_first_checkpoint_observation(
+                    throughput_profile,
+                    active_planned_steps=active_planned_steps,
+                    future_target_steps=future_target_steps,
+                    checkpoint_step=checkpoint_step,
+                    elapsed_since_launch_s=time.monotonic() - started,
+                    total_budget_s=total_budget_s,
+                    export_reserve_s=export_reserve_s,
+                    safety=timing_safety,
+                )
+            else:
+                observation = (
+                    adaptive_timing.emit_bootstrap_first_checkpoint_observation(
+                        bundle_id=timing_bundle,
+                        active_planned_steps=active_planned_steps,
+                        checkpoint_step=checkpoint_step,
+                        elapsed_since_launch_s=time.monotonic() - started,
+                    )
+                )
             _persist_first_checkpoint_observation(
                 cfg_path,
                 observation,
@@ -401,6 +437,15 @@ def _run_toolkit(
             telemetry.train_point(step or 0, loss, None)
     except Exception:
         pass
+
+    if (
+        (throughput_profile is not None or timing_probe)
+        and timing_record_required
+        and not first_checkpoint_observed
+    ):
+        raise adaptive_timing.TimingProfileError(
+            "required first-checkpoint timing observation was not produced"
+        )
 
     # A clean exit (0) or a deadline stop are both success: a checkpoint should be
     # on disk. A nonzero exit we did NOT trigger means ai-toolkit failed — but if

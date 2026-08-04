@@ -67,11 +67,13 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
     bundle_sha = krea_runtime.bundle_contract_sha256(bundle)
     document = adaptive_timing.seal_profile_document(
         {
-            "schema": 1,
+            "schema": adaptive_timing.PROFILE_SCHEMA,
             "kind": adaptive_timing.PROFILE_KIND,
             "bundle_id": bundle,
             "bundle_sha256": bundle_sha,
             "model_type": "krea2",
+            "measured_dataset_size": 18,
+            "dataset_regime": adaptive_timing.dataset_regime(18),
             "seconds_per_step": 1.3,
             "startup_seconds": startup_seconds,
             "measurement": {
@@ -85,7 +87,7 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
                 "source_record_sha256": "b" * 64,
                 "runtime_commit": krea_runtime.OWNED_RUNTIME_COMMIT,
                 "measured_at_utc": "2026-08-04T12:00:00Z",
-                "accelerator": "NVIDIA H100 PCIe",
+                "accelerator_identity": "NVIDIA H100 PCIe|81559-MiB",
             },
         }
     )
@@ -94,6 +96,9 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
         expected_bundle_id=bundle,
         expected_bundle_sha256=bundle_sha,
         expected_model_type="krea2",
+        current_dataset_size=18,
+        expected_dataset_regime=adaptive_timing.dataset_regime(18),
+        expected_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
     )
 
 
@@ -131,6 +136,54 @@ def test_non_krea_config_ignores_krea_experiment_environment(monkeypatch):
 
     assert observed is original
     assert manifest is None
+
+
+@pytest.mark.parametrize(
+    "model_type", ["ideogram4", "qwen-image", "z-image", "flux"]
+)
+def test_non_krea_runtime_always_uses_exact_incumbent_tree(
+    monkeypatch, model_type
+):
+    monkeypatch.setenv(krea_runtime.BUNDLE_ENV, krea_runtime.LEADER_BUNDLE)
+    monkeypatch.setenv(krea_runtime.INCUMBENT_RUNTIME_DIR_ENV, "/incumbent")
+    monkeypatch.setenv(krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV, "/owned-krea")
+
+    assert krea_runtime.runtime_directory(model_type) == "/incumbent"
+
+
+def test_only_experimental_krea_uses_owned_runtime(monkeypatch):
+    monkeypatch.setenv(krea_runtime.INCUMBENT_RUNTIME_DIR_ENV, "/incumbent")
+    monkeypatch.setenv(krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV, "/owned-krea")
+
+    assert krea_runtime.runtime_directory(
+        "krea2", krea_runtime.INCUMBENT_BUNDLE
+    ) == "/incumbent"
+    for bundle in (
+        krea_runtime.LEADER_BUNDLE,
+        krea_runtime.LEADER_COMFY_TE_BUNDLE,
+        krea_runtime.MAE_BUNDLE,
+    ):
+        assert krea_runtime.runtime_directory("krea2", bundle) == "/owned-krea"
+
+    incumbent_contract = krea_runtime.bundle_contract_document(
+        krea_runtime.INCUMBENT_BUNDLE
+    )
+    assert incumbent_contract["runtime_repository"] == (
+        "https://github.com/ostris/ai-toolkit.git"
+    )
+    assert incumbent_contract["runtime_commit"] == krea_runtime.PINNED_BASE_COMMIT
+
+
+def test_stable_bundle_ids_carry_honest_source_derived_claims():
+    rank1 = krea_runtime.bundle_claim_document(krea_runtime.LEADER_BUNDLE)
+    rank3 = krea_runtime.bundle_claim_document(krea_runtime.MAE_BUNDLE)
+
+    assert rank1["source_config_sha256"] == krea_runtime.PUBLIC_RANK1_CONFIG_SHA256
+    assert rank3["source_config_sha256"] == krea_runtime.PUBLIC_RANK3_CONFIG_SHA256
+    assert rank1["byte_equivalent_to_source_config"] is False
+    assert rank3["byte_equivalent_to_source_config"] is False
+    assert "source-derived" in rank1["classification"]
+    assert "source-derived" in rank3["classification"]
 
 
 def test_unknown_bundle_is_fatal(monkeypatch):
@@ -176,7 +229,7 @@ def test_capability_manifest_rejects_unknown_claim(tmp_path, monkeypatch):
         krea_runtime.load_capability_manifest()
 
 
-def test_leader_bundle_matches_public_effective_recipe(tmp_path, monkeypatch):
+def test_rank1_source_derived_bundle_applies_declared_fields(tmp_path, monkeypatch):
     _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
 
     cfg = config.build_config(_spec(), num_images=18, hours_to_complete=0.75)
@@ -239,7 +292,7 @@ def test_leader_overlay_never_partially_mutates_incumbent(tmp_path, monkeypatch)
     assert incumbent == snapshot
 
 
-def test_mae_bundle_matches_public_positive_control(tmp_path, monkeypatch):
+def test_rank3_source_derived_bundle_applies_declared_fields(tmp_path, monkeypatch):
     _activate(monkeypatch, tmp_path, krea_runtime.MAE_BUNDLE)
 
     cfg = config.build_config(_spec(), num_images=18, hours_to_complete=0.75)
@@ -258,14 +311,22 @@ def test_mae_bundle_matches_public_positive_control(tmp_path, monkeypatch):
 def test_effective_runtime_record_hash_binds_exact_generated_config(
     tmp_path, monkeypatch
 ):
-    _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
+    manifest_path = _activate(
+        monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE
+    )
     cfg = config.build_config(_spec(), num_images=18, hours_to_complete=0.75)
     config_path = tmp_path / "task.yaml"
     config.write_config(cfg, str(config_path))
     manifest = krea_runtime.load_capability_manifest()
 
     record = krea_runtime.emit_effective_runtime_record(
-        cfg, "krea2", str(config_path), manifest, timing_probe=True
+        cfg,
+        "krea2",
+        str(config_path),
+        manifest,
+        timing_probe=True,
+        current_dataset_size=18,
+        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
     )
     on_disk = json.loads(
         (tmp_path / "task.yaml.effective-runtime.json").read_text(encoding="utf-8")
@@ -282,8 +343,21 @@ def test_effective_runtime_record_hash_binds_exact_generated_config(
         "normalized_config_projection",
     }
     assert record["timing"]["mode"] == "bootstrap_probe_unmeasured"
+    assert record["timing"]["measured_dataset_size"] is None
+    assert record["timing"]["current_dataset_size"] == 18
+    assert record["timing"]["dataset_regime"] == "small-11-24"
+    assert record["timing"]["accelerator_identity"] == (
+        "NVIDIA H100 PCIe|81559-MiB"
+    )
     assert record["runtime_commit"] == krea_runtime.OWNED_RUNTIME_COMMIT
     assert record["timing"]["runtime_commit"] == krea_runtime.OWNED_RUNTIME_COMMIT
+    assert record["bundle_claim"]["byte_equivalent_to_source_config"] is False
+    assert record["capability_manifest_file_sha256"] == hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    assert record["capability_manifest_semantic_sha256"] == (
+        krea_runtime._canonical_sha256(manifest)
+    )
     # Task paths, trigger strings, and credentials do not enter this sidecar.
     assert "AetherTest" not in json.dumps(record)
 
@@ -305,6 +379,8 @@ def test_experimental_record_emission_is_mandatory(tmp_path, monkeypatch):
             str(config_path),
             krea_runtime.load_capability_manifest(),
             timing_probe=True,
+            current_dataset_size=18,
+            current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
         )
 
 
@@ -328,14 +404,45 @@ def test_measured_profile_is_bound_to_bundle_in_effective_record(
         str(config_path),
         krea_runtime.load_capability_manifest(),
         throughput_profile=profile,
+        current_dataset_size=18,
     )
 
     assert record["timing"] == {
         "mode": "measured_profile",
         "profile_sha256": profile.profile_sha256,
         "runtime_commit": profile.runtime_commit,
+        "measured_dataset_size": 18,
+        "current_dataset_size": 18,
+        "dataset_regime": adaptive_timing.dataset_regime(18),
+        "accelerator_identity": profile.accelerator_identity,
     }
     assert record["bundle_contract_sha256"] == profile.bundle_sha256
+
+
+def test_effective_record_preserves_measured_and_current_regime_sizes(
+    tmp_path, monkeypatch
+):
+    _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
+    profile = _timing_profile(krea_runtime.LEADER_BUNDLE)
+    cfg = config.build_config(
+        _spec(), num_images=20, hours_to_complete=0.75,
+        throughput_profile=profile,
+    )
+    config_path = tmp_path / "same-regime.yaml"
+    config.write_config(cfg, str(config_path))
+
+    record = krea_runtime.emit_effective_runtime_record(
+        cfg,
+        "krea2",
+        str(config_path),
+        krea_runtime.load_capability_manifest(),
+        throughput_profile=profile,
+        current_dataset_size=20,
+    )
+
+    assert record["timing"]["measured_dataset_size"] == 18
+    assert record["timing"]["current_dataset_size"] == 20
+    assert record["timing"]["dataset_regime"] == "small-11-24"
 
 
 def test_effective_record_rejects_profile_from_another_runtime(
@@ -365,6 +472,7 @@ def test_effective_record_rejects_profile_from_another_runtime(
             str(config_path),
             krea_runtime.load_capability_manifest(),
             throughput_profile=foreign_profile,
+            current_dataset_size=18,
         )
 
 
@@ -424,6 +532,7 @@ def test_timing_contract_rejects_throughput_semantic_drift(
             str(config_path),
             krea_runtime.load_capability_manifest(),
             throughput_profile=profile,
+            current_dataset_size=18,
         )
 
 
@@ -526,6 +635,7 @@ def test_first_durable_checkpoint_is_observed_once_and_persisted(
         spec.config_path,
         krea_runtime.load_capability_manifest(),
         throughput_profile=profile,
+        current_dataset_size=18,
     )
     meta_updates = []
     monkeypatch.setattr(
@@ -589,6 +699,93 @@ def test_first_durable_checkpoint_is_observed_once_and_persisted(
         "krea_effective_runtime_record_sha256": record["record_sha256"]
     }
     assert hashlib.sha256(Path(spec.config_path).read_bytes()).hexdigest() == config_before
+
+
+def test_experimental_profile_requires_post_run_checkpoint_observation(
+    tmp_path, monkeypatch
+):
+    spec = _spec()
+    _localize_spec(monkeypatch, tmp_path, spec)
+    _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
+    profile = _timing_profile(krea_runtime.LEADER_BUNDLE, startup_seconds=0.0)
+    cfg = config.build_config(spec, 18, 0.75, throughput_profile=profile)
+    Path(spec.config_path).parent.mkdir(parents=True)
+    config.write_config(cfg, spec.config_path)
+    krea_runtime.emit_effective_runtime_record(
+        cfg,
+        "krea2",
+        spec.config_path,
+        krea_runtime.load_capability_manifest(),
+        throughput_profile=profile,
+        current_dataset_size=18,
+    )
+    Path(spec.save_root).mkdir(parents=True)
+    scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+    planned = cfg["config"]["process"][0]["train"]["steps"]
+    scope = checkpoints.set_planned_steps(spec.save_root, scope, planned)
+    toolkit_dir = tmp_path / "no-checkpoint-toolkit"
+    toolkit_dir.mkdir()
+    (toolkit_dir / "run.py").write_text("pass\n", encoding="utf-8")
+    monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
+
+    class Deadline:
+        def remaining(self):
+            return 10_000.0
+
+    with pytest.raises(
+        adaptive_timing.TimingProfileError,
+        match="required first-checkpoint timing observation",
+    ):
+        aitoolkit._run_toolkit(
+            spec.config_path,
+            Deadline(),
+            spec,
+            scope,
+            throughput_profile=profile,
+            active_planned_steps=planned,
+            future_target_steps=recipe.size_target_steps(
+                "krea2", 18, planned
+            ),
+            total_budget_s=2700.0,
+            timing_record_required=True,
+            toolkit_dir=str(toolkit_dir),
+        )
+
+
+def test_bootstrap_probe_requires_post_run_checkpoint_observation(
+    tmp_path, monkeypatch
+):
+    spec = _spec()
+    _localize_spec(monkeypatch, tmp_path, spec)
+    Path(spec.config_path).parent.mkdir(parents=True)
+    Path(spec.config_path).write_text("{}\n", encoding="utf-8")
+    Path(spec.save_root).mkdir(parents=True)
+    scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+    scope = checkpoints.set_planned_steps(spec.save_root, scope, 1000)
+    toolkit_dir = tmp_path / "empty-bootstrap-toolkit"
+    toolkit_dir.mkdir()
+    (toolkit_dir / "run.py").write_text("pass\n", encoding="utf-8")
+    monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
+
+    class Deadline:
+        def remaining(self):
+            return 10_000.0
+
+    with pytest.raises(
+        adaptive_timing.TimingProfileError,
+        match="required first-checkpoint timing observation",
+    ):
+        aitoolkit._run_toolkit(
+            spec.config_path,
+            Deadline(),
+            spec,
+            scope,
+            active_planned_steps=1000,
+            timing_record_required=True,
+            timing_probe=True,
+            timing_bundle=krea_runtime.LEADER_BUNDLE,
+            toolkit_dir=str(toolkit_dir),
+        )
 
 
 def test_incumbent_timing_observation_persistence_is_best_effort(monkeypatch):

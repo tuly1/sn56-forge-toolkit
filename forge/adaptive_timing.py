@@ -21,14 +21,16 @@ import math
 import os
 import re
 import stat
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 
 PROFILE_ENV = "FORGE_KREA_THROUGHPUT_PROFILE"
+ACCELERATOR_IDENTITY_ENV = "FORGE_KREA_ACCELERATOR_IDENTITY"
 PROFILE_KIND = "forge-measured-throughput-profile"
-PROFILE_SCHEMA = 1
+PROFILE_SCHEMA = 2
 FIRST_CHECKPOINT_EVENT = "first_checkpoint_timing_observed"
 _MAX_PROFILE_BYTES = 64 * 1024
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -41,6 +43,8 @@ _PROFILE_FIELDS = {
     "bundle_id",
     "bundle_sha256",
     "model_type",
+    "measured_dataset_size",
+    "dataset_regime",
     "seconds_per_step",
     "startup_seconds",
     "measurement",
@@ -58,7 +62,7 @@ _PROVENANCE_FIELDS = {
     "source_record_sha256",
     "runtime_commit",
     "measured_at_utc",
-    "accelerator",
+    "accelerator_identity",
 }
 
 
@@ -81,6 +85,8 @@ class ThroughputProfile:
     bundle_id: str
     bundle_sha256: str
     model_type: str
+    measured_dataset_size: int
+    dataset_regime: str
     seconds_per_step: float
     startup_seconds: float
     completed_steps: int
@@ -91,7 +97,7 @@ class ThroughputProfile:
     source_record_sha256: str
     runtime_commit: str
     measured_at_utc: str
-    accelerator: str
+    accelerator_identity: str
     profile_sha256: str
 
 
@@ -147,6 +153,29 @@ class FirstCheckpointCorrection:
         }
 
 
+@dataclass(frozen=True)
+class BootstrapFirstCheckpointObservation:
+    """Raw durable-checkpoint timing evidence collected before a profile exists."""
+
+    bundle_id: str
+    checkpoint_step: int
+    elapsed_since_launch_s: float
+    active_planned_steps: int
+    observation_mode: str = "bootstrap_raw_first_checkpoint"
+
+    def telemetry_fields(self) -> dict[str, Any]:
+        return {
+            "bundle_id": self.bundle_id,
+            "timing_profile_sha256": None,
+            "observation_mode": self.observation_mode,
+            "checkpoint_step": self.checkpoint_step,
+            "elapsed_since_launch_s": round(self.elapsed_since_launch_s, 3),
+            "active_planned_steps": self.active_planned_steps,
+            "active_plan_mutable": False,
+            "active_plan_action": "observe_only_fixed_subprocess",
+        }
+
+
 def canonical_sha256(value: Any) -> str:
     """Hash a JSON value using the project's canonical JSON convention."""
 
@@ -168,12 +197,73 @@ def seal_profile_document(value: Mapping[str, Any]) -> dict[str, Any]:
     return document
 
 
+def dataset_regime(dataset_size: int) -> str:
+    """Return the stable fixture-size band recorded alongside the exact size."""
+
+    size = _positive_int(dataset_size, "dataset size")
+    if size <= 10:
+        return "tiny-1-10"
+    if size <= 24:
+        return "small-11-24"
+    if size <= 50:
+        return "medium-25-50"
+    return "large-51-plus"
+
+
+def current_accelerator_identity(
+    *,
+    environ: Mapping[str, str] | None = None,
+    runner: Callable[..., Any] = subprocess.run,
+) -> str:
+    """Return a portable GPU-class identity or fail before profile reuse.
+
+    The explicit environment value is intended for a measured harness.  The
+    live fallback binds model name and total memory while deliberately omitting
+    per-device UUID, allowing the same measured profile on an equivalent card.
+    """
+
+    env = os.environ if environ is None else environ
+    explicit = str(env.get(ACCELERATOR_IDENTITY_ENV, "")).strip()
+    if explicit:
+        return _text(explicit, "accelerator identity", maximum=256)
+    try:
+        completed = runner(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        rows = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        if completed.returncode != 0 or len(rows) != 1:
+            raise ValueError
+        name, memory = (part.strip() for part in rows[0].rsplit(",", 1))
+        if not name or not memory.isdigit():
+            raise ValueError
+        return _text(
+            f"{name}|{int(memory)}-MiB",
+            "accelerator identity",
+            maximum=256,
+        )
+    except Exception as exc:
+        raise TimingProfileError(
+            "current accelerator identity could not be established"
+        ) from exc
+
+
 def load_bundle_profile(
     *,
     bundle_id: str,
     bundle_sha256: str,
     model_type: str,
+    current_dataset_size: int,
+    dataset_regime: str,
     required: bool,
+    expected_accelerator_identity: str | None = None,
     environ: Mapping[str, str] | None = None,
     path: str | None = None,
 ) -> ThroughputProfile | None:
@@ -194,11 +284,17 @@ def load_bundle_profile(
                 f"measured throughput profile required for bundle {bundle_id!r}"
             )
         return None
+    accelerator_identity = expected_accelerator_identity
+    if accelerator_identity is None:
+        accelerator_identity = current_accelerator_identity(environ=env)
     return load_profile(
         selected_path,
         expected_bundle_id=bundle_id,
         expected_bundle_sha256=bundle_sha256,
         expected_model_type=model_type,
+        current_dataset_size=current_dataset_size,
+        expected_dataset_regime=dataset_regime,
+        expected_accelerator_identity=accelerator_identity,
     )
 
 
@@ -208,6 +304,9 @@ def load_profile(
     expected_bundle_id: str,
     expected_bundle_sha256: str,
     expected_model_type: str,
+    current_dataset_size: int,
+    expected_dataset_regime: str,
+    expected_accelerator_identity: str,
 ) -> ThroughputProfile:
     """Load and validate one exact profile, rejecting all binding drift."""
 
@@ -232,6 +331,9 @@ def load_profile(
         expected_bundle_id=expected_bundle_id,
         expected_bundle_sha256=expected_bundle_sha256,
         expected_model_type=expected_model_type,
+        current_dataset_size=current_dataset_size,
+        expected_dataset_regime=expected_dataset_regime,
+        expected_accelerator_identity=expected_accelerator_identity,
     )
 
 
@@ -241,6 +343,9 @@ def validate_profile(
     expected_bundle_id: str,
     expected_bundle_sha256: str,
     expected_model_type: str,
+    current_dataset_size: int,
+    expected_dataset_regime: str,
+    expected_accelerator_identity: str,
 ) -> ThroughputProfile:
     """Validate schema, provenance, self-hash, and exact bundle binding."""
 
@@ -256,6 +361,12 @@ def validate_profile(
     bundle_id = _bundle_id(document["bundle_id"])
     bundle_sha256 = _sha256(document["bundle_sha256"], "bundle sha256")
     model_type = _text(document["model_type"], "model type", maximum=64).lower()
+    measured_dataset_size = _positive_int(
+        document["measured_dataset_size"], "measured dataset size"
+    )
+    profile_dataset_regime = _text(
+        document["dataset_regime"], "dataset regime", maximum=64
+    )
     if bundle_id != _bundle_id(expected_bundle_id):
         raise TimingProfileError("timing profile bundle id mismatch")
     if bundle_sha256 != _sha256(expected_bundle_sha256, "expected bundle sha256"):
@@ -264,6 +375,16 @@ def validate_profile(
         expected_model_type, "expected model type", maximum=64
     ).lower():
         raise TimingProfileError("timing profile model type mismatch")
+    current_size = _positive_int(current_dataset_size, "current dataset size")
+    expected_regime = _text(
+        expected_dataset_regime, "expected dataset regime", maximum=64
+    )
+    if expected_regime != dataset_regime(current_size):
+        raise TimingProfileError("current dataset regime is inconsistent")
+    if profile_dataset_regime != dataset_regime(measured_dataset_size):
+        raise TimingProfileError("timing profile dataset regime is inconsistent")
+    if profile_dataset_regime != expected_regime:
+        raise TimingProfileError("timing profile dataset regime mismatch")
 
     declared_profile_sha = _sha256(
         document["profile_sha256"], "profile sha256"
@@ -326,12 +447,24 @@ def validate_profile(
     )
     runtime_commit = _git_commit(provenance["runtime_commit"])
     measured_at_utc = _utc(provenance["measured_at_utc"])
-    accelerator = _text(provenance["accelerator"], "accelerator", maximum=256)
+    accelerator_identity = _text(
+        provenance["accelerator_identity"],
+        "accelerator identity",
+        maximum=256,
+    )
+    if accelerator_identity != _text(
+        expected_accelerator_identity,
+        "expected accelerator identity",
+        maximum=256,
+    ):
+        raise TimingProfileError("timing profile accelerator identity mismatch")
 
     return ThroughputProfile(
         bundle_id=bundle_id,
         bundle_sha256=bundle_sha256,
         model_type=model_type,
+        measured_dataset_size=measured_dataset_size,
+        dataset_regime=profile_dataset_regime,
         seconds_per_step=seconds_per_step,
         startup_seconds=startup_seconds,
         completed_steps=completed_steps,
@@ -342,7 +475,7 @@ def validate_profile(
         source_record_sha256=source_record_sha256,
         runtime_commit=runtime_commit,
         measured_at_utc=measured_at_utc,
-        accelerator=accelerator,
+        accelerator_identity=accelerator_identity,
         profile_sha256=declared_profile_sha,
     )
 
@@ -441,6 +574,42 @@ def emit_first_checkpoint_observation(
         sink(FIRST_CHECKPOINT_EVENT, **observation.telemetry_fields())
     except Exception:
         # Telemetry can never change the training result.
+        pass
+    return observation
+
+
+def emit_bootstrap_first_checkpoint_observation(
+    *,
+    bundle_id: str,
+    checkpoint_step: int,
+    elapsed_since_launch_s: float,
+    active_planned_steps: int,
+    event_sink: Callable[..., None] | None = None,
+) -> BootstrapFirstCheckpointObservation:
+    """Persistable raw observation for an explicitly labeled profile bootstrap."""
+
+    planned = _positive_int(active_planned_steps, "active planned steps")
+    observed_step = _positive_int(checkpoint_step, "checkpoint step")
+    if observed_step > planned:
+        raise TimingProfileError("observed checkpoint exceeds the active plan")
+    observation = BootstrapFirstCheckpointObservation(
+        bundle_id=_bundle_id(bundle_id),
+        checkpoint_step=observed_step,
+        elapsed_since_launch_s=_finite_positive(
+            elapsed_since_launch_s,
+            "elapsed since launch",
+            maximum=604800.0,
+        ),
+        active_planned_steps=planned,
+    )
+    sink = event_sink
+    if sink is None:
+        from forge import telemetry
+
+        sink = telemetry.event
+    try:
+        sink(FIRST_CHECKPOINT_EVENT, **observation.telemetry_fields())
+    except Exception:
         pass
     return observation
 
