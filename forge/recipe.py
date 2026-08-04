@@ -58,8 +58,28 @@ EXPORT_RESERVE_S = 180.0  # mirrors cli._EXPORT_RESERVE_SECONDS
 MARGIN = 0.85  # jitter/save/eval headroom
 
 
-def size_scaled_steps(model_type, num_images, hours_to_complete, template_steps):
-    """Never raises → falls back to template_steps on any error (INV-1)."""
+def size_scaled_steps(
+    model_type,
+    num_images,
+    hours_to_complete,
+    template_steps,
+    *,
+    throughput_profile=None,
+):
+    """Materialize the size law under a static or explicit measured budget.
+
+    With no profile this retains the historical never-raise fallback and exact
+    incumbent outputs.  Supplying a profile is an experimental, fail-closed
+    operation: its model binding is checked before the legacy fallback block.
+    """
+    if throughput_profile is not None:
+        from forge.adaptive_timing import ThroughputProfile, TimingProfileError
+
+        if not isinstance(throughput_profile, ThroughputProfile):
+            raise TimingProfileError("recipe received an invalid timing profile")
+        expected_model = (model_type or "").strip().lower()
+        if throughput_profile.model_type != expected_model:
+            raise TimingProfileError("recipe timing profile model type mismatch")
     try:
         mt = (model_type or "").strip().lower()
         row = STEP_TABLE.get(mt)
@@ -69,9 +89,18 @@ def size_scaled_steps(model_type, num_images, hours_to_complete, template_steps)
         scaled = row["base"] * (n / row["n_ref"]) ** row["p"]
         scaled = int(round(max(row["min"], min(row["max"], scaled))))
 
-        sit = SEC_PER_IT.get(mt, 3.0)
+        sit = (
+            throughput_profile.seconds_per_step
+            if throughput_profile is not None
+            else SEC_PER_IT.get(mt, 3.0)
+        )
+        startup_s = (
+            throughput_profile.startup_seconds
+            if throughput_profile is not None
+            else STARTUP_S
+        )
         budget_s = max(0.0, float(hours_to_complete) * 3600.0)
-        train_s = budget_s * MARGIN - STARTUP_S - EXPORT_RESERVE_S
+        train_s = budget_s * MARGIN - startup_s - EXPORT_RESERVE_S
         budget_cap = int(train_s / sit) if train_s > 0 else 1
         return max(1, min(scaled, budget_cap))  # cap may push below `min`
     except Exception:
