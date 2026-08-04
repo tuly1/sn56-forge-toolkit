@@ -31,8 +31,12 @@ RUN retry_network() { \
             attempt=$((attempt + 1)); \
         done; \
     }; \
-    retry_network git fetch origin 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
-    git checkout 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+    git remote set-url origin https://github.com/tuly1/sn56-ai-toolkit-mirror.git && \
+    retry_network git fetch origin c465e700019c4bcbac633c5fe279b2446e2e77a5 && \
+    git checkout c465e700019c4bcbac633c5fe279b2446e2e77a5 && \
+    test "$(git rev-parse HEAD)" = c465e700019c4bcbac633c5fe279b2446e2e77a5 && \
+    test -f sn56_krea_runtime_capabilities.json && \
+    python3 -c 'import hashlib,json,pathlib; p=pathlib.Path("sn56_krea_runtime_capabilities.json"); v={"schema":1,"runtime_repository":"https://github.com/tuly1/sn56-ai-toolkit-mirror.git","runtime_commit":"c465e700019c4bcbac633c5fe279b2446e2e77a5","capability_manifest_sha256":hashlib.sha256(p.read_bytes()).hexdigest()}; pathlib.Path(".sn56-runtime-identity.json").write_text(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")' && \
     retry_network pip install --no-cache-dir \
         --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
         --requirement requirements.txt && \

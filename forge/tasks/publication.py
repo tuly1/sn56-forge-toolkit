@@ -35,6 +35,10 @@ _PRIVATE_SIDECARS = (
     "loss_log.db",
     "loss_log.db-wal",
     "loss_log.db-shm",
+    # Owned Week-6 ai-toolkit persists resumable EMA shadow/live state here.
+    # It is optimizer-private state, never an evaluator artifact.
+    "ema.pt",
+    "ema_resume_transaction.json",
     "forge_holdout_scores.json",
     "forge_checkpoint_selection.json",
     ".forge_checkpoint_scope.json",
