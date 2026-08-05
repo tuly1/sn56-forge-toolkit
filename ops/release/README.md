@@ -29,16 +29,20 @@ launchers only.
   through one descriptor. Forge never reopens those paths. A persistent later
   path replacement fails the final binding check; an A/B/A replacement cannot
   change the evidence Forge consumed.
-- The timing receipt must exist and parse as schema 2, kind
-  `sn56.week6.operator-attested-timing-provenance.v2`, `state=PASS`, with the
+- The timing receipt must exist and parse as schema 3, kind
+  `sn56.week6.operator-attested-timing-provenance.v3`, `state=PASS`, with a
+  required machine-enforced `origin=real|synthetic` and the
   exact materialized source path/manifest, release commit, tree, scope, and
   evidence hashes. The delegated `result.env` is parsed as data and must bind
   the same commit, trees, scope, mode, archive, source manifest, and mode-specific
-  result state.
-- The final Week-6 envelope is schema v3 and is prepared and published with an
+  result state. Production rejects synthetic receipts; CPU integration accepts
+  only synthetic receipts. The receipt accelerator identity must exactly match
+  the delegate's live H100 observation (or the non-GPU integration sentinel).
+- The final Week-6 envelope is schema v4 and is prepared and published with an
   atomic no-replace rename under `SN56_RELEASE_ENVELOPE_BASE`. Production emits
   `PASS`; `cpu-integration` emits only `DRY_RUN_PASS`. Receipt/envelope v1 and
-  envelope v2, timing-profile schema 3, and raw-runtime schema 4 are
+  envelopes v2/v3, timing receipts v1/v2, timing-profile schema 3, and
+  raw-runtime schema 4 are
   intentionally invalid.
 
 ## Lab/production boundary
@@ -63,7 +67,8 @@ must show a duration-consistent training window inside the rental interval.
   captures and stages the YAML bytes before any mutation, passes those exact
   bytes through a private real `.yaml` file accepted by the pinned loader,
   executes only a verified archive of the selected runtime commit, emits the
-  sealed v2 Friday gate event, writes evidence atomically outside the upload
+  sealed v3 Friday gate event with `origin=real`, writes evidence atomically
+  outside the upload
   tree, and is never imported by a production path.
 - `sn56-week6-final-release-cert.sh`: minimal public trust/bootstrap launcher.
 - `sn56-week6-final-release-cert-worker.sh`: archived strict Bash timing and
@@ -76,7 +81,8 @@ must show a duration-consistent training window inside the rental interval.
   GPU observations and cannot emit production `PASS`.
 - `../../tests/integration/sn56-week6-release-dry-run.sh`: exact-head clean-clone
   wrapper proof. Its companion fixture generator produces explicitly
-  non-authoritative schema-current timing input; the wrapper still executes all
+  non-authoritative `origin=synthetic` schema-current timing input; the wrapper
+  still executes all
   CPU/build, receipt, image, and publication gates for real.
 
 CPU tests do not certify a Docker image, GPU execution, evaluator attachment,

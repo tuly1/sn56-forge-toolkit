@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -82,7 +83,7 @@ def test_delegate_has_fixed_policy_neutral_two_subject_matrix_and_no_asserts():
     source = DELEGATE.read_text(encoding="utf-8")
     tree = ast.parse(source)
 
-    assert module.RESULT_SCHEMA == "sn56.week6.build-gpu-cert.v1"
+    assert module.RESULT_SCHEMA == "sn56.week6.build-gpu-cert.v2"
     assert [(item.name, item.dockerfile) for item in module.SUBJECTS] == [
         ("toolkit", "ops/docker/standalone-image-toolkit-trainer.dockerfile"),
         ("legacy", "ops/docker/standalone-image-trainer.dockerfile"),
@@ -130,6 +131,7 @@ def test_cpu_integration_can_never_emit_production_pass():
 
     hostile_tools = {name: "/must/not/execute" for name in module.ABSOLUTE_TOOLS}
     assert module.observe_host_gpu(module.CPU_INTEGRATION_MODE, hostile_tools) == {
+        "accelerator_identity": "INTEGRATION-STUB-NO-GPU-CLAIM|0-MiB",
         "claim": "none",
         "reason": "physical-gpu-boundary-stubbed-for-cpu-integration",
         "state": "STUBBED",
@@ -205,6 +207,10 @@ def test_fixed_subprocess_environment_does_not_inherit_operator_state(monkeypatc
     assert all(os.path.isabs(path) for path in module.ABSOLUTE_TOOLS.values())
     assert value["GIT_NO_REPLACE_OBJECTS"] == "1"
     assert value["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert value["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert value["GIT_CONFIG_COUNT"] == str(len(module.GIT_CONFIG_OVERRIDES))
+    assert value["GIT_CONFIG_KEY_0"] == "core.fsmonitor"
+    assert value["GIT_CONFIG_VALUE_0"] == "false"
 
 
 def test_integration_harness_calls_real_outer_wrapper_and_forbids_pass():
@@ -216,7 +222,13 @@ def test_integration_harness_calls_real_outer_wrapper_and_forbids_pass():
     assert "SN56_RELEASE_CERT_MODE=cpu-integration" in source
     assert "SN56_WEEK6_FINAL_RELEASE_CERT=DRY_RUN_PASS" in source
     assert "CPU integration illegally emitted production PASS" in source
-    assert source.count("--no-replace-objects") >= 5
+    assert "git_isolated()" in source
+    assert "GIT_CONFIG_KEY_0=core.fsmonitor" in source
+    assert "GIT_CONFIG_VALUE_0=false" in source
+    assert "core.fsmonitor=false" in source
+    assert source.count("git_isolated ") >= 7
+    assert "sleep 2 #" in source
+    assert "url.https://attacker.invalid/spoof.git.insteadOf" in source
 
 
 def test_integration_harness_snapshots_the_complete_pipeline_status():
@@ -283,6 +295,81 @@ def test_archive_materialization_ignores_skip_worktree_bytes(tmp_path):
 
     assert (materialized.root / "forge" / "contract.py").read_text() == "VALUE = 'A'\n"
     assert tracked.read_text() == "VALUE = 'B'\n"
+
+
+def test_malicious_local_fsmonitor_cannot_spoof_clean_source(tmp_path):
+    module, repository, identity, tools = _repository(tmp_path)
+    tracked = repository / "forge" / "contract.py"
+    _git(repository, "config", "core.fsmonitor", "sleep 2 #")
+    _git(repository, "update-index", "--fsmonitor")
+    tracked.write_text("VALUE = 'B'\n", encoding="utf-8")
+
+    started = time.monotonic()
+    with pytest.raises(module.DelegateError, match="source checkout has changed"):
+        module.verify_source_repository(repository, identity, tools)
+    assert time.monotonic() - started < 1.5
+
+    command = module.git_command(tools, repository, "status", "--porcelain=v1")
+    assert "core.fsmonitor=false" in command
+    assert module.FIXED_ENV["GIT_CONFIG_KEY_0"] == "core.fsmonitor"
+    assert module.FIXED_ENV["GIT_CONFIG_VALUE_0"] == "false"
+
+
+def test_live_h100_identity_is_derived_from_nvidia_smi(monkeypatch):
+    module = _delegate()
+
+    def observed(argv, **_kwargs):
+        assert argv == [
+            "/usr/bin/nvidia-smi",
+            "--query-gpu=name,uuid,driver_version,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                b"NVIDIA H100 PCIe, GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, "
+                b"570.86.15, 81559\n"
+            ),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(module, "run_capture", observed)
+    result = module.observe_host_gpu(
+        module.PRODUCTION_MODE,
+        {"nvidia_smi": "/usr/bin/nvidia-smi"},
+    )
+
+    assert result["accelerator_identity"] == "NVIDIA H100 PCIe|81559-MiB"
+    assert result["state"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b"NVIDIA H100 PCIe, GPU-a, 570.86.15, 81559\nsecond\n", "exactly one"),
+        (b"NVIDIA A100, GPU-aaaaaaaa, 570.86.15, 81559\n", "not an H100"),
+        (b"NVIDIA H100 PCIe, invalid, 570.86.15, 81559\n", "UUID"),
+        (b"NVIDIA H100 PCIe, GPU-aaaaaaaa, driver, 81559\n", "driver"),
+    ],
+)
+def test_live_gpu_identity_rejects_ambiguous_or_invalid_rows(
+    monkeypatch, payload, message
+):
+    module = _delegate()
+    monkeypatch.setattr(
+        module,
+        "run_capture",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=payload, stderr=b""
+        ),
+    )
+
+    with pytest.raises(module.DelegateError, match=message):
+        module.observe_host_gpu(
+            module.PRODUCTION_MODE,
+            {"nvidia_smi": "/usr/bin/nvidia-smi"},
+        )
 
 
 def test_clean_clone_gate_rejects_ignored_execution_surface(tmp_path):
@@ -358,11 +445,12 @@ def test_result_env_has_exact_week6_schema_and_stub_state():
         "legacy_image_tag": "sn56/legacy:deadbeef",
         "legacy_image_id": "sha256:" + "4" * 64,
         "gpu_boundary": "STUBBED_NO_CLAIM",
+        "accelerator_identity": "INTEGRATION-STUB-NO-GPU-CLAIM|0-MiB",
         "completed_at_utc": "2026-08-04T00:00:00Z",
     }
     payload = module.result_env_payload(result).decode("utf-8")
 
-    assert payload.startswith("schema=sn56.week6.build-gpu-cert.v1\n")
+    assert payload.startswith("schema=sn56.week6.build-gpu-cert.v2\n")
     assert "state=DRY_RUN_PASS\n" in payload
     assert "gpu_boundary=STUBBED_NO_CLAIM\n" in payload
     assert "state=PASS\n" not in payload

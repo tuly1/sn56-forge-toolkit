@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
@@ -34,11 +35,12 @@ import time
 from typing import Any, BinaryIO, Callable, Iterable, Mapping, Sequence
 
 
-RESULT_SCHEMA = "sn56.week6.build-gpu-cert.v1"
+RESULT_SCHEMA = "sn56.week6.build-gpu-cert.v2"
 PRODUCTION_MODE = "production"
 CPU_INTEGRATION_MODE = "cpu-integration"
 PASS_STATE = "PASS"
 DRY_RUN_PASS_STATE = "DRY_RUN_PASS"
+CPU_ACCELERATOR_IDENTITY = "INTEGRATION-STUB-NO-GPU-CLAIM|0-MiB"
 
 SHA1_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -48,6 +50,17 @@ IMAGE_TAG_RE = re.compile(
 )
 FROM_DIGEST_RE = re.compile(r"^[^\s]+@sha256:[0-9a-f]{64}$")
 
+GIT_CONFIG_OVERRIDES = (
+    ("core.fsmonitor", "false"),
+    ("core.hooksPath", "/dev/null"),
+    ("core.untrackedCache", "false"),
+    ("core.ignoreStat", "false"),
+    ("core.trustctime", "true"),
+    ("core.checkStat", "default"),
+    ("core.attributesFile", "/dev/null"),
+    ("core.excludesFile", "/dev/null"),
+)
+
 FIXED_ENV = {
     "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "HOME": "/nonexistent",
@@ -56,9 +69,16 @@ FIXED_ENV = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONNOUSERSITE": "1",
     "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_TERMINAL_PROMPT": "0",
+    "GIT_CONFIG_COUNT": str(len(GIT_CONFIG_OVERRIDES)),
 }
+for _git_config_index, (_git_config_key, _git_config_value) in enumerate(
+    GIT_CONFIG_OVERRIDES
+):
+    FIXED_ENV[f"GIT_CONFIG_KEY_{_git_config_index}"] = _git_config_key
+    FIXED_ENV[f"GIT_CONFIG_VALUE_{_git_config_index}"] = _git_config_value
 
 ABSOLUTE_TOOLS: dict[str, str] = {
     "containerd": "/usr/bin/containerd",
@@ -388,17 +408,15 @@ class AtomicEvidence:
 
 
 def git_command(tools: Mapping[str, str], repository: Path, *arguments: str) -> list[str]:
-    return [
+    command = [
         tools["git"],
         "--no-replace-objects",
-        "-c",
-        f"safe.directory={repository}",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-C",
-        str(repository),
-        *arguments,
     ]
+    for key, value in GIT_CONFIG_OVERRIDES:
+        command.extend(("-c", f"{key}={value}"))
+    command.extend(("-c", f"safe.directory={repository}", "-C", str(repository)))
+    command.extend(arguments)
+    return command
 
 
 @dataclass(frozen=True)
@@ -535,6 +553,7 @@ def materialize_exact_archive(
     with archive.open("rb") as input_stream:
         embedded = run_capture(
             [tools["git"], "--no-replace-objects", "get-tar-commit-id"],
+            cwd=Path("/"),
             stdin=input_stream,
         ).stdout.decode("ascii", errors="strict").strip()
     require(embedded == expected.commit, "git archive commit identity differs")
@@ -1002,6 +1021,7 @@ def observe_host_gpu(
 ) -> dict[str, Any]:
     if mode == CPU_INTEGRATION_MODE:
         return {
+            "accelerator_identity": CPU_ACCELERATOR_IDENTITY,
             "claim": "none",
             "reason": "physical-gpu-boundary-stubbed-for-cpu-integration",
             "state": "STUBBED",
@@ -1014,9 +1034,24 @@ def observe_host_gpu(
         ]
     ).stdout.decode("utf-8", errors="strict")
     rows = [row.strip() for row in output.splitlines() if row.strip()]
-    require(bool(rows), "nvidia-smi returned no GPU rows")
-    require("H100" in rows[0], "GPU 0 is not an H100")
-    return {"gpu_0": rows[0], "state": "PASS"}
+    require(len(rows) == 1, "nvidia-smi must return exactly one GPU row")
+    try:
+        fields = next(csv.reader([rows[0]], skipinitialspace=True))
+    except Exception as exc:
+        raise DelegateError("nvidia-smi GPU row is malformed") from exc
+    require(len(fields) == 4, "nvidia-smi GPU row has an unexpected shape")
+    name, uuid, driver, memory = (field.strip() for field in fields)
+    require("H100" in name, "GPU 0 is not an H100")
+    require(re.fullmatch(r"GPU-[0-9A-Fa-f-]+", uuid) is not None, "GPU UUID is invalid")
+    require(re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", driver) is not None, "GPU driver is invalid")
+    require(memory.isdigit() and int(memory) > 0, "GPU memory is invalid")
+    accelerator_identity = f"{name}|{int(memory)}-MiB"
+    require(len(accelerator_identity) <= 256, "GPU identity is too long")
+    return {
+        "accelerator_identity": accelerator_identity,
+        "gpu_0": rows[0],
+        "state": "PASS",
+    }
 
 
 def observe_image_gpu(
@@ -1083,6 +1118,7 @@ def result_env_payload(result: Mapping[str, str]) -> bytes:
         "legacy_image_tag",
         "legacy_image_id",
         "gpu_boundary",
+        "accelerator_identity",
         "completed_at_utc",
     )
     require(set(result) == set(required_order), "delegated result fields differ")
@@ -1211,6 +1247,8 @@ def build_and_certify(args: argparse.Namespace, tools: Mapping[str, str]) -> tup
 
         state = result_state_for_mode(args.mode)
         gpu_boundary = "REAL_H100" if args.mode == PRODUCTION_MODE else "STUBBED_NO_CLAIM"
+        accelerator_identity = str(host_gpu.get("accelerator_identity", ""))
+        require(accelerator_identity, "host GPU observation lacks accelerator identity")
         result = {
             "schema": RESULT_SCHEMA,
             "state": state,
@@ -1229,6 +1267,7 @@ def build_and_certify(args: argparse.Namespace, tools: Mapping[str, str]) -> tup
             "legacy_image_tag": subject_results["legacy"]["image_tag"],
             "legacy_image_id": subject_results["legacy"]["image_id"],
             "gpu_boundary": gpu_boundary,
+            "accelerator_identity": accelerator_identity,
             "completed_at_utc": utc_now(),
         }
         evidence.write_bytes("result.env", result_env_payload(result))

@@ -253,6 +253,7 @@ def create_fixture(args: argparse.Namespace) -> dict[str, str]:
 
     event = {
         "event": validator.EVENT_KIND,
+        "origin": "synthetic",
         "gate_session_id": session_id,
         "source_run_id": source_run_id,
         "rental_started_at_utc": rental_started,
@@ -304,12 +305,13 @@ def create_fixture(args: argparse.Namespace) -> dict[str, str]:
         model_type=model_type,
         current_dataset_size=str(dataset_size),
         dataset_regime=regime,
-        accelerator_identity=accelerator,
+        expected_origin="synthetic",
         allow_dirty_forge=False,
         git_self_test_mode=False,
     )
     receipt = validator.validate(validation_args)
     require(receipt.get("state") == "PASS", "generated fixture did not validate")
+    require(receipt.get("origin") == "synthetic", "fixture origin is not synthetic")
     receipt_path = output / "fixture-validation-receipt.json"
     write_exclusive(receipt_path, canonical_bytes(receipt))
 

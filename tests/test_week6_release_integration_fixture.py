@@ -79,7 +79,10 @@ def _run_generator(
             "--output-dir",
             str(output),
         ],
-        env={"PYTHONDONTWRITEBYTECODE": "1"},
+        env={
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "SN56_EVIDENCE_ORIGIN": "real",
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -116,9 +119,14 @@ def test_generator_produces_schema_current_package_that_real_validator_accepts(
         maximum_bytes=256 * 1024,
     )[1]
     assert receipt["state"] == "PASS"
+    assert receipt["schema"] == 3
+    assert receipt["origin"] == "synthetic"
     assert receipt["evidence_class"] == "operator-attested"
     assert receipt["forge"]["repository"] == str(materialized)
     assert receipt["forge"]["materialized_manifest_sha256"] == manifest
+    generator_source = GENERATOR.read_text(encoding="utf-8")
+    assert '"origin": "synthetic"' in generator_source
+    assert "--origin" not in generator_source
 
 
 def test_generator_rejects_wrong_manifest_before_publishing_fixture(tmp_path):

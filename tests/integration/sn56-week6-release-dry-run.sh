@@ -38,10 +38,36 @@ usage() {
     '  --h100-rental-started-at-utc UTC --h100-rental-ended-at-utc UTC' \
     '  --timing-bundle-id ID --timing-bundle-sha256 SHA256' \
     '  --timing-model-type TYPE --timing-current-dataset-size N' \
-    '  --timing-dataset-regime REGIME --timing-accelerator-identity ID' \
+    '  --timing-dataset-regime REGIME' \
     '  --toolkit-image-tag TAG --legacy-image-tag TAG' \
     '  --expected-docker-root ABS --expected-containerd-root ABS'
   exit 64
+}
+
+git_isolated() {
+  /usr/bin/env -i \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/nonexistent LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 \
+    GIT_CONFIG_COUNT=8 \
+    GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false \
+    GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null \
+    GIT_CONFIG_KEY_2=core.untrackedCache GIT_CONFIG_VALUE_2=false \
+    GIT_CONFIG_KEY_3=core.ignoreStat GIT_CONFIG_VALUE_3=false \
+    GIT_CONFIG_KEY_4=core.trustctime GIT_CONFIG_VALUE_4=true \
+    GIT_CONFIG_KEY_5=core.checkStat GIT_CONFIG_VALUE_5=default \
+    GIT_CONFIG_KEY_6=core.attributesFile GIT_CONFIG_VALUE_6=/dev/null \
+    GIT_CONFIG_KEY_7=core.excludesFile GIT_CONFIG_VALUE_7=/dev/null \
+    /usr/bin/git --no-replace-objects \
+      -c core.fsmonitor=false \
+      -c core.hooksPath=/dev/null \
+      -c core.untrackedCache=false \
+      -c core.ignoreStat=false \
+      -c core.trustctime=true \
+      -c core.checkStat=default \
+      -c core.attributesFile=/dev/null \
+      -c core.excludesFile=/dev/null "$@"
 }
 
 repo_url=''
@@ -65,7 +91,6 @@ timing_bundle_sha256=''
 timing_model_type=''
 timing_current_dataset_size=''
 timing_dataset_regime=''
-timing_accelerator_identity=''
 toolkit_image_tag=''
 legacy_image_tag=''
 expected_docker_root=''
@@ -95,7 +120,6 @@ while (( $# )); do
     --timing-model-type) timing_model_type=$2 ;;
     --timing-current-dataset-size) timing_current_dataset_size=$2 ;;
     --timing-dataset-regime) timing_dataset_regime=$2 ;;
-    --timing-accelerator-identity) timing_accelerator_identity=$2 ;;
     --toolkit-image-tag) toolkit_image_tag=$2 ;;
     --legacy-image-tag) legacy_image_tag=$2 ;;
     --expected-docker-root) expected_docker_root=$2 ;;
@@ -115,7 +139,7 @@ for required_value in \
   "${h100_rental_ended_at_utc}" "${timing_bundle_id}" \
   "${timing_bundle_sha256}" "${timing_model_type}" \
   "${timing_current_dataset_size}" "${timing_dataset_regime}" \
-  "${timing_accelerator_identity}" "${toolkit_image_tag}" \
+  "${toolkit_image_tag}" \
   "${legacy_image_tag}" "${expected_docker_root}" \
   "${expected_containerd_root}"
 do
@@ -124,7 +148,7 @@ done
 
 [[ ${repo_url} =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$ ]] || usage
 [[ ${remote_ref} =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]] || usage
-/usr/bin/git check-ref-format "${remote_ref}" || usage
+git_isolated -C / check-ref-format "${remote_ref}" || usage
 [[ ${commit} =~ ^[0-9a-f]{40}$ ]] || usage
 [[ ${timing_bundle_sha256} =~ ^[0-9a-f]{64}$ ]] || usage
 [[ ${evidence_namespace} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || usage
@@ -176,28 +200,22 @@ trap cleanup EXIT
 /bin/chmod 0700 "${temporary_directory}"
 clone=${temporary_directory}/exact-head-clone
 
-/usr/bin/env -i \
-  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  HOME=/nonexistent \
-  LANG=C.UTF-8 \
-  LC_ALL=C.UTF-8 \
-  GIT_NO_REPLACE_OBJECTS=1 \
-  GIT_TERMINAL_PROMPT=0 \
-  /usr/bin/git --no-replace-objects clone --no-checkout -- "${repo_url}" "${clone}"
-/usr/bin/env -i \
-  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  HOME=/nonexistent \
-  LANG=C.UTF-8 \
-  LC_ALL=C.UTF-8 \
-  GIT_NO_REPLACE_OBJECTS=1 \
-  GIT_TERMINAL_PROMPT=0 \
-  /usr/bin/git --no-replace-objects -C "${clone}" checkout --detach "${commit}"
+git_isolated -C / clone --no-checkout -- "${repo_url}" "${clone}"
+git_isolated -C "${clone}" checkout --detach "${commit}"
 
-actual_head=$(/usr/bin/git --no-replace-objects -C "${clone}" rev-parse HEAD)
+# Exact hostile repository-local configuration from the independent audit.
+# The wrapper must inspect/archive the repository without executing the
+# fsmonitor command or applying its URL rewrite.
+git_isolated -C "${clone}" config --local core.fsmonitor 'sleep 2 #'
+git_isolated -C "${clone}" update-index --fsmonitor
+git_isolated -C "${clone}" config --local \
+  url.https://attacker.invalid/spoof.git.insteadOf "${repo_url}"
+
+actual_head=$(git_isolated -C "${clone}" rev-parse HEAD)
 [[ ${actual_head} == "${commit}" ]]
-source_tree=$(/usr/bin/git --no-replace-objects -C "${clone}" rev-parse 'HEAD^{tree}')
-forge_tree=$(/usr/bin/git --no-replace-objects -C "${clone}" rev-parse 'HEAD:forge')
-status=$(/usr/bin/git --no-replace-objects -C "${clone}" status \
+source_tree=$(git_isolated -C "${clone}" rev-parse 'HEAD^{tree}')
+forge_tree=$(git_isolated -C "${clone}" rev-parse 'HEAD:forge')
+status=$(git_isolated -C "${clone}" status \
   --porcelain=v1 --untracked-files=all --ignored=matching)
 [[ -z ${status} ]] || {
   /usr/bin/printf 'exact-head integration clone is not clean:\n%s\n' "${status}" >&2
@@ -257,7 +275,6 @@ set +e
   SN56_RELEASE_TIMING_MODEL_TYPE="${timing_model_type}" \
   SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE="${timing_current_dataset_size}" \
   SN56_RELEASE_TIMING_DATASET_REGIME="${timing_dataset_regime}" \
-  SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY="${timing_accelerator_identity}" \
   /bin/sh "${wrapper}" 2>&1 | /usr/bin/tee "${transcript}"
 pipeline_status=("${PIPESTATUS[@]}")
 wrapper_rc=${pipeline_status[0]}

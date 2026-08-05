@@ -10,7 +10,7 @@ of the operator and gate harness that produced the record.
 The gate log is JSON Lines.  The matching event must contain these fields:
 
 ``event``
-    ``sn56.week6.friday-h100-timing-evidence-sealed.v2``
+    ``sn56.week6.friday-h100-timing-evidence-sealed.v3``
 ``gate_session_id`` / ``source_run_id``
     Exact values supplied to this validator.
 ``rental_started_at_utc`` / ``rental_ended_at_utc``
@@ -24,7 +24,8 @@ The gate log is JSON Lines.  The matching event must contain these fields:
 ``profile_semantic_sha256`` / ``raw_record_semantic_sha256``
     Canonical semantic hashes embedded in the profile and raw record.
 ``forge_commit`` / ``bundle_id`` / ``bundle_sha256`` / ``model_type``
-``current_dataset_size`` / ``dataset_regime`` / ``accelerator_identity``
+``current_dataset_size`` / ``dataset_regime`` / ``accelerator_identity`` /
+``origin``
     The exact Forge contract and scope that the event supervised.
 
 Extra event fields are permitted so the Friday harness can carry its own host,
@@ -51,10 +52,11 @@ import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
 
-EVENT_KIND = "sn56.week6.friday-h100-timing-evidence-sealed.v2"
-RECEIPT_KIND = "sn56.week6.operator-attested-timing-provenance.v2"
-DELEGATED_RESULT_SCHEMA = "sn56.week6.build-gpu-cert.v1"
+EVENT_KIND = "sn56.week6.friday-h100-timing-evidence-sealed.v3"
+RECEIPT_KIND = "sn56.week6.operator-attested-timing-provenance.v3"
+DELEGATED_RESULT_SCHEMA = "sn56.week6.build-gpu-cert.v2"
 PROFILE_KIND = "forge-operator-attested-throughput-profile"
+EVIDENCE_ORIGINS = frozenset({"real", "synthetic"})
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 SOURCE_RUN_RE = re.compile(r".+:[0-9a-f]{32}")
 SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -66,6 +68,7 @@ RECEIPT_KEYS = frozenset(
         "schema",
         "kind",
         "state",
+        "origin",
         "evidence_class",
         "claim_limit",
         "gate_session_id",
@@ -134,14 +137,21 @@ DELEGATED_RESULT_KEYS = frozenset(
         "legacy_image_tag",
         "legacy_image_id",
         "gpu_boundary",
+        "accelerator_identity",
         "completed_at_utc",
     }
 )
 DELEGATED_MODE_CONTRACT = {
-    "production": {"state": "PASS", "gpu_boundary": "REAL_H100"},
+    "production": {
+        "state": "PASS",
+        "gpu_boundary": "REAL_H100",
+        "evidence_origin": "real",
+    },
     "cpu-integration": {
         "state": "DRY_RUN_PASS",
         "gpu_boundary": "STUBBED_NO_CLAIM",
+        "evidence_origin": "synthetic",
+        "accelerator_identity": "INTEGRATION-STUB-NO-GPU-CLAIM|0-MiB",
     },
 }
 DELEGATED_SHA256_FIELDS = frozenset(
@@ -906,6 +916,9 @@ def validate(
         raise ProvenanceError("release tree is invalid")
     if args.certificate_scope != "toolkit-krea-only":
         raise ProvenanceError("certificate scope is invalid")
+    expected_origin = getattr(args, "expected_origin", None)
+    if expected_origin not in EVIDENCE_ORIGINS:
+        raise ProvenanceError("expected evidence origin is invalid")
 
     rental_start = parse_utc(args.rental_started_at_utc, "rental start")
     rental_end = parse_utc(args.rental_ended_at_utc, "rental end")
@@ -985,6 +998,14 @@ def validate(
         raise ProvenanceError("profile or raw-record provenance is incomplete") from exc
     if not isinstance(profile_provenance, dict):
         raise ProvenanceError("profile provenance must be an object")
+    accelerator_identity = profile_provenance.get("accelerator_identity")
+    if (
+        not isinstance(accelerator_identity, str)
+        or not accelerator_identity
+        or len(accelerator_identity) > 256
+        or any(character in accelerator_identity for character in ("\x00", "\n", "\r"))
+    ):
+        raise ProvenanceError("profile accelerator identity is invalid")
     if canonical_sha256_without(profile, "profile_sha256") != profile_semantic:
         raise ProvenanceError("profile canonical semantic hash mismatch")
     if forge_runtime_record_sha256_without(
@@ -1026,7 +1047,7 @@ def validate(
             expected_model_type=args.model_type,
             current_dataset_size=expected_dataset_size,
             expected_dataset_regime=args.dataset_regime,
-            expected_accelerator_identity=args.accelerator_identity,
+            expected_accelerator_identity=accelerator_identity,
             terminal_artifact_evidence=artifact_evidence,
             require_artifact_file_identity=False,
         )
@@ -1067,7 +1088,8 @@ def validate(
                     == expected_dataset_size
                     and event.get("dataset_regime") == args.dataset_regime
                     and event.get("accelerator_identity")
-                    == args.accelerator_identity
+                    == accelerator_identity
+                    and event.get("origin") == expected_origin
                 ):
                     matches.append((line_number, event))
     except Exception as exc:
@@ -1139,9 +1161,10 @@ def validate(
         )
 
     receipt: dict[str, Any] = {
-        "schema": 2,
+        "schema": 3,
         "kind": RECEIPT_KIND,
         "state": "PASS",
+        "origin": expected_origin,
         "evidence_class": "operator-attested",
         "claim_limit": "not-independent-proof-of-elapsed-time-or-hardware-measurement",
         "gate_session_id": args.gate_session_id,
@@ -1163,7 +1186,7 @@ def validate(
             "model_type": args.model_type,
             "current_dataset_size": expected_dataset_size,
             "dataset_regime": args.dataset_regime,
-            "accelerator_identity": args.accelerator_identity,
+            "accelerator_identity": accelerator_identity,
         },
         "rental_window": {
             "started_at_utc": args.rental_started_at_utc,
@@ -1398,6 +1421,24 @@ def assert_delegated_result(
     for field in ("toolkit_image_id", "legacy_image_id"):
         if re.fullmatch(r"sha256:[0-9a-f]{64}", result[field]) is None:
             raise ProvenanceError(f"delegated result.env {field} is invalid")
+    accelerator_identity = result["accelerator_identity"]
+    expected_accelerator = mode_contract.get("accelerator_identity")
+    if expected_accelerator is not None:
+        if accelerator_identity != expected_accelerator:
+            raise ProvenanceError(
+                "delegated result.env accelerator_identity differs from release mode"
+            )
+    elif (
+        "H100" not in accelerator_identity
+        or re.fullmatch(
+            r"[^|\x00\r\n]{1,220}\|[1-9][0-9]*-MiB",
+            accelerator_identity,
+        )
+        is None
+    ):
+        raise ProvenanceError(
+            "delegated result.env accelerator_identity is not a canonical H100 identity"
+        )
     parse_utc(result["completed_at_utc"], "delegated result completion time")
     return result
 
@@ -1446,6 +1487,7 @@ def assert_pass_receipt(
     release_commit: str,
     release_tree: str,
     certificate_scope: str,
+    expected_origin: str,
     expected_file_hashes: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     payload = read_small_regular_file(path, "timing receipt", 256 * 1024)
@@ -1499,10 +1541,13 @@ def assert_pass_receipt(
         "tree": release_tree,
         "materialized_manifest_sha256": materialized_manifest,
     }
+    if expected_origin not in EVIDENCE_ORIGINS:
+        raise ProvenanceError("authority evidence origin is invalid")
     if (
-        receipt.get("schema") != 2
+        receipt.get("schema") != 3
         or receipt.get("kind") != RECEIPT_KIND
         or receipt.get("state") != "PASS"
+        or receipt.get("origin") != expected_origin
         or receipt.get("evidence_class") != "operator-attested"
         or receipt.get("claim_limit")
         != "not-independent-proof-of-elapsed-time-or-hardware-measurement"
@@ -1519,6 +1564,58 @@ def assert_pass_receipt(
     return receipt
 
 
+def assert_receipt_delegated_binding(
+    receipt_path: str,
+    result_path: str,
+    *,
+    expected_repository: str,
+    expected_materialized_manifest_sha256: str,
+    release_commit: str,
+    release_tree: str,
+    forge_tree: str,
+    certificate_scope: str,
+    mode: str,
+    expected_source_archive_sha256: str,
+    expected_source_manifest_sha256: str,
+    expected_file_hashes: Mapping[str, str] | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Bind one mode-typed receipt to the delegate's live GPU observation."""
+
+    mode_contract = DELEGATED_MODE_CONTRACT.get(mode)
+    if mode_contract is None:
+        raise ProvenanceError("receipt/delegate binding mode is unsupported")
+    receipt = assert_pass_receipt(
+        receipt_path,
+        expected_repository=expected_repository,
+        expected_materialized_manifest_sha256=(
+            expected_materialized_manifest_sha256
+        ),
+        release_commit=release_commit,
+        release_tree=release_tree,
+        certificate_scope=certificate_scope,
+        expected_origin=mode_contract["evidence_origin"],
+        expected_file_hashes=expected_file_hashes,
+    )
+    result = assert_delegated_result(
+        result_path,
+        release_commit=release_commit,
+        release_tree=release_tree,
+        forge_tree=forge_tree,
+        certificate_scope=certificate_scope,
+        mode=mode,
+        expected_source_archive_sha256=expected_source_archive_sha256,
+        expected_source_manifest_sha256=expected_source_manifest_sha256,
+    )
+    if (
+        receipt["scope"]["accelerator_identity"]
+        != result["accelerator_identity"]
+    ):
+        raise ProvenanceError(
+            "timing receipt accelerator identity differs from delegated live GPU observation"
+        )
+    return receipt, result
+
+
 def run_pinned_validator(
     validator_path: str,
     validator_sha256: str,
@@ -1530,6 +1627,7 @@ def run_pinned_validator(
     release_commit: str,
     release_tree: str,
     certificate_scope: str,
+    expected_origin: str,
 ) -> subprocess.CompletedProcess[str]:
     """Testable authority runner: zero scripts and missing receipts are fatal."""
 
@@ -1562,6 +1660,7 @@ def run_pinned_validator(
             release_commit=release_commit,
             release_tree=release_tree,
             certificate_scope=certificate_scope,
+            expected_origin=expected_origin,
         )
         return completed
 
@@ -1831,6 +1930,7 @@ def self_test(
 
         event = {
             "event": EVENT_KIND,
+            "origin": "synthetic",
             "gate_session_id": session_id,
             "source_run_id": source_run_id,
             "rental_started_at_utc": started,
@@ -1882,12 +1982,13 @@ def self_test(
             model_type=model_type,
             current_dataset_size=str(dataset_size),
             dataset_regime=regime,
-            accelerator_identity=accelerator,
+            expected_origin="synthetic",
             allow_dirty_forge=True,
             git_self_test_mode=True,
         )
         receipt = validate(args)
         assert receipt["state"] == "PASS"
+        assert receipt["origin"] == "synthetic"
         assert receipt["evidence_class"] == "operator-attested"
 
         # Exercise the actual capture-to-Forge handoff, not merely a helper.
@@ -2102,6 +2203,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--stage-maximum-bytes", type=int)
     result.add_argument("--assert-receipt")
     result.add_argument("--assert-result-env")
+    result.add_argument("--assert-receipt-result-binding", action="store_true")
     result.add_argument("--assert-file")
     result.add_argument("--assert-file-sha256")
     result.add_argument("--assert-release-policy", action="store_true")
@@ -2132,7 +2234,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--model-type")
     result.add_argument("--current-dataset-size")
     result.add_argument("--dataset-regime")
-    result.add_argument("--accelerator-identity")
+    result.add_argument("--expected-origin")
     result.add_argument("--receipt")
     result.add_argument("--self-test", action="store_true")
     return result
@@ -2203,6 +2305,54 @@ def main() -> int:
         )
         print("SN56_RELEASE_FILE_BINDING=PASS")
         return 0
+    if args.assert_receipt_result_binding:
+        required_binding = (
+            "assert_receipt",
+            "assert_result_env",
+            "forge_repository",
+            "forge_materialized_manifest_sha256",
+            "forge_commit",
+            "release_tree",
+            "forge_tree",
+            "certificate_scope",
+            "delegated_mode",
+            "source_archive_sha256",
+            "source_manifest_sha256",
+            "profile_file_sha256",
+            "raw_record_file_sha256",
+            "terminal_artifact_file_sha256",
+            "gate_log_file_sha256",
+        )
+        missing = [name for name in required_binding if not getattr(args, name)]
+        if missing:
+            raise ProvenanceError(
+                "receipt/delegate binding lacks: " + ", ".join(missing)
+            )
+        expected_file_hashes = {
+            "profile": args.profile_file_sha256,
+            "raw_record": args.raw_record_file_sha256,
+            "terminal_artifact": args.terminal_artifact_file_sha256,
+            "archived_terminal_artifact": args.terminal_artifact_file_sha256,
+            "gate_log": args.gate_log_file_sha256,
+        }
+        assert_receipt_delegated_binding(
+            args.assert_receipt,
+            args.assert_result_env,
+            expected_repository=args.forge_repository,
+            expected_materialized_manifest_sha256=(
+                args.forge_materialized_manifest_sha256
+            ),
+            release_commit=args.forge_commit,
+            release_tree=args.release_tree,
+            forge_tree=args.forge_tree,
+            certificate_scope=args.certificate_scope,
+            mode=args.delegated_mode,
+            expected_source_archive_sha256=args.source_archive_sha256,
+            expected_source_manifest_sha256=args.source_manifest_sha256,
+            expected_file_hashes=expected_file_hashes,
+        )
+        print("SN56_RELEASE_RECEIPT_DELEGATE_BINDING=PASS")
+        return 0
     if args.assert_receipt:
         if (
             not args.forge_repository
@@ -2210,6 +2360,7 @@ def main() -> int:
             or not args.forge_commit
             or not args.release_tree
             or not args.certificate_scope
+            or not args.expected_origin
         ):
             raise ProvenanceError("receipt assertion lacks release identity")
         file_hash_arguments = {
@@ -2235,6 +2386,7 @@ def main() -> int:
             release_commit=args.forge_commit,
             release_tree=args.release_tree,
             certificate_scope=args.certificate_scope,
+            expected_origin=args.expected_origin,
             expected_file_hashes=expected_file_hashes,
         )
         print("SN56_RELEASE_RECEIPT=PASS")
@@ -2316,7 +2468,7 @@ def main() -> int:
         "model_type",
         "current_dataset_size",
         "dataset_regime",
-        "accelerator_identity",
+        "expected_origin",
     )
     missing = [name for name in required if not getattr(args, name)]
     if missing:

@@ -12,8 +12,8 @@ unset BASH_ENV CDPATH ENV GIT_CONFIG GIT_DIR GIT_WORK_TREE \
   PYTHONHOME PYTHONPATH PYTHONSTARTUP
 readonly CERT_SCOPE=toolkit-krea-only
 # Updated mechanically after both archived authority programs are final.
-readonly VALIDATOR_SHA256=d1e148479b9a4bf8bfd48348f71100145f39c5233a9a90ae4731c40cef571ed0
-readonly DELEGATED_SHA256=9b5cb2e631a647b989aaf6b988973cbddf74a8f822ececffc0be5e8632a2c9e2
+readonly VALIDATOR_SHA256=c0d206703b52a09d966b96fea06b392540c84ea41cbe44bac1712145004a82ac
+readonly DELEGATED_SHA256=e3a9222856edd6870fdcf80f8f9fc4628def1a13ebfb279075a7447845b5497e
 
 fail() {
   /usr/bin/printf 'SN56_WEEK6_FINAL_RELEASE_CERT=FAIL reason=%s\n' "$1" >&2
@@ -63,8 +63,7 @@ for required_name in \
   SN56_RELEASE_TIMING_BUNDLE_SHA256 \
   SN56_RELEASE_TIMING_MODEL_TYPE \
   SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE \
-  SN56_RELEASE_TIMING_DATASET_REGIME \
-  SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY
+  SN56_RELEASE_TIMING_DATASET_REGIME
 do
   require_env "${required_name}"
 done
@@ -93,6 +92,13 @@ done
   fail 'invalid archived release evidence namespace' 64
 
 readonly RELEASE_MODE=${SN56_RELEASE_CERT_MODE}
+if [[ ${RELEASE_MODE} == production ]]; then
+  readonly RESULT_STATE=PASS
+  readonly EVIDENCE_ORIGIN=real
+else
+  readonly RESULT_STATE=DRY_RUN_PASS
+  readonly EVIDENCE_ORIGIN=synthetic
+fi
 readonly RELEASE_COMMIT=${SN56_RELEASE_COMMIT}
 readonly RELEASE_TREE=${SN56_RELEASE_TREE}
 readonly FORGE_TREE=${SN56_RELEASE_FORGE_TREE}
@@ -340,7 +346,7 @@ validator \
   --model-type "${SN56_RELEASE_TIMING_MODEL_TYPE}" \
   --current-dataset-size "${SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE}" \
   --dataset-regime "${SN56_RELEASE_TIMING_DATASET_REGIME}" \
-  --accelerator-identity "${SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY}" \
+  --expected-origin "${EVIDENCE_ORIGIN}" \
   --receipt "${RECEIPT}" \
   >"${AUTHORITY_STAGE}/timing-validation.stdout"
 
@@ -351,6 +357,7 @@ validator \
   --forge-commit "${RELEASE_COMMIT}" \
   --release-tree "${RELEASE_TREE}" \
   --certificate-scope "${CERT_SCOPE}" \
+  --expected-origin "${EVIDENCE_ORIGIN}" \
   --profile-file-sha256 "${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
   --raw-record-file-sha256 "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
   --terminal-artifact-file-sha256 "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
@@ -400,12 +407,6 @@ then
   fail 'generic Week-6 build/GPU delegate failed'
 fi
 
-if [[ ${RELEASE_MODE} == production ]]; then
-  readonly RESULT_STATE=PASS
-else
-  readonly RESULT_STATE=DRY_RUN_PASS
-fi
-
 /usr/bin/env -i \
   PATH="${FIXED_PATH}" HOME=/nonexistent LANG=C.UTF-8 LC_ALL=C.UTF-8 \
   PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
@@ -439,6 +440,27 @@ validator \
   --source-archive-sha256 "${SOURCE_ARCHIVE_SHA256}" \
   --source-manifest-sha256 "${SOURCE_MANIFEST_SHA256}" \
   >"${AUTHORITY_STAGE}/delegated-result-assertion.stdout"
+
+# The receipt's evidence class and accelerator cannot be supplied by the
+# caller: bind them to the delegate mode and its live GPU observation.
+validator \
+  --assert-receipt-result-binding \
+  --assert-receipt "${RECEIPT}" \
+  --assert-result-env "${DELEGATED_RESULT}" \
+  --forge-repository "${SOURCE}" \
+  --forge-materialized-manifest-sha256 "${SOURCE_MANIFEST_SHA256}" \
+  --forge-commit "${RELEASE_COMMIT}" \
+  --release-tree "${RELEASE_TREE}" \
+  --forge-tree "${FORGE_TREE}" \
+  --certificate-scope "${CERT_SCOPE}" \
+  --delegated-mode "${RELEASE_MODE}" \
+  --source-archive-sha256 "${SOURCE_ARCHIVE_SHA256}" \
+  --source-manifest-sha256 "${SOURCE_MANIFEST_SHA256}" \
+  --profile-file-sha256 "${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
+  --raw-record-file-sha256 "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
+  --terminal-artifact-file-sha256 "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
+  --gate-log-file-sha256 "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}" \
+  >"${AUTHORITY_STAGE}/receipt-delegate-binding.stdout"
 
 # Verify every delegated evidence entry without trusting sha256sum path parsing.
 delegated_manifest_sha256=$(
@@ -578,18 +600,19 @@ stage_evidence "${DELEGATED_MANIFEST}" "${delegated_manifest_sha256}" \
   "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
   "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
   "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}" \
-  "${receipt_sha256}" "${policy_sha256}" "${DELEGATED_EVIDENCE}" \
+  "${receipt_sha256}" "${policy_sha256}" "${EVIDENCE_ORIGIN}" \
+  "${DELEGATED_EVIDENCE}" \
   "${delegated_result_sha256}" "${delegated_manifest_sha256}" <<'PY'
 from datetime import datetime, timezone
 import os
 from pathlib import Path
 import sys
 
-if len(sys.argv) != 21:
+if len(sys.argv) != 22:
     raise SystemExit("outer result construction argument error")
 stage = Path(sys.argv[1])
 fields = {
-    "schema": "sn56.week6.final-release-cert-envelope.v3",
+    "schema": "sn56.week6.final-release-cert-envelope.v4",
     "state": sys.argv[2],
     "mode": sys.argv[3],
     "certificate_scope": sys.argv[4],
@@ -608,9 +631,10 @@ fields = {
     "gate_log_file_sha256": sys.argv[15],
     "timing_receipt_file_sha256": sys.argv[16],
     "release_policy_receipt_file_sha256": sys.argv[17],
-    "delegated_evidence": sys.argv[18],
-    "delegated_result_file_sha256": sys.argv[19],
-    "delegated_manifest_sha256": sys.argv[20],
+    "timing_evidence_origin": sys.argv[18],
+    "delegated_evidence": sys.argv[19],
+    "delegated_result_file_sha256": sys.argv[20],
+    "delegated_manifest_sha256": sys.argv[21],
     "completed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 for name, value in fields.items():
@@ -636,9 +660,9 @@ finally:
 
 check_payload = (
     f"state={sys.argv[2]}\n"
-    f"delegated_evidence={sys.argv[18]}\n"
-    f"delegated_result_file_sha256={sys.argv[19]}\n"
-    f"delegated_manifest_sha256={sys.argv[20]}\n"
+    f"delegated_evidence={sys.argv[19]}\n"
+    f"delegated_result_file_sha256={sys.argv[20]}\n"
+    f"delegated_manifest_sha256={sys.argv[21]}\n"
 ).encode("utf-8")
 check_target = stage / "delegated-manifest-check.txt"
 descriptor = os.open(
@@ -751,6 +775,7 @@ validator \
   --forge-commit "${RELEASE_COMMIT}" \
   --release-tree "${RELEASE_TREE}" \
   --certificate-scope "${CERT_SCOPE}" \
+  --expected-origin "${EVIDENCE_ORIGIN}" \
   --profile-file-sha256 "${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
   --raw-record-file-sha256 "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
   --terminal-artifact-file-sha256 "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
@@ -766,6 +791,25 @@ validator \
   --source-archive-sha256 "${SOURCE_ARCHIVE_SHA256}" \
   --source-manifest-sha256 "${SOURCE_MANIFEST_SHA256}" \
   >"${AUTHORITY_STAGE}/published-delegate-assertion.stdout"
+
+validator \
+  --assert-receipt-result-binding \
+  --assert-receipt "${ENVELOPE}/timing-provenance-receipt.json" \
+  --assert-result-env "${ENVELOPE}/delegated-result.env" \
+  --forge-repository "${SOURCE}" \
+  --forge-materialized-manifest-sha256 "${SOURCE_MANIFEST_SHA256}" \
+  --forge-commit "${RELEASE_COMMIT}" \
+  --release-tree "${RELEASE_TREE}" \
+  --forge-tree "${FORGE_TREE}" \
+  --certificate-scope "${CERT_SCOPE}" \
+  --delegated-mode "${RELEASE_MODE}" \
+  --source-archive-sha256 "${SOURCE_ARCHIVE_SHA256}" \
+  --source-manifest-sha256 "${SOURCE_MANIFEST_SHA256}" \
+  --profile-file-sha256 "${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
+  --raw-record-file-sha256 "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
+  --terminal-artifact-file-sha256 "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
+  --gate-log-file-sha256 "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}" \
+  >"${AUTHORITY_STAGE}/published-receipt-delegate-binding.stdout"
 
 /usr/bin/printf 'SN56_WEEK6_FINAL_RELEASE_CERT=%s evidence=%s\n' \
   "${RESULT_STATE}" "${ENVELOPE}"

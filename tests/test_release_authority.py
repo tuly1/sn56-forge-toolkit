@@ -47,14 +47,17 @@ def _pass_receipt(
     path: Path,
     *,
     state: str = "PASS",
-    schema: int = 2,
+    schema: int = 3,
+    origin: str = "real",
     repository: str = REPOSITORY,
+    accelerator_identity: str = "NVIDIA H100 PCIe|81559-MiB",
 ):
     sha = "d" * 64
     value = {
         "schema": schema,
         "kind": authority.RECEIPT_KIND,
         "state": state,
+        "origin": origin,
         "evidence_class": "operator-attested",
         "claim_limit": (
             "not-independent-proof-of-elapsed-time-or-hardware-measurement"
@@ -74,7 +77,7 @@ def _pass_receipt(
             "model_type": "krea2",
             "current_dataset_size": 18,
             "dataset_regime": "small",
-            "accelerator_identity": "NVIDIA H100 PCIe|81559-MiB",
+            "accelerator_identity": accelerator_identity,
         },
         "rental_window": {
             "started_at_utc": "2026-08-07T00:00:00Z",
@@ -143,6 +146,7 @@ def _delegated_result(authority) -> dict[str, str]:
         "legacy_image_tag": "sn56/legacy:test",
         "legacy_image_id": f"sha256:{sha}",
         "gpu_boundary": "REAL_H100",
+        "accelerator_identity": "NVIDIA H100 PCIe|81559-MiB",
         "completed_at_utc": "2026-08-07T00:59:00Z",
     }
 
@@ -167,9 +171,14 @@ def test_wrapper_is_strict_fixed_authority_with_one_release_commit():
     assert "--assert-receipt" in worker
     assert "--assert-result-env" in worker
     assert re.search(r"printf[^\n]*\$\(", text + worker) is None
-    assert "sn56.week6.final-release-cert-envelope.v3" in worker
-    assert "sn56.week6.final-release-cert-envelope.v2" not in worker
+    assert "sn56.week6.final-release-cert-envelope.v4" in worker
+    assert "sn56.week6.final-release-cert-envelope.v3" not in worker
     assert "sn56-week5-final-release-cert.sh" not in text + worker
+    assert "core.fsmonitor=false" in text
+    assert "GIT_CONFIG_KEY_0=core.fsmonitor" in text
+    assert "GIT_CONFIG_VALUE_0=false" in text
+    assert "config --local --no-includes --get-all remote.origin.url" in text
+    assert "remote get-url" not in text
 
 
 def test_wrapper_pins_exact_validator_and_delegate_hashes():
@@ -209,6 +218,7 @@ def test_success_exit_without_receipt_is_failure(tmp_path):
             release_commit=COMMIT,
             release_tree=TREE,
             certificate_scope=SCOPE,
+            expected_origin="real",
         )
 
 
@@ -303,6 +313,7 @@ def test_delegated_cpu_integration_mode_cannot_claim_production_pass(tmp_path):
             "mode": "cpu-integration",
             "state": "DRY_RUN_PASS",
             "gpu_boundary": "STUBBED_NO_CLAIM",
+            "accelerator_identity": "INTEGRATION-STUB-NO-GPU-CLAIM|0-MiB",
         }
     )
     _write_result_env(path, result)
@@ -390,6 +401,7 @@ def test_receipt_requires_current_schema_kind_state_and_identity(tmp_path):
         release_commit=COMMIT,
         release_tree=TREE,
         certificate_scope=SCOPE,
+        expected_origin="real",
     )["state"] == "PASS"
 
     _pass_receipt(authority, receipt, schema=1)
@@ -401,6 +413,7 @@ def test_receipt_requires_current_schema_kind_state_and_identity(tmp_path):
             release_commit=COMMIT,
             release_tree=TREE,
             certificate_scope=SCOPE,
+            expected_origin="real",
         )
 
 
@@ -417,6 +430,7 @@ def test_receipt_repository_is_authority_supplied_not_self_derived(tmp_path):
             release_commit=COMMIT,
             release_tree=TREE,
             certificate_scope=SCOPE,
+            expected_origin="real",
         )
 
 
@@ -440,6 +454,7 @@ def test_receipt_rejects_extra_top_level_and_nested_schema_fields(tmp_path):
             release_commit=COMMIT,
             release_tree=TREE,
             certificate_scope=SCOPE,
+            expected_origin="real",
         )
 
     _pass_receipt(authority, receipt)
@@ -459,8 +474,117 @@ def test_receipt_rejects_extra_top_level_and_nested_schema_fields(tmp_path):
             release_commit=COMMIT,
             release_tree=TREE,
             certificate_scope=SCOPE,
+            expected_origin="real",
         )
 
+
+def test_production_rejects_synthetic_or_missing_receipt_origin(tmp_path):
+    authority = _authority()
+    receipt = tmp_path / "receipt.json"
+    _pass_receipt(authority, receipt, origin="synthetic")
+
+    with pytest.raises(authority.ProvenanceError, match="authoritative PASS"):
+        authority.assert_pass_receipt(
+            str(receipt),
+            expected_repository=REPOSITORY,
+            expected_materialized_manifest_sha256=MATERIALIZED_MANIFEST,
+            release_commit=COMMIT,
+            release_tree=TREE,
+            certificate_scope=SCOPE,
+            expected_origin="real",
+        )
+
+    value = json.loads(receipt.read_text(encoding="utf-8"))
+    value.pop("origin")
+    value["receipt_sha256"] = hashlib.sha256(
+        authority.canonical_bytes(
+            {key: item for key, item in value.items() if key != "receipt_sha256"}
+        )
+    ).hexdigest()
+    receipt.write_bytes(authority.canonical_bytes(value) + b"\n")
+    with pytest.raises(authority.ProvenanceError, match="pinned schema"):
+        authority.assert_pass_receipt(
+            str(receipt),
+            expected_repository=REPOSITORY,
+            expected_materialized_manifest_sha256=MATERIALIZED_MANIFEST,
+            release_commit=COMMIT,
+            release_tree=TREE,
+            certificate_scope=SCOPE,
+            expected_origin="real",
+        )
+
+
+def test_receipt_origin_and_accelerator_cross_bind_to_delegate_mode(tmp_path):
+    authority = _authority()
+    receipt = tmp_path / "receipt.json"
+    result_path = tmp_path / "result.env"
+    _pass_receipt(authority, receipt)
+    _write_result_env(result_path, _delegated_result(authority))
+
+    bound_receipt, bound_result = authority.assert_receipt_delegated_binding(
+        str(receipt),
+        str(result_path),
+        expected_repository=REPOSITORY,
+        expected_materialized_manifest_sha256=MATERIALIZED_MANIFEST,
+        release_commit=COMMIT,
+        release_tree=TREE,
+        forge_tree=FORGE_TREE,
+        certificate_scope=SCOPE,
+        mode="production",
+        expected_source_archive_sha256=DELEGATED_SOURCE_ARCHIVE,
+        expected_source_manifest_sha256=DELEGATED_SOURCE_MANIFEST,
+    )
+    assert bound_receipt["origin"] == "real"
+    assert bound_result["accelerator_identity"] == "NVIDIA H100 PCIe|81559-MiB"
+
+    mismatched = _delegated_result(authority)
+    mismatched["accelerator_identity"] = "NVIDIA H100 SXM|81559-MiB"
+    _write_result_env(result_path, mismatched)
+    with pytest.raises(authority.ProvenanceError, match="differs from delegated"):
+        authority.assert_receipt_delegated_binding(
+            str(receipt),
+            str(result_path),
+            expected_repository=REPOSITORY,
+            expected_materialized_manifest_sha256=MATERIALIZED_MANIFEST,
+            release_commit=COMMIT,
+            release_tree=TREE,
+            forge_tree=FORGE_TREE,
+            certificate_scope=SCOPE,
+            mode="production",
+            expected_source_archive_sha256=DELEGATED_SOURCE_ARCHIVE,
+            expected_source_manifest_sha256=DELEGATED_SOURCE_MANIFEST,
+        )
+
+    sentinel = "INTEGRATION-STUB-NO-GPU-CLAIM|0-MiB"
+    _pass_receipt(
+        authority,
+        receipt,
+        origin="synthetic",
+        accelerator_identity=sentinel,
+    )
+    integration_result = _delegated_result(authority)
+    integration_result.update(
+        {
+            "mode": "cpu-integration",
+            "state": "DRY_RUN_PASS",
+            "gpu_boundary": "STUBBED_NO_CLAIM",
+            "accelerator_identity": sentinel,
+        }
+    )
+    _write_result_env(result_path, integration_result)
+    assert authority.assert_receipt_delegated_binding(
+        str(receipt),
+        str(result_path),
+        expected_repository=REPOSITORY,
+        expected_materialized_manifest_sha256=MATERIALIZED_MANIFEST,
+        release_commit=COMMIT,
+        release_tree=TREE,
+        forge_tree=FORGE_TREE,
+        certificate_scope=SCOPE,
+        mode="cpu-integration",
+        expected_source_archive_sha256=DELEGATED_SOURCE_ARCHIVE,
+        expected_source_manifest_sha256=DELEGATED_SOURCE_MANIFEST,
+    )[0]["origin"] == "synthetic"
 
 def test_materialized_tree_manifest_binds_file_bytes_paths_and_modes(tmp_path):
     authority = _authority()

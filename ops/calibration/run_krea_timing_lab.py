@@ -54,8 +54,8 @@ from forge.tasks.integrity import inspect_training_artifact
 
 _PROGRAM = "sn56-krea-timing-lab"
 _RECEIPT_KIND = "sn56-krea-timing-lab-receipt"
-_RECEIPT_SCHEMA = 2
-_GATE_EVENT_KIND = "sn56.week6.friday-h100-timing-evidence-sealed.v2"
+_RECEIPT_SCHEMA = 3
+_GATE_EVENT_KIND = "sn56.week6.friday-h100-timing-evidence-sealed.v3"
 _CERTIFICATE_SCOPE = "toolkit-krea-only"
 _MAX_CONFIG_BYTES = 4 * 1024 * 1024
 _MAX_RECORD_BYTES = 1024 * 1024
@@ -792,6 +792,7 @@ def _receipt_base(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema": _RECEIPT_SCHEMA,
         "kind": _RECEIPT_KIND,
+        "origin": "real",
         "evidence_scope": "lab-only",
         "bundle": args.bundle,
         "task_id": args.task_id,
@@ -1135,6 +1136,7 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
     )
     event = {
         "event": _GATE_EVENT_KIND,
+        "origin": "real",
         "gate_session_id": args.gate_session_id,
         "source_run_id": source_run_id,
         "rental_started_at_utc": args.rental_started_at_utc,

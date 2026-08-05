@@ -330,6 +330,7 @@ def test_lab_launcher_executes_committed_runtime_a_despite_hidden_worktree_b(
         "LD_PRELOAD",
         "HF_TOKEN",
         "SN56_RELEASE_COMMIT",
+        "SN56_EVIDENCE_ORIGIN",
     ):
         monkeypatch.setenv(poison_key, "must-not-reach-child")
     accelerator_calls = []
@@ -403,6 +404,8 @@ def test_lab_launcher_executes_committed_runtime_a_despite_hidden_worktree_b(
     gate_event = json.loads(gate_lines[0])
     assert receipt == persisted_receipt
     assert receipt["state"] == "PASS"
+    assert receipt["schema"] == 3
+    assert receipt["origin"] == "real"
     assert receipt["evidence_scope"] == "lab-only"
     assert raw["schema"] == krea_runtime.EFFECTIVE_RUNTIME_SCHEMA
     assert raw["lifecycle"] == "terminal"
@@ -435,6 +438,7 @@ def test_lab_launcher_executes_committed_runtime_a_despite_hidden_worktree_b(
     }
     expected_event_fields = {
         "event",
+        "origin",
         "gate_session_id",
         "source_run_id",
         "rental_started_at_utc",
@@ -460,8 +464,9 @@ def test_lab_launcher_executes_committed_runtime_a_despite_hidden_worktree_b(
     }
     assert set(gate_event) == expected_event_fields
     assert gate_event["event"] == (
-        "sn56.week6.friday-h100-timing-evidence-sealed.v2"
+        "sn56.week6.friday-h100-timing-evidence-sealed.v3"
     )
+    assert gate_event["origin"] == "real"
     assert gate_event["certificate_scope"] == "toolkit-krea-only"
     assert gate_event["profile_file_sha256"] == hashlib.sha256(
         (evidence / "profile.json").read_bytes()

@@ -63,7 +63,6 @@ require_env SN56_RELEASE_TIMING_BUNDLE_SHA256 "${SN56_RELEASE_TIMING_BUNDLE_SHA2
 require_env SN56_RELEASE_TIMING_MODEL_TYPE "${SN56_RELEASE_TIMING_MODEL_TYPE-}"
 require_env SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE "${SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE-}"
 require_env SN56_RELEASE_TIMING_DATASET_REGIME "${SN56_RELEASE_TIMING_DATASET_REGIME-}"
-require_env SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY "${SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY-}"
 
 # Run the launcher itself, not merely its children, under one explicit
 # allowlist.  The clean sentinel is deliberately not accepted as release input;
@@ -78,6 +77,15 @@ if [ "${SN56_RELEASE_BOOTSTRAP_CLEAN-}" != 1 ]; then
     PYTHONNOUSERSITE=1 \
     GIT_CONFIG_NOSYSTEM=1 \
     GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_COUNT=8 \
+    GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false \
+    GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null \
+    GIT_CONFIG_KEY_2=core.untrackedCache GIT_CONFIG_VALUE_2=false \
+    GIT_CONFIG_KEY_3=core.ignoreStat GIT_CONFIG_VALUE_3=false \
+    GIT_CONFIG_KEY_4=core.trustctime GIT_CONFIG_VALUE_4=true \
+    GIT_CONFIG_KEY_5=core.checkStat GIT_CONFIG_VALUE_5=default \
+    GIT_CONFIG_KEY_6=core.attributesFile GIT_CONFIG_VALUE_6=/dev/null \
+    GIT_CONFIG_KEY_7=core.excludesFile GIT_CONFIG_VALUE_7=/dev/null \
     GIT_NO_REPLACE_OBJECTS=1 \
     GIT_TERMINAL_PROMPT=0 \
     SN56_RELEASE_BOOTSTRAP_CLEAN=1 \
@@ -111,7 +119,6 @@ if [ "${SN56_RELEASE_BOOTSTRAP_CLEAN-}" != 1 ]; then
     SN56_RELEASE_TIMING_MODEL_TYPE="${SN56_RELEASE_TIMING_MODEL_TYPE}" \
     SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE="${SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE}" \
     SN56_RELEASE_TIMING_DATASET_REGIME="${SN56_RELEASE_TIMING_DATASET_REGIME}" \
-    SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY="${SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY}" \
     /bin/sh "${launcher_path}"
 fi
 
@@ -174,11 +181,27 @@ git_checkout() {
     LC_ALL=C.UTF-8 \
     GIT_CONFIG_NOSYSTEM=1 \
     GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_COUNT=8 \
+    GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false \
+    GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null \
+    GIT_CONFIG_KEY_2=core.untrackedCache GIT_CONFIG_VALUE_2=false \
+    GIT_CONFIG_KEY_3=core.ignoreStat GIT_CONFIG_VALUE_3=false \
+    GIT_CONFIG_KEY_4=core.trustctime GIT_CONFIG_VALUE_4=true \
+    GIT_CONFIG_KEY_5=core.checkStat GIT_CONFIG_VALUE_5=default \
+    GIT_CONFIG_KEY_6=core.attributesFile GIT_CONFIG_VALUE_6=/dev/null \
+    GIT_CONFIG_KEY_7=core.excludesFile GIT_CONFIG_VALUE_7=/dev/null \
     GIT_NO_REPLACE_OBJECTS=1 \
     GIT_TERMINAL_PROMPT=0 \
     /usr/bin/git --no-replace-objects \
       -c "safe.directory=${SN56_RELEASE_SOURCE_CHECKOUT}" \
+      -c core.fsmonitor=false \
       -c core.hooksPath=/dev/null \
+      -c core.untrackedCache=false \
+      -c core.ignoreStat=false \
+      -c core.trustctime=true \
+      -c core.checkStat=default \
+      -c core.attributesFile=/dev/null \
+      -c core.excludesFile=/dev/null \
       -C "${SN56_RELEASE_SOURCE_CHECKOUT}" "$@"
 }
 
@@ -190,9 +213,26 @@ git_remote() {
     LC_ALL=C.UTF-8 \
     GIT_CONFIG_NOSYSTEM=1 \
     GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_COUNT=8 \
+    GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false \
+    GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null \
+    GIT_CONFIG_KEY_2=core.untrackedCache GIT_CONFIG_VALUE_2=false \
+    GIT_CONFIG_KEY_3=core.ignoreStat GIT_CONFIG_VALUE_3=false \
+    GIT_CONFIG_KEY_4=core.trustctime GIT_CONFIG_VALUE_4=true \
+    GIT_CONFIG_KEY_5=core.checkStat GIT_CONFIG_VALUE_5=default \
+    GIT_CONFIG_KEY_6=core.attributesFile GIT_CONFIG_VALUE_6=/dev/null \
+    GIT_CONFIG_KEY_7=core.excludesFile GIT_CONFIG_VALUE_7=/dev/null \
     GIT_NO_REPLACE_OBJECTS=1 \
     GIT_TERMINAL_PROMPT=0 \
-    /usr/bin/git --no-replace-objects "$@"
+    /usr/bin/git --no-replace-objects \
+      -c core.fsmonitor=false \
+      -c core.hooksPath=/dev/null \
+      -c core.untrackedCache=false \
+      -c core.ignoreStat=false \
+      -c core.trustctime=true \
+      -c core.checkStat=default \
+      -c core.attributesFile=/dev/null \
+      -c core.excludesFile=/dev/null -C / "$@"
 }
 
 # Validate all authority directory chains before a temporary directory is
@@ -261,7 +301,7 @@ release_tree=$(git_checkout rev-parse --verify 'HEAD^{tree}') || \
   fail 'release tree could not be resolved'
 forge_tree=$(git_checkout rev-parse --verify 'HEAD:forge') || \
   fail 'Forge tree could not be resolved'
-origin_url=$(git_checkout remote get-url --all origin) || \
+origin_url=$(git_checkout config --local --no-includes --get-all remote.origin.url) || \
   fail 'release checkout has no origin remote'
 [ "${origin_url}" = "${SN56_RELEASE_EXPECTED_ORIGIN_URL}" ] || \
   fail 'release checkout origin differs from SN56_RELEASE_EXPECTED_ORIGIN_URL'
@@ -530,6 +570,15 @@ exec /usr/bin/env -i \
   PYTHONNOUSERSITE=1 \
   GIT_CONFIG_NOSYSTEM=1 \
   GIT_CONFIG_GLOBAL=/dev/null \
+  GIT_CONFIG_COUNT=8 \
+  GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false \
+  GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null \
+  GIT_CONFIG_KEY_2=core.untrackedCache GIT_CONFIG_VALUE_2=false \
+  GIT_CONFIG_KEY_3=core.ignoreStat GIT_CONFIG_VALUE_3=false \
+  GIT_CONFIG_KEY_4=core.trustctime GIT_CONFIG_VALUE_4=true \
+  GIT_CONFIG_KEY_5=core.checkStat GIT_CONFIG_VALUE_5=default \
+  GIT_CONFIG_KEY_6=core.attributesFile GIT_CONFIG_VALUE_6=/dev/null \
+  GIT_CONFIG_KEY_7=core.excludesFile GIT_CONFIG_VALUE_7=/dev/null \
   GIT_NO_REPLACE_OBJECTS=1 \
   GIT_TERMINAL_PROMPT=0 \
   SN56_RELEASE_CERT_MODE="${SN56_RELEASE_CERT_MODE}" \
@@ -568,5 +617,4 @@ exec /usr/bin/env -i \
   SN56_RELEASE_TIMING_MODEL_TYPE="${SN56_RELEASE_TIMING_MODEL_TYPE}" \
   SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE="${SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE}" \
   SN56_RELEASE_TIMING_DATASET_REGIME="${SN56_RELEASE_TIMING_DATASET_REGIME}" \
-  SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY="${SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY}" \
   /bin/bash "${worker}"
