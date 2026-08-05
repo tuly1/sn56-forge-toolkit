@@ -37,4 +37,10 @@ jobs:
             forge/tasks/aitoolkit.py \
             forge/tasks/checkpoints.py \
             forge/tasks/integrity.py \
-            forge/tasks/publication.py
+            forge/tasks/publication.py \
+            ops/calibration/run_krea_timing_lab.py \
+            ops/release/sn56-week6-validate-timing-provenance.py
+      - name: Check release-authority shell syntax
+        run: |
+          bash -n ops/release/sn56-week5-final-release-cert.sh
+          bash -n ops/release/sn56-week6-final-release-cert.sh

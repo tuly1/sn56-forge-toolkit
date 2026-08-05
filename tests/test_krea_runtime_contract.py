@@ -97,6 +97,7 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
         {
             "schema": adaptive_timing.PROFILE_SCHEMA,
             "kind": adaptive_timing.PROFILE_KIND,
+            "evidence_scope": "lab-only",
             "bundle_id": bundle,
             "bundle_sha256": bundle_sha,
             "model_type": "krea2",
@@ -116,6 +117,7 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
                 "runtime_commit": krea_runtime.OWNED_RUNTIME_COMMIT,
                 "measured_at_utc": "2026-08-04T12:00:00Z",
                 "accelerator_identity": "NVIDIA H100 PCIe|81559-MiB",
+                "accelerator_identity_evidence": "operator-attested",
             },
         }
     )
@@ -571,6 +573,26 @@ def test_effective_record_lifecycle_is_ordered_and_terminal_immutable(
     record_path = Path(str(config_path) + ".effective-runtime.json")
     bootstrap_bytes = record_path.read_bytes()
 
+    old_draft = json.loads(bootstrap_bytes)
+    old_draft["schema"] = 4
+    old_draft.pop("record_sha256")
+    old_draft["record_sha256"] = krea_runtime._canonical_sha256(old_draft)
+    record_path.write_bytes(krea_runtime._canonical_bytes(old_draft))
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError, match="schema is unsupported"
+    ):
+        krea_runtime.persist_first_checkpoint_observation(
+            str(config_path),
+            adaptive_timing.emit_bootstrap_first_checkpoint_observation(
+                bundle_id=krea_runtime.LEADER_BUNDLE,
+                checkpoint_step=200,
+                elapsed_since_launch_s=300.0,
+                active_planned_steps=planned,
+                event_sink=lambda *_args, **_kwargs: None,
+            ),
+        )
+    record_path.write_bytes(bootstrap_bytes)
+
     with pytest.raises(
         krea_runtime.KreaRuntimeContractError, match="out of order"
     ):
@@ -769,6 +791,7 @@ def test_operator_attested_profile_is_bound_to_bundle_in_effective_record(
         "current_dataset_size": 18,
         "dataset_regime": adaptive_timing.dataset_regime(18),
         "accelerator_identity": profile.accelerator_identity,
+        "accelerator_identity_evidence": "operator-attested",
     }
     assert record["bundle_contract_sha256"] == profile.bundle_sha256
 
@@ -832,7 +855,7 @@ def test_effective_record_rejects_profile_from_another_runtime(
         )
 
 
-def test_experimental_effective_record_rejects_unlabeled_static_timing(
+def test_experimental_effective_record_uses_reviewed_release_constant(
     tmp_path, monkeypatch
 ):
     _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
@@ -840,17 +863,24 @@ def test_experimental_effective_record_rejects_unlabeled_static_timing(
     config_path = tmp_path / "static.yaml"
     config.write_config(cfg, str(config_path))
 
-    with pytest.raises(
-        krea_runtime.KreaRuntimeContractError,
-        match="operator-attested timing",
-    ):
-        krea_runtime.emit_effective_runtime_record(
-            cfg,
-            "krea2",
-            str(config_path),
-            krea_runtime.load_capability_manifest(),
-            source_run_id=SOURCE_RUN_ID,
-        )
+    record = krea_runtime.emit_effective_runtime_record(
+        cfg,
+        "krea2",
+        str(config_path),
+        krea_runtime.load_capability_manifest(),
+        source_run_id=SOURCE_RUN_ID,
+        current_dataset_size=18,
+    )
+
+    timing = record["timing"]
+    assert record["schema"] == krea_runtime.EFFECTIVE_RUNTIME_SCHEMA
+    assert record["lifecycle"] == "release_constant"
+    assert timing["mode"] == "reviewed_release_constant"
+    assert timing["profile_sha256"] is None
+    assert timing["release_timing_policy"]["seconds_per_step"] == 2.2
+    assert timing["release_timing_policy_sha256"] == krea_runtime._canonical_sha256(
+        timing["release_timing_policy"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -974,6 +1004,60 @@ def test_default_incumbent_runner_does_not_emit_record(
     aitoolkit.run(spec, Deadline())
 
     assert not Path(spec.config_path + ".effective-runtime.json").exists()
+
+
+def test_production_runner_ignores_host_bound_profile_and_probe_environment(
+    tmp_path, monkeypatch
+):
+    spec = _spec()
+    _localize_spec(monkeypatch, tmp_path, spec)
+    _activate(monkeypatch, tmp_path, krea_runtime.LEADER_BUNDLE)
+    monkeypatch.setenv(adaptive_timing.PROFILE_ENV, "/host/lab-profile.json")
+    monkeypatch.setenv(adaptive_timing.SOURCE_RECORD_ENV, "/host/raw-record.json")
+    monkeypatch.setenv(krea_runtime.TIMING_PROBE_ENV, "1")
+    monkeypatch.setattr(
+        adaptive_timing,
+        "load_bundle_profile",
+        lambda **_kwargs: pytest.fail("production loaded a host-bound profile"),
+    )
+    monkeypatch.setattr(
+        adaptive_timing,
+        "current_accelerator_identity",
+        lambda **_kwargs: pytest.fail("production probed host identity"),
+    )
+    monkeypatch.setattr(
+        krea_runtime,
+        "timing_probe_enabled",
+        lambda *_args, **_kwargs: pytest.fail("production entered timing-probe mode"),
+    )
+    monkeypatch.setattr(
+        aitoolkit.dataset,
+        "prepare_aitoolkit_dataset",
+        lambda *_args, **_kwargs: (spec.dataset_images_dir, 18),
+    )
+    monkeypatch.setattr(aitoolkit.holdout, "budget_allows", lambda *_args: False)
+    monkeypatch.setattr(aitoolkit.holdout, "enabled_for", lambda *_args: False)
+    monkeypatch.setattr(aitoolkit, "_run_toolkit", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(aitoolkit, "_finalize", lambda *_args, **_kwargs: None)
+
+    class Deadline:
+        def remaining(self):
+            return 10_000.0
+
+        def remaining_hard(self):
+            return 10_000.0
+
+    aitoolkit.run(spec, Deadline())
+
+    record = json.loads(
+        Path(spec.config_path + ".effective-runtime.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert record["lifecycle"] == "release_constant"
+    assert record["timing"]["mode"] == "reviewed_release_constant"
+    assert record["timing"]["release_timing_policy"]["seconds_per_step"] == 2.2
+    assert "accelerator_identity" not in record["timing"]
 
 
 def test_attested_tree_different_from_executed_tree_aborts_before_launch(

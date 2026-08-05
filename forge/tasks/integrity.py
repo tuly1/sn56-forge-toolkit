@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import struct
 
 from forge.file_evidence import open_regular_file, stat_identity
@@ -139,35 +140,67 @@ def _training_step(header: dict) -> int:
     return step
 
 
+def inspect_training_artifact_fd(
+    fd: int,
+    *,
+    path_label: str,
+) -> TrainingArtifactEvidence:
+    """Inspect the exact regular-file object already open as ``fd``.
+
+    The caller retains ownership of the descriptor.  ``path_label`` is only a
+    human-readable identity for the returned evidence; this function never
+    resolves or reopens it.  Validation, metadata inspection, and hashing all
+    operate on the same descriptor, whose filesystem identity must remain
+    stable for the whole inspection.
+    """
+
+    if isinstance(fd, bool) or not isinstance(fd, int) or fd < 0:
+        raise ValueError("training artifact descriptor is invalid")
+    if not isinstance(path_label, str) or not path_label:
+        raise ValueError("training artifact path label is invalid")
+
+    opened = os.fstat(fd)
+    if not stat.S_ISREG(opened.st_mode):
+        raise ValueError("training artifact must be a regular file")
+    if opened.st_size < 10:
+        raise ValueError("training artifact is empty or truncated")
+
+    header = _validated_header(fd, int(opened.st_size))
+    checkpoint_step = _training_step(header)
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    remaining = int(opened.st_size)
+    while remaining:
+        block = os.read(fd, min(1024 * 1024, remaining))
+        if not block:
+            raise ValueError("training artifact was truncated while hashing")
+        digest.update(block)
+        remaining -= len(block)
+    if os.read(fd, 1):
+        raise ValueError("training artifact grew while hashing")
+
+    closed_over = os.fstat(fd)
+    if stat_identity(closed_over) != stat_identity(opened):
+        raise ValueError("training artifact changed while it was inspected")
+    return TrainingArtifactEvidence(
+        path=path_label,
+        size_bytes=int(opened.st_size),
+        sha256=digest.hexdigest(),
+        checkpoint_step=checkpoint_step,
+        file_identity=stat_identity(opened),
+    )
+
+
 def inspect_training_artifact(path: str) -> TrainingArtifactEvidence:
-    """Validate, hash, and read the training step from one opened descriptor."""
+    """Open once, then inspect that exact training-artifact descriptor."""
 
     absolute = os.path.abspath(path)
     with open_regular_file(
         absolute,
         label="training artifact",
         minimum_size=10,
-    ) as (fd, opened):
-        header = _validated_header(fd, int(opened.st_size))
-        checkpoint_step = _training_step(header)
-        os.lseek(fd, 0, os.SEEK_SET)
-        digest = hashlib.sha256()
-        remaining = int(opened.st_size)
-        while remaining:
-            block = os.read(fd, min(1024 * 1024, remaining))
-            if not block:
-                raise ValueError("training artifact was truncated while hashing")
-            digest.update(block)
-            remaining -= len(block)
-        if os.read(fd, 1):
-            raise ValueError("training artifact grew while hashing")
-        return TrainingArtifactEvidence(
-            path=absolute,
-            size_bytes=int(opened.st_size),
-            sha256=digest.hexdigest(),
-            checkpoint_step=checkpoint_step,
-            file_identity=stat_identity(opened),
-        )
+    ) as (fd, _opened):
+        return inspect_training_artifact_fd(fd, path_label=absolute)
 
 
 def valid_safetensors(path: str) -> bool:

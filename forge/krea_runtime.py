@@ -51,6 +51,7 @@ KNOWN_BUNDLES = frozenset(
 )
 
 RUNTIME_CONTRACT_ID = "sn56-krea-runtime-v1"
+EFFECTIVE_RUNTIME_SCHEMA = 5
 PINNED_BASE_COMMIT = "99be3d96a2468d3a5228a4eb05ba67e63c586b4e"
 OWNED_RUNTIME_COMMIT = "71e133b4e73a716d1094f22355a46be07953b828"
 OWNED_RUNTIME_REPOSITORY = "https://github.com/tuly1/sn56-ai-toolkit-mirror.git"
@@ -530,8 +531,18 @@ def bundle_contract_document(bundle: str) -> dict[str, Any]:
     """
     if bundle not in KNOWN_BUNDLES:
         raise KreaRuntimeContractError(f"unknown Krea bundle: {bundle!r}")
+    from forge import recipe
+
+    release_timing_policy = copy.deepcopy(recipe.KREA_RELEASE_TIMING_POLICY)
+    release_timing_policy.update(
+        {
+            "startup_seconds": recipe.STARTUP_S,
+            "export_reserve_seconds": recipe.EXPORT_RESERVE_S,
+            "training_margin": recipe.MARGIN,
+        }
+    )
     return {
-        "schema": 2,
+        "schema": 3,
         "runtime_contract_id": RUNTIME_CONTRACT_ID,
         "bundle": bundle,
         "claim": bundle_claim_document(bundle),
@@ -544,6 +555,10 @@ def bundle_contract_document(bundle: str) -> dict[str, Any]:
             for name in _BUNDLE_CAPABILITIES.get(bundle, ())
             if name in _RUNTIME_CAPABILITY_WIRE_ALIASES
         },
+        "release_timing_policy": release_timing_policy,
+        "release_timing_policy_sha256": _canonical_sha256(
+            release_timing_policy
+        ),
         "normalized_config_projection": _reference_bundle_projection(bundle),
     }
 
@@ -607,11 +622,6 @@ def emit_effective_runtime_record(
         raise KreaRuntimeContractError(
             "effective config no longer matches the bundle timing contract"
         )
-    if bundle != INCUMBENT_BUNDLE and throughput_profile is None and not timing_probe:
-        raise KreaRuntimeContractError(
-            "experimental Krea execution needs operator-attested timing "
-            "or explicit probe mode"
-        )
     timing: dict[str, Any]
     if throughput_profile is not None:
         from forge.adaptive_timing import ThroughputProfile, dataset_regime
@@ -649,6 +659,9 @@ def emit_effective_runtime_record(
             "current_dataset_size": current_dataset_size,
             "dataset_regime": throughput_profile.dataset_regime,
             "accelerator_identity": throughput_profile.accelerator_identity,
+            "accelerator_identity_evidence": (
+                throughput_profile.accelerator_identity_evidence
+            ),
         }
     elif timing_probe:
         from forge.adaptive_timing import dataset_regime
@@ -672,6 +685,37 @@ def emit_effective_runtime_record(
             "current_dataset_size": current_dataset_size,
             "dataset_regime": dataset_regime(current_dataset_size),
             "accelerator_identity": current_accelerator_identity.strip(),
+            "accelerator_identity_evidence": "operator-attested",
+        }
+    elif bundle != INCUMBENT_BUNDLE:
+        from forge import adaptive_timing, recipe
+
+        if (
+            isinstance(current_dataset_size, bool)
+            or not isinstance(current_dataset_size, int)
+            or current_dataset_size <= 0
+        ):
+            raise KreaRuntimeContractError(
+                "reviewed release timing dataset identity is incomplete"
+            )
+        policy = copy.deepcopy(recipe.KREA_RELEASE_TIMING_POLICY)
+        policy.update(
+            {
+                "startup_seconds": recipe.STARTUP_S,
+                "export_reserve_seconds": recipe.EXPORT_RESERVE_S,
+                "training_margin": recipe.MARGIN,
+            }
+        )
+        timing = {
+            "mode": "reviewed_release_constant",
+            "profile_sha256": None,
+            "runtime_commit": runtime_commit_for_bundle(bundle),
+            "current_dataset_size": current_dataset_size,
+            "dataset_regime": adaptive_timing.dataset_regime(
+                current_dataset_size
+            ),
+            "release_timing_policy": policy,
+            "release_timing_policy_sha256": _canonical_sha256(policy),
         }
     else:
         timing = {
@@ -697,9 +741,13 @@ def emit_effective_runtime_record(
             bundle=bundle,
             error_type=type(exc).__name__,
         )
-        return {"schema": 4, "bundle": bundle, "emission_failed": True}
+        return {
+            "schema": EFFECTIVE_RUNTIME_SCHEMA,
+            "bundle": bundle,
+            "emission_failed": True,
+        }
     record: dict[str, Any] = {
-        "schema": 4,
+        "schema": EFFECTIVE_RUNTIME_SCHEMA,
         "runtime_contract_id": RUNTIME_CONTRACT_ID,
         "source_run_id": source_run_id,
         "model_type": (model_type or "").strip().lower(),
@@ -723,7 +771,11 @@ def emit_effective_runtime_record(
         },
         "timing": timing,
         "effective": _effective_fields(cfg, bundle=bundle),
-        "lifecycle": "bootstrap",
+        "lifecycle": (
+            "bootstrap"
+            if throughput_profile is not None or timing_probe
+            else "release_constant"
+        ),
         "first_checkpoint_observation": None,
         "training_completion_observation": None,
     }
@@ -995,7 +1047,7 @@ def persist_first_checkpoint_observation(
             raise ValueError("record digest mismatch")
         if record.get("generated_config_sha256") != _sha256_file(config_path):
             raise ValueError("generated config binding mismatch")
-        if record.get("schema") != 4:
+        if record.get("schema") != EFFECTIVE_RUNTIME_SCHEMA:
             raise ValueError("effective runtime record schema is unsupported")
         if (
             record.get("lifecycle") != "bootstrap"
@@ -1049,7 +1101,7 @@ def persist_training_completion_observation(
             raise ValueError("record digest mismatch")
         if record.get("generated_config_sha256") != _sha256_file(config_path):
             raise ValueError("generated config binding mismatch")
-        if record.get("schema") != 4:
+        if record.get("schema") != EFFECTIVE_RUNTIME_SCHEMA:
             raise ValueError("effective runtime record schema is unsupported")
         if (
             record.get("lifecycle") != "first_checkpoint"

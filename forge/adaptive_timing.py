@@ -1,8 +1,8 @@
-"""Operator-attested, bundle-bound timing profiles for opt-in experiments.
+"""Operator-attested, bundle-bound timing profiles for lab experiments.
 
-The incumbent recipe continues to use :mod:`forge.recipe`'s literal timing
-constants unless a caller explicitly loads and supplies one of these profiles.
-Experimental bundles are different: their caller must set ``required=True`` so
+These host-bound profiles are lab evidence only. The tournament entrypoint
+never discovers or supplies one; production consumes the reviewed conservative
+constant in :mod:`forge.recipe`. Explicit lab callers set ``required=True`` so
 a missing, malformed, or wrongly bound profile stops the experiment instead of
 silently running it with another bundle's timing assumption.
 
@@ -31,7 +31,7 @@ from forge.file_evidence import RegularFileError, read_regular_bytes
 PROFILE_ENV = "FORGE_KREA_THROUGHPUT_PROFILE"
 SOURCE_RECORD_ENV = "FORGE_KREA_THROUGHPUT_SOURCE_RECORD"
 PROFILE_KIND = "forge-operator-attested-throughput-profile"
-PROFILE_SCHEMA = 3
+PROFILE_SCHEMA = 4
 FIRST_CHECKPOINT_EVENT = "first_checkpoint_timing_observed"
 _MAX_PROFILE_BYTES = 64 * 1024
 _MAX_SOURCE_RECORD_BYTES = 1024 * 1024
@@ -43,6 +43,7 @@ _SOURCE_RUN_ID_RE = re.compile(r".+:[0-9a-f]{32}")
 _PROFILE_FIELDS = {
     "schema",
     "kind",
+    "evidence_scope",
     "bundle_id",
     "bundle_sha256",
     "model_type",
@@ -66,6 +67,7 @@ _PROVENANCE_FIELDS = {
     "runtime_commit",
     "measured_at_utc",
     "accelerator_identity",
+    "accelerator_identity_evidence",
 }
 _SOURCE_RECORD_FIELDS = {
     "schema",
@@ -97,6 +99,7 @@ _PROBE_TIMING_FIELDS = {
     "current_dataset_size",
     "dataset_regime",
     "accelerator_identity",
+    "accelerator_identity_evidence",
 }
 _FIRST_OBSERVATION_FIELDS = {
     "bundle_id",
@@ -145,7 +148,7 @@ class ThroughputProfile:
     """An operator-attested timing claim for one experimental bundle.
 
     ``training_elapsed_seconds`` and ``first_checkpoint_elapsed_seconds`` are
-    declared relative to subprocess launch. Schema 3 conservatively includes
+    declared relative to subprocess launch. Schema 4 conservatively includes
     startup in the rate and therefore records ``startup_seconds`` as zero. The
     declared rate must equal
     ``(training_elapsed_seconds - startup_seconds) / completed_steps`` within
@@ -170,6 +173,7 @@ class ThroughputProfile:
     runtime_commit: str
     measured_at_utc: str
     accelerator_identity: str
+    accelerator_identity_evidence: str
     profile_sha256: str
 
 
@@ -330,7 +334,7 @@ def current_accelerator_identity(
 
 
 def produce_profile_document(
-    source_record_path: str,
+    source_record_path: str | None,
     *,
     source_run_id: str,
     bundle_id: str,
@@ -339,6 +343,10 @@ def produce_profile_document(
     measured_at_utc: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
     expected_accelerator_identity: str | None = None,
+    terminal_artifact_path: str | None = None,
+    source_record_bytes: bytes | None = None,
+    terminal_artifact_evidence: Any | None = None,
+    require_artifact_file_identity: bool = True,
 ) -> dict[str, Any]:
     """Derive an operator-attested profile from one completed runtime record.
 
@@ -370,9 +378,14 @@ def produce_profile_document(
     accelerator_identity = _text(
         accelerator_identity, "accelerator identity", maximum=256
     )
-    raw, record = _read_source_record(source_record_path)
+    if source_record_bytes is None:
+        if source_record_path is None:
+            raise TimingProfileError("source runtime record is absent")
+        raw, record = _read_source_record(source_record_path)
+    else:
+        raw, record = _decode_source_record_bytes(source_record_bytes)
     document = _exact_object(record, _SOURCE_RECORD_FIELDS, "source runtime record")
-    if document["schema"] != 4:
+    if document["schema"] != krea_runtime.EFFECTIVE_RUNTIME_SCHEMA:
         raise TimingProfileError("unsupported source runtime record schema")
 
     declared_record_sha = _sha256(
@@ -434,6 +447,7 @@ def produce_profile_document(
         or timing["current_dataset_size"] != expected_size
         or timing["dataset_regime"] != expected_regime
         or timing["accelerator_identity"] != accelerator_identity
+        or timing["accelerator_identity_evidence"] != "operator-attested"
     ):
         raise TimingProfileError("source timing identity mismatch")
 
@@ -512,19 +526,33 @@ def produce_profile_document(
     scope_attempt_nonce = _attempt_nonce(completion["scope_attempt_nonce"])
     if not expected_run_id.endswith(f":{scope_attempt_nonce}"):
         raise TimingProfileError("source terminal artifact scope mismatch")
-    try:
-        from forge.tasks.integrity import inspect_training_artifact
+    artifact = terminal_artifact_evidence
+    if artifact is None:
+        try:
+            from forge.tasks.integrity import inspect_training_artifact
 
-        artifact = inspect_training_artifact(artifact_path)
-    except Exception as exc:
-        raise TimingProfileError("source terminal artifact is unavailable") from exc
+            artifact = inspect_training_artifact(
+                terminal_artifact_path or artifact_path
+            )
+        except Exception as exc:
+            raise TimingProfileError("source terminal artifact is unavailable") from exc
+    else:
+        from forge.tasks.integrity import TrainingArtifactEvidence
+
+        if not isinstance(artifact, TrainingArtifactEvidence):
+            raise TimingProfileError("terminal artifact evidence is invalid")
     if (
-        artifact.path != os.path.abspath(artifact_path)
-        or artifact_name != os.path.basename(artifact.path)
-        or artifact.size_bytes != artifact_size
+        artifact.size_bytes != artifact_size
         or artifact.sha256 != artifact_sha
         or artifact.checkpoint_step != artifact_step
-        or artifact.file_identity != artifact_file_identity
+        or (
+            require_artifact_file_identity
+            and (
+                artifact.path != os.path.abspath(artifact_path)
+                or artifact_name != os.path.basename(artifact.path)
+                or artifact.file_identity != artifact_file_identity
+            )
+        )
         or completion["artifact_loadable"] is not True
         or completed_steps != artifact_step
     ):
@@ -549,6 +577,7 @@ def produce_profile_document(
         {
             "schema": PROFILE_SCHEMA,
             "kind": PROFILE_KIND,
+            "evidence_scope": "lab-only",
             "bundle_id": expected_bundle,
             "bundle_sha256": expected_bundle_sha,
             "model_type": expected_model,
@@ -569,6 +598,7 @@ def produce_profile_document(
                 "runtime_commit": expected_runtime_commit,
                 "measured_at_utc": measured_at,
                 "accelerator_identity": accelerator_identity,
+                "accelerator_identity_evidence": "operator-attested",
             },
         }
     )
@@ -598,7 +628,7 @@ def load_bundle_profile(
     path: str | None = None,
     source_record_path: str | None = None,
 ) -> ThroughputProfile | None:
-    """Load the explicitly configured profile for one bundle.
+    """Load an explicitly configured lab profile for one bundle.
 
     ``required=True`` is the fail-closed contract for experimental bundles.
     The incumbent caller uses ``required=False``; with no path configured this
@@ -647,8 +677,10 @@ def load_profile(
     current_dataset_size: int,
     expected_dataset_regime: str,
     expected_accelerator_identity: str,
+    terminal_artifact_path: str | None = None,
+    require_artifact_file_identity: bool = True,
 ) -> ThroughputProfile:
-    """Load a profile and canonically reproduce it from its exact raw record."""
+    """Load captured bytes and reproduce a profile from one path-level read."""
 
     try:
         raw = read_regular_bytes(
@@ -656,13 +688,63 @@ def load_profile(
             label="timing profile",
             maximum_size=_MAX_PROFILE_BYTES,
         )
-        value = json.loads(raw.decode("utf-8"))
+        source_raw = read_regular_bytes(
+            source_record_path,
+            label="source runtime record",
+            maximum_size=_MAX_SOURCE_RECORD_BYTES,
+        )
     except TimingProfileError:
         raise
     except RegularFileError as exc:
         raise TimingProfileError(str(exc)) from exc
     except Exception as exc:
         raise TimingProfileError(f"timing profile unavailable: {path}") from exc
+
+    return load_profile_bytes(
+        raw,
+        source_record_bytes=source_raw,
+        expected_bundle_id=expected_bundle_id,
+        expected_bundle_sha256=expected_bundle_sha256,
+        expected_model_type=expected_model_type,
+        current_dataset_size=current_dataset_size,
+        expected_dataset_regime=expected_dataset_regime,
+        expected_accelerator_identity=expected_accelerator_identity,
+        terminal_artifact_path=terminal_artifact_path,
+        require_artifact_file_identity=require_artifact_file_identity,
+    )
+
+
+def load_profile_bytes(
+    profile_bytes: bytes,
+    *,
+    source_record_bytes: bytes,
+    expected_bundle_id: str,
+    expected_bundle_sha256: str,
+    expected_model_type: str,
+    current_dataset_size: int,
+    expected_dataset_regime: str,
+    expected_accelerator_identity: str,
+    terminal_artifact_path: str | None = None,
+    terminal_artifact_evidence: Any | None = None,
+    require_artifact_file_identity: bool = True,
+) -> ThroughputProfile:
+    """Validate exact captured bytes without reopening any evidence path.
+
+    Release authority callers capture the profile and raw record once and
+    inspect the terminal artifact through one retained descriptor.  Passing
+    those values here makes the semantic contract consume the same evidence
+    bytes that the release receipt hashes.
+    """
+
+    try:
+        profile_raw = bytes(profile_bytes)
+        if not profile_raw or len(profile_raw) > _MAX_PROFILE_BYTES:
+            raise ValueError
+        value = json.loads(profile_raw.decode("utf-8"))
+    except Exception as exc:
+        raise TimingProfileError("timing profile bytes are not valid JSON") from exc
+    source_raw = bytes(source_record_bytes)
+    _decode_source_record_bytes(source_raw)
 
     profile = validate_profile(
         value,
@@ -674,13 +756,17 @@ def load_profile(
         expected_accelerator_identity=expected_accelerator_identity,
     )
     reproduced = produce_profile_document(
-        source_record_path,
+        None,
         source_run_id=profile.source_run_id,
         bundle_id=profile.bundle_id,
         model_type=profile.model_type,
         measured_dataset_size=profile.measured_dataset_size,
         measured_at_utc=profile.measured_at_utc,
         expected_accelerator_identity=expected_accelerator_identity,
+        terminal_artifact_path=terminal_artifact_path,
+        source_record_bytes=source_raw,
+        terminal_artifact_evidence=terminal_artifact_evidence,
+        require_artifact_file_identity=require_artifact_file_identity,
     )
     if _canonical_json_bytes(reproduced) != _canonical_json_bytes(value):
         raise TimingProfileError(
@@ -709,6 +795,8 @@ def validate_profile(
         or document["kind"] != PROFILE_KIND
     ):
         raise TimingProfileError("unsupported timing profile contract")
+    if document["evidence_scope"] != "lab-only":
+        raise TimingProfileError("timing profile is not lab-only evidence")
 
     bundle_id = _bundle_id(document["bundle_id"])
     bundle_sha256 = _sha256(document["bundle_sha256"], "bundle sha256")
@@ -802,6 +890,15 @@ def validate_profile(
         "accelerator identity",
         maximum=256,
     )
+    accelerator_identity_evidence = _text(
+        provenance["accelerator_identity_evidence"],
+        "accelerator identity evidence",
+        maximum=64,
+    )
+    if accelerator_identity_evidence != "operator-attested":
+        raise TimingProfileError(
+            "timing profile accelerator identity evidence is unsupported"
+        )
     if accelerator_identity != _text(
         expected_accelerator_identity,
         "expected accelerator identity",
@@ -826,6 +923,7 @@ def validate_profile(
         runtime_commit=runtime_commit,
         measured_at_utc=measured_at_utc,
         accelerator_identity=accelerator_identity,
+        accelerator_identity_evidence=accelerator_identity_evidence,
         profile_sha256=declared_profile_sha,
     )
 
@@ -978,6 +1076,18 @@ def _read_source_record(path: str) -> tuple[bytes, Any]:
         raise TimingProfileError(
             f"source runtime record unavailable: {path}"
         ) from exc
+
+
+def _decode_source_record_bytes(raw: bytes) -> tuple[bytes, Any]:
+    """Decode one already captured, bounded source-record byte string."""
+
+    try:
+        payload = bytes(raw)
+        if not payload or len(payload) > _MAX_SOURCE_RECORD_BYTES:
+            raise ValueError
+        return payload, json.loads(payload.decode("utf-8"))
+    except Exception as exc:
+        raise TimingProfileError("source runtime record bytes are invalid") from exc
 
 
 def _runtime_record_semantic_sha256(value: Any) -> str:

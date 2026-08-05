@@ -108,30 +108,12 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     # ordinary export reserve itself.
     hours = _recipe_hours(deadline, scoring_reserve_s)
     bundle = krea_runtime.requested_bundle(spec.model_type)
+    # Tournament execution consumes only the reviewed constants committed in
+    # forge.recipe. Host-bound profiles/probes are lab evidence and are never
+    # discovered from environment variables by this production entrypoint.
     timing_probe = False
     throughput_profile = None
     timing_accelerator_identity = None
-    if spec.model_type == "krea2":
-        timing_probe = krea_runtime.timing_probe_enabled()
-        throughput_profile = adaptive_timing.load_bundle_profile(
-            bundle_id=bundle,
-            bundle_sha256=krea_runtime.bundle_contract_sha256(bundle),
-            model_type=spec.model_type,
-            current_dataset_size=pairs,
-            dataset_regime=adaptive_timing.dataset_regime(pairs),
-            required=(
-                bundle != krea_runtime.INCUMBENT_BUNDLE and not timing_probe
-            ),
-        )
-        if timing_probe and throughput_profile is None:
-            timing_accelerator_identity = (
-                adaptive_timing.current_accelerator_identity()
-            )
-            telemetry.event(
-                "krea_timing_bootstrap_probe",
-                bundle=bundle,
-                operator_attested_profile=False,
-            )
     cfg = build_config(
         spec,
         num_images=pairs,
@@ -206,9 +188,7 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         total_budget_s=hours * 3600.0,
         export_reserve_s=recipe.EXPORT_RESERVE_S,
         timing_safety=recipe.MARGIN,
-        timing_record_required=(
-            bundle != krea_runtime.INCUMBENT_BUNDLE or timing_probe
-        ),
+        timing_record_required=False,
         timing_probe=timing_probe,
         timing_bundle=bundle,
         toolkit_dir=toolkit_dir,

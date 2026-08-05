@@ -109,7 +109,13 @@ def open_regular_file(
 
     fd: int | None = None
     try:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        # O_NONBLOCK makes special files fail at the subsequent fstat/type gate
+        # instead of allowing a FIFO/device open to stall release validation.
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         fd = _open_evidence_path(path, flags)
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):

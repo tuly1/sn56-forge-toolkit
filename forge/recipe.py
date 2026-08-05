@@ -51,8 +51,24 @@ STEP_TABLE = {
 # per step → highest. These are guesses to be replaced by measured per_step().
 # z-image/qwen train quantized (qfloat8/uint3, low_vram) → slower per it;
 # conservative until measured.
-SEC_PER_IT = {"flux": 2.5, "krea2": 2.2, "ideogram4": 3.0,
-              "z-image": 3.0, "qwen-image": 4.0}
+KREA_RELEASE_TIMING_POLICY = {
+    "schema": 1,
+    "kind": "forge-reviewed-conservative-timing-constant",
+    "model_type": "krea2",
+    # Owner-reviewed Week-5 field constant. Lab profiles may inform a later
+    # diff, but tournament execution consumes this readable release value only.
+    "seconds_per_step": 2.2,
+    "basis": "week5-validator-field-depth-owner-reviewed-2026-08-03",
+    "evidence_boundary": "host-bound-lab-profile-never-consumed-by-production",
+}
+
+SEC_PER_IT = {
+    "flux": 2.5,
+    "krea2": KREA_RELEASE_TIMING_POLICY["seconds_per_step"],
+    "ideogram4": 3.0,
+    "z-image": 3.0,
+    "qwen-image": 4.0,
+}
 STARTUP_S = 300.0  # big base-model load + latent/text-embed warmup
 EXPORT_RESERVE_S = 180.0  # mirrors cli._EXPORT_RESERVE_SECONDS
 MARGIN = 0.85  # jitter/save/eval headroom
@@ -66,11 +82,12 @@ def size_scaled_steps(
     *,
     throughput_profile=None,
 ):
-    """Materialize the size law under a static or operator-attested budget.
+    """Materialize the size law under a release constant or lab-only profile.
 
     With no profile this retains the historical never-raise fallback and exact
-    incumbent outputs.  Supplying a profile is an experimental, fail-closed
-    operation: its model binding is checked before the legacy fallback block.
+    incumbent outputs. Supplying a profile is an explicit lab operation; the
+    tournament runner never supplies one. Its model binding is checked before
+    the legacy fallback block.
     """
     if throughput_profile is not None:
         from forge.adaptive_timing import ThroughputProfile, TimingProfileError

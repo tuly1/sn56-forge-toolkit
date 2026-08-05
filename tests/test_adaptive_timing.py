@@ -40,7 +40,7 @@ def _write_source_record(
         tmp_path / f"{bundle}-terminal.safetensors", step=1000
     )
     record = {
-        "schema": 4,
+        "schema": krea_runtime.EFFECTIVE_RUNTIME_SCHEMA,
         "runtime_contract_id": krea_runtime.RUNTIME_CONTRACT_ID,
         "source_run_id": SOURCE_RUN_ID,
         "model_type": "krea2",
@@ -64,6 +64,7 @@ def _write_source_record(
             "current_dataset_size": 24,
             "dataset_regime": "small-11-24",
             "accelerator_identity": ACCELERATOR_IDENTITY,
+            "accelerator_identity_evidence": "operator-attested",
         },
         "effective": {
             "planned_steps": 1000,
@@ -190,7 +191,7 @@ def test_no_profile_preserves_incumbent_recipe_outputs(monkeypatch):
     assert recipe.size_scaled_steps("krea2", 24, 1.0, 2000) == 1172
 
 
-def test_experimental_bundle_requires_profile(monkeypatch):
+def test_explicit_lab_bundle_profile_loader_fails_closed(monkeypatch):
     monkeypatch.delenv(adaptive_timing.PROFILE_ENV, raising=False)
 
     with pytest.raises(
@@ -242,6 +243,77 @@ def test_profile_producer_hashes_and_crosschecks_raw_completed_run(tmp_path):
     assert profile.seconds_per_step == pytest.approx(1.3)
     assert profile.startup_seconds == 0.0
     assert document["kind"] == "forge-operator-attested-throughput-profile"
+    assert document["schema"] == 4
+    assert document["evidence_scope"] == "lab-only"
+    assert (
+        document["provenance"]["accelerator_identity_evidence"]
+        == "operator-attested"
+    )
+
+
+def test_captured_profile_bytes_and_descriptor_evidence_ignore_path_swap(tmp_path):
+    profile_path = _write_profile(tmp_path)
+    source_path = _source_path(tmp_path)
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    artifact_path = source["training_completion_observation"]["artifact_path"]
+    artifact = inspect_training_artifact(artifact_path)
+    profile_bytes = profile_path.read_bytes()
+    source_bytes = source_path.read_bytes()
+
+    profile_path.write_text('{"schema":999}', encoding="utf-8")
+    source_path.write_text('{"schema":999}', encoding="utf-8")
+    with open(artifact_path, "wb") as handle:
+        handle.write(b"not-safetensors")
+
+    loaded = adaptive_timing.load_profile_bytes(
+        profile_bytes,
+        source_record_bytes=source_bytes,
+        expected_bundle_id=krea_runtime.LEADER_BUNDLE,
+        expected_bundle_sha256=BUNDLE_SHA,
+        expected_model_type="krea2",
+        current_dataset_size=DATASET_SIZE,
+        expected_dataset_regime=DATASET_REGIME,
+        expected_accelerator_identity=ACCELERATOR_IDENTITY,
+        terminal_artifact_evidence=artifact,
+        require_artifact_file_identity=False,
+    )
+
+    assert loaded.source_run_id == SOURCE_RUN_ID
+
+
+def test_prior_profile_and_raw_runtime_schemas_are_explicitly_invalidated(tmp_path):
+    profile_path = _write_profile(tmp_path)
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    profile["schema"] = 3
+    profile = adaptive_timing._seal_profile_document(profile)
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    with pytest.raises(
+        adaptive_timing.TimingProfileError,
+        match="unsupported timing profile contract",
+    ):
+        _load(profile_path)
+
+    raw_path = _write_source_record(tmp_path)
+    raw = json.loads(raw_path.read_text(encoding="utf-8"))
+    raw["schema"] = 4
+    raw.pop("record_sha256")
+    raw["record_sha256"] = adaptive_timing._runtime_record_semantic_sha256(raw)
+    raw_path.write_text(
+        json.dumps(raw, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        adaptive_timing.TimingProfileError,
+        match="unsupported source runtime record schema",
+    ):
+        adaptive_timing.produce_profile_document(
+            str(raw_path),
+            source_run_id=SOURCE_RUN_ID,
+            bundle_id=krea_runtime.LEADER_BUNDLE,
+            model_type="krea2",
+            measured_dataset_size=DATASET_SIZE,
+            runner=_nvidia_runner(),
+        )
 
 
 def test_profile_producer_accepts_mae_bundle_capability_subset(tmp_path):

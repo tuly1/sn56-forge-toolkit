@@ -97,3 +97,31 @@ def test_openat2_path_policy_error_does_not_fall_back(tmp_path, monkeypatch):
             label="record",
             maximum_size=1024,
         )
+
+
+def test_descriptor_reader_always_requests_nonblocking_open(tmp_path, monkeypatch):
+    target = tmp_path / "record.json"
+    target.write_bytes(b"{}")
+    observed = {}
+    original = file_evidence._open_evidence_path
+
+    def capture(path, flags):
+        observed["flags"] = flags
+        return original(path, flags)
+
+    monkeypatch.setattr(file_evidence, "_open_evidence_path", capture)
+
+    assert file_evidence.read_regular_bytes(
+        str(target), label="record", maximum_size=1024
+    ) == b"{}"
+    assert observed["flags"] & os.O_NONBLOCK
+
+
+def test_fifo_evidence_is_rejected_without_waiting_for_a_writer(tmp_path):
+    fifo = tmp_path / "record.fifo"
+    os.mkfifo(fifo)
+
+    with pytest.raises(file_evidence.RegularFileError, match="regular file"):
+        file_evidence.read_regular_bytes(
+            str(fifo), label="record", maximum_size=1024
+        )
