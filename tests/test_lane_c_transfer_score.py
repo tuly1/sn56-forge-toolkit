@@ -237,6 +237,46 @@ def test_port_gate_retries_kernel_teardown_window_before_launch(
     assert sleeps == [0.25, 0.25]
 
 
+def test_port_gate_fails_closed_after_teardown_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def bind(self, _address):
+            raise OSError(errno.EADDRINUSE, "address still in use")
+
+    clock = iter((10.0, 15.1))
+    monkeypatch.setattr(runner.socket, "socket", lambda *_args: Probe())
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(RuntimeError, match="remained unavailable"):
+        runner._wait_for_bindable_port(8188, timeout_s=5.0)
+
+
+def test_port_gate_does_not_retry_unexpected_bind_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def bind(self, _address):
+            raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(runner.socket, "socket", lambda *_args: Probe())
+
+    with pytest.raises(RuntimeError, match="cannot verify"):
+        runner._wait_for_bindable_port(8188, timeout_s=5.0)
+
+
 def test_runner_rejects_wrong_seed_mode_and_never_publishes_aggregate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
