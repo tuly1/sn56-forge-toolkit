@@ -51,7 +51,7 @@ _TOOLING_NODE = "comfyui-tooling-nodes"
 
 
 def _comfy_child_environment(
-    *, comfy_python: Path, isolation_root: Path
+    *, comfy_python: Path, isolation_root: Path, gpu_index: int = 0
 ) -> dict[str, str]:
     """Construct a scorer-child environment without operator inheritance."""
 
@@ -80,6 +80,9 @@ def _comfy_child_environment(
         "DIFFUSERS_OFFLINE": "1",
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "TOKENIZERS_PARALLELISM": "false",
+        # Expose exactly the selected physical GPU to the fresh Comfy process.
+        # The process sees that one device as logical GPU 0.
+        "CUDA_VISIBLE_DEVICES": str(gpu_index),
         **{name: str(path) for name, path in directories.items()},
     }
 
@@ -96,6 +99,36 @@ def _port(value: str) -> int:
     if not 1 <= parsed <= 65535:
         raise argparse.ArgumentTypeError("must be in [1, 65535]")
     return parsed
+
+
+def _gpu_index(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative GPU index")
+    return parsed
+
+
+def _generation_count(value: str) -> int:
+    parsed = int(value)
+    if parsed not in {2, 5}:
+        raise argparse.ArgumentTypeError("must be 2 (reduced diagnostic) or 5")
+    return parsed
+
+
+def _resolve_generations(
+    *, validator_default: int, requested: int | None
+) -> tuple[int, str]:
+    """Resolve the predeclared Lane-C seed mode without changing seed order."""
+
+    if validator_default != 5:
+        raise RuntimeError(
+            "pinned Krea evaluator default changed; expected five generations"
+        )
+    if requested is None or requested == 5:
+        return 5, "validator-exact-5"
+    if requested == 2:
+        return 2, "reduced-2"
+    raise RuntimeError("unsupported Krea generation count")
 
 
 def _ordered_image_enumerator(
@@ -143,6 +176,12 @@ def _parse() -> argparse.Namespace:
     )
     parser.add_argument("--port", type=_port, default=_DEFAULT_PORT)
     parser.add_argument(
+        "--gpu-index",
+        type=_gpu_index,
+        default=0,
+        help="Physical GPU index exposed exclusively to the Comfy subprocess",
+    )
+    parser.add_argument(
         "--startup-timeout-s",
         type=_positive_float,
         default=300.0,
@@ -160,6 +199,14 @@ def _parse() -> argparse.Namespace:
     parser.add_argument("--expected-god-commit")
     parser.add_argument("--expected-comfy-commit")
     parser.add_argument("--expected-tooling-commit")
+    parser.add_argument(
+        "--generations",
+        type=_generation_count,
+        help=(
+            "Generation count. Omit (or pass 5) for validator-exact scoring; "
+            "pass 2 only for the predeclared reduced-2 diagnostic mode."
+        ),
+    )
     parser.add_argument(
         "--expected-image",
         action="append",
@@ -776,16 +823,16 @@ def main() -> int:
             raise RuntimeError("supplied G.O.D checkout has no Krea2 eval defaults")
         defaults = dict(constants.EVAL_DEFAULTS[model_type])
         steps = defaults.get("steps")
-        generations = defaults.get("generations")
+        validator_generations = defaults.get("generations")
         cfg = defaults.get("cfg")
         denoise = defaults.get("denoise")
         if (
             not isinstance(steps, int)
             or isinstance(steps, bool)
             or steps <= 0
-            or not isinstance(generations, int)
-            or isinstance(generations, bool)
-            or generations <= 0
+            or not isinstance(validator_generations, int)
+            or isinstance(validator_generations, bool)
+            or validator_generations <= 0
             or isinstance(cfg, bool)
             or isinstance(denoise, bool)
             or not math.isfinite(float(cfg))
@@ -794,6 +841,10 @@ def main() -> int:
             or not 0.0 <= float(denoise) <= 1.0
         ):
             raise RuntimeError(f"invalid Krea2 eval defaults: {defaults}")
+        generations, seed_mode = _resolve_generations(
+            validator_default=validator_generations,
+            requested=args.generations,
+        )
 
         candidate_sha256 = _sha256(candidate)
         candidate_name = f"candidate-{candidate_sha256}.safetensors"
@@ -870,6 +921,7 @@ def main() -> int:
             child_environment = _comfy_child_environment(
                 comfy_python=comfy_python,
                 isolation_root=isolation_root,
+                gpu_index=args.gpu_index,
             )
 
             with comfy_log.open("xb") as log_handle:
@@ -1074,6 +1126,8 @@ def main() -> int:
             "cfg": cfg,
             "denoise": denoise,
             "generations": generations,
+            "validator_default_generations": validator_generations,
+            "seed_mode": seed_mode,
             "master_seed": master_seed,
             "seeds": seeds,
             "text_guided_losses": normalized["text_guided_losses"],
@@ -1118,6 +1172,8 @@ def main() -> int:
                 "api_nodes_disabled": True,
                 "isolated_input_output_temp_user": True,
                 "offline_environment": True,
+                "physical_gpu_index": args.gpu_index,
+                "cuda_visible_devices": str(args.gpu_index),
                 "custom_node_allowlist": [_TOOLING_NODE],
                 "startup_timeout_s": args.startup_timeout_s,
                 "evaluation_timeout_s": args.evaluation_timeout_s,

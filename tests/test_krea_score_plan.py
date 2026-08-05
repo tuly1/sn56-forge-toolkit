@@ -27,6 +27,36 @@ import test_krea_training_evidence_cli as stage3_test  # noqa: E402
 from test_krea_v2_batch_contract import ProducerHarness  # noqa: E402
 
 
+def test_exact_scorer_generation_modes_are_explicit_and_fail_closed() -> None:
+    assert evaluate_krea_local._resolve_generations(
+        validator_default=5,
+        requested=None,
+    ) == (5, "validator-exact-5")
+    assert evaluate_krea_local._resolve_generations(
+        validator_default=5,
+        requested=5,
+    ) == (5, "validator-exact-5")
+    assert evaluate_krea_local._resolve_generations(
+        validator_default=5,
+        requested=2,
+    ) == (2, "reduced-2")
+    with pytest.raises(RuntimeError, match="default changed"):
+        evaluate_krea_local._resolve_generations(
+            validator_default=4,
+            requested=2,
+        )
+    with pytest.raises(RuntimeError, match="unsupported"):
+        evaluate_krea_local._resolve_generations(
+            validator_default=5,
+            requested=3,
+        )
+
+    assert evaluate_krea_local._generation_count("2") == 2
+    assert evaluate_krea_local._generation_count("5") == 5
+    with pytest.raises(Exception, match="must be 2"):
+        evaluate_krea_local._generation_count("3")
+
+
 def test_exact_scorer_environments_do_not_inherit_operator_controls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -63,6 +93,7 @@ def test_exact_scorer_environments_do_not_inherit_operator_controls(
             assert name not in environment
         assert environment["HF_HUB_OFFLINE"] == "1"
         assert environment["HF_HOME"].startswith(str(tmp_path))
+    assert inner["CUDA_VISIBLE_DEVICES"] == "0"
 
     inspection = evaluate_krea_local._inspection_environment()
     for name in (

@@ -63,13 +63,13 @@ _FORBIDDEN_OUTPUT = "forge_holdout_scores.json"
 _COMFY_LORA_PLACEHOLDER = "put_loras_here"
 _SCORER_SUPPORT_MODULE_SHA256 = {
     "krea_execution_surface_policy.py": (
-        "597e5047e419a5007e5dd7e9c80c3d771ac21995028899edaac38ba47bf02722"
+        "744d1ae0948e35fc87c1d75f8cf716212818a7e2474993f0f015ddd150290e10"
     ),
     "krea_historical_training_evidence.py": (
         "6734200163e856a14a2d41a370e98e1b4b801091e5f828c37817ff9d4435f3d0"
     ),
     "krea_scorer_extension_policy.py": (
-        "b0c033025dc35f0cdc3e348234507c24f17ac636f522eaff3a392cd3e74a062b"
+        "85eab12528098e342531d6d0f95823ae36da73e3b9b4cab9b640b8d4b9da4cc2"
     ),
 }
 _FIXTURE_KIND = "forge-krea-fixture-split"
@@ -3238,6 +3238,8 @@ def _result_envelope(result: dict[str, Any]) -> dict[str, Any]:
         "cfg": result["cfg"],
         "denoise": result["denoise"],
         "generations": result["generations"],
+        "validator_default_generations": result["validator_default_generations"],
+        "seed_mode": result["seed_mode"],
         "master_seed": result["master_seed"],
         "seeds": result["seeds"],
         "text_weight": result["text_weight"],
@@ -3293,6 +3295,8 @@ def _validate_result(
         "cfg",
         "denoise",
         "generations",
+        "validator_default_generations",
+        "seed_mode",
         "master_seed",
         "seeds",
         "text_guided_losses",
@@ -3351,6 +3355,8 @@ def _validate_result(
         or result["cfg"] != defaults["cfg"]
         or result["denoise"] != defaults["denoise"]
         or result["generations"] != defaults["generations"]
+        or result["validator_default_generations"] != defaults["generations"]
+        or result["seed_mode"] != f"validator-exact-{defaults['generations']}"
         or result["master_seed"] != defaults["master_seed"]
         or result["text_weight"] != defaults["text_weight"]
     ):
