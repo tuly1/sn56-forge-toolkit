@@ -855,6 +855,18 @@ print(json.dumps(result, allow_nan=False, separators=(",", ":"), sort_keys=True)
 """
 
 
+IMAGE_CPU_IMPORT_PROGRAM = r"""
+import json
+import torch
+import forge
+print(json.dumps({
+    "forge": forge.__file__,
+    "state": "PASS",
+    "torch": torch.__version__,
+}, allow_nan=False, separators=(",", ":"), sort_keys=True))
+"""
+
+
 GPU_IMPORT_PROGRAM = r"""
 import json
 import torch
@@ -872,6 +884,29 @@ print(json.dumps({
     "torch": torch.__version__,
 }, allow_nan=False, separators=(",", ":"), sort_keys=True))
 """
+
+
+def observe_image_cpu_imports(
+    tools: Mapping[str, str], image_tag: str
+) -> dict[str, Any]:
+    """Import the shipped runtime without crossing the physical GPU boundary."""
+
+    completed = run_image_python(tools, image_tag, IMAGE_CPU_IMPORT_PROGRAM)
+    try:
+        value = json.loads(completed.stdout)
+    except Exception as exc:
+        raise DelegateError("container CPU import observation is not valid JSON") from exc
+    require(
+        isinstance(value, dict) and value.get("state") == "PASS",
+        "container CPU imports did not pass",
+    )
+    require(bool(str(value.get("torch", "")).strip()), "container torch version is absent")
+    forge_path = str(value.get("forge", ""))
+    require(
+        forge_path.startswith("/app/forge/"),
+        f"container Forge imported from an unexpected path: {forge_path}",
+    )
+    return value
 
 
 def certify_cpu_image_surface(
@@ -898,6 +933,12 @@ def certify_cpu_image_surface(
         f"{subject.name} image input binding did not pass",
     )
     evidence.write_bytes(f"subjects/{subject.name}/image-input-binding.stdout", binding.stdout)
+
+    import_observation = observe_image_cpu_imports(tools, image_tag)
+    evidence.write_json(
+        f"subjects/{subject.name}/cpu-import-observation.json",
+        import_observation,
+    )
 
     verifier = run_capture(
         docker_run_command(
@@ -950,6 +991,7 @@ def certify_cpu_image_surface(
         "cli_help": "PASS",
         "forge_byte_manifest": "PASS",
         "offline_runtime_inventory": "PASS",
+        "python_imports": "PASS",
         "runtime_inputs": "PASS",
     }
 

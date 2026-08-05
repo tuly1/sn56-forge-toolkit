@@ -13,7 +13,7 @@ unset BASH_ENV CDPATH ENV GIT_CONFIG GIT_DIR GIT_WORK_TREE \
 readonly CERT_SCOPE=toolkit-krea-only
 # Updated mechanically after both archived authority programs are final.
 readonly VALIDATOR_SHA256=d1e148479b9a4bf8bfd48348f71100145f39c5233a9a90ae4731c40cef571ed0
-readonly DELEGATED_SHA256=222df447fdc8820702a7837bb9842f4df128a97348f5d20a16b3cb194e953010
+readonly DELEGATED_SHA256=9b5cb2e631a647b989aaf6b988973cbddf74a8f822ececffc0be5e8632a2c9e2
 
 fail() {
   /usr/bin/printf 'SN56_WEEK6_FINAL_RELEASE_CERT=FAIL reason=%s\n' "$1" >&2

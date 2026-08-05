@@ -143,6 +143,53 @@ def test_cpu_integration_can_never_emit_production_pass():
     }
 
 
+def test_cpu_surface_imports_torch_and_forge_before_the_gpu_boundary(monkeypatch):
+    module = _delegate()
+    observed: list[tuple[str, str]] = []
+
+    def successful_import(_tools, image_tag, program, *program_args):
+        observed.append((image_tag, program))
+        assert not program_args
+        return subprocess.CompletedProcess(
+            ["python3"],
+            0,
+            stdout=(
+                b'{"forge":"/app/forge/__init__.py","state":"PASS",'
+                b'"torch":"2.6.0+cu124"}\n'
+            ),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(module, "run_image_python", successful_import)
+    result = module.observe_image_cpu_imports(
+        {"docker": "/usr/bin/docker"}, "sn56/toolkit:exact-head"
+    )
+
+    assert result["state"] == "PASS"
+    assert result["forge"] == "/app/forge/__init__.py"
+    assert observed == [("sn56/toolkit:exact-head", module.IMAGE_CPU_IMPORT_PROGRAM)]
+    assert "import torch" in module.IMAGE_CPU_IMPORT_PROGRAM
+    assert "import forge" in module.IMAGE_CPU_IMPORT_PROGRAM
+    assert "torch.cuda" not in module.IMAGE_CPU_IMPORT_PROGRAM
+    certify_source = (
+        DELEGATE.read_text(encoding="utf-8")
+        .split("def certify_cpu_image_surface", 1)[1]
+        .split("def observe_host_gpu", 1)[0]
+    )
+    assert "observe_image_cpu_imports" in certify_source
+
+    def broken_import(_tools, _image_tag, _program, *_program_args):
+        return subprocess.CompletedProcess(
+            ["python3"], 0, stdout=b'{"state":"PASS","torch":"2.6.0"}\n', stderr=b""
+        )
+
+    monkeypatch.setattr(module, "run_image_python", broken_import)
+    with pytest.raises(module.DelegateError, match="unexpected path"):
+        module.observe_image_cpu_imports(
+            {"docker": "/usr/bin/docker"}, "sn56/toolkit:broken"
+        )
+
+
 def test_fixed_subprocess_environment_does_not_inherit_operator_state(monkeypatch):
     module = _delegate()
     monkeypatch.setenv("BASH_ENV", "/tmp/hostile")
