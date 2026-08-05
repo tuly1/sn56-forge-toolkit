@@ -14,14 +14,17 @@ leaves diagnostic evidence but can never be mistaken for a complete campaign.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import socket
 import stat
 import subprocess
+import time
 from typing import Any
 
 
@@ -33,6 +36,7 @@ _GENERATION_COUNT = 2
 _COMPARISONS_PER_ROW = 2
 _REDUCED_SEEDS = [2746317213, 1181241943]
 _DEFAULT_EXPECTED_CANDIDATES = 15
+_LOOPBACK = "127.0.0.1"
 
 
 def _positive_float(value: str) -> float:
@@ -92,6 +96,9 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
         "--evaluation-timeout-s", type=_positive_float, default=3600.0
     )
     parser.add_argument("--shutdown-timeout-s", type=_positive_float, default=20.0)
+    parser.add_argument(
+        "--port-reuse-timeout-s", type=_positive_float, default=90.0
+    )
     return parser.parse_args(argv)
 
 
@@ -293,6 +300,43 @@ def _fixed_environment(driver_python: Path, output_dir: Path) -> dict[str, str]:
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "TOKENIZERS_PARALLELISM": "false",
     }
+
+
+def _wait_for_bindable_port(port: int, *, timeout_s: float) -> dict[str, Any]:
+    """Wait until the evaluator's own bind-based freshness gate can pass.
+
+    A clean ComfyUI shutdown can leave the listening port unavailable during
+    the kernel's socket teardown window even though no process is listening.
+    The evaluator deliberately fails closed on that state.  Mirror its exact
+    bind test here between candidates instead of converting a transient
+    teardown state into a failed campaign.
+    """
+
+    started = time.monotonic()
+    deadline = started + timeout_s
+    attempts = 0
+    while True:
+        attempts += 1
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind((_LOOPBACK, port))
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE:
+                    raise RuntimeError(
+                        f"cannot verify ComfyUI port {_LOOPBACK}:{port}"
+                    ) from exc
+                now = time.monotonic()
+                if now >= deadline:
+                    raise RuntimeError(
+                        f"ComfyUI port {_LOOPBACK}:{port} remained unavailable "
+                        f"for {timeout_s}s"
+                    ) from exc
+            else:
+                return {
+                    "attempts": attempts,
+                    "waited_s": time.monotonic() - started,
+                }
+        time.sleep(0.25)
 
 
 def _command(
@@ -504,6 +548,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     for candidate in candidates:
         _assert_lora_root_empty(lora_root)
+        port_gate = _wait_for_bindable_port(
+            args.port, timeout_s=args.port_reuse_timeout_s
+        )
         staged_candidate, source_bytes = _stage_candidate(candidate, lora_root)
         result_path = results_dir / f"{candidate['id']}.json"
         comfy_log = logs_dir / f"{candidate['id']}.comfy.log"
@@ -551,6 +598,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             summary["driver_log_sha256"] = _sha256(driver_log)
             summary["comfy_log_sha256"] = _sha256(comfy_log)
+            summary["prelaunch_port_gate"] = port_gate
             completed.append(summary)
             print(
                 f"LANE-C DONE {candidate['id']} "
@@ -577,6 +625,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "seed_mode": "reduced-2",
         "expected_prompt_count_per_candidate": expected_prompt_count,
         "gpu_index": args.gpu_index,
+        "port_reuse_timeout_s": args.port_reuse_timeout_s,
         "evaluator_script_sha256": _sha256(evaluator_script),
         "results": completed,
     }

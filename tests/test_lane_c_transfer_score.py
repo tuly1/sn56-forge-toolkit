@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 from pathlib import Path
@@ -76,6 +77,7 @@ def _surface(tmp_path: Path, *, candidates: int = 2) -> tuple[SimpleNamespace, l
         startup_timeout_s=300.0,
         evaluation_timeout_s=3600.0,
         shutdown_timeout_s=20.0,
+        port_reuse_timeout_s=90.0,
     )
     return args, candidate_paths
 
@@ -195,11 +197,44 @@ def test_runner_scores_all_candidates_and_publishes_only_complete_aggregate(
     assert result["image_count"] == 2
     assert result["expected_prompt_count_per_candidate"] == 8
     assert result["seed_mode"] == "reduced-2"
+    assert result["port_reuse_timeout_s"] == 90.0
+    assert all(
+        row["prelaunch_port_gate"]["attempts"] >= 1 for row in result["results"]
+    )
     assert len(commands) == 2
     assert (Path(args.output_dir) / "aggregate.json").is_file()
     runner._assert_lora_root_empty(Path(args.comfy_root) / "models" / "loras")
     with pytest.raises(FileExistsError, match="stale output"):
         runner.run(args)
+
+
+def test_port_gate_retries_kernel_teardown_window_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = [errno.EADDRINUSE, errno.EADDRINUSE, None]
+    clock = iter((10.0, 10.1, 10.2, 10.3))
+    sleeps: list[float] = []
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def bind(self, address):
+            assert address == ("127.0.0.1", 8188)
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise OSError(outcome, "address still in use")
+
+    monkeypatch.setattr(runner.socket, "socket", lambda *_args: Probe())
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    result = runner._wait_for_bindable_port(8188, timeout_s=5.0)
+    assert result == {"attempts": 3, "waited_s": pytest.approx(0.3)}
+    assert sleeps == [0.25, 0.25]
 
 
 def test_runner_rejects_wrong_seed_mode_and_never_publishes_aggregate(
