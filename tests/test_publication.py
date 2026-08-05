@@ -244,6 +244,10 @@ def test_publication_runs_after_loss_selection_and_preserves_model_bytes(tmp_pat
     (root / "config.yaml").write_text("private_recipe: true\n", encoding="utf-8")
     (root / "config.toml").write_text("private_recipe = true\n", encoding="utf-8")
     (root / "learnable_snr.json").write_text("{}", encoding="utf-8")
+    (root / "ema.pt").write_bytes(b"private-ema-resume-state")
+    (root / "ema_resume_transaction.json").write_text(
+        '{"private":true}\n', encoding="utf-8"
+    )
     record = checkpoints.finalize(str(root), "repo", scope)
     assert record["source"] == "training_loss_divergence"
     assert (root / "last.safetensors").read_bytes() == early
@@ -254,6 +258,11 @@ def test_publication_runs_after_loss_selection_and_preserves_model_bytes(tmp_pat
     result = publication.finalize_public_bundle(str(root))
 
     assert result["complete"] is True
+    assert result["scrub_failure_policy"] == {
+        "mode": publication.SCRUB_FAILURE_POLICY,
+        "accepted_tradeoff": True,
+        "residual_risk": publication.SCRUB_RESIDUAL_RISK,
+    }
     assert result["selection_attested"] is True
     assert result["artifact_sha256"] == before
     assert _sha256(root / "last.safetensors") == before
@@ -270,6 +279,8 @@ def test_publication_runs_after_loss_selection_and_preserves_model_bytes(tmp_pat
         "config.yaml",
         "config.toml",
         "learnable_snr.json",
+        "ema.pt",
+        "ema_resume_transaction.json",
     ):
         assert os.path.isfile(os.path.join(private_dir, name))
     public = json.loads((root / "forge_run.json").read_text())
@@ -307,6 +318,10 @@ def test_archive_failure_removes_private_sidecar_and_reports_incomplete(
     result = publication.finalize_public_bundle(str(root))
 
     assert result["complete"] is False
+    assert result["scrub_failure_policy"]["accepted_tradeoff"] is True
+    assert result["scrub_failure_policy"]["mode"] == (
+        "accepted-fail-open-never-forfeit"
+    )
     assert any(error.startswith("archive_failed:config.yaml") for error in result["errors"])
     assert not (root / "config.yaml").exists()
     assert (root / "last.safetensors").read_bytes() == final

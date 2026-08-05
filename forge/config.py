@@ -15,7 +15,7 @@ import os
 
 import yaml
 
-from forge import ideogram_release_policy, recipe, telemetry
+from forge import ideogram_release_policy, krea_runtime, recipe, telemetry
 
 # Templates are shipped INSIDE the package (forge/templates/*.yaml) so they are
 # present under any deployment (source COPY, `pip install .` wheel, or local test)
@@ -78,11 +78,31 @@ def resolve_base_model(cached_model_dir: str) -> str:
     return cached_model_dir
 
 
-def build_config(spec, num_images, hours_to_complete) -> dict:
+def build_config(
+    spec,
+    num_images,
+    hours_to_complete,
+    *,
+    throughput_profile=None,
+) -> dict:
     cfg = load_template(spec.model_type)  # may raise → caller wraps
     try:
-        resolved = _apply_overrides(cfg, spec, num_images, hours_to_complete)
-    except Exception:
+        resolved = _apply_overrides(
+            cfg,
+            spec,
+            num_images,
+            hours_to_complete,
+            throughput_profile=throughput_profile,
+        )
+    except Exception as exc:
+        # Calibration bundles are evidence-bearing experiments.  Silently
+        # degrading one to the incumbent config would mislabel the experiment,
+        # so their contract is deliberately fail-closed.  The ordinary deployed
+        # path retains the historical never-forfeit degradation below.
+        if krea_runtime.requested_bundle(spec.model_type) != krea_runtime.INCUMBENT_BUNDLE:
+            raise krea_runtime.KreaRuntimeContractError(
+                "experimental Krea config overrides failed"
+            ) from exc
         # Degrade to the template with only the load-bearing name/paths patched so
         # an override bug can't forfeit (INV-1). name==repo is non-negotiable.
         try:
@@ -121,7 +141,7 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
         return cfg
 
     try:
-        return ideogram_release_policy.apply(resolved, spec.model_type)
+        candidate = ideogram_release_policy.apply(resolved, spec.model_type)
     except Exception as exc:
         # Never emit a partial candidate.  An invalid release binding preserves
         # the already-built Week-4 config and records why it stayed inactive.
@@ -130,10 +150,23 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
             reason="application_failed",
             error_type=type(exc).__name__,
         )
-        return resolved
+        candidate = resolved
+
+    # No environment variable means incumbent-v1, which returns the original
+    # object untouched. Experimental Krea bundles validate the runtime manifest
+    # before applying an all-or-nothing overlay.
+    candidate, _manifest = krea_runtime.apply(candidate, spec.model_type)
+    return candidate
 
 
-def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
+def _apply_overrides(
+    cfg,
+    spec,
+    num_images,
+    hours_to_complete,
+    *,
+    throughput_profile=None,
+) -> dict:
     cfg["config"]["name"] = spec.expected_repo_name  # MUST == repo_name
     p = cfg["config"]["process"][0]  # process is a LIST
     p["training_folder"] = spec.training_folder
@@ -145,7 +178,11 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
 
     template_steps = p["train"]["steps"]
     steps = recipe.size_scaled_steps(
-        spec.model_type, num_images, hours_to_complete, template_steps
+        spec.model_type,
+        num_images,
+        hours_to_complete,
+        template_steps,
+        throughput_profile=throughput_profile,
     )
     p["train"]["steps"] = steps
     p["save"]["save_every"] = recipe.kill_safe_save_every(

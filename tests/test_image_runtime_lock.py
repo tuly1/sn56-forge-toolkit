@@ -104,6 +104,31 @@ def test_toolkit_image_applies_the_certified_two_phase_lock():
     assert "--files-only" in contents
 
 
+@pytest.mark.parametrize("dockerfile", [TOOLKIT_DOCKERFILE, LEGACY_FLUX_DOCKERFILE])
+def test_owned_krea_runtime_is_structurally_separate_from_incumbent(
+    dockerfile: Path,
+):
+    contents = dockerfile.read_text(encoding="utf-8")
+
+    assert "git remote set-url origin" not in contents
+    assert "AI_TOOLKIT_DIR=/app/ai-toolkit" in contents
+    assert "FORGE_KREA_AI_TOOLKIT_DIR=/opt/sn56/krea-ai-toolkit" in contents
+    assert "git checkout 99be3d96a2468d3a5228a4eb05ba67e63c586b4e" in contents
+    assert "cd /opt/sn56/krea-ai-toolkit" in contents
+    assert (
+        "git remote add origin "
+        "https://github.com/tuly1/sn56-ai-toolkit-mirror.git"
+    ) in contents
+    assert (
+        'test "$(git -C /app/ai-toolkit rev-parse HEAD)" = '
+        "99be3d96a2468d3a5228a4eb05ba67e63c586b4e"
+    ) in contents
+    assert (
+        'test "$(git -C /opt/sn56/krea-ai-toolkit rev-parse HEAD)" = '
+        "71e133b4e73a716d1094f22355a46be07953b828"
+    ) in contents
+
+
 def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
     contents = LEGACY_FLUX_DOCKERFILE.read_text(encoding="utf-8")
 
@@ -148,7 +173,16 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
             f"/usr/lib/python3/dist-packages/{system_distribution}/ "
             f"/opt/sn56/ai-toolkit-python/{target_name}/"
         ) in contents
-    assert contents.count("99be3d96a2468d3a5228a4eb05ba67e63c586b4e") == 3
+    assert contents.count("71e133b4e73a716d1094f22355a46be07953b828") == 4
+    assert contents.count("99be3d96a2468d3a5228a4eb05ba67e63c586b4e") == 4
+    assert "FORGE_KREA_AI_TOOLKIT_DIR=/opt/sn56/krea-ai-toolkit" in contents
+    assert (
+        "COPY --from=aitoolkit-runtime /opt/sn56/krea-ai-toolkit/ "
+        "/opt/sn56/krea-ai-toolkit/"
+    ) in contents
+    assert 'pathlib.Path(".sn56-runtime-identity.json")' in contents
+    assert "https://github.com/tuly1/sn56-ai-toolkit-mirror.git" in contents
+    assert "test -f sn56_krea_runtime_capabilities.json" in contents
     assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents
     assert "python3 /opt/sn56/verify-image-runtime.py" in contents
     assert "assert torch.__version__ == '2.6.0+cu124'" in contents
@@ -212,7 +246,8 @@ def test_image_build_network_access_has_bounded_retries(
     assert contents.count('if [ "$attempt" -ge 5 ]') == retry_loop_count
     assert contents.count("SN56_NETWORK_RETRY exhausted") == retry_loop_count
     assert contents.count("SN56_NETWORK_RETRY retry=") == retry_loop_count
-    assert "retry_network git fetch origin 99be3d96" in contents
+    assert "retry_network git fetch origin 99be3d9" in contents
+    assert "retry_network git fetch --depth=1 origin 71e133b" in contents
     assert contents.count("retry_network pip install --no-cache-dir") == 3
     assert "retry_network python3 -m pip install --no-cache-dir --no-deps" in contents
     assert "--network=host" not in contents
@@ -242,7 +277,13 @@ def test_image_sources_are_pinned_to_certified_identities():
         "FROM diagonalge/ai-toolkit:latest@sha256:"
         "c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8"
     ) in dockerfile
-    assert dockerfile.count("99be3d96a2468d3a5228a4eb05ba67e63c586b4e") == 2
+    assert dockerfile.count("71e133b4e73a716d1094f22355a46be07953b828") == 4
+    assert dockerfile.count("99be3d96a2468d3a5228a4eb05ba67e63c586b4e") == 4
+    assert "git remote set-url origin" not in dockerfile
+    assert "FORGE_KREA_AI_TOOLKIT_DIR=/opt/sn56/krea-ai-toolkit" in dockerfile
+    assert 'pathlib.Path(".sn56-runtime-identity.json")' in dockerfile
+    assert "https://github.com/tuly1/sn56-ai-toolkit-mirror.git" in dockerfile
+    assert "test -f sn56_krea_runtime_capabilities.json" in dockerfile
     assert (
         "diffusers @ git+https://github.com/huggingface/diffusers.git@"
         "dc8d9032171c83741fd37ed2b12bc9d8274464f3"

@@ -1,0 +1,49 @@
+name: SN56 Lane A CPU conformance
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - codex/week6-krea-runtime-conformance
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  forge-contract:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+      - name: Run Forge contract suite
+        run: python -m pytest -q
+      - name: Compile changed Forge surfaces
+        run: |
+          python -m py_compile \
+            forge/adaptive_timing.py \
+            forge/file_evidence.py \
+            forge/krea_runtime.py \
+            forge/tasks/aitoolkit.py \
+            forge/tasks/checkpoints.py \
+            forge/tasks/integrity.py \
+            forge/tasks/publication.py \
+            ops/calibration/run_krea_timing_lab.py \
+            ops/release/sn56-week6-build-gpu-cert.py \
+            ops/release/sn56-week6-validate-timing-provenance.py \
+            tests/integration/sn56-week6-generate-release-fixture.py
+      - name: Check release-authority shell syntax
+        run: |
+          sh -n ops/release/sn56-week6-final-release-cert.sh
+          bash -n ops/release/sn56-week6-final-release-cert-worker.sh
+          bash -n tests/integration/sn56-week6-release-dry-run.sh

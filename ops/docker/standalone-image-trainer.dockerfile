@@ -32,12 +32,22 @@ RUN retry_network() { \
     }; \
     retry_network git fetch origin 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
     git checkout 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+    test "$(git rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
     retry_network pip install --no-cache-dir \
         --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
         --requirement requirements.txt && \
     retry_network pip install --no-cache-dir \
         torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-        --index-url https://download.pytorch.org/whl/cu124
+        --index-url https://download.pytorch.org/whl/cu124 && \
+    install -d -m 0755 /opt/sn56/krea-ai-toolkit && \
+    cd /opt/sn56/krea-ai-toolkit && \
+    git init && \
+    git remote add origin https://github.com/tuly1/sn56-ai-toolkit-mirror.git && \
+    retry_network git fetch --depth=1 origin 71e133b4e73a716d1094f22355a46be07953b828 && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = 71e133b4e73a716d1094f22355a46be07953b828 && \
+    test -f sn56_krea_runtime_capabilities.json && \
+    python3 -c 'import hashlib,json,pathlib; p=pathlib.Path("sn56_krea_runtime_capabilities.json"); v={"schema":1,"runtime_repository":"https://github.com/tuly1/sn56-ai-toolkit-mirror.git","runtime_commit":"71e133b4e73a716d1094f22355a46be07953b828","capability_manifest_sha256":hashlib.sha256(p.read_bytes()).hexdigest()}; pathlib.Path(".sn56-runtime-identity.json").write_text(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")'
 
 RUN retry_network() { \
         attempt=1; \
@@ -79,7 +89,8 @@ RUN retry_network() { \
     python3 /opt/sn56/verify-image-runtime.py \
         --lock /opt/sn56/image-runtime-lock.txt \
         --constraints /opt/sn56/image-runtime-phase1-constraints.txt && \
-    test "$(git rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e
+    test "$(git -C /app/ai-toolkit rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+    test "$(git -C /opt/sn56/krea-ai-toolkit rev-parse HEAD)" = 71e133b4e73a716d1094f22355a46be07953b828
 
 
 FROM diagonalge/kohya_latest:latest@sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e
@@ -152,6 +163,7 @@ ENV PYTHONUNBUFFERED=1 \
     TOKENIZERS_PARALLELISM=false \
     FORGE_FLUX_BACKEND=kohya \
     AI_TOOLKIT_DIR=/app/ai-toolkit \
+    FORGE_KREA_AI_TOOLKIT_DIR=/opt/sn56/krea-ai-toolkit \
     FORGE_TEMPLATES_DIR=/app/forge/templates \
     FORGE_KOHYA_PYTHONPATH=/home/.local/lib/python3.10/site-packages \
     FORGE_KOHYA_LD_LIBRARY_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64 \
@@ -170,6 +182,7 @@ ENV PYTHONUNBUFFERED=1 \
 # in the standalone child process; the two incompatible Torch stacks never
 # share one interpreter.
 COPY --from=aitoolkit-runtime /app/ai-toolkit/ /app/ai-toolkit/
+COPY --from=aitoolkit-runtime /opt/sn56/krea-ai-toolkit/ /opt/sn56/krea-ai-toolkit/
 COPY --from=aitoolkit-runtime /usr/local/lib/python3.10/dist-packages/ /opt/sn56/ai-toolkit-python/
 # pip and wheel come from Ubuntu's dist-packages in the ai-toolkit stage, not
 # /usr/local.  Carry their code and metadata into the isolated graph as well;

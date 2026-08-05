@@ -316,6 +316,48 @@ def current_loras(save_root: str, state: dict[str, Any] | None) -> list[str]:
     return sorted(out)
 
 
+def descriptor_is_current_lora(
+    save_root: str,
+    path: str,
+    state: dict[str, Any] | None,
+    file_identity: Mapping[str, int],
+) -> bool:
+    """Bind one already-opened artifact descriptor to the active run scope.
+
+    The caller obtained ``file_identity`` from the same descriptor used to
+    validate and hash the artifact.  Comparing that identity to the pre-run
+    inventory avoids a second path lookup and therefore cannot swap the object
+    between a scope check and evidence collection.
+    """
+
+    absolute_root = os.path.abspath(save_root)
+    active = _ACTIVE_RUNS.get(absolute_root)
+    if not _scope_is_complete(state) or not _scope_is_complete(active):
+        return False
+    identity_fields = ("process_nonce", "attempt_nonce", "repo")
+    if any((state or {}).get(key) != active.get(key) for key in identity_fields):
+        return False
+    if (state or {}).get("before") != active.get("before"):
+        return False
+    state = active
+    absolute_path = os.path.abspath(path)
+    if os.path.dirname(absolute_path) != absolute_root:
+        return False
+    repo = str((state or {}).get("repo") or "")
+    name = os.path.basename(absolute_path)
+    periodic = re.compile(
+        rf"^{re.escape(repo)}(?:_\d+|-step\d+)\.safetensors$"
+    )
+    if name != f"{repo}.safetensors" and periodic.fullmatch(name) is None:
+        return False
+    required = {"size", "mtime_ns", "ctime_ns", "inode"}
+    if not isinstance(file_identity, Mapping) or not required.issubset(file_identity):
+        return False
+    current = {key: int(file_identity[key]) for key in required}
+    before = (state or {}).get("before", {}).get(name)
+    return before is None or before != current
+
+
 def current_selection_record(
     save_root: str, state: dict[str, Any] | None = None
 ) -> dict[str, Any] | None:
