@@ -222,6 +222,23 @@ status=$(git_isolated -C "${clone}" status \
   exit 1
 }
 
+# Plant the independent audit's exact hostile-attributes surface only after the
+# harness has done its own convenience clean check. The release wrapper must
+# neither execute this filter nor let it spoof its source-byte verification.
+hostile_filter=${clone}/.git/sn56-hostile-clean-filter
+hostile_marker=${temporary_directory}/hostile-filter-executed
+/usr/bin/printf '%s\n' \
+  '#!/bin/sh' \
+  '/usr/bin/touch -- "$1"' \
+  '/bin/cat' >"${hostile_filter}"
+/bin/chmod 0700 "${hostile_filter}"
+/bin/mkdir -p "${clone}/.git/info"
+/usr/bin/printf '%s\n' 'forge/recipe.py filter=sn56-hostile' \
+  >"${clone}/.git/info/attributes"
+git_isolated -C "${clone}" config --local filter.sn56-hostile.clean \
+  "${hostile_filter} ${hostile_marker}"
+/usr/bin/touch "${clone}/forge/recipe.py"
+
 hash_file() {
   local path=$1
   local line
@@ -301,6 +318,10 @@ if /usr/bin/grep -Eq \
   /usr/bin/printf 'CPU integration illegally emitted production PASS\n' >&2
   exit 1
 fi
+[[ ! -e ${hostile_marker} ]] || {
+  /usr/bin/printf 'release wrapper executed repository-local clean filter\n' >&2
+  exit 1
+}
 
 /usr/bin/printf \
   'SN56_WEEK6_CLEAN_CLONE_WRAPPER_INTEGRATION=DRY_RUN_PASS commit=%s tree=%s forge_tree=%s transcript=%s\n' \

@@ -229,6 +229,9 @@ def test_integration_harness_calls_real_outer_wrapper_and_forbids_pass():
     assert source.count("git_isolated ") >= 7
     assert "sleep 2 #" in source
     assert "url.https://attacker.invalid/spoof.git.insteadOf" in source
+    assert ".git/info/attributes" in source
+    assert "filter.sn56-hostile.clean" in source
+    assert "hostile-filter-executed" in source
 
 
 def test_integration_harness_snapshots_the_complete_pipeline_status():
@@ -270,7 +273,8 @@ def test_archive_materialization_ignores_assume_unchanged_worktree_bytes(tmp_pat
     _git(repository, "update-index", "--assume-unchanged", "forge/contract.py")
     tracked.write_text("VALUE = 'B'\n", encoding="utf-8")
 
-    module.verify_source_repository(repository, identity, tools)
+    with pytest.raises(module.DelegateError, match="source checkout has changed"):
+        module.verify_source_repository(repository, identity, tools)
     work = tmp_path / "work-a"
     work.mkdir()
     materialized = module.materialize_exact_archive(repository, identity, work, tools)
@@ -288,7 +292,8 @@ def test_archive_materialization_ignores_skip_worktree_bytes(tmp_path):
     _git(repository, "update-index", "--skip-worktree", "forge/contract.py")
     tracked.write_text("VALUE = 'B'\n", encoding="utf-8")
 
-    module.verify_source_repository(repository, identity, tools)
+    with pytest.raises(module.DelegateError, match="source checkout has changed"):
+        module.verify_source_repository(repository, identity, tools)
     work = tmp_path / "work-b"
     work.mkdir()
     materialized = module.materialize_exact_archive(repository, identity, work, tools)
@@ -313,6 +318,45 @@ def test_malicious_local_fsmonitor_cannot_spoof_clean_source(tmp_path):
     assert "core.fsmonitor=false" in command
     assert module.FIXED_ENV["GIT_CONFIG_KEY_0"] == "core.fsmonitor"
     assert module.FIXED_ENV["GIT_CONFIG_VALUE_0"] == "false"
+
+
+def test_hostile_info_attributes_filter_cannot_spoof_or_execute(tmp_path):
+    module, repository, identity, tools = _repository(tmp_path)
+    tracked = repository / "forge" / "contract.py"
+    marker = tmp_path / "hostile-filter-executed"
+    driver = repository / ".git" / "hostile-clean-filter"
+    driver.write_text(
+        "#!/bin/sh\n"
+        "/usr/bin/touch -- \"$1\"\n"
+        "/usr/bin/printf \"VALUE = 'A'\\n\"\n",
+        encoding="utf-8",
+    )
+    driver.chmod(0o700)
+    info = repository / ".git" / "info"
+    info.mkdir(exist_ok=True)
+    (info / "attributes").write_text(
+        "forge/contract.py filter=hostile\n",
+        encoding="utf-8",
+    )
+    _git(repository, "config", "filter.hostile.clean", f"{driver} {marker}")
+    tracked.write_text("VALUE = 'B'\n", encoding="utf-8")
+
+    # Reproduce the displaced implementation's false-clean result and command
+    # execution, then prove the release delegate does neither.
+    assert _git(
+        repository,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+    ) == b""
+    assert marker.is_file()
+    marker.unlink()
+
+    with pytest.raises(module.DelegateError, match="source checkout has changed"):
+        module.verify_source_repository(repository, identity, tools)
+
+    assert not marker.exists(), "release verification executed the hostile clean filter"
 
 
 def test_live_h100_identity_is_derived_from_nvidia_smi(monkeypatch):

@@ -179,6 +179,8 @@ def test_wrapper_is_strict_fixed_authority_with_one_release_commit():
     assert "GIT_CONFIG_VALUE_0=false" in text
     assert "config --local --no-includes --get-all remote.origin.url" in text
     assert "remote get-url" not in text
+    assert "git_checkout status" not in text
+    assert "Compare bytes and executable modes directly" in text
 
 
 def test_wrapper_pins_exact_validator_and_delegate_hashes():

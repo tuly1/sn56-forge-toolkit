@@ -439,8 +439,19 @@ def verify_source_repository(
     require(git("rev-parse", "HEAD:forge") == expected.forge_tree, "Forge tree differs")
     top = Path(git("rev-parse", "--show-toplevel")).resolve(strict=True)
     require(top == repository, "source checkout is not the exact repository root")
-    status = git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching")
-    require(not status, "source checkout has changed, untracked, or ignored surfaces")
+    committed = parse_ls_tree(
+        run_capture(
+            git_command(
+                tools,
+                repository,
+                "ls-tree",
+                "-rz",
+                "--full-tree",
+                expected.commit,
+            )
+        ).stdout
+    )
+    verify_worktree_matches_blobs(repository, committed)
 
 
 def parse_ls_tree(payload: bytes) -> dict[str, tuple[str, str]]:
@@ -463,6 +474,109 @@ def parse_ls_tree(payload: bytes) -> dict[str, tuple[str, str]]:
         result[path] = (mode, object_id)
     require(bool(result), "release tree contains no files")
     return result
+
+
+def _read_worktree_file(path: Path) -> tuple[bytes, os.stat_result]:
+    """Read one regular worktree file without invoking Git conversions."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise DelegateError(f"worktree file could not be opened safely: {path}") from exc
+    try:
+        before = os.fstat(descriptor)
+        require(stat.S_ISREG(before.st_mode), f"worktree entry is not regular: {path}")
+        chunks: list[bytes] = []
+        consumed = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+            consumed += len(block)
+        after = os.fstat(descriptor)
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        require(
+            consumed == before.st_size and identity(before) == identity(after),
+            f"worktree file changed while read: {path}",
+        )
+        return b"".join(chunks), before
+    finally:
+        os.close(descriptor)
+
+
+def verify_worktree_matches_blobs(
+    repository: Path,
+    committed: Mapping[str, tuple[str, str]],
+) -> None:
+    """Compare worktree bytes directly with Git blobs, bypassing attributes.
+
+    ``git status`` is deliberately forbidden here: repository-local
+    ``.git/info/attributes`` and ``filter.<name>.clean`` can both falsify its
+    answer and execute attacker-selected commands. The authority instead reads
+    every worktree file itself and reproduces the Git blob identity.
+    """
+
+    actual: dict[str, tuple[bool, str]] = {}
+    for current, directory_names, file_names in os.walk(
+        repository,
+        topdown=True,
+        followlinks=False,
+    ):
+        current_path = Path(current)
+        if current_path == repository:
+            directory_names[:] = [name for name in directory_names if name != ".git"]
+            file_names = [name for name in file_names if name != ".git"]
+        directory_names.sort()
+        file_names.sort()
+        for name in directory_names:
+            candidate = current_path / name
+            try:
+                metadata = candidate.lstat()
+            except OSError as exc:
+                raise DelegateError(
+                    f"worktree directory could not be inspected: {candidate}"
+                ) from exc
+            require(
+                stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode),
+                f"worktree contains an indirect directory: {candidate}",
+            )
+        for name in file_names:
+            candidate = current_path / name
+            relative = candidate.relative_to(repository).as_posix()
+            require(
+                relative not in actual,
+                f"worktree contains a duplicate path: {relative}",
+            )
+            payload, metadata = _read_worktree_file(candidate)
+            actual[relative] = (
+                bool(metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)),
+                git_blob_sha1(payload),
+            )
+
+    require(
+        set(actual) == set(committed),
+        "source checkout has changed, untracked, or ignored surfaces",
+    )
+    for relative, (expected_mode, expected_blob) in committed.items():
+        executable, actual_blob = actual[relative]
+        require(
+            actual_blob == expected_blob
+            and executable == (expected_mode == "100755"),
+            "source checkout has changed, untracked, or ignored surfaces",
+        )
 
 
 def _validate_tar_member(member: tarfile.TarInfo) -> PurePosixPath:

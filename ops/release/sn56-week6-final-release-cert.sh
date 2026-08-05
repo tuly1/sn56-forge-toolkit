@@ -319,11 +319,6 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-status_file=${private_workspace}/checkout-status
-git_checkout status --porcelain=v1 -z --untracked-files=all --ignored=matching \
-  >"${status_file}" || fail 'release checkout status could not be inspected'
-[ ! -s "${status_file}" ] || fail 'release checkout is not clean'
-
 remote_rows=${private_workspace}/remote-ref
 git_remote ls-remote --exit-code -- \
   "${SN56_RELEASE_EXPECTED_ORIGIN_URL}" "${SN56_RELEASE_REMOTE_REF}" \
@@ -363,7 +358,8 @@ git_checkout ls-tree -rz --full-tree "${SN56_RELEASE_COMMIT}" \
 materialization_result=${private_workspace}/materialization.env
 fixed_python - \
   "${archive}" "${tree_index}" "${materialized_source}" \
-  "${launcher_path}" >"${materialization_result}" <<'PY'
+  "${launcher_path}" "${SN56_RELEASE_SOURCE_CHECKOUT}" \
+  >"${materialization_result}" <<'PY'
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
@@ -415,12 +411,13 @@ def file_bytes_nofollow(path: Path, label: str) -> bytes:
     finally:
         os.close(descriptor)
 
-if len(sys.argv) != 5:
+if len(sys.argv) != 6:
     fail("release extraction argument error")
 archive = Path(sys.argv[1])
 index = Path(sys.argv[2])
 destination = Path(sys.argv[3])
 launcher = Path(sys.argv[4])
+repository = Path(sys.argv[5])
 
 committed: dict[str, tuple[str, str]] = {}
 for row in index.read_bytes().split(b"\0"):
@@ -445,6 +442,83 @@ for row in index.read_bytes().split(b"\0"):
     committed[relative.as_posix()] = (mode, object_id)
 if not committed:
     fail("release commit contains no regular files")
+
+# Never ask Git to classify the worktree: .git/info/attributes plus a
+# filter.<name>.clean driver can both falsify that answer and execute an
+# attacker command. Compare bytes and executable modes directly with the
+# committed blobs instead. The later archive check independently proves the
+# exact bytes that are handed to the worker.
+worktree: dict[str, tuple[bool, str]] = {}
+for current, directory_names, file_names in os.walk(
+    repository,
+    topdown=True,
+    followlinks=False,
+):
+    current_path = Path(current)
+    if current_path == repository:
+        directory_names[:] = [name for name in directory_names if name != ".git"]
+        file_names = [name for name in file_names if name != ".git"]
+    directory_names.sort()
+    file_names.sort()
+    for name in directory_names:
+        candidate = current_path / name
+        try:
+            metadata = candidate.lstat()
+        except OSError as exc:
+            fail(f"release worktree directory could not be inspected: {exc}")
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            fail(f"release worktree has an indirect directory: {candidate}")
+    for name in file_names:
+        candidate = current_path / name
+        relative = candidate.relative_to(repository).as_posix()
+        if relative in worktree:
+            fail(f"release worktree duplicates a path: {relative}")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(candidate, flags)
+        except OSError as exc:
+            fail(f"release worktree file could not be opened safely: {exc}")
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                fail(f"release worktree entry is not regular: {relative}")
+            blob = hashlib.sha1()  # noqa: S324 - Git SHA-1 object identity
+            blob.update(f"blob {before.st_size}\0".encode("ascii"))
+            consumed = 0
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                consumed += len(block)
+                blob.update(block)
+            after = os.fstat(descriptor)
+            identity = lambda item: (
+                item.st_dev,
+                item.st_ino,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+            )
+            if consumed != before.st_size or identity(before) != identity(after):
+                fail(f"release worktree file changed while read: {relative}")
+        finally:
+            os.close(descriptor)
+        worktree[relative] = (
+            bool(before.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)),
+            blob.hexdigest(),
+        )
+
+if set(worktree) != set(committed):
+    fail("release checkout is not clean")
+for name, (mode, object_id) in committed.items():
+    executable, blob_id = worktree[name]
+    if blob_id != object_id or executable != (mode == "100755"):
+        fail("release checkout is not clean")
 
 seen_members: set[str] = set()
 extracted: dict[str, tuple[str, str]] = {}
