@@ -10,7 +10,7 @@ of the operator and gate harness that produced the record.
 The gate log is JSON Lines.  The matching event must contain these fields:
 
 ``event``
-    ``sn56.week6.friday-h100-timing-evidence-sealed.v1``
+    ``sn56.week6.friday-h100-timing-evidence-sealed.v2``
 ``gate_session_id`` / ``source_run_id``
     Exact values supplied to this validator.
 ``rental_started_at_utc`` / ``rental_ended_at_utc``
@@ -42,6 +42,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import struct
 import subprocess
@@ -52,14 +53,111 @@ from typing import Any, Callable, Mapping, Sequence
 
 EVENT_KIND = "sn56.week6.friday-h100-timing-evidence-sealed.v2"
 RECEIPT_KIND = "sn56.week6.operator-attested-timing-provenance.v2"
+DELEGATED_RESULT_SCHEMA = "sn56.week6.build-gpu-cert.v1"
 PROFILE_KIND = "forge-operator-attested-throughput-profile"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 SOURCE_RUN_RE = re.compile(r".+:[0-9a-f]{32}")
 SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+ENVELOPE_NAMESPACE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+DELEGATED_MODE_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
+RECEIPT_KEYS = frozenset(
+    {
+        "schema",
+        "kind",
+        "state",
+        "evidence_class",
+        "claim_limit",
+        "gate_session_id",
+        "source_run_id",
+        "forge",
+        "certificate_scope",
+        "scope",
+        "rental_window",
+        "gate_event",
+        "files",
+        "receipt_sha256",
+    }
+)
+RECEIPT_FORGE_KEYS = frozenset(
+    {"repository", "commit", "tree", "materialized_manifest_sha256"}
+)
+RECEIPT_SCOPE_KEYS = frozenset(
+    {
+        "bundle_id",
+        "bundle_sha256",
+        "model_type",
+        "current_dataset_size",
+        "dataset_regime",
+        "accelerator_identity",
+    }
+)
+RECEIPT_RENTAL_WINDOW_KEYS = frozenset({"started_at_utc", "ended_at_utc"})
+RECEIPT_GATE_EVENT_KEYS = frozenset(
+    {
+        "line",
+        "training_started_at_utc",
+        "raw_record_produced_at_utc",
+        "profile_produced_at_utc",
+        "sealed_at_utc",
+    }
+)
+RECEIPT_FILES_KEYS = frozenset(
+    {
+        "profile",
+        "raw_record",
+        "terminal_artifact",
+        "archived_terminal_artifact",
+        "gate_log",
+    }
+)
+RECEIPT_SEMANTIC_FILE_KEYS = frozenset(
+    {"path", "bytes", "file_sha256", "semantic_sha256"}
+)
+RECEIPT_ARTIFACT_FILE_KEYS = frozenset({"path", "bytes", "file_sha256"})
+DELEGATED_RESULT_KEYS = frozenset(
+    {
+        "schema",
+        "state",
+        "mode",
+        "certificate_scope",
+        "source_commit",
+        "source_tree",
+        "forge_tree",
+        "source_archive_sha256",
+        "source_manifest_sha256",
+        "production_manifest_sha256",
+        "toolkit_dockerfile_sha256",
+        "legacy_dockerfile_sha256",
+        "toolkit_image_tag",
+        "toolkit_image_id",
+        "legacy_image_tag",
+        "legacy_image_id",
+        "gpu_boundary",
+        "completed_at_utc",
+    }
+)
+DELEGATED_MODE_CONTRACT = {
+    "production": {"state": "PASS", "gpu_boundary": "REAL_H100"},
+    "cpu-integration": {
+        "state": "DRY_RUN_PASS",
+        "gpu_boundary": "STUBBED_NO_CLAIM",
+    },
+}
+DELEGATED_SHA256_FIELDS = frozenset(
+    {
+        "source_archive_sha256",
+        "source_manifest_sha256",
+        "production_manifest_sha256",
+        "toolkit_dockerfile_sha256",
+        "legacy_dockerfile_sha256",
+    }
+)
 _AT_FDCWD = -100
 _OPENAT2_SYSCALL = 437
 _RESOLVE_NO_SYMLINKS = 0x04
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 0x00000004
 _OPENAT2_MACHINES = frozenset(
     {"aarch64", "arm64", "riscv64", "x86_64", "amd64"}
 )
@@ -178,13 +276,417 @@ def checked_path(path: str, label: str) -> str:
     return absolute
 
 
+def require_exact_keys(
+    value: Any,
+    expected: frozenset[str],
+    label: str,
+) -> Mapping[str, Any]:
+    """Require one pinned object schema rather than trusting candidate fields."""
+
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ProvenanceError(f"{label} keys differ from the pinned schema")
+    return value
+
+
+def _directory_open_flags() -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise ProvenanceError("symlink-hardened directory opens are unavailable")
+    return (
+        os.O_RDONLY
+        | directory
+        | nofollow
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _open_directory_path_nofollow(
+    path: str,
+    *,
+    label: str,
+    create_leaf: bool = False,
+    create_mode: int = 0o750,
+) -> int:
+    """Open every absolute-path component through no-follow directory FDs."""
+
+    checked = checked_path(path, label)
+    components = [component for component in checked.split(os.sep) if component]
+    flags = _directory_open_flags()
+    current = os.open(os.sep, flags)
+    try:
+        for index, component in enumerate(components):
+            is_leaf = index == len(components) - 1
+            created = False
+            try:
+                following = os.open(component, flags, dir_fd=current)
+            except FileNotFoundError:
+                if not (create_leaf and is_leaf):
+                    raise ProvenanceError(
+                        f"{label} is unavailable without following symlinks"
+                    ) from None
+                try:
+                    os.mkdir(component, create_mode, dir_fd=current)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise ProvenanceError(f"{label} could not be created") from exc
+                else:
+                    created = True
+                    os.fsync(current)
+                try:
+                    following = os.open(component, flags, dir_fd=current)
+                except OSError as exc:
+                    raise ProvenanceError(
+                        f"{label} could not be opened after creation"
+                    ) from exc
+            except OSError as exc:
+                raise ProvenanceError(
+                    f"{label} is unavailable without following symlinks"
+                ) from exc
+            opened = os.fstat(following)
+            if not stat.S_ISDIR(opened.st_mode):
+                os.close(following)
+                raise ProvenanceError(f"{label} contains a non-directory component")
+            if created:
+                os.fchmod(following, create_mode)
+                os.fsync(following)
+            os.close(current)
+            current = following
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _validate_envelope_namespace(namespace: str) -> str:
+    if (
+        not isinstance(namespace, str)
+        or ENVELOPE_NAMESPACE_RE.fullmatch(namespace) is None
+    ):
+        raise ProvenanceError("envelope namespace is invalid")
+    return namespace
+
+
+def _materialized_manifest_rows(
+    directory_fd: int,
+    *,
+    prefix: str = "",
+) -> list[str]:
+    """Hash one no-symlink archive tree using the delegate's row contract."""
+
+    directory_flags = _directory_open_flags()
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError as exc:
+        raise ProvenanceError("materialized tree could not be listed") from exc
+    rows: list[str] = []
+    for name in names:
+        if (
+            name in {".", ".."}
+            or os.sep in name
+            or "\x00" in name
+            or "\n" in name
+            or "\r" in name
+        ):
+            raise ProvenanceError("materialized tree contains an unsafe path")
+        relative = f"{prefix}/{name}" if prefix else name
+        try:
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ProvenanceError("materialized tree entry could not be inspected") from exc
+        if stat.S_ISDIR(entry.st_mode):
+            try:
+                child = os.open(name, directory_flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise ProvenanceError(
+                    "materialized tree directory could not be opened safely"
+                ) from exc
+            try:
+                opened = os.fstat(child)
+                if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+                    raise ProvenanceError("materialized tree directory identity changed")
+                rows.extend(_materialized_manifest_rows(child, prefix=relative))
+            finally:
+                os.close(child)
+            continue
+        if not stat.S_ISREG(entry.st_mode):
+            raise ProvenanceError("materialized tree contains a nonregular entry")
+        try:
+            file_fd = os.open(name, file_flags, dir_fd=directory_fd)
+        except OSError as exc:
+            raise ProvenanceError(
+                "materialized tree file could not be opened safely"
+            ) from exc
+        try:
+            opened = os.fstat(file_fd)
+            if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+                raise ProvenanceError("materialized tree file identity changed")
+            digest = hashlib.sha256()
+            consumed = 0
+            while True:
+                block = os.read(file_fd, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                consumed += len(block)
+            closed_over = os.fstat(file_fd)
+            if consumed != opened.st_size or file_identity(opened) != file_identity(
+                closed_over
+            ):
+                raise ProvenanceError("materialized tree file changed while hashed")
+        finally:
+            os.close(file_fd)
+        mode = "100755" if entry.st_mode & 0o111 else "100644"
+        rows.append(f"{digest.hexdigest()} {mode} {relative}\n")
+    return rows
+
+
+def materialized_tree_manifest_sha256(path: str) -> str:
+    """Return the deterministic content/mode manifest hash for an archive tree."""
+
+    checked = checked_path(path, "materialized Forge tree")
+    directory_fd = _open_directory_path_nofollow(
+        checked,
+        label="materialized Forge tree",
+    )
+    try:
+        rows = sorted(_materialized_manifest_rows(directory_fd))
+    finally:
+        os.close(directory_fd)
+    if not rows:
+        raise ProvenanceError("materialized Forge tree is empty")
+    return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
+
+
+def _dir_entry_exists(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ProvenanceError(
+            "envelope directory entry could not be inspected"
+        ) from exc
+    return True
+
+
+def prepare_atomic_envelope(base: str, namespace: str) -> str:
+    """Create a private same-filesystem stage under a no-symlink base."""
+
+    checked_base = checked_path(base, "envelope base")
+    checked_namespace = _validate_envelope_namespace(namespace)
+    base_fd = _open_directory_path_nofollow(
+        checked_base,
+        label="envelope base",
+        create_leaf=True,
+    )
+    try:
+        if _dir_entry_exists(base_fd, checked_namespace):
+            raise ProvenanceError("final envelope namespace already exists")
+        prefix = f".{checked_namespace}."
+        for _attempt in range(64):
+            stage_name = f"{prefix}{secrets.token_hex(16)}.tmp"
+            try:
+                os.mkdir(stage_name, 0o750, dir_fd=base_fd)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise ProvenanceError(
+                    "private envelope stage could not be created"
+                ) from exc
+            os.fsync(base_fd)
+            return os.path.join(checked_base, stage_name)
+        raise ProvenanceError("a unique private envelope stage could not be created")
+    finally:
+        os.close(base_fd)
+
+
+def _fsync_envelope_tree(directory_fd: int) -> None:
+    """Durably sync a regular-file/directory envelope before publication."""
+
+    flags = _directory_open_flags()
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError as exc:
+        raise ProvenanceError("private envelope stage could not be listed") from exc
+    for name in names:
+        if name in {".", ".."} or os.sep in name:
+            raise ProvenanceError("private envelope stage has an invalid entry")
+        try:
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ProvenanceError("private envelope entry could not be inspected") from exc
+        if stat.S_ISDIR(entry.st_mode):
+            try:
+                child = os.open(name, flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise ProvenanceError(
+                    "private envelope directory could not be opened safely"
+                ) from exc
+            try:
+                opened = os.fstat(child)
+                if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+                    raise ProvenanceError("private envelope directory identity changed")
+                _fsync_envelope_tree(child)
+            finally:
+                os.close(child)
+            continue
+        if not stat.S_ISREG(entry.st_mode):
+            raise ProvenanceError("private envelope contains a nonregular entry")
+        try:
+            file_fd = os.open(name, file_flags, dir_fd=directory_fd)
+        except OSError as exc:
+            raise ProvenanceError(
+                "private envelope file could not be opened safely"
+            ) from exc
+        try:
+            opened = os.fstat(file_fd)
+            if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+                raise ProvenanceError("private envelope file identity changed")
+            os.fsync(file_fd)
+        finally:
+            os.close(file_fd)
+    os.fsync(directory_fd)
+
+
+def _rename_noreplace(
+    old_directory_fd: int,
+    old_name: str,
+    new_directory_fd: int,
+    new_name: str,
+) -> None:
+    """Atomically rename a directory while refusing an existing destination."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    old_bytes = os.fsencode(old_name)
+    new_bytes = os.fsencode(new_name)
+    if hasattr(libc, "renameat2"):
+        operation = libc.renameat2
+        operation.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        operation.restype = ctypes.c_int
+        result = operation(
+            old_directory_fd,
+            old_bytes,
+            new_directory_fd,
+            new_bytes,
+            _RENAME_NOREPLACE,
+        )
+    elif hasattr(libc, "renameatx_np"):
+        operation = libc.renameatx_np
+        operation.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        operation.restype = ctypes.c_int
+        result = operation(
+            old_directory_fd,
+            old_bytes,
+            new_directory_fd,
+            new_bytes,
+            _RENAME_EXCL,
+        )
+    else:
+        raise ProvenanceError("atomic no-replace rename is unavailable")
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise ProvenanceError("final envelope namespace already exists")
+        raise ProvenanceError("private envelope stage could not be published") from OSError(
+            error, os.strerror(error)
+        )
+
+
+def publish_atomic_envelope(
+    base: str,
+    namespace: str,
+    stage: str,
+    *,
+    _before_rename: Callable[[], None] | None = None,
+) -> str:
+    """Fsync and atomically publish one prepared envelope without replacement."""
+
+    checked_base = checked_path(base, "envelope base")
+    checked_namespace = _validate_envelope_namespace(namespace)
+    checked_stage = checked_path(stage, "private envelope stage")
+    stage_name = os.path.basename(checked_stage)
+    if (
+        os.path.dirname(checked_stage) != checked_base
+        or re.fullmatch(
+            rf"\.{re.escape(checked_namespace)}\.[0-9a-f]{{32}}\.tmp",
+            stage_name,
+        )
+        is None
+    ):
+        raise ProvenanceError("private envelope stage is outside its authority base")
+    base_fd = _open_directory_path_nofollow(
+        checked_base,
+        label="envelope base",
+    )
+    stage_fd: int | None = None
+    try:
+        if _dir_entry_exists(base_fd, checked_namespace):
+            raise ProvenanceError("final envelope namespace already exists")
+        try:
+            stage_fd = os.open(
+                stage_name,
+                _directory_open_flags(),
+                dir_fd=base_fd,
+            )
+        except OSError as exc:
+            raise ProvenanceError(
+                "private envelope stage could not be opened safely"
+            ) from exc
+        _fsync_envelope_tree(stage_fd)
+        if _before_rename is not None:
+            _before_rename()
+        current = os.stat(stage_name, dir_fd=base_fd, follow_symlinks=False)
+        opened = os.fstat(stage_fd)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ProvenanceError("private envelope stage identity changed")
+        _rename_noreplace(base_fd, stage_name, base_fd, checked_namespace)
+        os.fsync(base_fd)
+        return os.path.join(checked_base, checked_namespace)
+    finally:
+        if stage_fd is not None:
+            os.close(stage_fd)
+        os.close(base_fd)
+
+
 def load_forge_contract(
     repository: str,
     expected_commit: str,
     *,
-    require_clean: bool,
+    materialized_manifest_sha256: str | None = None,
+    git_self_test_mode: bool = False,
+    require_clean: bool = True,
 ):
-    """Load the exact Forge contract implementation named by the certificate."""
+    """Load Forge from an exact archive tree, or Git only for internal self-test."""
 
     if GIT_COMMIT_RE.fullmatch(expected_commit or "") is None:
         raise ProvenanceError("Forge commit is invalid")
@@ -198,33 +700,42 @@ def load_forge_contract(
     if resolved != root or not os.path.isdir(root):
         raise ProvenanceError("Forge repository is symlinked or not a directory")
 
-    def git(*arguments: str) -> str:
-        completed = subprocess.run(
-            ["git", "-C", root, *arguments],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise ProvenanceError(
-                f"Forge repository check failed: {' '.join(arguments)}"
+    if git_self_test_mode:
+        def git(*arguments: str) -> str:
+            completed = subprocess.run(
+                ["git", "-C", root, *arguments],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
             )
-        return completed.stdout.strip()
+            if completed.returncode != 0:
+                raise ProvenanceError(
+                    f"Forge repository check failed: {' '.join(arguments)}"
+                )
+            return completed.stdout.strip()
 
-    if git("rev-parse", "HEAD") != expected_commit:
-        raise ProvenanceError("Forge repository HEAD differs from certificate pin")
-    if os.path.realpath(git("rev-parse", "--show-toplevel")) != root:
-        raise ProvenanceError("Forge path is not the exact repository root")
-    if require_clean and git(
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        "--ignored=matching",
-    ):
-        raise ProvenanceError(
-            "Forge repository has changed, untracked, or ignored surfaces"
+        if git("rev-parse", "HEAD") != expected_commit:
+            raise ProvenanceError("Forge repository HEAD differs from certificate pin")
+        if os.path.realpath(git("rev-parse", "--show-toplevel")) != root:
+            raise ProvenanceError("Forge path is not the exact repository root")
+        if require_clean and git(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ):
+            raise ProvenanceError(
+                "Forge repository has changed, untracked, or ignored surfaces"
+            )
+    else:
+        expected_manifest = require_sha(
+            materialized_manifest_sha256,
+            "expected materialized Forge manifest hash",
         )
+        actual_manifest = materialized_tree_manifest_sha256(root)
+        if actual_manifest != expected_manifest:
+            raise ProvenanceError("materialized Forge tree manifest differs")
 
     sys.dont_write_bytecode = True
     if root not in sys.path:
@@ -237,6 +748,9 @@ def load_forge_contract(
     expected_prefix = os.path.join(root, "forge") + os.sep
     if not loaded_path.startswith(expected_prefix):
         raise ProvenanceError("a different Forge package was imported")
+    if not git_self_test_mode:
+        if materialized_tree_manifest_sha256(root) != materialized_manifest_sha256:
+            raise ProvenanceError("materialized Forge tree changed while imported")
     return adaptive_timing
 
 
@@ -405,6 +919,10 @@ def validate(
     adaptive_timing = load_forge_contract(
         args.forge_repository,
         args.forge_commit,
+        materialized_manifest_sha256=getattr(
+            args, "forge_materialized_manifest_sha256", None
+        ),
+        git_self_test_mode=getattr(args, "git_self_test_mode", False),
         require_clean=not getattr(args, "allow_dirty_forge", False),
     )
 
@@ -628,6 +1146,11 @@ def validate(
             "repository": args.forge_repository,
             "commit": args.forge_commit,
             "tree": args.release_tree,
+            "materialized_manifest_sha256": (
+                getattr(args, "forge_materialized_manifest_sha256", None)
+                if not getattr(args, "git_self_test_mode", False)
+                else "0" * 64
+            ),
         },
         "certificate_scope": args.certificate_scope,
         "scope": {
@@ -825,22 +1348,53 @@ def assert_delegated_result(
     *,
     release_commit: str,
     release_tree: str,
+    forge_tree: str,
     certificate_scope: str,
+    mode: str,
+    expected_source_archive_sha256: str,
+    expected_source_manifest_sha256: str,
 ) -> dict[str, str]:
     payload = read_small_regular_file(path, "delegated result.env", 64 * 1024)
     result = parse_result_env_bytes(payload)
+    if set(result) != DELEGATED_RESULT_KEYS:
+        raise ProvenanceError(
+            "delegated result.env keys differ from the pinned schema"
+        )
+    if DELEGATED_MODE_RE.fullmatch(mode or "") is None:
+        raise ProvenanceError("delegated result.env authority mode is invalid")
+    mode_contract = DELEGATED_MODE_CONTRACT.get(mode)
+    if mode_contract is None:
+        raise ProvenanceError("delegated result.env authority mode is unsupported")
     expected = {
-        "schema": "sn56.week5.final-release-cert.v2",
-        "state": "PASS",
+        "schema": DELEGATED_RESULT_SCHEMA,
+        "mode": mode,
+        "state": mode_contract["state"],
         "source_commit": release_commit,
         "source_tree": release_tree,
+        "forge_tree": forge_tree,
         "certificate_scope": certificate_scope,
+        "gpu_boundary": mode_contract["gpu_boundary"],
+        "source_archive_sha256": require_sha(
+            expected_source_archive_sha256,
+            "release authority source archive hash",
+        ),
+        "source_manifest_sha256": require_sha(
+            expected_source_manifest_sha256,
+            "release authority source manifest hash",
+        ),
     }
     for field, value in expected.items():
         if result.get(field) != value:
             raise ProvenanceError(
                 f"delegated result.env {field} differs from release authority"
             )
+    for field in DELEGATED_SHA256_FIELDS:
+        if SHA256_RE.fullmatch(result[field]) is None:
+            raise ProvenanceError(f"delegated result.env {field} is invalid")
+    for field in ("toolkit_image_id", "legacy_image_id"):
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", result[field]) is None:
+            raise ProvenanceError(f"delegated result.env {field} is invalid")
+    parse_utc(result["completed_at_utc"], "delegated result completion time")
     return result
 
 
@@ -883,6 +1437,8 @@ def read_small_regular_file(path: str, label: str, maximum_bytes: int) -> bytes:
 def assert_pass_receipt(
     path: str,
     *,
+    expected_repository: str,
+    expected_materialized_manifest_sha256: str,
     release_commit: str,
     release_tree: str,
     certificate_scope: str,
@@ -895,18 +1451,50 @@ def assert_pass_receipt(
         raise ProvenanceError("timing receipt is not valid JSON") from exc
     if not isinstance(receipt, dict):
         raise ProvenanceError("timing receipt is not an object")
+    require_exact_keys(receipt, RECEIPT_KEYS, "timing receipt")
+    forge_identity = require_exact_keys(
+        receipt.get("forge"), RECEIPT_FORGE_KEYS, "timing receipt forge identity"
+    )
+    require_exact_keys(
+        receipt.get("scope"), RECEIPT_SCOPE_KEYS, "timing receipt scope"
+    )
+    require_exact_keys(
+        receipt.get("rental_window"),
+        RECEIPT_RENTAL_WINDOW_KEYS,
+        "timing receipt rental window",
+    )
+    require_exact_keys(
+        receipt.get("gate_event"),
+        RECEIPT_GATE_EVENT_KEYS,
+        "timing receipt gate event",
+    )
+    files = require_exact_keys(
+        receipt.get("files"), RECEIPT_FILES_KEYS, "timing receipt files"
+    )
+    for name in ("profile", "raw_record"):
+        require_exact_keys(
+            files.get(name),
+            RECEIPT_SEMANTIC_FILE_KEYS,
+            f"timing receipt {name}",
+        )
+    for name in ("terminal_artifact", "archived_terminal_artifact", "gate_log"):
+        require_exact_keys(
+            files.get(name),
+            RECEIPT_ARTIFACT_FILE_KEYS,
+            f"timing receipt {name}",
+        )
     declared = receipt.get("receipt_sha256")
-    forge_identity = receipt.get("forge")
-    expected_forge = None
-    if isinstance(forge_identity, dict):
-        repository = forge_identity.get("repository")
-        if not isinstance(repository, str) or not os.path.isabs(repository):
-            repository = None
-        expected_forge = {
-            "repository": repository,
-            "commit": release_commit,
-            "tree": release_tree,
-        }
+    repository = checked_path(expected_repository, "authority repository")
+    materialized_manifest = require_sha(
+        expected_materialized_manifest_sha256,
+        "authority materialized Forge manifest hash",
+    )
+    expected_forge = {
+        "repository": repository,
+        "commit": release_commit,
+        "tree": release_tree,
+        "materialized_manifest_sha256": materialized_manifest,
+    }
     if (
         receipt.get("schema") != 2
         or receipt.get("kind") != RECEIPT_KIND
@@ -920,9 +1508,6 @@ def assert_pass_receipt(
     ):
         raise ProvenanceError("timing receipt is not an authoritative PASS")
     if expected_file_hashes is not None:
-        files = receipt.get("files")
-        if not isinstance(files, dict):
-            raise ProvenanceError("timing receipt file bindings are absent")
         for name, expected_hash in expected_file_hashes.items():
             item = files.get(name)
             if not isinstance(item, dict) or item.get("file_sha256") != expected_hash:
@@ -936,6 +1521,8 @@ def run_pinned_validator(
     arguments: Sequence[str],
     *,
     receipt_path: str,
+    expected_repository: str,
+    expected_materialized_manifest_sha256: str,
     release_commit: str,
     release_tree: str,
     certificate_scope: str,
@@ -964,6 +1551,10 @@ def run_pinned_validator(
             )
         assert_pass_receipt(
             receipt_path,
+            expected_repository=expected_repository,
+            expected_materialized_manifest_sha256=(
+                expected_materialized_manifest_sha256
+            ),
             release_commit=release_commit,
             release_tree=release_tree,
             certificate_scope=certificate_scope,
@@ -975,19 +1566,21 @@ def assert_reviewed_release_policy(
     repository: str,
     release_commit: str,
     release_tree: str,
+    materialized_manifest_sha256: str,
 ) -> dict[str, Any]:
     """Bind production to the readable conservative constant in the release."""
 
-    load_forge_contract(repository, release_commit, require_clean=True)
-    completed = subprocess.run(
-        ["git", "-C", repository, "rev-parse", "HEAD^{tree}"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
+    if GIT_COMMIT_RE.fullmatch(release_tree or "") is None:
+        raise ProvenanceError("release tree is invalid")
+    expected_manifest = require_sha(
+        materialized_manifest_sha256,
+        "expected materialized Forge manifest hash",
     )
-    if completed.returncode != 0 or completed.stdout.strip() != release_tree:
-        raise ProvenanceError("release tree differs from the release commit")
+    load_forge_contract(
+        repository,
+        release_commit,
+        materialized_manifest_sha256=expected_manifest,
+    )
     from forge import recipe
 
     expected = {
@@ -1008,6 +1601,10 @@ def assert_reviewed_release_policy(
         "schema": 1,
         "kind": "sn56.week6.reviewed-release-timing-policy",
         "state": "PASS",
+        "materialized_tree_path": checked_path(
+            repository, "materialized Forge tree"
+        ),
+        "materialized_manifest_sha256": expected_manifest,
         "release_commit": release_commit,
         "release_tree": release_tree,
         "policy": expected,
@@ -1027,6 +1624,7 @@ def self_test(
             load_forge_contract(
                 os.path.join(forge_repository, "forge"),
                 forge_commit,
+                git_self_test_mode=True,
                 require_clean=False,
             )
         except ProvenanceError as exc:
@@ -1086,6 +1684,7 @@ def self_test(
             load_forge_contract(
                 os.path.realpath(ignored_repo),
                 ignored_commit,
+                git_self_test_mode=True,
                 require_clean=True,
             )
         except ProvenanceError as exc:
@@ -1096,6 +1695,7 @@ def self_test(
         adaptive_timing = load_forge_contract(
             forge_repository,
             forge_commit,
+            git_self_test_mode=True,
             require_clean=False,
         )
         from forge import krea_runtime
@@ -1269,6 +1869,7 @@ def self_test(
             rental_started_at_utc=started,
             rental_ended_at_utc=ended,
             forge_repository=forge_repository,
+            forge_materialized_manifest_sha256=None,
             forge_commit=forge_commit,
             release_tree=release_tree,
             certificate_scope=certificate_scope,
@@ -1279,6 +1880,7 @@ def self_test(
             dataset_regime=regime,
             accelerator_identity=accelerator,
             allow_dirty_forge=True,
+            git_self_test_mode=True,
         )
         receipt = validate(args)
         assert receipt["state"] == "PASS"
@@ -1484,6 +2086,11 @@ def self_test(
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
+    result.add_argument("--prepare-envelope-base")
+    result.add_argument("--prepare-envelope-namespace")
+    result.add_argument("--publish-envelope-base")
+    result.add_argument("--publish-envelope-namespace")
+    result.add_argument("--publish-envelope-stage")
     result.add_argument("--stage-source")
     result.add_argument("--stage-destination")
     result.add_argument("--stage-sha256")
@@ -1508,9 +2115,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--rental-started-at-utc")
     result.add_argument("--rental-ended-at-utc")
     result.add_argument("--forge-repository")
+    result.add_argument("--forge-materialized-manifest-sha256")
     result.add_argument("--forge-commit")
     result.add_argument("--release-tree")
+    result.add_argument("--forge-tree")
     result.add_argument("--certificate-scope")
+    result.add_argument("--delegated-mode")
+    result.add_argument("--source-archive-sha256")
+    result.add_argument("--source-manifest-sha256")
     result.add_argument("--bundle-id")
     result.add_argument("--bundle-sha256")
     result.add_argument("--model-type")
@@ -1524,6 +2136,45 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    prepare_requested = bool(
+        args.prepare_envelope_base or args.prepare_envelope_namespace
+    )
+    publish_requested = bool(
+        args.publish_envelope_base
+        or args.publish_envelope_namespace
+        or args.publish_envelope_stage
+    )
+    if prepare_requested and publish_requested:
+        raise ProvenanceError("envelope action is ambiguous")
+    if prepare_requested:
+        if not args.prepare_envelope_base or not args.prepare_envelope_namespace:
+            raise ProvenanceError(
+                "envelope preparation requires base and namespace"
+            )
+        stage = prepare_atomic_envelope(
+            args.prepare_envelope_base,
+            args.prepare_envelope_namespace,
+        )
+        print(f"SN56_ENVELOPE_STAGE={stage}")
+        return 0
+    if publish_requested:
+        if not all(
+            (
+                args.publish_envelope_base,
+                args.publish_envelope_namespace,
+                args.publish_envelope_stage,
+            )
+        ):
+            raise ProvenanceError(
+                "envelope publication requires base, namespace, and stage"
+            )
+        published = publish_atomic_envelope(
+            args.publish_envelope_base,
+            args.publish_envelope_namespace,
+            args.publish_envelope_stage,
+        )
+        print(f"SN56_ENVELOPE_PUBLISHED={published}")
+        return 0
     if args.stage_source:
         if not args.stage_destination or not args.stage_sha256:
             raise ProvenanceError(
@@ -1549,7 +2200,13 @@ def main() -> int:
         print("SN56_RELEASE_FILE_BINDING=PASS")
         return 0
     if args.assert_receipt:
-        if not args.forge_commit or not args.release_tree or not args.certificate_scope:
+        if (
+            not args.forge_repository
+            or not args.forge_materialized_manifest_sha256
+            or not args.forge_commit
+            or not args.release_tree
+            or not args.certificate_scope
+        ):
             raise ProvenanceError("receipt assertion lacks release identity")
         file_hash_arguments = {
             "profile": args.profile_file_sha256,
@@ -1567,6 +2224,10 @@ def main() -> int:
             expected_file_hashes = file_hash_arguments
         assert_pass_receipt(
             args.assert_receipt,
+            expected_repository=args.forge_repository,
+            expected_materialized_manifest_sha256=(
+                args.forge_materialized_manifest_sha256
+            ),
             release_commit=args.forge_commit,
             release_tree=args.release_tree,
             certificate_scope=args.certificate_scope,
@@ -1575,23 +2236,41 @@ def main() -> int:
         print("SN56_RELEASE_RECEIPT=PASS")
         return 0
     if args.assert_result_env:
-        if not args.forge_commit or not args.release_tree or not args.certificate_scope:
+        if (
+            not args.forge_commit
+            or not args.release_tree
+            or not args.forge_tree
+            or not args.certificate_scope
+            or not args.delegated_mode
+            or not args.source_archive_sha256
+            or not args.source_manifest_sha256
+        ):
             raise ProvenanceError("delegated assertion lacks release identity")
         assert_delegated_result(
             args.assert_result_env,
             release_commit=args.forge_commit,
             release_tree=args.release_tree,
+            forge_tree=args.forge_tree,
             certificate_scope=args.certificate_scope,
+            mode=args.delegated_mode,
+            expected_source_archive_sha256=args.source_archive_sha256,
+            expected_source_manifest_sha256=args.source_manifest_sha256,
         )
         print("SN56_DELEGATED_RESULT=PASS")
         return 0
     if args.assert_release_policy:
-        if not args.forge_repository or not args.forge_commit or not args.release_tree:
+        if (
+            not args.forge_repository
+            or not args.forge_materialized_manifest_sha256
+            or not args.forge_commit
+            or not args.release_tree
+        ):
             raise ProvenanceError("release-policy assertion lacks release identity")
         policy_receipt = assert_reviewed_release_policy(
             args.forge_repository,
             args.forge_commit,
             args.release_tree,
+            args.forge_materialized_manifest_sha256,
         )
         if not args.receipt:
             raise ProvenanceError("release-policy assertion requires receipt")
@@ -1624,6 +2303,7 @@ def main() -> int:
         "rental_started_at_utc",
         "rental_ended_at_utc",
         "forge_repository",
+        "forge_materialized_manifest_sha256",
         "forge_commit",
         "release_tree",
         "certificate_scope",

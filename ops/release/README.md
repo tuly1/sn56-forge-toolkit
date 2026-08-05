@@ -6,13 +6,22 @@ launchers only.
 
 ## Authority contract
 
-- `SN56_RELEASE_COMMIT` is the single release identity. The wrapper derives the
-  release tree and Forge subtree from that exact clean checkout and supplies the
-  same identity to the timing validator and delegated build/GPU certificate.
-- The wrapper hash-pins both executable authority files, copies the exact
-  descriptor-opened bytes into a private directory, and executes only those
-  copies. There is no delegated-script path override or validate-only release
-  bypass.
+- `SN56_RELEASE_COMMIT` is the single release identity. The public launcher
+  requires `SN56_RELEASE_EXPECTED_ORIGIN_URL` and a full
+  `SN56_RELEASE_REMOTE_REF`, resolves that ref independently with `git
+  ls-remote`, and requires the unique remote result, clean checkout `HEAD`,
+  release tree, and Forge tree to agree.
+- The `/bin/sh` launcher immediately re-execs itself through `/usr/bin/env -i`.
+  It archives the selected commit with `/usr/bin/git --no-replace-objects`,
+  extracts only canonical regular files/directories into a private `0700`
+  workspace, verifies every file's Git blob and executable mode, and proves the
+  executing launcher bytes equal the committed launcher. It then execs only the
+  archived Bash worker with an explicit environment.
+- The archived worker hash-pins and descriptor-stages both the timing validator
+  and the generic Week-6 build/GPU delegate. The delegate must reproduce the
+  launcher's exact source archive and full materialized-source manifest hashes;
+  a matching commit/tree alone is insufficient. There is no executable path
+  override, old Week-5 delegation, or validate-only release bypass.
 - Every lab-evidence source is opened with nonblocking, no-follow protection,
   hashed while its descriptor bytes are copied, and forwarded by the validated
   content hash. The timing profile and raw record are handed to Forge as those
@@ -22,11 +31,15 @@ launchers only.
   change the evidence Forge consumed.
 - The timing receipt must exist and parse as schema 2, kind
   `sn56.week6.operator-attested-timing-provenance.v2`, `state=PASS`, with the
-  exact release commit, tree, scope, and evidence hashes. The delegated
-  `result.env` is parsed as data and must bind the same commit, tree, scope, and
-  PASS state.
-- The final Week-6 envelope is schema v2. Receipt/envelope v1, timing-profile
-  schema 3, and raw-runtime schema 4 are intentionally invalid.
+  exact materialized source path/manifest, release commit, tree, scope, and
+  evidence hashes. The delegated `result.env` is parsed as data and must bind
+  the same commit, trees, scope, mode, archive, source manifest, and mode-specific
+  result state.
+- The final Week-6 envelope is schema v3 and is prepared and published with an
+  atomic no-replace rename under `SN56_RELEASE_ENVELOPE_BASE`. Production emits
+  `PASS`; `cpu-integration` emits only `DRY_RUN_PASS`. Receipt/envelope v1 and
+  envelope v2, timing-profile schema 3, and raw-runtime schema 4 are
+  intentionally invalid.
 
 ## Lab/production boundary
 
@@ -48,15 +61,23 @@ must show a duration-consistent training window inside the rental interval.
   `bootstrap -> first_checkpoint -> terminal -> profile` lifecycle. It performs
   a live `nvidia-smi` query, requires a new atomically created checkpoint root,
   captures and stages the YAML bytes before any mutation, passes those exact
-  bytes to the trainer through an inherited descriptor, re-verifies the runtime
-  at launch, emits the sealed v2 Friday gate event, writes evidence atomically
-  outside the upload tree, and is never imported by a production path.
-- `sn56-week6-final-release-cert.sh`: strict outer authority and envelope.
+  bytes through a private real `.yaml` file accepted by the pinned loader,
+  executes only a verified archive of the selected runtime commit, emits the
+  sealed v2 Friday gate event, writes evidence atomically outside the upload
+  tree, and is never imported by a production path.
+- `sn56-week6-final-release-cert.sh`: minimal public trust/bootstrap launcher.
+- `sn56-week6-final-release-cert-worker.sh`: archived strict Bash timing and
+  outer-envelope authority.
 - `sn56-week6-validate-timing-provenance.py`: descriptor staging, lab package
-  validation, receipt/result parsing, reviewed-constant validation, and
-  self-tests.
-- `sn56-week5-final-release-cert.sh`: hash-pinned delegated no-cache build/GPU
-  certificate.
+  validation, exact receipt/result parsing, materialized-source binding,
+  reviewed-constant validation, atomic envelope helpers, and self-tests.
+- `sn56-week6-build-gpu-cert.py`: policy-neutral exact-archive no-cache build
+  and GPU delegate. Its `cpu-integration` mode stubs only physical host/container
+  GPU observations and cannot emit production `PASS`.
+- `../../tests/integration/sn56-week6-release-dry-run.sh`: exact-head clean-clone
+  wrapper proof. Its companion fixture generator produces explicitly
+  non-authoritative schema-current timing input; the wrapper still executes all
+  CPU/build, receipt, image, and publication gates for real.
 
 CPU tests do not certify a Docker image, GPU execution, evaluator attachment,
 or deployment. Those remain release gates.

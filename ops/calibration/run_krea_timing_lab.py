@@ -27,6 +27,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from typing import Any, Sequence
@@ -63,6 +64,25 @@ _MAX_LOG_BYTES = 1024 * 1024 * 1024
 _CHECKPOINT_PATTERN = re.compile(r"(?:_|-step)(\d+)\.safetensors$")
 _GATE_SESSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _GIT_OBJECT_PATTERN = re.compile(r"[0-9a-f]{40}")
+_ABSOLUTE_GIT = "/usr/bin/git"
+_CHILD_PATH = "/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+_MAX_RUNTIME_ARCHIVE_BYTES = 512 * 1024 * 1024
+_MAX_RUNTIME_FILE_BYTES = 128 * 1024 * 1024
+_MAX_RUNTIME_TOTAL_BYTES = 1024 * 1024 * 1024
+_MAX_RUNTIME_MEMBERS = 100_000
+_CHILD_ENV_PASSTHROUGH = (
+    "CUDA_HOME",
+    "CUDA_VISIBLE_DEVICES",
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "HUGGINGFACE_HUB_CACHE",
+    "LD_LIBRARY_PATH",
+    "NVIDIA_DRIVER_CAPABILITIES",
+    "NVIDIA_VISIBLE_DEVICES",
+    "TORCH_HOME",
+    "TRANSFORMERS_CACHE",
+    "XDG_CACHE_HOME",
+)
 
 
 class LabTimingError(RuntimeError):
@@ -139,71 +159,381 @@ def _sha256(path: Path, *, maximum_size: int) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _open_sealed_config(path: Path) -> tuple[int, str]:
-    """Open and hash the staged config once for descriptor handoff."""
-
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+def _create_supervised_workspace(path: Path) -> None:
     try:
-        descriptor = os.open(path, flags)
+        os.mkdir(path, 0o700)
+    except FileExistsError as exc:
+        raise LabTimingError("supervised workspace appeared during preflight") from exc
     except OSError as exc:
-        raise LabTimingError("sealed executed config could not be opened") from exc
+        raise LabTimingError("supervised workspace could not be created") from exc
+    if path.stat().st_mode & 0o777 != 0o700:
+        raise LabTimingError("supervised workspace is not mode 0700")
+
+
+def _stage_captured_config(workspace: Path, payload: bytes) -> Path:
+    descriptor, name = tempfile.mkstemp(
+        prefix="captured-config-",
+        suffix=".yaml",
+        dir=workspace,
+    )
+    path = Path(name)
     try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise LabTimingError("sealed executed config is not a regular file")
-        if before.st_size <= 0 or before.st_size > _MAX_CONFIG_BYTES:
-            raise LabTimingError("sealed executed config size is invalid")
-        chunks: list[bytes] = []
-        remaining = before.st_size
-        while remaining:
-            chunk = os.read(descriptor, min(1024 * 1024, remaining))
-            if not chunk:
-                raise LabTimingError("sealed executed config was truncated")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        if os.read(descriptor, 1):
-            raise LabTimingError("sealed executed config grew while being read")
-        after = os.fstat(descriptor)
-        identity_before = (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
+        os.fchmod(descriptor, 0o400)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory_descriptor = os.open(
+            workspace,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
         )
-        identity_after = (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        path_state = os.stat(path, follow_symlinks=False)
-        if (
-            identity_before != identity_after
-            or not stat.S_ISREG(path_state.st_mode)
-            or (path_state.st_dev, path_state.st_ino)
-            != (after.st_dev, after.st_ino)
-        ):
-            raise LabTimingError("sealed executed config changed while opening")
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        return descriptor, hashlib.sha256(b"".join(chunks)).hexdigest()
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except BaseException:
-        os.close(descriptor)
+        try:
+            path.unlink()
+        except OSError:
+            pass
         raise
+    return path
 
 
-def _descriptor_path(descriptor: int) -> str:
-    for root in ("/proc/self/fd", "/dev/fd"):
-        candidate = f"{root}/{descriptor}"
-        if os.path.exists(candidate):
-            return candidate
-    raise LabTimingError("this host cannot expose an inherited config descriptor")
+def _private_child_directory(workspace: Path, name: str) -> Path:
+    path = workspace / name
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        if not path.is_dir() or path.is_symlink():
+            raise LabTimingError(f"private child {name} path is invalid")
+    if (path.stat().st_mode & 0o777) != 0o700:
+        raise LabTimingError(f"private child {name} path is not mode 0700")
+    return path
+
+
+def _child_environment(workspace: Path) -> dict[str, str]:
+    """Build an explicit training environment; arbitrary caller keys never flow."""
+
+    child_home = _private_child_directory(workspace, "child-home")
+    child_tmp = _private_child_directory(workspace, "child-tmp")
+    environment = {
+        "HOME": str(child_home),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": _CHILD_PATH,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "TMPDIR": str(child_tmp),
+    }
+    for key in _CHILD_ENV_PASSTHROUGH:
+        value = os.environ.get(key)
+        if value:
+            if "\x00" in value:
+                raise LabTimingError(f"child environment {key} contains NUL")
+            environment[key] = value
+    return environment
+
+
+def _git_environment() -> dict[str, str]:
+    return {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+
+
+def _git_object_store_identity(object_store: Path) -> tuple[str, str]:
+    def git(*arguments: str) -> str:
+        try:
+            completed = subprocess.run(
+                [
+                    _ABSOLUTE_GIT,
+                    "--no-replace-objects",
+                    "-C",
+                    str(object_store),
+                    *arguments,
+                ],
+                check=False,
+                capture_output=True,
+                env=_git_environment(),
+                text=True,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise LabTimingError("runtime object-store verification failed") from exc
+        if completed.returncode != 0:
+            raise LabTimingError("runtime object-store verification failed")
+        return completed.stdout.strip()
+
+    commit = git(
+        "rev-parse",
+        "--verify",
+        f"{krea_runtime.OWNED_RUNTIME_COMMIT}^{{commit}}",
+    )
+    tree = git(
+        "rev-parse",
+        "--verify",
+        f"{krea_runtime.OWNED_RUNTIME_COMMIT}^{{tree}}",
+    )
+    if commit != krea_runtime.OWNED_RUNTIME_COMMIT:
+        raise LabTimingError("runtime object store resolves a different commit")
+    if _GIT_OBJECT_PATTERN.fullmatch(tree) is None:
+        raise LabTimingError("runtime object-store tree is invalid")
+    return commit, tree
+
+
+def _safe_archive_parts(name: str) -> tuple[str, ...]:
+    if not isinstance(name, str) or not name or "\x00" in name:
+        raise LabTimingError("runtime archive member name is invalid")
+    normalized = name[:-1] if name.endswith("/") else name
+    parts = tuple(normalized.split("/"))
+    if (
+        normalized.startswith("/")
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise LabTimingError("runtime archive member escapes materialization root")
+    return parts
+
+
+def _ensure_private_directories(root: Path, parts: tuple[str, ...]) -> Path:
+    current = root
+    for part in parts:
+        current = current / part
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            state = current.lstat()
+            if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+                raise LabTimingError("runtime archive parent is not a directory")
+    return current
+
+
+def _extract_runtime_archive(payload: bytes, destination: Path) -> None:
+    try:
+        os.mkdir(destination, 0o700)
+    except OSError as exc:
+        raise LabTimingError("materialized runtime directory could not be created") from exc
+    seen: set[tuple[str, ...]] = set()
+    total_size = 0
+    try:
+        with tempfile.TemporaryFile() as archive_file:
+            archive_file.write(payload)
+            archive_file.seek(0)
+            with tarfile.open(fileobj=archive_file, mode="r:") as archive:
+                members = archive.getmembers()
+                if len(members) > _MAX_RUNTIME_MEMBERS:
+                    raise LabTimingError("runtime archive has too many members")
+                validated: list[tuple[tarfile.TarInfo, tuple[str, ...]]] = []
+                for member in members:
+                    parts = _safe_archive_parts(member.name)
+                    if parts in seen:
+                        raise LabTimingError("runtime archive contains duplicate paths")
+                    seen.add(parts)
+                    if not (member.isdir() or member.isreg()):
+                        raise LabTimingError(
+                            "runtime archive contains a non-regular member"
+                        )
+                    if member.size < 0 or member.size > _MAX_RUNTIME_FILE_BYTES:
+                        raise LabTimingError("runtime archive member size is invalid")
+                    total_size += member.size
+                    if total_size > _MAX_RUNTIME_TOTAL_BYTES:
+                        raise LabTimingError("runtime archive expands beyond its limit")
+                    if parts == (krea_runtime.RUNTIME_IDENTITY_FILENAME,):
+                        raise LabTimingError(
+                            "runtime identity must be synthesized, not archived"
+                        )
+                    validated.append((member, parts))
+
+                for member, parts in sorted(
+                    validated,
+                    key=lambda row: (len(row[1]), row[1]),
+                ):
+                    if member.isdir():
+                        _ensure_private_directories(destination, parts)
+                        continue
+                    parent = _ensure_private_directories(destination, parts[:-1])
+                    output = parent / parts[-1]
+                    flags = (
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    mode = 0o700 if member.mode & 0o111 else 0o600
+                    descriptor = os.open(output, flags, mode)
+                    source = archive.extractfile(member)
+                    if source is None:
+                        os.close(descriptor)
+                        raise LabTimingError("runtime archive file is unreadable")
+                    try:
+                        remaining = member.size
+                        while remaining:
+                            chunk = source.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise LabTimingError(
+                                    "runtime archive file was truncated"
+                                )
+                            view = memoryview(chunk)
+                            while view:
+                                written = os.write(descriptor, view)
+                                if written <= 0:
+                                    raise LabTimingError(
+                                        "runtime archive file write failed"
+                                    )
+                                view = view[written:]
+                            remaining -= len(chunk)
+                        if source.read(1):
+                            raise LabTimingError("runtime archive file grew")
+                        os.fsync(descriptor)
+                    finally:
+                        source.close()
+                        os.close(descriptor)
+    except (tarfile.TarError, OSError) as exc:
+        raise LabTimingError("runtime archive could not be safely extracted") from exc
+
+
+def _materialized_file_manifest(runtime: Path) -> tuple[list[dict[str, Any]], str]:
+    rows: list[dict[str, Any]] = []
+    total_size = 0
+    for path in sorted(runtime.rglob("*"), key=lambda item: item.as_posix()):
+        state = path.lstat()
+        relative = path.relative_to(runtime).as_posix()
+        if stat.S_ISLNK(state.st_mode):
+            raise LabTimingError("materialized runtime contains a symlink")
+        if stat.S_ISDIR(state.st_mode):
+            rows.append(
+                {
+                    "path": relative,
+                    "type": "directory",
+                    "mode": stat.S_IMODE(state.st_mode),
+                }
+            )
+            continue
+        if not stat.S_ISREG(state.st_mode):
+            raise LabTimingError("materialized runtime contains a special file")
+        if state.st_size > _MAX_RUNTIME_FILE_BYTES:
+            raise LabTimingError("materialized runtime file is too large")
+        total_size += state.st_size
+        if total_size > _MAX_RUNTIME_TOTAL_BYTES:
+            raise LabTimingError("materialized runtime exceeds its size limit")
+        rows.append(
+            {
+                "path": relative,
+                "type": "file",
+                "mode": stat.S_IMODE(state.st_mode),
+                "size_bytes": state.st_size,
+                "sha256": _sha256(path, maximum_size=_MAX_RUNTIME_FILE_BYTES),
+            }
+        )
+    digest = hashlib.sha256(_canonical_bytes(rows)).hexdigest()
+    return rows, digest
+
+
+def _validate_materialized_runtime(
+    runtime: Path,
+    *,
+    bundle: str,
+    expected_file_manifest_sha256: str,
+) -> dict[str, Any]:
+    environment = {
+        krea_runtime.BUNDLE_ENV: bundle,
+        krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV: str(runtime),
+    }
+    manifest = krea_runtime.load_capability_manifest(
+        model_type="krea2",
+        bundle=bundle,
+        environ=environment,
+    )
+    krea_runtime.require_capabilities(
+        manifest,
+        tuple(krea_runtime.REQUIRED_CAPABILITIES),
+    )
+    _rows, current_sha256 = _materialized_file_manifest(runtime)
+    if current_sha256 != expected_file_manifest_sha256:
+        raise LabTimingError("materialized runtime file manifest changed")
+    run_path = runtime / "run.py"
+    try:
+        state = run_path.lstat()
+    except OSError as exc:
+        raise LabTimingError("materialized runtime run.py is absent") from exc
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
+        raise LabTimingError("materialized runtime run.py is not regular")
+    return manifest
+
+
+def _materialize_runtime(
+    object_store: Path,
+    workspace: Path,
+    *,
+    bundle: str,
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    commit, tree = _git_object_store_identity(object_store)
+    try:
+        completed = subprocess.run(
+            [
+                _ABSOLUTE_GIT,
+                "--no-replace-objects",
+                "-C",
+                str(object_store),
+                "archive",
+                "--format=tar",
+                commit,
+            ],
+            check=False,
+            capture_output=True,
+            env=_git_environment(),
+            timeout=120,
+        )
+    except Exception as exc:
+        raise LabTimingError("pinned runtime archive failed") from exc
+    if completed.returncode != 0:
+        raise LabTimingError("pinned runtime archive failed")
+    archive_payload = completed.stdout
+    if not archive_payload or len(archive_payload) > _MAX_RUNTIME_ARCHIVE_BYTES:
+        raise LabTimingError("pinned runtime archive size is invalid")
+    runtime = workspace / "materialized-runtime"
+    _extract_runtime_archive(archive_payload, runtime)
+
+    manifest_path = runtime / krea_runtime.CAPABILITY_MANIFEST_FILENAME
+    manifest_payload = read_regular_bytes(
+        str(manifest_path),
+        label="materialized Krea capability manifest",
+        maximum_size=256 * 1024,
+    )
+    manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+    identity = {
+        "schema": 1,
+        "runtime_repository": krea_runtime.OWNED_RUNTIME_REPOSITORY,
+        "runtime_commit": krea_runtime.OWNED_RUNTIME_COMMIT,
+        "capability_manifest_sha256": manifest_sha256,
+    }
+    _atomic_write(
+        runtime / krea_runtime.RUNTIME_IDENTITY_FILENAME,
+        _canonical_bytes(identity),
+        mode=0o400,
+    )
+    _rows, file_manifest_sha256 = _materialized_file_manifest(runtime)
+    manifest = _validate_materialized_runtime(
+        runtime,
+        bundle=bundle,
+        expected_file_manifest_sha256=file_manifest_sha256,
+    )
+    evidence = {
+        "commit": commit,
+        "tree": tree,
+        "archive_sha256": hashlib.sha256(archive_payload).hexdigest(),
+        "capability_manifest_file_sha256": manifest_sha256,
+        "materialized_file_manifest_sha256": file_manifest_sha256,
+    }
+    return runtime, manifest, evidence
 
 
 def _positive_number(value: Any, label: str) -> float:
@@ -268,13 +598,15 @@ def _git_release_identity() -> tuple[str, str]:
         try:
             completed = subprocess.run(
                 [
-                    "git",
+                    _ABSOLUTE_GIT,
+                    "--no-replace-objects",
                     "-C",
                     str(_REPOSITORY_ROOT),
                     *arguments,
                 ],
                 check=False,
                 capture_output=True,
+                env=_git_environment(),
                 text=True,
                 timeout=15,
             )
@@ -494,17 +826,17 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
     gate_log_path = _outside_upload_tree(
         Path(args.output_gate_log), save_root, "Friday H100 gate log"
     )
-    sealed_config_path = _outside_upload_tree(
-        receipt_path.with_name(f".{receipt_path.name}.executed-config.yaml"),
+    supervised_workspace = _outside_upload_tree(
+        receipt_path.with_name(f".{receipt_path.name}.supervised"),
         save_root,
-        "sealed executed config",
+        "supervised config workspace",
     )
     for path, label in (
         (profile_path, "timing profile"),
         (receipt_path, "timing receipt"),
         (log_path, "training log"),
         (gate_log_path, "Friday H100 gate log"),
-        (sealed_config_path, "sealed executed config"),
+        (supervised_workspace, "supervised config workspace"),
     ):
         if path.exists() or path.is_symlink():
             raise LabTimingError(f"{label} output already exists: {path}")
@@ -513,27 +845,20 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
         receipt_path,
         log_path,
         gate_log_path,
-        sealed_config_path,
+        supervised_workspace,
     }
     if len(outputs) != 5:
         raise LabTimingError(
-            "profile, receipt, log, gate-log, and sealed-config outputs "
+            "profile, receipt, log, gate-log, and supervised-workspace outputs "
             "must be distinct"
         )
-
-    raw_record_path = Path(str(sealed_config_path) + ".effective-runtime.json")
-    if any(
-        output in {config_path, raw_record_path}
-        for output in outputs
-    ):
+    if config_path in outputs:
         raise LabTimingError(
-            "profile, receipt, log, gate-log, and sealed-config outputs cannot "
-            "alias original config/raw evidence"
+            "profile, receipt, log, gate-log, and supervised-workspace outputs "
+            "cannot alias the original config"
         )
-    if raw_record_path.exists() or raw_record_path.is_symlink():
-        raise LabTimingError(
-            f"raw timing record output already exists: {raw_record_path}"
-        )
+    for path in (profile_path, receipt_path, log_path, gate_log_path):
+        _outside_upload_tree(path, supervised_workspace, "evidence output")
 
     config_payload, config_document, planned_steps = _load_config(config_path)
     original_config_sha256 = hashlib.sha256(config_payload).hexdigest()
@@ -551,24 +876,9 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
     try:
         requested_runtime = Path(args.runtime_dir).resolve(strict=True)
     except OSError as exc:
-        raise LabTimingError("selected runtime checkout is unavailable") from exc
-    explicit_environment = {
-        krea_runtime.BUNDLE_ENV: args.bundle,
-        krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV: str(requested_runtime),
-    }
-    verified_runtime = Path(
-        krea_runtime.verify_selected_runtime(
-            "krea2",
-            args.bundle,
-            environ=explicit_environment,
-        )
-    ).resolve(strict=True)
-    if verified_runtime != requested_runtime:
-        raise LabTimingError("attested runtime differs from the checkout to execute")
-    manifest = krea_runtime.load_capability_manifest(
-        model_type="krea2",
-        bundle=args.bundle,
-        environ=explicit_environment,
+        raise LabTimingError("runtime object store is unavailable") from exc
+    object_store_commit, object_store_tree = _git_object_store_identity(
+        requested_runtime
     )
     forge_commit, release_tree = _git_release_identity()
     bundle_sha256 = krea_runtime.bundle_contract_sha256(args.bundle)
@@ -587,22 +897,46 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
         (receipt_path, "timing receipt"),
         (log_path, "training log"),
         (gate_log_path, "Friday H100 gate log"),
-        (sealed_config_path, "sealed executed config"),
-        (raw_record_path, "raw timing record"),
+        (supervised_workspace, "supervised config workspace"),
     ):
         if path.exists() or path.is_symlink():
             raise LabTimingError(f"{label} output appeared during preflight: {path}")
 
     # Phase two begins here. Stage exactly the descriptor-captured source bytes
-    # under a private derived path. The caller's original config path is never
-    # reopened as execution authority after this point.
-    _atomic_write(sealed_config_path, config_payload, mode=0o400)
+    # as a real .yaml tempfile under a private supervised workspace. The pinned
+    # ai-toolkit loader dispatches on filename suffix, so fd pseudo-paths are
+    # intentionally forbidden even though they would otherwise narrow a race.
+    supervised_workspace.parent.mkdir(parents=True, exist_ok=True)
+    _create_supervised_workspace(supervised_workspace)
+    sealed_config_path = _stage_captured_config(
+        supervised_workspace,
+        config_payload,
+    )
     executed_config_sha256 = _sha256(
         sealed_config_path,
         maximum_size=_MAX_CONFIG_BYTES,
     )
     if executed_config_sha256 != original_config_sha256:
         raise LabTimingError("sealed executed config differs from captured bytes")
+    raw_record_path = Path(str(sealed_config_path) + ".effective-runtime.json")
+    if raw_record_path.exists() or raw_record_path.is_symlink():
+        raise LabTimingError(
+            f"raw timing record output already exists: {raw_record_path}"
+        )
+    materialized_runtime, manifest, runtime_evidence = _materialize_runtime(
+        requested_runtime,
+        supervised_workspace,
+        bundle=args.bundle,
+    )
+    if (
+        runtime_evidence["commit"] != object_store_commit
+        or runtime_evidence["tree"] != object_store_tree
+    ):
+        raise LabTimingError("runtime object-store identity changed during archive")
+    explicit_environment = {
+        krea_runtime.BUNDLE_ENV: args.bundle,
+        krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV: str(materialized_runtime),
+    }
 
     # Atomic save-root creation follows every read-only gate. Every derived path
     # and attested runtime is fixed before checkpoint scope state can exist.
@@ -640,42 +974,46 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
     )
     temporary_log = Path(temporary_log_name)
     pending_log_descriptor: int | None = log_descriptor
-    sealed_config_descriptor: int | None = None
     try:
-        launch_runtime = Path(
-            krea_runtime.verify_selected_runtime(
-                "krea2",
-                args.bundle,
-                environ=explicit_environment,
-            )
-        ).resolve(strict=True)
-        if launch_runtime != verified_runtime:
-            raise LabTimingError("selected runtime changed before process launch")
-        sealed_config_descriptor, handed_config_sha256 = _open_sealed_config(
-            sealed_config_path
+        launch_commit, launch_tree = _git_object_store_identity(requested_runtime)
+        if (
+            launch_commit != object_store_commit
+            or launch_tree != object_store_tree
+        ):
+            raise LabTimingError("runtime object store changed before process launch")
+        _validate_materialized_runtime(
+            materialized_runtime,
+            bundle=args.bundle,
+            expected_file_manifest_sha256=runtime_evidence[
+                "materialized_file_manifest_sha256"
+            ],
         )
-        if handed_config_sha256 != executed_config_sha256:
+        if (
+            _sha256(sealed_config_path, maximum_size=_MAX_CONFIG_BYTES)
+            != executed_config_sha256
+        ):
             raise LabTimingError(
                 "sealed executed config changed before process launch"
             )
-        handed_config_path = _descriptor_path(sealed_config_descriptor)
         training_started_at_utc = _utc_now()
         started = time.monotonic()
         stopped_by_deadline = False
         observed = False
-        launch_environment = os.environ.copy()
-        launch_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        launch_environment = _child_environment(supervised_workspace)
         log_handle = os.fdopen(log_descriptor, "wb")
         pending_log_descriptor = None
         with log_handle:
             process = subprocess.Popen(
-                [sys.executable, "run.py", handed_config_path],
-                cwd=launch_runtime,
+                [
+                    sys.executable,
+                    str(materialized_runtime / "run.py"),
+                    str(sealed_config_path),
+                ],
+                cwd=materialized_runtime,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 env=launch_environment,
                 start_new_session=True,
-                pass_fds=(sealed_config_descriptor,),
             )
             try:
                 while process.poll() is None:
@@ -706,12 +1044,22 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
             log_handle.flush()
             os.fsync(log_handle.fileno())
     finally:
-        if sealed_config_descriptor is not None:
-            os.close(sealed_config_descriptor)
         if pending_log_descriptor is not None:
             os.close(pending_log_descriptor)
         if temporary_log.exists():
             _commit_file(temporary_log, log_path)
+    _validate_materialized_runtime(
+        materialized_runtime,
+        bundle=args.bundle,
+        expected_file_manifest_sha256=runtime_evidence[
+            "materialized_file_manifest_sha256"
+        ],
+    )
+    if (
+        _sha256(sealed_config_path, maximum_size=_MAX_CONFIG_BYTES)
+        != executed_config_sha256
+    ):
+        raise LabTimingError("sealed executed config changed during process execution")
     elapsed_seconds = time.monotonic() - started
 
     if not observed:
@@ -840,6 +1188,11 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
                     maximum_size=_MAX_CONFIG_BYTES,
                 ),
             },
+        },
+        "runtime": {
+            "object_store_path": str(requested_runtime),
+            "materialized_path": str(materialized_runtime),
+            **runtime_evidence,
         },
         "raw_record": {
             "path": str(raw_record_path),

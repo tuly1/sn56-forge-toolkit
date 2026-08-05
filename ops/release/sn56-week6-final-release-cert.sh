@@ -1,329 +1,572 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
-umask 027
+#!/bin/sh
+set -eu
+umask 077
 
-# Canonical Week-6 release authority. The H100 timing package is lab evidence;
-# the tournament runtime consumes only the reviewed constant in forge.recipe.
-# A single SN56_RELEASE_COMMIT binds this wrapper, the validator, the delegated
-# build certificate, the release tree, and the production timing-policy diff.
+# Public Week-6 release launcher.  This file performs only the bootstrap trust
+# transition: bind one clean checkout to one independently resolved remote ref,
+# materialize that commit without worktree bytes, prove this launcher's bytes
+# came from that commit, and exec the archived authority worker in a fixed env.
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset BASH_ENV CDPATH ENV GIT_CONFIG GIT_CONFIG_GLOBAL GIT_DIR GIT_WORK_TREE \
+  PYTHONHOME PYTHONPATH PYTHONSTARTUP
+IFS=$(/usr/bin/printf ' \t\n_')
+IFS=${IFS%_}
+
+fail() {
+  /usr/bin/printf 'SN56_WEEK6_FINAL_RELEASE_CERT=FAIL reason=%s\n' "$1" >&2
+  exit "${2-1}"
+}
 
 require_env() {
-  local name=$1
-  [[ -n ${!name-} ]] || {
-    printf 'required environment variable is unset: %s\n' "${name}" >&2
-    exit 64
-  }
+  [ -n "$2" ] || fail "required environment variable is unset: $1" 64
+  case $2 in
+    *'
+'*|*''*) fail "required environment variable contains a line break: $1" 64 ;;
+  esac
 }
 
-for required_name in \
-  SN56_RELEASE_COMMIT \
-  SN56_RELEASE_SOURCE_CHECKOUT \
-  SN56_RELEASE_EVIDENCE_NAMESPACE \
-  SN56_RELEASE_TIMING_PROFILE \
-  SN56_RELEASE_TIMING_PROFILE_SHA256 \
-  SN56_RELEASE_TIMING_SOURCE_RECORD \
-  SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256 \
-  SN56_RELEASE_TIMING_TERMINAL_ARTIFACT \
-  SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256 \
-  SN56_RELEASE_FRIDAY_GATE_LOG \
-  SN56_RELEASE_FRIDAY_GATE_LOG_SHA256 \
-  SN56_RELEASE_TIMING_SOURCE_RUN_ID \
-  SN56_RELEASE_H100_GATE_SESSION_ID \
-  SN56_RELEASE_H100_RENTAL_STARTED_AT_UTC \
-  SN56_RELEASE_H100_RENTAL_ENDED_AT_UTC \
-  SN56_RELEASE_TIMING_BUNDLE_ID \
-  SN56_RELEASE_TIMING_BUNDLE_SHA256 \
-  SN56_RELEASE_TIMING_MODEL_TYPE \
-  SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE \
-  SN56_RELEASE_TIMING_DATASET_REGIME \
-  SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY
+[ "$#" -eq 0 ] || fail 'the release launcher accepts no arguments' 64
+case $0 in
+  /*) launcher_path=$0 ;;
+  *) fail 'release launcher must be invoked by its absolute path' 64 ;;
+esac
+
+require_env SN56_RELEASE_CERT_MODE "${SN56_RELEASE_CERT_MODE-}"
+require_env SN56_RELEASE_COMMIT "${SN56_RELEASE_COMMIT-}"
+require_env SN56_RELEASE_SOURCE_CHECKOUT "${SN56_RELEASE_SOURCE_CHECKOUT-}"
+require_env SN56_RELEASE_EXPECTED_ORIGIN_URL "${SN56_RELEASE_EXPECTED_ORIGIN_URL-}"
+require_env SN56_RELEASE_REMOTE_REF "${SN56_RELEASE_REMOTE_REF-}"
+require_env SN56_RELEASE_EVIDENCE_NAMESPACE "${SN56_RELEASE_EVIDENCE_NAMESPACE-}"
+require_env SN56_RELEASE_DELEGATE_EVIDENCE_BASE "${SN56_RELEASE_DELEGATE_EVIDENCE_BASE-}"
+require_env SN56_RELEASE_ENVELOPE_BASE "${SN56_RELEASE_ENVELOPE_BASE-}"
+require_env SN56_RELEASE_WORK_BASE "${SN56_RELEASE_WORK_BASE-}"
+require_env SN56_RELEASE_TOOLKIT_IMAGE_TAG "${SN56_RELEASE_TOOLKIT_IMAGE_TAG-}"
+require_env SN56_RELEASE_LEGACY_IMAGE_TAG "${SN56_RELEASE_LEGACY_IMAGE_TAG-}"
+require_env SN56_RELEASE_EXPECTED_DOCKER_ROOT "${SN56_RELEASE_EXPECTED_DOCKER_ROOT-}"
+require_env SN56_RELEASE_EXPECTED_CONTAINERD_ROOT "${SN56_RELEASE_EXPECTED_CONTAINERD_ROOT-}"
+require_env SN56_RELEASE_TIMING_PROFILE "${SN56_RELEASE_TIMING_PROFILE-}"
+require_env SN56_RELEASE_TIMING_PROFILE_SHA256 "${SN56_RELEASE_TIMING_PROFILE_SHA256-}"
+require_env SN56_RELEASE_TIMING_SOURCE_RECORD "${SN56_RELEASE_TIMING_SOURCE_RECORD-}"
+require_env SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256 "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256-}"
+require_env SN56_RELEASE_TIMING_TERMINAL_ARTIFACT "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT-}"
+require_env SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256 "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256-}"
+require_env SN56_RELEASE_FRIDAY_GATE_LOG "${SN56_RELEASE_FRIDAY_GATE_LOG-}"
+require_env SN56_RELEASE_FRIDAY_GATE_LOG_SHA256 "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256-}"
+require_env SN56_RELEASE_TIMING_SOURCE_RUN_ID "${SN56_RELEASE_TIMING_SOURCE_RUN_ID-}"
+require_env SN56_RELEASE_H100_GATE_SESSION_ID "${SN56_RELEASE_H100_GATE_SESSION_ID-}"
+require_env SN56_RELEASE_H100_RENTAL_STARTED_AT_UTC "${SN56_RELEASE_H100_RENTAL_STARTED_AT_UTC-}"
+require_env SN56_RELEASE_H100_RENTAL_ENDED_AT_UTC "${SN56_RELEASE_H100_RENTAL_ENDED_AT_UTC-}"
+require_env SN56_RELEASE_TIMING_BUNDLE_ID "${SN56_RELEASE_TIMING_BUNDLE_ID-}"
+require_env SN56_RELEASE_TIMING_BUNDLE_SHA256 "${SN56_RELEASE_TIMING_BUNDLE_SHA256-}"
+require_env SN56_RELEASE_TIMING_MODEL_TYPE "${SN56_RELEASE_TIMING_MODEL_TYPE-}"
+require_env SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE "${SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE-}"
+require_env SN56_RELEASE_TIMING_DATASET_REGIME "${SN56_RELEASE_TIMING_DATASET_REGIME-}"
+require_env SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY "${SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY-}"
+
+# Run the launcher itself, not merely its children, under one explicit
+# allowlist.  The clean sentinel is deliberately not accepted as release input;
+# it is created only by this one-time re-exec.
+if [ "${SN56_RELEASE_BOOTSTRAP_CLEAN-}" != 1 ]; then
+  exec /usr/bin/env -i \
+    PATH="${PATH}" \
+    HOME=/nonexistent \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1 \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    GIT_TERMINAL_PROMPT=0 \
+    SN56_RELEASE_BOOTSTRAP_CLEAN=1 \
+    SN56_RELEASE_CERT_MODE="${SN56_RELEASE_CERT_MODE}" \
+    SN56_RELEASE_COMMIT="${SN56_RELEASE_COMMIT}" \
+    SN56_RELEASE_SOURCE_CHECKOUT="${SN56_RELEASE_SOURCE_CHECKOUT}" \
+    SN56_RELEASE_EXPECTED_ORIGIN_URL="${SN56_RELEASE_EXPECTED_ORIGIN_URL}" \
+    SN56_RELEASE_REMOTE_REF="${SN56_RELEASE_REMOTE_REF}" \
+    SN56_RELEASE_EVIDENCE_NAMESPACE="${SN56_RELEASE_EVIDENCE_NAMESPACE}" \
+    SN56_RELEASE_DELEGATE_EVIDENCE_BASE="${SN56_RELEASE_DELEGATE_EVIDENCE_BASE}" \
+    SN56_RELEASE_ENVELOPE_BASE="${SN56_RELEASE_ENVELOPE_BASE}" \
+    SN56_RELEASE_WORK_BASE="${SN56_RELEASE_WORK_BASE}" \
+    SN56_RELEASE_TOOLKIT_IMAGE_TAG="${SN56_RELEASE_TOOLKIT_IMAGE_TAG}" \
+    SN56_RELEASE_LEGACY_IMAGE_TAG="${SN56_RELEASE_LEGACY_IMAGE_TAG}" \
+    SN56_RELEASE_EXPECTED_DOCKER_ROOT="${SN56_RELEASE_EXPECTED_DOCKER_ROOT}" \
+    SN56_RELEASE_EXPECTED_CONTAINERD_ROOT="${SN56_RELEASE_EXPECTED_CONTAINERD_ROOT}" \
+    SN56_RELEASE_TIMING_PROFILE="${SN56_RELEASE_TIMING_PROFILE}" \
+    SN56_RELEASE_TIMING_PROFILE_SHA256="${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
+    SN56_RELEASE_TIMING_SOURCE_RECORD="${SN56_RELEASE_TIMING_SOURCE_RECORD}" \
+    SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256="${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
+    SN56_RELEASE_TIMING_TERMINAL_ARTIFACT="${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT}" \
+    SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256="${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
+    SN56_RELEASE_FRIDAY_GATE_LOG="${SN56_RELEASE_FRIDAY_GATE_LOG}" \
+    SN56_RELEASE_FRIDAY_GATE_LOG_SHA256="${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}" \
+    SN56_RELEASE_TIMING_SOURCE_RUN_ID="${SN56_RELEASE_TIMING_SOURCE_RUN_ID}" \
+    SN56_RELEASE_H100_GATE_SESSION_ID="${SN56_RELEASE_H100_GATE_SESSION_ID}" \
+    SN56_RELEASE_H100_RENTAL_STARTED_AT_UTC="${SN56_RELEASE_H100_RENTAL_STARTED_AT_UTC}" \
+    SN56_RELEASE_H100_RENTAL_ENDED_AT_UTC="${SN56_RELEASE_H100_RENTAL_ENDED_AT_UTC}" \
+    SN56_RELEASE_TIMING_BUNDLE_ID="${SN56_RELEASE_TIMING_BUNDLE_ID}" \
+    SN56_RELEASE_TIMING_BUNDLE_SHA256="${SN56_RELEASE_TIMING_BUNDLE_SHA256}" \
+    SN56_RELEASE_TIMING_MODEL_TYPE="${SN56_RELEASE_TIMING_MODEL_TYPE}" \
+    SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE="${SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE}" \
+    SN56_RELEASE_TIMING_DATASET_REGIME="${SN56_RELEASE_TIMING_DATASET_REGIME}" \
+    SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY="${SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY}" \
+    /bin/sh "${launcher_path}"
+fi
+
+case ${SN56_RELEASE_CERT_MODE} in
+  production|cpu-integration) ;;
+  *) fail 'SN56_RELEASE_CERT_MODE must be production or cpu-integration' 64 ;;
+esac
+case ${SN56_RELEASE_COMMIT} in
+  *[!0-9a-f]*|'') fail 'SN56_RELEASE_COMMIT is not a full lowercase commit id' 64 ;;
+esac
+[ "${#SN56_RELEASE_COMMIT}" -eq 40 ] || \
+  fail 'SN56_RELEASE_COMMIT is not a full lowercase commit id' 64
+case ${SN56_RELEASE_EVIDENCE_NAMESPACE} in
+  *[!A-Za-z0-9._-]*|'') fail 'invalid release evidence namespace' 64 ;;
+esac
+[ "${#SN56_RELEASE_EVIDENCE_NAMESPACE}" -le 128 ] || \
+  fail 'invalid release evidence namespace' 64
+case ${SN56_RELEASE_EVIDENCE_NAMESPACE} in
+  [A-Za-z0-9]*) ;;
+  *) fail 'invalid release evidence namespace' 64 ;;
+esac
+case ${SN56_RELEASE_REMOTE_REF} in
+  refs/heads/*) ;;
+  *) fail 'SN56_RELEASE_REMOTE_REF must be a full refs/heads ref' 64 ;;
+esac
+case ${SN56_RELEASE_EXPECTED_ORIGIN_URL} in
+  https://*|ssh://*|git@*:*) ;;
+  *) fail 'SN56_RELEASE_EXPECTED_ORIGIN_URL is not an allowed remote URL' 64 ;;
+esac
+
+for digest in \
+  "${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
+  "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
+  "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
+  "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}" \
+  "${SN56_RELEASE_TIMING_BUNDLE_SHA256}"
 do
-  require_env "${required_name}"
+  case ${digest} in
+    *[!0-9a-f]*|'') fail 'a required SHA-256 value is malformed' 64 ;;
+  esac
+  [ "${#digest}" -eq 64 ] || fail 'a required SHA-256 value is malformed' 64
 done
 
-readonly CERT_SCOPE=toolkit-krea-only
-readonly REPO=${SN56_RELEASE_SOURCE_CHECKOUT}
-readonly RELEASE_COMMIT=${SN56_RELEASE_COMMIT}
-[[ ${RELEASE_COMMIT} =~ ^[0-9a-f]{40}$ ]] || {
-  printf 'SN56_RELEASE_COMMIT is not a full lowercase commit id\n' >&2
-  exit 64
-}
-[[ ${SN56_RELEASE_EVIDENCE_NAMESPACE} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || {
-  printf 'invalid release evidence namespace\n' >&2
-  exit 64
+fixed_python() {
+  /usr/bin/env -i \
+    PATH="${PATH}" \
+    HOME=/nonexistent \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1 \
+    /usr/bin/python3 "$@"
 }
 
-script_parent=$(dirname -- "${BASH_SOURCE[0]}")
-script_dir=$(cd -- "${script_parent}" && pwd -P)
-readonly SCRIPT_DIR=${script_dir}
-readonly VALIDATOR_SOURCE=${SCRIPT_DIR}/sn56-week6-validate-timing-provenance.py
-readonly DELEGATED_SOURCE=${SCRIPT_DIR}/sn56-week5-final-release-cert.sh
-# Patched only after the two authority files are final; tests recompute both.
-readonly VALIDATOR_SHA256=e9ffa2779a446a7b5e1cb684d5858f3ecf19d3070715a6f1445356c8acf5be74
-readonly DELEGATED_SHA256=42e5e2530e831732a44d13aa60124f4ae69b9afd249dced74c21124950d2c562
-
-temporary_directory=$(mktemp -d)
-cleanup() {
-  rm -rf -- "${temporary_directory}"
+git_checkout() {
+  /usr/bin/env -i \
+    PATH="${PATH}" \
+    HOME=/nonexistent \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    GIT_TERMINAL_PROMPT=0 \
+    /usr/bin/git --no-replace-objects \
+      -c "safe.directory=${SN56_RELEASE_SOURCE_CHECKOUT}" \
+      -c core.hooksPath=/dev/null \
+      -C "${SN56_RELEASE_SOURCE_CHECKOUT}" "$@"
 }
-trap cleanup EXIT
-chmod 0700 "${temporary_directory}"
-readonly PINNED_VALIDATOR=${temporary_directory}/validator.py
-readonly PINNED_DELEGATED=${temporary_directory}/delegated-cert.sh
 
-# Bootstrap trust without a hash-then-reopen gap. Python opens each source once,
-# hashes and copies that descriptor's bytes into our private directory, and
-# refuses zero-byte/symlink/nonregular inputs before anything can execute.
-python3 - \
-  "${VALIDATOR_SOURCE}" "${VALIDATOR_SHA256}" "${PINNED_VALIDATOR}" \
-  "${DELEGATED_SOURCE}" "${DELEGATED_SHA256}" "${PINNED_DELEGATED}" <<'PY'
-import hashlib
+git_remote() {
+  /usr/bin/env -i \
+    PATH="${PATH}" \
+    HOME=/nonexistent \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    GIT_TERMINAL_PROMPT=0 \
+    /usr/bin/git --no-replace-objects "$@"
+}
+
+# Validate all authority directory chains before a temporary directory is
+# created.  Evidence bases may be absent only at their final component.
+fixed_python - \
+  "${launcher_path}" \
+  "${SN56_RELEASE_SOURCE_CHECKOUT}" \
+  "${SN56_RELEASE_WORK_BASE}" \
+  "${SN56_RELEASE_DELEGATE_EVIDENCE_BASE}" \
+  "${SN56_RELEASE_ENVELOPE_BASE}" <<'PY'
 import os
 from pathlib import Path
 import stat
 import sys
 
-def stage(source: str, expected: str, destination: str) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(source, flags)
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_size <= 0:
-            raise SystemExit(f"authority program is not a nonempty regular file: {source}")
-        digest = hashlib.sha256()
-        chunks = []
-        while True:
-            block = os.read(fd, 1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-            chunks.append(block)
-        after = os.fstat(fd)
-        identity = lambda value: (
-            value.st_dev, value.st_ino, value.st_size,
-            value.st_mtime_ns, value.st_ctime_ns,
-        )
-        if identity(opened) != identity(after) or digest.hexdigest() != expected:
-            raise SystemExit(f"authority program identity/hash mismatch: {source}")
-        payload = b"".join(chunks)
-    finally:
-        os.close(fd)
-    target = Path(destination)
-    out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o500)
-    try:
-        view = memoryview(payload)
-        while view:
-            written = os.write(out, view)
-            if written <= 0:
-                raise SystemExit("authority program staging write failed")
-            view = view[written:]
-        os.fsync(out)
-    finally:
-        os.close(out)
+def fail(message: str) -> None:
+    raise SystemExit(message)
 
-values = sys.argv[1:]
-if len(values) != 6:
-    raise SystemExit("authority bootstrap argument error")
-stage(*values[0:3])
-stage(*values[3:6])
+def lexical(path: str, label: str) -> Path:
+    if not path.startswith(os.sep) or os.path.normpath(path) != path:
+        fail(f"{label} must be a normalized absolute path")
+    return Path(path)
+
+def direct_existing(path: str, label: str, *, directory: bool) -> None:
+    candidate = lexical(path, label)
+    try:
+        resolved = candidate.resolve(strict=True)
+        metadata = candidate.lstat()
+    except OSError as exc:
+        fail(f"{label} is unavailable: {exc}")
+    if resolved != candidate or stat.S_ISLNK(metadata.st_mode):
+        fail(f"{label} contains a symlink or lexical indirection")
+    if directory and not stat.S_ISDIR(metadata.st_mode):
+        fail(f"{label} is not a directory")
+    if not directory and not stat.S_ISREG(metadata.st_mode):
+        fail(f"{label} is not a regular file")
+
+def creatable_leaf(path: str, label: str) -> None:
+    candidate = lexical(path, label)
+    if candidate.exists() or candidate.is_symlink():
+        direct_existing(path, label, directory=True)
+    else:
+        direct_existing(str(candidate.parent), f"{label} parent", directory=True)
+
+if len(sys.argv) != 6:
+    fail("launcher directory preflight argument error")
+direct_existing(sys.argv[1], "executed launcher", directory=False)
+direct_existing(sys.argv[2], "release checkout", directory=True)
+direct_existing(sys.argv[3], "release work base", directory=True)
+creatable_leaf(sys.argv[4], "delegate evidence base")
+creatable_leaf(sys.argv[5], "outer envelope base")
 PY
 
-git_safe=(git -c safe.directory="${REPO}" -C "${REPO}")
-release_head=$("${git_safe[@]}" rev-parse HEAD)
-[[ ${release_head} == "${RELEASE_COMMIT}" ]] || {
-  printf 'release checkout HEAD differs from SN56_RELEASE_COMMIT\n' >&2
-  exit 1
+git_remote check-ref-format "${SN56_RELEASE_REMOTE_REF}" >/dev/null || \
+  fail 'SN56_RELEASE_REMOTE_REF is not a valid Git ref' 64
+
+repository_root=$(git_checkout rev-parse --show-toplevel) || \
+  fail 'release checkout is not a Git worktree'
+[ "${repository_root}" = "${SN56_RELEASE_SOURCE_CHECKOUT}" ] || \
+  fail 'release checkout is not the exact repository root'
+release_head=$(git_checkout rev-parse --verify 'HEAD^{commit}') || \
+  fail 'release checkout HEAD could not be resolved'
+[ "${release_head}" = "${SN56_RELEASE_COMMIT}" ] || \
+  fail 'release checkout HEAD differs from SN56_RELEASE_COMMIT'
+release_tree=$(git_checkout rev-parse --verify 'HEAD^{tree}') || \
+  fail 'release tree could not be resolved'
+forge_tree=$(git_checkout rev-parse --verify 'HEAD:forge') || \
+  fail 'Forge tree could not be resolved'
+origin_url=$(git_checkout remote get-url --all origin) || \
+  fail 'release checkout has no origin remote'
+[ "${origin_url}" = "${SN56_RELEASE_EXPECTED_ORIGIN_URL}" ] || \
+  fail 'release checkout origin differs from SN56_RELEASE_EXPECTED_ORIGIN_URL'
+
+private_workspace=$(
+  /usr/bin/env -i PATH="${PATH}" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    /usr/bin/mktemp -d \
+      "${SN56_RELEASE_WORK_BASE}/sn56-week6-release.XXXXXXXX"
+) || fail 'private release workspace could not be created'
+/bin/chmod 0700 "${private_workspace}" || \
+  fail 'private release workspace permissions could not be set'
+cleanup() {
+  /bin/chmod -R u+w "${private_workspace}" 2>/dev/null || :
+  /bin/rm -rf -- "${private_workspace}"
 }
-release_tree=$("${git_safe[@]}" rev-parse 'HEAD^{tree}')
-forge_tree=$("${git_safe[@]}" rev-parse 'HEAD:forge')
-release_status=$("${git_safe[@]}" status --porcelain=v1 --untracked-files=all)
-[[ -z ${release_status} ]] || {
-  printf 'release checkout is not clean\n' >&2
-  exit 1
-}
-readonly RELEASE_TREE=${release_tree}
-readonly FORGE_TREE=${forge_tree}
-export SN56_RELEASE_TREE=${RELEASE_TREE}
-export SN56_RELEASE_FORGE_TREE=${FORGE_TREE}
-export SN56_RELEASE_CERT_SCOPE=${CERT_SCOPE}
+trap cleanup EXIT HUP INT TERM
 
-readonly STAGE=${temporary_directory}/lab-evidence
-mkdir -m 0700 "${STAGE}"
-readonly STAGED_PROFILE=${STAGE}/timing-profile.json
-readonly STAGED_SOURCE_RECORD=${STAGE}/timing-source-record.json
-readonly STAGED_ARTIFACT=${STAGE}/terminal-artifact.safetensors
-readonly STAGED_GATE_LOG=${STAGE}/friday-h100-gate-log.jsonl
-readonly RECEIPT=${STAGE}/timing-provenance-receipt.json
-readonly POLICY_RECEIPT=${STAGE}/reviewed-release-timing-policy.json
+status_file=${private_workspace}/checkout-status
+git_checkout status --porcelain=v1 -z --untracked-files=all --ignored=matching \
+  >"${status_file}" || fail 'release checkout status could not be inspected'
+[ ! -s "${status_file}" ] || fail 'release checkout is not clean'
 
-stage_evidence() {
-  local source=$1
-  local expected=$2
-  local destination=$3
-  local label=$4
-  local maximum=${5-}
-  local arguments=(
-    "${PINNED_VALIDATOR}"
-    --stage-source "${source}"
-    --stage-destination "${destination}"
-    --stage-sha256 "${expected}"
-    --stage-label "${label}"
-  )
-  if [[ -n ${maximum} ]]; then
-    arguments+=(--stage-maximum-bytes "${maximum}")
-  fi
-  python3 "${arguments[@]}"
-}
+remote_rows=${private_workspace}/remote-ref
+git_remote ls-remote --exit-code -- \
+  "${SN56_RELEASE_EXPECTED_ORIGIN_URL}" "${SN56_RELEASE_REMOTE_REF}" \
+  >"${remote_rows}" || fail 'release remote ref could not be resolved independently'
+fixed_python - \
+  "${remote_rows}" "${SN56_RELEASE_REMOTE_REF}" "${SN56_RELEASE_COMMIT}" <<'PY'
+import re
+from pathlib import Path
+import sys
 
-stage_evidence "${SN56_RELEASE_TIMING_PROFILE}" \
-  "${SN56_RELEASE_TIMING_PROFILE_SHA256}" "${STAGED_PROFILE}" \
-  'timing profile' 65536
-stage_evidence "${SN56_RELEASE_TIMING_SOURCE_RECORD}" \
-  "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" "${STAGED_SOURCE_RECORD}" \
-  'timing source record' 1048576
-stage_evidence "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT}" \
-  "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" "${STAGED_ARTIFACT}" \
-  'terminal artifact'
-stage_evidence "${SN56_RELEASE_FRIDAY_GATE_LOG}" \
-  "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}" "${STAGED_GATE_LOG}" \
-  'Friday H100 gate log' 16777216
+payload = Path(sys.argv[1]).read_bytes()
+expected = f"{sys.argv[3]}\t{sys.argv[2]}\n".encode("utf-8")
+if re.fullmatch(rb"[0-9a-f]{40}\trefs/heads/[^\x00-\x20\x7f]+\n", payload) is None:
+    raise SystemExit("remote ref did not resolve to one canonical row")
+if payload != expected:
+    raise SystemExit("remote ref differs from SN56_RELEASE_COMMIT")
+PY
 
-python3 "${PINNED_VALIDATOR}" \
-  --profile "${STAGED_PROFILE}" \
-  --profile-file-sha256 "${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
-  --raw-record "${STAGED_SOURCE_RECORD}" \
-  --raw-record-file-sha256 "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
-  --terminal-artifact "${STAGED_ARTIFACT}" \
-  --archived-terminal-artifact "${STAGED_ARTIFACT}" \
-  --terminal-artifact-file-sha256 "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
-  --gate-log "${STAGED_GATE_LOG}" \
-  --gate-log-file-sha256 "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}" \
-  --source-run-id "${SN56_RELEASE_TIMING_SOURCE_RUN_ID}" \
-  --gate-session-id "${SN56_RELEASE_H100_GATE_SESSION_ID}" \
-  --rental-started-at-utc "${SN56_RELEASE_H100_RENTAL_STARTED_AT_UTC}" \
-  --rental-ended-at-utc "${SN56_RELEASE_H100_RENTAL_ENDED_AT_UTC}" \
-  --forge-repository "${REPO}" \
-  --forge-commit "${RELEASE_COMMIT}" \
-  --release-tree "${RELEASE_TREE}" \
-  --certificate-scope "${CERT_SCOPE}" \
-  --bundle-id "${SN56_RELEASE_TIMING_BUNDLE_ID}" \
-  --bundle-sha256 "${SN56_RELEASE_TIMING_BUNDLE_SHA256}" \
-  --model-type "${SN56_RELEASE_TIMING_MODEL_TYPE}" \
-  --current-dataset-size "${SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE}" \
-  --dataset-regime "${SN56_RELEASE_TIMING_DATASET_REGIME}" \
-  --accelerator-identity "${SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY}" \
-  --receipt "${RECEIPT}"
+archive=${private_workspace}/release.tar
+tree_index=${private_workspace}/release-tree.z
+materialized_source=${private_workspace}/source
+/bin/mkdir -m 0700 "${materialized_source}" || \
+  fail 'materialized source directory could not be created'
+git_checkout archive --format=tar "${SN56_RELEASE_COMMIT}" >"${archive}" || \
+  fail 'exact release archive could not be produced'
+[ -s "${archive}" ] || fail 'exact release archive is empty'
+archive_commit=$(
+  git_remote get-tar-commit-id <"${archive}"
+) || fail 'release archive has no embedded commit identity'
+[ "${archive_commit}" = "${SN56_RELEASE_COMMIT}" ] || \
+  fail 'release archive embedded commit differs'
+git_checkout ls-tree -rz --full-tree "${SN56_RELEASE_COMMIT}" \
+  >"${tree_index}" || fail 'release tree index could not be produced'
 
-python3 "${PINNED_VALIDATOR}" \
-  --assert-receipt "${RECEIPT}" \
-  --forge-commit "${RELEASE_COMMIT}" \
-  --release-tree "${RELEASE_TREE}" \
-  --certificate-scope "${CERT_SCOPE}" \
-  --profile-file-sha256 "${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
-  --raw-record-file-sha256 "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
-  --terminal-artifact-file-sha256 "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
-  --gate-log-file-sha256 "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}"
+# Extract without tar(1).  Only canonical regular files/directories are
+# accepted; every file is checked against its committed Git blob and mode.
+materialization_result=${private_workspace}/materialization.env
+fixed_python - \
+  "${archive}" "${tree_index}" "${materialized_source}" \
+  "${launcher_path}" >"${materialization_result}" <<'PY'
+import hashlib
+import os
+from pathlib import Path, PurePosixPath
+import stat
+import sys
+import tarfile
 
-python3 "${PINNED_VALIDATOR}" \
-  --assert-release-policy \
-  --forge-repository "${REPO}" \
-  --forge-commit "${RELEASE_COMMIT}" \
-  --release-tree "${RELEASE_TREE}" \
-  --receipt "${POLICY_RECEIPT}"
+def fail(message: str) -> None:
+    raise SystemExit(message)
 
-# The delegated build/GPU certificate receives the same release identity and a
-# fixed hash-pinned script. It cannot be replaced with an environment override.
-/bin/bash "${PINNED_DELEGATED}"
+def safe_relative(raw: str, label: str) -> PurePosixPath:
+    if any(character in raw for character in ("\x00", "\n", "\r")):
+        fail(f"{label} contains a control character")
+    value = PurePosixPath(raw)
+    if (
+        value.is_absolute()
+        or str(value) in {"", "."}
+        or any(part in {"", ".", ".."} for part in value.parts)
+        or value.as_posix() != raw.rstrip("/")
+    ):
+        fail(f"{label} is unsafe: {raw!r}")
+    return value
 
-readonly DELEGATED_EVIDENCE=/mnt/sn56-evidence/final-release-cert/${SN56_RELEASE_EVIDENCE_NAMESPACE}
-readonly DELEGATED_RESULT=${DELEGATED_EVIDENCE}/result.env
-[[ -d ${DELEGATED_EVIDENCE} && -f ${DELEGATED_EVIDENCE}/MANIFEST.sha256 ]] || {
-  printf 'delegated certificate evidence is incomplete: %s\n' "${DELEGATED_EVIDENCE}" >&2
-  exit 1
-}
-python3 "${PINNED_VALIDATOR}" \
-  --assert-result-env "${DELEGATED_RESULT}" \
-  --forge-commit "${RELEASE_COMMIT}" \
-  --release-tree "${RELEASE_TREE}" \
-  --certificate-scope "${CERT_SCOPE}"
-(
-  cd "${DELEGATED_EVIDENCE}"
-  sha256sum -c MANIFEST.sha256
-) >"${temporary_directory}/delegated-manifest-check.txt"
+def file_bytes_nofollow(path: Path, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"{label} could not be opened: {exc}")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+            fail(f"{label} is not a nonempty regular file")
+        chunks = []
+        consumed = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+            consumed += len(block)
+        after = os.fstat(descriptor)
+        identity = lambda item: (
+            item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns
+        )
+        if consumed != before.st_size or identity(before) != identity(after):
+            fail(f"{label} changed while read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
-readonly ENVELOPE_BASE=/mnt/sn56-evidence/week6-final-release-cert
-readonly ENVELOPE=${ENVELOPE_BASE}/${SN56_RELEASE_EVIDENCE_NAMESPACE}
-[[ ! -e ${ENVELOPE} && ! -L ${ENVELOPE} ]] || {
-  printf 'Week-6 evidence envelope already exists: %s\n' "${ENVELOPE}" >&2
-  exit 1
-}
-install -d -o root -g root -m 0750 "${ENVELOPE_BASE}"
-install -d -o root -g root -m 0750 "${ENVELOPE}"
+if len(sys.argv) != 5:
+    fail("release extraction argument error")
+archive = Path(sys.argv[1])
+index = Path(sys.argv[2])
+destination = Path(sys.argv[3])
+launcher = Path(sys.argv[4])
 
-stage_evidence "${STAGED_PROFILE}" "${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
-  "${ENVELOPE}/timing-profile.json" 'envelope timing profile' 65536
-stage_evidence "${STAGED_SOURCE_RECORD}" "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
-  "${ENVELOPE}/timing-source-record.json" 'envelope timing source record' 1048576
-stage_evidence "${STAGED_ARTIFACT}" "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
-  "${ENVELOPE}/terminal-artifact.safetensors" 'envelope terminal artifact'
-stage_evidence "${STAGED_GATE_LOG}" "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}" \
-  "${ENVELOPE}/friday-h100-gate-log.jsonl" 'envelope gate log' 16777216
+committed: dict[str, tuple[str, str]] = {}
+for row in index.read_bytes().split(b"\0"):
+    if not row:
+        continue
+    try:
+        metadata, raw_path = row.split(b"\t", 1)
+        mode_bytes, type_bytes, object_bytes = metadata.split(b" ", 2)
+        path_text = raw_path.decode("utf-8", errors="strict")
+        mode = mode_bytes.decode("ascii")
+        object_type = type_bytes.decode("ascii")
+        object_id = object_bytes.decode("ascii")
+    except (UnicodeError, ValueError) as exc:
+        fail(f"Git tree index is malformed: {exc}")
+    relative = safe_relative(path_text, "committed path")
+    if object_type != "blob" or mode not in {"100644", "100755"}:
+        fail(f"unsupported committed entry: {path_text}")
+    if len(object_id) != 40 or any(ch not in "0123456789abcdef" for ch in object_id):
+        fail(f"committed object id is malformed: {path_text}")
+    if relative.as_posix() in committed:
+        fail(f"duplicate committed path: {path_text}")
+    committed[relative.as_posix()] = (mode, object_id)
+if not committed:
+    fail("release commit contains no regular files")
 
-receipt_hash_line=$(sha256sum "${RECEIPT}")
-receipt_sha256=${receipt_hash_line%% *}
-policy_hash_line=$(sha256sum "${POLICY_RECEIPT}")
-policy_receipt_sha256=${policy_hash_line%% *}
-stage_evidence "${RECEIPT}" "${receipt_sha256}" \
-  "${ENVELOPE}/timing-provenance-receipt.json" 'envelope timing receipt' 262144
-stage_evidence "${POLICY_RECEIPT}" "${policy_receipt_sha256}" \
-  "${ENVELOPE}/reviewed-release-timing-policy.json" 'envelope release policy' 65536
-install -o root -g root -m 0440 \
-  "${temporary_directory}/delegated-manifest-check.txt" \
-  "${ENVELOPE}/delegated-manifest-check.txt"
+seen_members: set[str] = set()
+extracted: dict[str, tuple[str, str]] = {}
+with tarfile.open(archive, mode="r:") as bundle:
+    members = bundle.getmembers()
+    validated = []
+    for member in members:
+        relative = safe_relative(member.name, "archive member")
+        name = relative.as_posix()
+        if name in seen_members:
+            fail(f"duplicate archive member: {name}")
+        seen_members.add(name)
+        if not (member.isdir() or member.isreg()):
+            fail(f"archive member is not a regular file/directory: {name}")
+        validated.append((member, relative))
+    for member, relative in sorted(
+        validated, key=lambda item: (len(item[1].parts), item[1].as_posix())
+    ):
+        target = destination.joinpath(*relative.parts)
+        if member.isdir():
+            if target.exists():
+                if not target.is_dir() or target.is_symlink():
+                    fail(f"archive directory collides with a file: {relative}")
+            else:
+                target.mkdir(mode=0o700)
+            continue
+        name = relative.as_posix()
+        if name not in committed:
+            fail(f"archive contains a path absent from the commit: {name}")
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            fail(f"archive file path collides: {name}")
+        source = bundle.extractfile(member)
+        if source is None:
+            fail(f"archive file is unreadable: {name}")
+        mode, object_id = committed[name]
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(target, flags, 0o700 if mode == "100755" else 0o600)
+        digest = hashlib.sha256()
+        git_digest = hashlib.sha1()  # noqa: S324 - Git SHA-1 object identity
+        git_digest.update(f"blob {member.size}\0".encode("ascii"))
+        consumed = 0
+        try:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                consumed += len(block)
+                digest.update(block)
+                git_digest.update(block)
+                view = memoryview(block)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        fail(f"archive extraction made no progress: {name}")
+                    view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+            source.close()
+        if consumed != member.size or git_digest.hexdigest() != object_id:
+            fail(f"archive bytes differ from committed blob: {name}")
+        os.chmod(target, 0o700 if mode == "100755" else 0o600)
+        extracted[name] = (mode, digest.hexdigest())
 
-python3 "${PINNED_VALIDATOR}" \
-  --assert-receipt "${ENVELOPE}/timing-provenance-receipt.json" \
-  --forge-commit "${RELEASE_COMMIT}" \
-  --release-tree "${RELEASE_TREE}" \
-  --certificate-scope "${CERT_SCOPE}" \
-  --profile-file-sha256 "${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
-  --raw-record-file-sha256 "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
-  --terminal-artifact-file-sha256 "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
-  --gate-log-file-sha256 "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}"
+if set(extracted) != set(committed):
+    missing = sorted(set(committed) - set(extracted))
+    extra = sorted(set(extracted) - set(committed))
+    fail(f"materialized file set differs: missing={missing[:3]} extra={extra[:3]}")
 
-delegated_manifest_hash_line=$(sha256sum "${DELEGATED_EVIDENCE}/MANIFEST.sha256")
-delegated_manifest_sha256=${delegated_manifest_hash_line%% *}
-completed_at_utc=$(date -u +%FT%TZ)
-{
-  printf 'schema=sn56.week6.final-release-cert-envelope.v2\n'
-  printf 'state=PASS\n'
-  printf 'certificate_scope=%s\n' "${CERT_SCOPE}"
-  printf 'source_commit=%s\n' "${RELEASE_COMMIT}"
-  printf 'source_tree=%s\n' "${RELEASE_TREE}"
-  printf 'forge_tree=%s\n' "${FORGE_TREE}"
-  printf 'timing_evidence_scope=lab-only\n'
-  printf 'production_timing_input=reviewed-conservative-constant\n'
-  printf 'profile_file_sha256=%s\n' "${SN56_RELEASE_TIMING_PROFILE_SHA256}"
-  printf 'raw_record_file_sha256=%s\n' "${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}"
-  printf 'terminal_artifact_file_sha256=%s\n' "${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}"
-  printf 'gate_log_file_sha256=%s\n' "${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}"
-  printf 'timing_receipt_file_sha256=%s\n' "${receipt_sha256}"
-  printf 'release_policy_receipt_file_sha256=%s\n' "${policy_receipt_sha256}"
-  printf 'delegated_evidence=%s\n' "${DELEGATED_EVIDENCE}"
-  printf 'delegated_manifest_sha256=%s\n' "${delegated_manifest_sha256}"
-  printf 'completed_at_utc=%s\n' "${completed_at_utc}"
-} >"${ENVELOPE}/result.env"
+rows = [
+    f"{digest} {mode} {name}\n"
+    for name, (mode, digest) in sorted(extracted.items())
+]
+manifest_sha256 = hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
+committed_launcher = destination / "ops/release/sn56-week6-final-release-cert.sh"
+if file_bytes_nofollow(launcher, "executed launcher") != file_bytes_nofollow(
+    committed_launcher, "committed launcher"
+):
+    fail("executed launcher bytes differ from selected committed launcher")
 
-(
-  cd "${ENVELOPE}"
-  find . -type f ! -name MANIFEST.sha256 -print0 \
-    | LC_ALL=C sort -z \
-    | xargs -0 -r sha256sum >MANIFEST.sha256
-)
-chmod -R a-w "${ENVELOPE}"
-sync
-manifest_hash_line=$(sha256sum "${ENVELOPE}/MANIFEST.sha256")
-manifest_sha256=${manifest_hash_line%% *}
-printf 'SN56_WEEK6_FINAL_RELEASE_CERT_PASS evidence=%s manifest=%s\n' \
-  "${ENVELOPE}" "${manifest_sha256}"
+archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+print(f"SN56_RELEASE_MATERIALIZED_MANIFEST_SHA256={manifest_sha256}")
+print(f"SN56_RELEASE_ARCHIVE_SHA256={archive_sha256}")
+PY
+
+materialized_manifest=''
+archive_sha256=''
+materialization_rows=0
+while IFS='=' read -r name value
+do
+  materialization_rows=$((materialization_rows + 1))
+  case ${name} in
+    SN56_RELEASE_MATERIALIZED_MANIFEST_SHA256)
+      [ -z "${materialized_manifest}" ] || fail 'duplicate materialized manifest result'
+      materialized_manifest=${value}
+      ;;
+    SN56_RELEASE_ARCHIVE_SHA256)
+      [ -z "${archive_sha256}" ] || fail 'duplicate archive hash result'
+      archive_sha256=${value}
+      ;;
+    *) fail 'unexpected materialization result' ;;
+  esac
+done <"${materialization_result}"
+[ "${materialization_rows}" -eq 2 ] || fail 'materialization result is incomplete'
+for digest in "${materialized_manifest}" "${archive_sha256}"
+do
+  case ${digest} in *[!0-9a-f]*|'') fail 'materialization hash is malformed' ;; esac
+  [ "${#digest}" -eq 64 ] || fail 'materialization hash is malformed'
+done
+
+worker=${materialized_source}/ops/release/sn56-week6-final-release-cert-worker.sh
+[ -f "${worker}" ] && [ ! -L "${worker}" ] && [ -x "${worker}" ] || \
+  fail 'archived Week-6 release worker is absent or not executable'
+
+exec /usr/bin/env -i \
+  PATH="${PATH}" \
+  HOME=/nonexistent \
+  LANG=C.UTF-8 \
+  LC_ALL=C.UTF-8 \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  GIT_CONFIG_NOSYSTEM=1 \
+  GIT_CONFIG_GLOBAL=/dev/null \
+  GIT_NO_REPLACE_OBJECTS=1 \
+  GIT_TERMINAL_PROMPT=0 \
+  SN56_RELEASE_CERT_MODE="${SN56_RELEASE_CERT_MODE}" \
+  SN56_RELEASE_COMMIT="${SN56_RELEASE_COMMIT}" \
+  SN56_RELEASE_TREE="${release_tree}" \
+  SN56_RELEASE_FORGE_TREE="${forge_tree}" \
+  SN56_RELEASE_SOURCE_CHECKOUT="${SN56_RELEASE_SOURCE_CHECKOUT}" \
+  SN56_RELEASE_EXPECTED_ORIGIN_URL="${SN56_RELEASE_EXPECTED_ORIGIN_URL}" \
+  SN56_RELEASE_REMOTE_REF="${SN56_RELEASE_REMOTE_REF}" \
+  SN56_RELEASE_EVIDENCE_NAMESPACE="${SN56_RELEASE_EVIDENCE_NAMESPACE}" \
+  SN56_RELEASE_DELEGATE_EVIDENCE_BASE="${SN56_RELEASE_DELEGATE_EVIDENCE_BASE}" \
+  SN56_RELEASE_ENVELOPE_BASE="${SN56_RELEASE_ENVELOPE_BASE}" \
+  SN56_RELEASE_WORK_BASE="${SN56_RELEASE_WORK_BASE}" \
+  SN56_RELEASE_PRIVATE_WORKSPACE="${private_workspace}" \
+  SN56_RELEASE_MATERIALIZED_SOURCE="${materialized_source}" \
+  SN56_RELEASE_MATERIALIZED_MANIFEST_SHA256="${materialized_manifest}" \
+  SN56_RELEASE_ARCHIVE_SHA256="${archive_sha256}" \
+  SN56_RELEASE_TOOLKIT_IMAGE_TAG="${SN56_RELEASE_TOOLKIT_IMAGE_TAG}" \
+  SN56_RELEASE_LEGACY_IMAGE_TAG="${SN56_RELEASE_LEGACY_IMAGE_TAG}" \
+  SN56_RELEASE_EXPECTED_DOCKER_ROOT="${SN56_RELEASE_EXPECTED_DOCKER_ROOT}" \
+  SN56_RELEASE_EXPECTED_CONTAINERD_ROOT="${SN56_RELEASE_EXPECTED_CONTAINERD_ROOT}" \
+  SN56_RELEASE_TIMING_PROFILE="${SN56_RELEASE_TIMING_PROFILE}" \
+  SN56_RELEASE_TIMING_PROFILE_SHA256="${SN56_RELEASE_TIMING_PROFILE_SHA256}" \
+  SN56_RELEASE_TIMING_SOURCE_RECORD="${SN56_RELEASE_TIMING_SOURCE_RECORD}" \
+  SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256="${SN56_RELEASE_TIMING_SOURCE_RECORD_SHA256}" \
+  SN56_RELEASE_TIMING_TERMINAL_ARTIFACT="${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT}" \
+  SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256="${SN56_RELEASE_TIMING_TERMINAL_ARTIFACT_SHA256}" \
+  SN56_RELEASE_FRIDAY_GATE_LOG="${SN56_RELEASE_FRIDAY_GATE_LOG}" \
+  SN56_RELEASE_FRIDAY_GATE_LOG_SHA256="${SN56_RELEASE_FRIDAY_GATE_LOG_SHA256}" \
+  SN56_RELEASE_TIMING_SOURCE_RUN_ID="${SN56_RELEASE_TIMING_SOURCE_RUN_ID}" \
+  SN56_RELEASE_H100_GATE_SESSION_ID="${SN56_RELEASE_H100_GATE_SESSION_ID}" \
+  SN56_RELEASE_H100_RENTAL_STARTED_AT_UTC="${SN56_RELEASE_H100_RENTAL_STARTED_AT_UTC}" \
+  SN56_RELEASE_H100_RENTAL_ENDED_AT_UTC="${SN56_RELEASE_H100_RENTAL_ENDED_AT_UTC}" \
+  SN56_RELEASE_TIMING_BUNDLE_ID="${SN56_RELEASE_TIMING_BUNDLE_ID}" \
+  SN56_RELEASE_TIMING_BUNDLE_SHA256="${SN56_RELEASE_TIMING_BUNDLE_SHA256}" \
+  SN56_RELEASE_TIMING_MODEL_TYPE="${SN56_RELEASE_TIMING_MODEL_TYPE}" \
+  SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE="${SN56_RELEASE_TIMING_CURRENT_DATASET_SIZE}" \
+  SN56_RELEASE_TIMING_DATASET_REGIME="${SN56_RELEASE_TIMING_DATASET_REGIME}" \
+  SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY="${SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY}" \
+  /bin/bash "${worker}"

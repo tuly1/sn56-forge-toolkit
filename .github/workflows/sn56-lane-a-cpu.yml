@@ -39,8 +39,11 @@ jobs:
             forge/tasks/integrity.py \
             forge/tasks/publication.py \
             ops/calibration/run_krea_timing_lab.py \
-            ops/release/sn56-week6-validate-timing-provenance.py
+            ops/release/sn56-week6-build-gpu-cert.py \
+            ops/release/sn56-week6-validate-timing-provenance.py \
+            tests/integration/sn56-week6-generate-release-fixture.py
       - name: Check release-authority shell syntax
         run: |
-          bash -n ops/release/sn56-week5-final-release-cert.sh
-          bash -n ops/release/sn56-week6-final-release-cert.sh
+          sh -n ops/release/sn56-week6-final-release-cert.sh
+          bash -n ops/release/sn56-week6-final-release-cert-worker.sh
+          bash -n tests/integration/sn56-week6-release-dry-run.sh

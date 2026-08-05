@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
+from types import ModuleType
 
 import pytest
 import yaml
@@ -14,7 +18,7 @@ from forge.data.schema import ImageSpec
 from ops.calibration import run_krea_timing_lab as launcher
 
 
-def _runtime_attestations(runtime: Path) -> None:
+def _runtime_manifest(runtime: Path) -> Path:
     capabilities = {
         name: True for name in krea_runtime.RUNTIME_MANIFEST_CAPABILITIES
     }
@@ -30,46 +34,91 @@ def _runtime_attestations(runtime: Path) -> None:
     }
     manifest_path = runtime / krea_runtime.CAPABILITY_MANIFEST_FILENAME
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path
+
+
+def _fake_run_script() -> str:
+    """Supplemental supervisor lifecycle fake; not loader-compatibility proof."""
+
+    return '''import hashlib, json, os, stat, struct, sys, time, yaml
+from pathlib import Path
+config_path = Path(sys.argv[1])
+if config_path.suffix != ".yaml" or not config_path.is_file():
+    raise SystemExit("launcher did not execute a real .yaml config")
+if stat.S_IMODE(config_path.parent.stat().st_mode) != 0o700:
+    raise SystemExit("launcher workspace is not private")
+config_payload = config_path.read_bytes()
+poison = {"PYTHONPATH", "LD_PRELOAD", "HF_TOKEN", "FORGE_KREA_BUNDLE", "SN56_RELEASE_COMMIT"}
+if poison.intersection(os.environ):
+    raise SystemExit("caller-controlled poison leaked into child environment")
+if os.environ.get("PATH") != "/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin":
+    raise SystemExit("child PATH is not the fixed supervisor constant")
+if os.environ.get("HOME") != str(config_path.parent / "child-home"):
+    raise SystemExit("child HOME is not supervisor-owned")
+if os.environ.get("TMPDIR") != str(config_path.parent / "child-tmp"):
+    raise SystemExit("child TMPDIR is not supervisor-owned")
+document = yaml.safe_load(config_payload)
+repo_name = document["config"]["name"]
+process = document["config"]["process"][0]
+save_root = Path(process["training_folder"]) / repo_name
+planned_steps = process["train"]["steps"]
+checkpoint = save_root / f"{repo_name}_000000200.safetensors"
+terminal = save_root / f"{repo_name}.safetensors"
+def write(path, step):
+    metadata = {"training_info": json.dumps({"step": step, "epoch": 1})}
+    header = json.dumps({"__metadata__": metadata, "weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode("utf-8")
+    Path(path).write_bytes(struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0))
+time.sleep(0.05)
+write(checkpoint, 200)
+time.sleep(0.08)
+write(terminal, planned_steps)
+print(f"EXECUTED_CONFIG_SHA256={hashlib.sha256(config_payload).hexdigest()}", flush=True)
+print(f"COMMITTED_RUNTIME_A_EXECUTED=1 {planned_steps}/{planned_steps} loss=0.1", flush=True)
+'''
+
+
+def _git(runtime: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        [launcher._ABSOLUTE_GIT, "-C", str(runtime), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _initialize_runtime_object_store(
+    runtime: Path,
+    monkeypatch,
+) -> tuple[str, str, bytes]:
+    runtime.mkdir()
+    committed_run = _fake_run_script().encode("utf-8")
+    (runtime / "run.py").write_bytes(committed_run)
+    _runtime_manifest(runtime)
+    (runtime / ".gitignore").write_text(
+        f"{krea_runtime.RUNTIME_IDENTITY_FILENAME}\n",
+        encoding="utf-8",
+    )
+    _git(runtime, "init", "-q")
+    _git(runtime, "config", "user.name", "SN56 Test")
+    _git(runtime, "config", "user.email", "sn56@example.invalid")
+    _git(runtime, "add", ".gitignore", "run.py", krea_runtime.CAPABILITY_MANIFEST_FILENAME)
+    _git(runtime, "commit", "-q", "-m", "committed runtime A")
+    commit = _git(runtime, "rev-parse", "HEAD^{commit}")
+    tree = _git(runtime, "rev-parse", "HEAD^{tree}")
+    monkeypatch.setattr(krea_runtime, "OWNED_RUNTIME_COMMIT", commit)
     identity = {
         "schema": 1,
         "runtime_repository": krea_runtime.OWNED_RUNTIME_REPOSITORY,
-        "runtime_commit": krea_runtime.OWNED_RUNTIME_COMMIT,
+        "runtime_commit": commit,
         "capability_manifest_sha256": hashlib.sha256(
-            manifest_path.read_bytes()
+            (runtime / krea_runtime.CAPABILITY_MANIFEST_FILENAME).read_bytes()
         ).hexdigest(),
     }
-    (runtime / krea_runtime.RUNTIME_IDENTITY_FILENAME).write_text(
-        json.dumps(identity),
-        encoding="utf-8",
+    (runtime / krea_runtime.RUNTIME_IDENTITY_FILENAME).write_bytes(
+        launcher._canonical_bytes(identity)
     )
-
-
-def _fake_run_script(
-    save_root: Path,
-    repo_name: str,
-    planned_steps: int,
-    *,
-    expected_config_sha256: str,
-) -> str:
-    checkpoint = save_root / f"{repo_name}_000000200.safetensors"
-    terminal = save_root / f"{repo_name}.safetensors"
-    return f'''import hashlib, json, struct, sys, time
-from pathlib import Path
-config_path = Path(sys.argv[1])
-if not str(config_path).startswith(("/proc/self/fd/", "/dev/fd/")):
-    raise SystemExit("launcher did not execute an inherited config descriptor")
-if hashlib.sha256(config_path.read_bytes()).hexdigest() != {expected_config_sha256!r}:
-    raise SystemExit("launcher did not execute captured config A")
-def write(path, step):
-    metadata = {{"training_info": json.dumps({{"step": step, "epoch": 1}})}}
-    header = json.dumps({{"__metadata__": metadata, "weight": {{"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}}}).encode("utf-8")
-    Path(path).write_bytes(struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0))
-time.sleep(0.05)
-write({str(checkpoint)!r}, 200)
-time.sleep(0.08)
-write({str(terminal)!r}, {planned_steps})
-print("{planned_steps}/{planned_steps} loss=0.1", flush=True)
-'''
+    return commit, tree, committed_run
 
 
 def _arguments(
@@ -157,8 +206,78 @@ def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def test_lab_launcher_executes_captured_config_a_across_original_a_b_a_swap(
+def _load_exact_pinned_config_loader(tmp_path, monkeypatch):
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "pinned_ai_toolkit"
+        / "config.py"
+    )
+    metadata_path = fixture.with_name("METADATA.json")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    source = fixture.read_bytes()
+    assert metadata == {
+        "schema": 1,
+        "repository": "https://github.com/tuly1/sn56-ai-toolkit-mirror.git",
+        "commit": krea_runtime.OWNED_RUNTIME_COMMIT,
+        "path": "toolkit/config.py",
+        "sha256": "526b26b8017a09974db6135c4990b84317a473f91108da60929db469f3008fe5",
+        "retrieved_at_utc": "2026-08-04T00:00:00Z",
+    }
+    assert hashlib.sha256(source).hexdigest() == metadata["sha256"]
+
+    oyaml_fixture = ModuleType("oyaml")
+    oyaml_fixture.SafeLoader = yaml.SafeLoader
+    oyaml_fixture.load = yaml.load
+    toolkit_fixture = ModuleType("toolkit")
+    toolkit_fixture.__path__ = []
+    paths_fixture = ModuleType("toolkit.paths")
+    paths_fixture.TOOLKIT_ROOT = str(tmp_path / "toolkit-root")
+    monkeypatch.setitem(sys.modules, "oyaml", oyaml_fixture)
+    monkeypatch.setitem(sys.modules, "toolkit", toolkit_fixture)
+    monkeypatch.setitem(sys.modules, "toolkit.paths", paths_fixture)
+
+    specification = importlib.util.spec_from_file_location(
+        "sn56_exact_pinned_ai_toolkit_config",
+        fixture,
+    )
+    assert specification is not None and specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def test_exact_pinned_loader_accepts_real_yaml_and_rejects_fd_pseudo_path(
     tmp_path, monkeypatch
+):
+    pinned_config = _load_exact_pinned_config_loader(tmp_path, monkeypatch)
+    workspace = tmp_path / "private-supervisor"
+    workspace.mkdir(mode=0o700)
+    captured = workspace / "captured-config.yaml"
+    captured.write_bytes(
+        b"job: extension\nconfig:\n  name: pinned-loader-contract\n"
+    )
+
+    loaded = pinned_config.get_config(str(captured))
+
+    assert loaded["job"] == "extension"
+    assert loaded["config"]["name"] == "pinned-loader-contract"
+    descriptor = os.open(captured, os.O_RDONLY)
+    try:
+        descriptor_path = next(
+            f"{root}/{descriptor}"
+            for root in ("/proc/self/fd", "/dev/fd")
+            if os.path.exists(f"{root}/{descriptor}")
+        )
+        with pytest.raises(ValueError, match="must be a json or yaml file"):
+            pinned_config.get_config(descriptor_path)
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("index_flag", ["--assume-unchanged", "--skip-worktree"])
+def test_lab_launcher_executes_committed_runtime_a_despite_hidden_worktree_b(
+    tmp_path, monkeypatch, index_flag
 ):
     expected_commit = "a" * 40
     expected_tree = "b" * 40
@@ -168,8 +287,10 @@ def test_lab_launcher_executes_captured_config_a_across_original_a_b_a_swap(
         lambda: (expected_commit, expected_tree),
     )
     runtime = tmp_path / "owned-runtime"
-    runtime.mkdir()
-    _runtime_attestations(runtime)
+    runtime_commit, runtime_tree, committed_run = _initialize_runtime_object_store(
+        runtime,
+        monkeypatch,
+    )
     repo_name = "lab-krea"
     save_root = tmp_path / "uploaded-checkpoints" / repo_name
     save_root.parent.mkdir(parents=True)
@@ -204,6 +325,13 @@ def test_lab_launcher_executes_captured_config_a_across_original_a_b_a_swap(
         krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV,
         str(runtime),
     )
+    for poison_key in (
+        "PYTHONPATH",
+        "LD_PRELOAD",
+        "HF_TOKEN",
+        "SN56_RELEASE_COMMIT",
+    ):
+        monkeypatch.setenv(poison_key, "must-not-reach-child")
     accelerator_calls = []
 
     def live_accelerator(**_kwargs):
@@ -220,33 +348,33 @@ def test_lab_launcher_executes_captured_config_a_across_original_a_b_a_swap(
     config.write_config(generated, str(config_path))
     original_config_payload = config_path.read_bytes()
     original_config_sha256 = hashlib.sha256(original_config_payload).hexdigest()
-    runtime_verifications = []
+    object_identity_calls = []
+    real_object_identity = launcher._git_object_store_identity
 
-    def verify_runtime(*_args, **_kwargs):
-        runtime_verifications.append(True)
-        if len(runtime_verifications) == 1:
+    def observed_object_identity(path):
+        object_identity_calls.append(True)
+        if len(object_identity_calls) == 1:
             incompatible_b = b"config:\n  name: incompatible-B\n"
             config_path.write_bytes(incompatible_b)
             assert config_path.read_bytes() == incompatible_b
             config_path.write_bytes(original_config_payload)
-        return str(runtime)
+        return real_object_identity(path)
 
     monkeypatch.setattr(
-        krea_runtime,
-        "verify_selected_runtime",
-        verify_runtime,
+        launcher,
+        "_git_object_store_identity",
+        observed_object_identity,
     )
     planned_steps = generated["config"]["process"][0]["train"]["steps"]
-    sealed_config_path = evidence / ".receipt.json.executed-config.yaml"
+    _git(runtime, "update-index", index_flag, "run.py")
+    hidden_b_marker = tmp_path / f"hidden-b-{index_flag.removeprefix('--')}"
     (runtime / "run.py").write_text(
-        _fake_run_script(
-            save_root,
-            repo_name,
-            planned_steps,
-            expected_config_sha256=original_config_sha256,
-        ),
+        "from pathlib import Path\n"
+        f"Path({str(hidden_b_marker)!r}).write_text('B executed')\n"
+        "raise SystemExit(91)\n",
         encoding="utf-8",
     )
+    assert _git(runtime, "status", "--porcelain=v1", "--untracked-files=all") == ""
     terminal = save_root / f"{repo_name}.safetensors"
     args = launcher.build_parser().parse_args(
         _arguments(
@@ -261,6 +389,7 @@ def test_lab_launcher_executes_captured_config_a_across_original_a_b_a_swap(
 
     receipt = launcher.run_lab(args)
 
+    sealed_config_path = Path(receipt["config"]["executed"]["path"])
     raw_path = Path(str(sealed_config_path) + ".effective-runtime.json")
     raw = json.loads(raw_path.read_text(encoding="utf-8"))
     profile = json.loads((evidence / "profile.json").read_text(encoding="utf-8"))
@@ -290,7 +419,9 @@ def test_lab_launcher_executes_captured_config_a_across_original_a_b_a_swap(
     ]["artifact_sha256"]
     assert config_path.read_bytes() == original_config_payload
     assert sealed_config_path.read_bytes() == original_config_payload
+    assert sealed_config_path.suffix == ".yaml"
     assert sealed_config_path.stat().st_mode & 0o777 == 0o400
+    assert sealed_config_path.parent.stat().st_mode & 0o777 == 0o700
     assert not Path(str(config_path) + ".effective-runtime.json").exists()
     assert receipt["config"] == {
         "original": {
@@ -373,8 +504,21 @@ def test_lab_launcher_executes_captured_config_a_across_original_a_b_a_swap(
     assert receipt["friday_h100_gate_log"]["event_sha256"] == receipt[
         "friday_h100_gate_log"
     ]["sha256"]
+    runtime_receipt = receipt["runtime"]
+    assert runtime_receipt["commit"] == runtime_commit
+    assert runtime_receipt["tree"] == runtime_tree
+    assert runtime_receipt["object_store_path"] == str(runtime)
+    assert len(runtime_receipt["archive_sha256"]) == 64
+    assert len(runtime_receipt["materialized_file_manifest_sha256"]) == 64
+    assert (
+        Path(runtime_receipt["materialized_path"]) / "run.py"
+    ).read_bytes() == committed_run
+    training_log = (evidence / "training.log").read_text(encoding="utf-8")
+    assert f"EXECUTED_CONFIG_SHA256={original_config_sha256}" in training_log
+    assert "COMMITTED_RUNTIME_A_EXECUTED=1" in training_log
+    assert not hidden_b_marker.exists()
     assert len(accelerator_calls) == 2
-    assert len(runtime_verifications) == 2
+    assert len(object_identity_calls) == 3
     assert not list(evidence.glob("*.tmp"))
 
 
@@ -458,9 +602,7 @@ def test_lab_launcher_yaml_output_mismatch_aborts_before_save_root_mutation(
     assert not evidence.exists()
 
 
-def test_lab_launcher_attested_executed_runtime_mismatch_aborts_pre_mutation(
-    tmp_path, monkeypatch
-):
+def test_lab_launcher_rejects_non_git_runtime_object_store_pre_mutation(tmp_path):
     repo_name = "lab-krea"
     save_root = tmp_path / "uploaded" / repo_name
     save_root.parent.mkdir(parents=True)
@@ -471,14 +613,7 @@ def test_lab_launcher_attested_executed_runtime_mismatch_aborts_pre_mutation(
         training_folder=save_root.parent,
     )
     selected_runtime = tmp_path / "selected-runtime"
-    different_runtime = tmp_path / "different-runtime"
     selected_runtime.mkdir()
-    different_runtime.mkdir()
-    monkeypatch.setattr(
-        krea_runtime,
-        "verify_selected_runtime",
-        lambda *_args, **_kwargs: str(different_runtime),
-    )
     evidence = tmp_path / "evidence"
     args = launcher.build_parser().parse_args(
         _arguments(
@@ -491,7 +626,7 @@ def test_lab_launcher_attested_executed_runtime_mismatch_aborts_pre_mutation(
         )
     )
 
-    with pytest.raises(launcher.LabTimingError, match="attested runtime differs"):
+    with pytest.raises(launcher.LabTimingError, match="object-store verification"):
         launcher.run_lab(args)
 
     assert not save_root.exists()
@@ -518,23 +653,25 @@ def test_lab_launcher_persistent_sealed_config_tamper_aborts_before_popen(
     )
     original_payload = config_path.read_bytes()
     runtime = tmp_path / "runtime"
-    runtime.mkdir()
-    _runtime_attestations(runtime)
+    _initialize_runtime_object_store(runtime, monkeypatch)
     evidence = tmp_path / "evidence"
-    sealed_config = evidence / ".receipt.json.executed-config.yaml"
-    verification_calls = []
+    supervised_workspace = evidence / ".receipt.json.supervised"
+    object_identity_calls = []
+    real_object_identity = launcher._git_object_store_identity
 
-    def verify_runtime(*_args, **_kwargs):
-        verification_calls.append(True)
-        if len(verification_calls) == 2:
+    def tampering_object_identity(path):
+        object_identity_calls.append(True)
+        result = real_object_identity(path)
+        if len(object_identity_calls) == 3:
+            sealed_config = next(supervised_workspace.glob("*.yaml"))
             sealed_config.chmod(0o600)
             sealed_config.write_bytes(b"persistent incompatible config B\n")
-        return str(runtime)
+        return result
 
     monkeypatch.setattr(
-        krea_runtime,
-        "verify_selected_runtime",
-        verify_runtime,
+        launcher,
+        "_git_object_store_identity",
+        tampering_object_identity,
     )
     monkeypatch.setattr(
         krea_runtime,
@@ -546,13 +683,6 @@ def test_lab_launcher_persistent_sealed_config_tamper_aborts_before_popen(
         "current_accelerator_identity",
         lambda **_kwargs: "NVIDIA H100 PCIe|81559-MiB",
     )
-    popen_calls = []
-
-    def forbidden_popen(*_args, **_kwargs):
-        popen_calls.append(True)
-        raise AssertionError("Popen must not receive a tampered sealed config")
-
-    monkeypatch.setattr(launcher.subprocess, "Popen", forbidden_popen)
     args = launcher.build_parser().parse_args(
         _arguments(
             config_path=config_path,
@@ -567,10 +697,11 @@ def test_lab_launcher_persistent_sealed_config_tamper_aborts_before_popen(
     with pytest.raises(launcher.LabTimingError, match="changed before process"):
         launcher.run_lab(args)
 
+    sealed_config = next(supervised_workspace.glob("*.yaml"))
     assert config_path.read_bytes() == original_payload
     assert sealed_config.read_bytes() == b"persistent incompatible config B\n"
-    assert len(verification_calls) == 2
-    assert popen_calls == []
+    assert len(object_identity_calls) == 3
+    assert not (save_root / f"{repo_name}.safetensors").exists()
     assert not (evidence / "profile.json").exists()
     assert not (evidence / "friday-h100-gate.jsonl").exists()
 
@@ -650,6 +781,29 @@ def test_git_release_identity_rejects_dirty_or_untracked_execution_surface(
 
     with pytest.raises(launcher.LabTimingError, match="not fully clean"):
         launcher._git_release_identity()
+
+
+def test_git_release_identity_uses_absolute_git_and_fixed_environment(monkeypatch):
+    commit = "a" * 40
+    tree = "b" * 40
+    observations = []
+
+    def fake_git(command, **kwargs):
+        observations.append((command, kwargs.get("env")))
+        if "status" in command:
+            value = ""
+        else:
+            value = tree if "HEAD^{tree}" in command else commit
+        return subprocess.CompletedProcess(command, 0, stdout=f"{value}\n", stderr="")
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_git)
+
+    assert launcher._git_release_identity() == (commit, tree)
+    assert observations
+    for command, environment in observations:
+        assert command[0] == launcher._ABSOLUTE_GIT
+        assert command[1] == "--no-replace-objects"
+        assert environment == launcher._git_environment()
 
 
 def test_lab_launcher_help_is_explicit_and_deterministic():
