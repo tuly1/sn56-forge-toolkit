@@ -436,6 +436,8 @@ class ProducerHarness:
             "cfg": 1.0,
             "denoise": 0.85,
             "generations": 1,
+            "validator_default_generations": 1,
+            "seed_mode": "validator-exact-1",
             "master_seed": 42,
             "seeds": [42 + index for index in range(len(rows))],
             "text_guided_losses": [loss] * len(rows),
