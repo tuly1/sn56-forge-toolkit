@@ -476,12 +476,30 @@ def test_materialized_tree_manifest_binds_file_bytes_paths_and_modes(tmp_path):
         f"{hashlib.sha256(regular.read_bytes()).hexdigest()} 100644 forge/__init__.py\n",
         f"{hashlib.sha256(executable.read_bytes()).hexdigest()} 100755 runner.py\n",
     ]
-    expected = hashlib.sha256("".join(sorted(rows)).encode("utf-8")).hexdigest()
+    expected = hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
 
     assert authority.materialized_tree_manifest_sha256(str(root)) == expected
 
     executable.write_bytes(b"#!/usr/bin/python3\nprint('changed')\n")
     assert authority.materialized_tree_manifest_sha256(str(root)) != expected
+
+
+def test_materialized_tree_manifest_uses_delegate_relative_path_order(tmp_path):
+    authority = _authority()
+    root = tmp_path / "materialized"
+    root.mkdir()
+    first = root / "a.txt"
+    last = root / "z.txt"
+    first.write_bytes(b"VALUE = 1\n")
+    last.write_bytes(b"#!/usr/bin/python3\n")
+    rows = [
+        f"{hashlib.sha256(first.read_bytes()).hexdigest()} 100644 a.txt\n",
+        f"{hashlib.sha256(last.read_bytes()).hexdigest()} 100644 z.txt\n",
+    ]
+    assert rows != sorted(rows), "fixture must distinguish path and digest order"
+    expected = hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
+
+    assert authority.materialized_tree_manifest_sha256(str(root)) == expected
 
 
 def test_load_forge_contract_imports_exact_manifest_bound_archive_tree(tmp_path):

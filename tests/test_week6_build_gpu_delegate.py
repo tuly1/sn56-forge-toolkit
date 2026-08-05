@@ -172,6 +172,39 @@ def test_integration_harness_calls_real_outer_wrapper_and_forbids_pass():
     assert source.count("--no-replace-objects") >= 5
 
 
+def test_integration_harness_snapshots_the_complete_pipeline_status():
+    source = INTEGRATION.read_text(encoding="utf-8")
+    snapshot = 'pipeline_status=("${PIPESTATUS[@]}")'
+    wrapper_status = 'wrapper_rc=${pipeline_status[0]}'
+    tee_status = 'tee_rc=${pipeline_status[1]}'
+
+    assert snapshot in source
+    assert source.index(snapshot) < source.index(wrapper_status) < source.index(tee_status)
+    assert "wrapper_rc=${PIPESTATUS[0]}" not in source
+    assert "tee_rc=${PIPESTATUS[1]}" not in source
+
+    completed = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            """
+set -uo pipefail
+set +e
+/bin/bash -c 'exit 7' | /usr/bin/tee /dev/null
+pipeline_status=("${PIPESTATUS[@]}")
+wrapper_rc=${pipeline_status[0]}
+tee_rc=${pipeline_status[1]}
+[[ ${wrapper_rc} -eq 7 && ${tee_rc} -eq 0 ]]
+""",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_archive_materialization_ignores_assume_unchanged_worktree_bytes(tmp_path):
     module, repository, identity, tools = _repository(tmp_path)
     tracked = repository / "forge" / "contract.py"

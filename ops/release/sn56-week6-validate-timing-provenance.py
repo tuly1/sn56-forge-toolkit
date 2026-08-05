@@ -458,11 +458,15 @@ def materialized_tree_manifest_sha256(path: str) -> str:
         label="materialized Forge tree",
     )
     try:
-        rows = sorted(_materialized_manifest_rows(directory_fd))
+        rows = _materialized_manifest_rows(directory_fd)
     finally:
         os.close(directory_fd)
     if not rows:
         raise ProvenanceError("materialized Forge tree is empty")
+    # The launcher and generic build/GPU delegate define this manifest in
+    # relative-path order.  Sorting whole rows would order by the leading
+    # content digest and produce a different hash for the identical tree.
+    rows.sort(key=lambda row: row.split(" ", 2)[2])
     return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
 
 

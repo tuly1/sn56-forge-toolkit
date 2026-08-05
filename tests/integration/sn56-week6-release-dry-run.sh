@@ -259,8 +259,9 @@ set +e
   SN56_RELEASE_TIMING_DATASET_REGIME="${timing_dataset_regime}" \
   SN56_RELEASE_TIMING_ACCELERATOR_IDENTITY="${timing_accelerator_identity}" \
   /bin/sh "${wrapper}" 2>&1 | /usr/bin/tee "${transcript}"
-wrapper_rc=${PIPESTATUS[0]}
-tee_rc=${PIPESTATUS[1]}
+pipeline_status=("${PIPESTATUS[@]}")
+wrapper_rc=${pipeline_status[0]}
+tee_rc=${pipeline_status[1]}
 set -e
 (( tee_rc == 0 )) || {
   /usr/bin/printf 'transcript write failed rc=%s\n' "${tee_rc}" >&2
