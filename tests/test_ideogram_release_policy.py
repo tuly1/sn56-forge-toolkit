@@ -74,19 +74,27 @@ def _activation(*, owner_override: bool = False) -> dict:
     }
 
 
-# What `recipe.size_scaled_steps("ideogram4", 36, 0.75, ...)` materialises for
-# the fixture shape below.  Was 171 under the discredited Jul-16 row
-# (base 140 / p 0.50 / max 400); now 302 under the week-6 field calibration
-# (base 240 / p 0.57), which is the SIZE law — the 4.2 s/step clock cap on a
-# 0.75 h budget is 477, so it does not bind.  Pinned in ONE place so a depth
-# change shows up as a single deliberate edit rather than four silent ones; the
-# depth law itself is guarded in tests/test_week6_depth_geometry.py.
-PLANNED_STEPS = 302
+# What `recipe.size_scaled_steps("ideogram4", 14, 0.75, ...)` materialises for
+# the fixture shape below.  Was 107 under the discredited Jul-16 row
+# (base 140 / p 0.50 / max 400), briefly 177 under the withdrawn two-point fit
+# to the champion's step counts, and is now 421 under `base 500 / p 0.32`.
+#
+# The fixture shape moved 36 -> 14 pairs at the same 0.75 h ON PURPOSE.  14/0.75
+# is the REAL Aug-3 `1365fa1c` shape, and at that shape the SIZE LAW binds
+# (421 against a 477 clock cap), so this constant is invariant to `MARGIN` and
+# to `SEC_PER_IT["ideogram4"]`.  At 36 pairs the CLOCK binds instead (477 at
+# MARGIN 0.92, 432 at 0.85), which would have coupled this release-policy
+# contract to a constant another unit is actively revising.
+#
+# Pinned in ONE place so a depth change shows up as a single deliberate edit
+# rather than four silent ones; the depth law itself is guarded in
+# tests/test_week6_ideogram_depth.py and tests/test_week6_depth_geometry.py.
+PLANNED_STEPS = 421
 
 
 def _build(monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setattr(policy, "PRODUCTION_ACTIVATION", _activation())
-    cfg = config.build_config(_spec(), num_images=36, hours_to_complete=0.75)
+    cfg = config.build_config(_spec(), num_images=14, hours_to_complete=0.75)
     assert cfg["config"]["process"][0]["train"]["steps"] == PLANNED_STEPS
     return cfg
 

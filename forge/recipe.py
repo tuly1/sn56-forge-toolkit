@@ -82,26 +82,104 @@ STEP_TABLE = {
     # sufficient; this moves us from 39 to ~64 steps/img, i.e. into the band of
     # ranks 3-5, not into rank 1.
     "krea2": dict(base=1500, n_ref=_N_REF, p=0.35, min=600, max=2200),
-    # ideogram4 — was base=140 p=0.50 min=48 max=400, the direct output of the
-    # discredited Jul-16 experiment and the least defensible entry in the table.
-    # Two CHAMPION WINS give an exact two-point law:
-    #     N=14 -> 174 steps (won by 46.06%) ; N=46 -> 341 steps (won by 27.2%)
-    #     => p = ln(341/174)/ln(46/14) = 0.5655 , base = 174/(14/24)^0.5655 = 237.5
-    # base=240/p=0.57 reproduces both to within 2%.  `max` 400 -> 1600 not
-    # because the law reaches it (N=50 gives only 365) but because 400 makes the
-    # 1300-step regime that WON task b72da8c6 structurally unreachable; keeping a
-    # discredited hard ceiling is the worse error.
-    # RESIDUAL UNCERTAINTY — FLAGGED BY THE AUDIT AS TOO THIN TO CONCLUDE FROM:
-    # n=5 artifacts, 3 tasks, 2 usable head-to-heads, INTERNALLY CONTRADICTORY.
-    # At N=14 shallow (174) crushed deep (1000) by 46%; at N=40 both entrants
-    # were deep (1300 vs 1523) and there is NO shallow arm on that task at all.
-    # The champion himself swung 4.5x between two same-size style tasks and the
-    # deep arm lost.  We ship this only because the incumbent row is a provable
-    # artefact of a discredited experiment: this replaces a bad prior with a
-    # weak posterior, NOT with a measurement.  ideogram4 is one of the two R1
-    # draws, so it is also the highest-variance line here.  Pre-commit to
-    # accepting a loss on ideogram4 without concluding anything from it.
-    "ideogram4": dict(base=240, n_ref=_N_REF, p=0.57, min=120, max=1600),
+    # ideogram4 — was base=140 p=0.50 min=48 max=400 (the discredited Jul-16
+    # experiment), then base=240 p=0.57 min=120 max=1600, a two-point fit to the
+    # champion's own published step counts (N=14 -> 174, N=46 -> 341).  BOTH are
+    # rejected, and the second for the reason the first one hid:
+    #
+    # THE CHAMPION'S STEP COUNTS ARE NOT TRANSFERABLE TO OUR RECIPE.  Every
+    # ideogram4 config in the field runs `lr: 0.0004` CONSTANT with
+    # `ema_decay 0.99` (OBSERVED in 5FBmn1ax's three published config.yaml).
+    # `forge.ideogram_release_policy` runs us at lr 2.5e-5 cosine-decayed to
+    # 2.5e-6 — a 16x lower peak, ~29x lower mean — with `ema_decay 0.995`.
+    # Under Adam the per-coordinate displacement per step is ~lr, so the
+    # comparable quantity across two recipes is the lr INTEGRAL, not the step
+    # count:
+    #     champion, 1365fa1c : 174 steps x 4e-4 constant   = 0.0696
+    #     us at the old law's 177 steps                    = 0.00245  (28.5x less)
+    #     ...and `save()` exports the EMA, a lagged average rather than the
+    #     final iterate, which costs another 2.3x at that depth
+    #                                                      = 0.00106  (65.6x less)
+    # Shipping "177 because the champion shipped 174" does not reproduce his
+    # shallow optimum; it ships ~1.5% of his parameter movement.  That single
+    # factor invalidates the two-point fit, so it is gone.
+    #
+    # WHAT THE FIELD ACTUALLY SUPPORTS — re-derived independently from the
+    # safetensors `__metadata__` headers of all SIX Aug-3 ideogram4 artifacts:
+    #   1365fa1c product N=14 h=0.75: 174 (rank 1) vs >900 (rank 2, +46.1% loss)
+    #       The ONLY clean shallow-vs-deep head-to-head anywhere in ideogram4,
+    #       and shallow won big.  But the deep arm published NO config and
+    #       stripped its metadata (its depth is only bounded by a last_000000900
+    #       checkpoint), so the 46% cannot be attributed to depth alone.
+    #   84be9fcd style N=46 h=1.0: 341 (rank 1) vs UNKNOWN (rank 2 published two
+    #       files, no `__metadata__`, no checkpoint ladder).  This point carries
+    #       ZERO DEPTH INFORMATION and must not be used to calibrate anything.
+    #   b72da8c6 style N=40 h=1.0: >=1200 (rank 1) vs 1523 (rank 2, +4.4%).
+    #       BOTH arms deep, no shallow arm.  It says 1250 ~= 1523; it does NOT
+    #       say that 321 would have lost.
+    #   Jul-20 R1 3cfa1578 ideogram4, N=9, SIXTEEN miners — the largest
+    #       ideogram4 sample we have (SN56-WEEK3-POSTMORTEM.md §6a): we ran the
+    #       shortest run in the field (85 steps) and placed 4/16; the deep
+    #       cluster was 722-1000+, the bracket winner 1200, and the recorded
+    #       finding is that the img2img metric "did NOT punish overtraining".
+    # Net across two tournaments: ideogram4 depth is FLAT and WIDE — 85 to 1250
+    # are all competitive — with the deep end favoured in the larger field.
+    # There is NO size law to fit: N=9 -> 1200, N=14 -> 174, N=40 -> 1250,
+    # N=46 -> 341 is uncorrelated with size.
+    #
+    # NO FAMILY SPLIT, and NOT because it is infeasible.  `spec.trigger_word is
+    # None` separates `style` from every other family 12/12 across the Aug-3
+    # configs (both style tasks carry no trigger word; all ten design/social/
+    # logo/product configs do), so a style router IS implementable from data the
+    # container actually receives.  It is rejected because the two style tasks
+    # disagree with EACH OTHER by 4.5x — 341 won at N=46, ~1250 won at N=40 —
+    # so there is no style depth to route TO.  Adding a one-task-per-branch
+    # parameter to the highest-variance row in this table, which is half the R1
+    # draw, is the worst available trade.
+    #
+    # THE ROW BELOW IS THEREFORE NOT A FIT TO THE FIELD.  It is set from the two
+    # constraints we can measure on OUR OWN pipeline:
+    #  (a) EMA FLOOR.  ai-toolkit seeds the EMA shadow from the LoRA at init
+    #      (B = 0, i.e. zero effect), constructs it with `use_num_updates=False`
+    #      so there is no warm-up or bias correction, and `save()` ALWAYS
+    #      exports the EMA (`BaseSDTrainProcess.py:566-568,840-851`;
+    #      `toolkit/ema.py` __init__/update).  So 0.995^T of every artifact we
+    #      upload is the untrained init: 41% at 177 steps, 12% at 421, 4.6% at
+    #      616.  Depth is the ONLY lever on this that does not require
+    #      re-signing the hash-bound release activation record.
+    #  (b) CLOCK CEILING AT OUR COST.  `do_cfg: true` runs the transformer at
+    #      batch 2 every step, so SEC_PER_IT is 4.2 for us, not the field's
+    #      2.05 -> the 1.0 h cap is 674 steps and the 0.75 h cap is 477.  The
+    #      b72da8c6 winning regime (~1250) is UNREACHABLE while do_cfg is on.
+    #      That is a do_cfg decision, not a depth decision.
+    # base/p are chosen so the SIZE LAW binds ~10-15% below that ceiling on all
+    # three real shapes — 421 / 589 / 616 against caps 477 / 674 / 674 — taking
+    # grant utilisation from 45-54% to 82-85%.  KNOWN CORNER, stated rather than
+    # hidden: on a 0.75 h grant the law crosses the 477 cap at N~21, so a SHORT
+    # R1 ideogram task with a mid-size dataset is clock-bound at 477 (432 if the
+    # margin reverts to 0.85).  That is the do_cfg tax being visible, not a
+    # miscalibration; it is still 1.3x the withdrawn law and it keeps four
+    # periodic candidates.  Every 1.0 h shape up to N=50 stays law-bound.
+    # Because the law binds on the real shapes and the
+    # clock does not, this row is invariant to MARGIN and to any SEC_PER_IT
+    # revision, and it absorbs a 21% error in the INFERRED 4.2 s/step constant
+    # before anything truncates (the tightest shape, 84be9fcd at 616 steps,
+    # breaks only above 5.06 s/step = 2.47x the field's own no-do_cfg bound);
+    # a truncation then DEGRADES rather than forfeits
+    # (`forge/tasks/aitoolkit.py` _run_toolkit -> _terminate -> _finalize
+    # promotes the newest periodic save, and there are four of them).
+    # p 0.57 -> 0.32 because the field shows no size signal at all; this mirrors
+    # krea2's deliberately flat 0.35 rather than a 2-point fit.  min 120 -> 350
+    # binds only below N~8, under the smallest ideogram4 dataset ever observed
+    # (N=9, Jul-20).  max 1600 -> 620: 1600 was INERT (the old law topped out at
+    # 365 at N=50, so it could never bind within 4x), whereas 620 binds from
+    # N >= 47, inside the observed 9-50 range, and caps extrapolation of a
+    # recipe we have never run past ~200 steps in a tournament.
+    # PRE-COMMIT: this is a reasoned bet, not a measurement.  If ideogram4 is
+    # the R1 draw and we lose, the correct next experiment is do_cfg on/off at
+    # matched depth (which buys back 2x the reachable depth), NOT another depth
+    # change.
+    "ideogram4": dict(base=500, n_ref=_N_REF, p=0.32, min=350, max=620),
     # z-image — was base=1100 p=0.50 min=400 max=2000.  Cleanest result in the
     # audit: TWO DIFFERENT rank-1 operators with different recipes imply the
     # same law to 0.1% —
@@ -163,7 +241,7 @@ SEC_PER_IT = {
     # (PIPELINE-MATERIALIZATION-AUDIT D6).  ~2x the field's per-step cost, so
     # 2.05 * 2 ~= 4.2 is the honest constant FOR OUR PIPELINE.  This costs us
     # nothing on the real shapes: on all three Aug-3 ideogram4 tasks the size law
-    # (177/348/321) binds well below the 4.2-based cap (477/674/674), so the
+    # (421/616/589) still binds below the 4.2-based cap (477/674/674), so the
     # materialised steps are identical to what a 2.1 constant would give — while
     # preserving the kill-safety margin that a 2x-optimistic constant would burn.
     "ideogram4": 4.2,

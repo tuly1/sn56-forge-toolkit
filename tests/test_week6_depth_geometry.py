@@ -51,7 +51,7 @@ REAL_TASKS = [
      887, (21, 21), {(1024, 768): 21}),
     ("7421f056", 2, "qwen-image", "design", 28, 1.25, 850, 836, 909, 182,
      887, (28, 28), {(1024, 768): 28}),
-    ("84be9fcd", 2, "ideogram4", "style", 46, 1.0, 341, 194, 348, 70,
+    ("84be9fcd", 2, "ideogram4", "style", 46, 1.0, 341, 194, 616, 124,
      None, None, {(1408, 768): 45, (768, 1376): 1}),
     ("b290d171", 2, "z-image", "design", 39, 1.0, 1188, 860, 1186, 238,
      747, (37, 39), {(1408, 768): 37, (768, 1376): 2}),
@@ -63,7 +63,7 @@ REAL_TASKS = [
      758, (26, 43), {(768, 1376): 18, (1408, 768): 17, (1376, 768): 8}),
     ("ff643470", 4, "qwen-image", "social", 41, 1.5, 1095, 1027, 1104, 221,
      887, (41, 41), {(1024, 768): 41}),
-    ("1365fa1c", 5, "ideogram4", "product", 14, 0.75, 174, 107, 177, 36,
+    ("1365fa1c", 5, "ideogram4", "product", 14, 0.75, 174, 107, 421, 85,
      None, None, {(1195, 896): 13, (1376, 768): 1}),
     ("3e0fdcde", 5, "krea2", "design", 42, 1.0, 2012, 1172, 1825, 366,
      887, (42, 42), {(1024, 768): 42}),
@@ -71,7 +71,7 @@ REAL_TASKS = [
      747, (31, 31), {(1408, 768): 31}),
     ("b2582457", 5, "z-image", "social", 48, 1.0, 1317, 860, 1315, 264,
      887, (48, 48), {(1024, 768): 48}),
-    ("b72da8c6", 5, "ideogram4", "style", 40, 1.0, 1300, 181, 321, 65,
+    ("b72da8c6", 5, "ideogram4", "style", 40, 1.0, 1300, 181, 589, 118,
      None, None, {(1024, 768): 40}),
     ("f6725c2b", 5, "krea2", "design", 50, 1.0, 2012, 1172, 1888, 378,
      887, (50, 50), {(1024, 768): 50}),
@@ -142,9 +142,12 @@ def test_step_table_is_the_week6_field_calibration():
         # 5FBmn1ax's krea2 policy is pure clock-fill: 2012 steps on N=42, 43 AND
         # 50 (8x the size range, identical depth), 1432 at h=0.75.
         "krea2": dict(base=1500, n_ref=24, p=0.35, min=600, max=2200),
-        # Two champion WINS: N=14 -> 174 (+46.06%), N=46 -> 341 (+27.2%)
-        # => p = ln(341/174)/ln(46/14) = 0.5655, base = 237.5.
-        "ideogram4": dict(base=240, n_ref=24, p=0.57, min=120, max=1600),
+        # NOT a fit to the field: the champion runs lr 4e-4 constant and we run
+        # 2.5e-5 cosine, so his step counts are not transferable (28.5x less lr
+        # integral at matched steps).  Set instead from our own EMA floor
+        # (0.995^T untrained init in every export) and our own do_cfg clock
+        # ceiling.  See the recipe.py comment.
+        "ideogram4": dict(base=500, n_ref=24, p=0.32, min=350, max=620),
         # Two INDEPENDENT rank-1 operators: 1317@N=48 and 1188@N=39 both imply
         # base 931/932 at p=0.5. Agreement to 0.1%.
         "z-image": dict(base=930, n_ref=24, p=0.50, min=350, max=1800),
@@ -340,10 +343,12 @@ def test_first_periodic_save_is_kill_safe(row, dataset_dirs, monkeypatch):
         ("z-image", 1.00),
         ("qwen-image", 1.03),
         ("flux", 1.08),
-        # ideogram4 lands at 0.76 only because of task b72da8c6, where BOTH
-        # entrants were deep (1300 vs 1523) and no shallow arm exists — that is
-        # missing evidence, not a demonstrated loss. Excluding it gives 1.02.
-        ("ideogram4", 0.76),
+        # ideogram4 IS DELIBERATELY ABSENT.  Matching the field winners' STEP
+        # COUNTS is not a valid target for this type: every field ideogram4
+        # config runs lr 4e-4 constant and ours runs 2.5e-5 cosine, so equal
+        # steps mean 28.5x less parameter movement.  Its depth is asserted
+        # against our own EMA floor and clock ceiling instead — see
+        # test_ideogram4_depth_is_set_by_our_own_pipeline_not_the_field.
     ],
 )
 def test_shipped_depth_now_tracks_the_field_winners(model_type, expected):
@@ -359,6 +364,11 @@ def test_every_type_moved_off_the_shallow_edge_of_its_band():
         model_type, winner, before, after = row[2], row[6], row[7], row[8]
         if row[0] == "b72da8c6":
             continue  # the one uninformative task; see the parametrised test
+        if model_type == "ideogram4":
+            # Excluded on purpose: the field's ideogram4 step counts are not a
+            # band we should be inside, because they were produced at 16x our
+            # learning rate.  Asserted separately against our own constraints.
+            continue
         assert after >= before or model_type == "qwen-image"
         assert 0.85 <= after / winner <= 1.40, f"{row[0]} {model_type}"
 

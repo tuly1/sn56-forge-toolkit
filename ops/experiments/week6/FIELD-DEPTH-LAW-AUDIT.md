@@ -15,7 +15,7 @@ actually shipped, averaged over that type's tasks.
 | type | tasks | winners shipped (steps) | forge would ship | **now/win** | verdict |
 |---|---|---|---|---|---|
 | **krea2** | 4 | 2012, 1000, 2012, 2012 | 1172, 824, 1172, 1172 | **0.64×** | **UNDER-TRAINED. Biggest single gap. Change.** |
-| **ideogram4** | 3 | 174, 341, 1300 | 107, 194, 181 | **0.44×** | **UNDER-TRAINED + hard ceiling wrong. Change.** |
+| **ideogram4** | 3 | 174, 341, 1300 | 107, 194, 181 | **0.44×** | **`now/win` IS THE WRONG METRIC HERE — see §6.2 REVISION. Change, but not toward these step counts.** |
 | **z-image** | 2 | 1317, 1188 | 860, 860 | **0.69×** | **UNDER-TRAINED, purely by a bad clock. Change.** |
 | **flux** | 2 | 870, 750 | 726, 726 | **0.90×** | Near-correct. Small clock fix only. |
 | **qwen-image** | 3 | 949, 850, 1095 | 1027, 836, 1027 | **1.00×** | **Already calibrated. Do not touch the depth.** |
@@ -172,6 +172,14 @@ The winners' steps-per-image band is **tight per type and different between
 types** — ~47 (krea2), ~30 (qwen, z-image), ~54 (flux), and ideogram4 alone is
 wide (7–33). That is the depth law, in the right unit.
 
+> **REVISION (ideogram4 only).** The ideogram4 row is not a band, it is scatter,
+> and it is scatter around *one operator's* choices at `lr 4e-4`. Widen the
+> sample to the Jul-20 R1 ideogram4 field (16 miners, task `3cfa1578`,
+> SN56-WEEK3-POSTMORTEM §6a) and the range runs 85 → 1200 steps on N=9 with the
+> 85-step entry placing 4/16 and the 1200-step entry winning the bracket. Across
+> both tournaments ideogram4 depth is **flat and wide**, not a tight interior
+> optimum. Do not calibrate our ideogram4 depth off a steps-per-image band.
+
 ---
 
 ## 3. Does depth actually cause score? Three independent tests
@@ -277,6 +285,17 @@ direction: on both sides of the band you lose. z-image at 51 steps/img loses to
 what §2.1 shows. **Every one of our five current settings sits on or below the
 shallow edge of its band, never inside it, except qwen-image.**
 
+> **REVISION — the ideogram4 Spearman (+0.894) must not be read as a result.**
+> It is computed over n=5 artifacts of which only **two** are usable pairs, and
+> the pair that drives the sign (`1365fa1c`: 12.4/img beat 71.4/img by 46.1%) is
+> **confounded**: the deep arm published no `config.yaml` and stripped its
+> `__metadata__`, so its lr, EMA and network are all unknown. The other usable
+> pair (`b72da8c6`) is deep-vs-deeper, and the *shallower* of the two deep arms
+> won by 4.4%. A third "point" (`84be9fcd`) contributes no depth information at
+> all — that opponent published two files, no metadata and no ladder. Net: one
+> confounded pair, and it is the entire ideogram4 depth signal in this
+> tournament.
+
 ---
 
 ## 4. What the top of the field actually configured
@@ -297,7 +316,7 @@ shallow edge of its band, never inside it, except qwen-image.**
 
 | | `5FBmn1ax` (8 wins) | `5EACrayt` / `5FNLSgh8` / `5FW2Eaae` / `5FpdSckw` / `5D2Qee4V` cluster |
 |---|---|---|
-| depth policy | **time-fill** on krea2, **power law** on qwen/z-image, **family-routed** on ideogram4 | power law, moderate |
+| depth policy | **time-fill** on krea2, **power law** on qwen/z-image, **unstable/exploratory** on ideogram4 (4.5× swing between two same-size style tasks; see §4.4 — this was previously called "family-routed", which §4.4 itself refutes) | power law, moderate |
 | network | 32/32 (krea2, z-image, ideogram4); **141/141 and 149/149 on qwen** | 32/32, 40/40, 48/48; 128/128 on qwen |
 | lr | template (1e-4 / 4e-4); **qwen `lr = 1.0877e-3 / sqrt(rank)`** | 1e-4 |
 | loss | **`mae`** on krea2/qwen/z-image (template is `mse`) | `mse` |
@@ -347,14 +366,35 @@ how close 478 s is to forge's own `STARTUP_S + EXPORT_RESERVE_S = 480`.
 Different operators, different recipes, both rank-1, `base ≈ 931 @ n_ref 24,
 p = 0.5`. The loser on that task ran the flat 2000-step template and lost 7.9 %.
 
-**ideogram4 — the two calibratable champion wins:**
+**ideogram4 — the two champion wins, and why they are NOT calibratable:**
 
 ```
   N=14 → 174 (won by 46.06%) ; N=46 → 341 (won by 27.2%)
   ⇒ p = ln(341/174)/ln(46/14) = 0.5655 ,  base = 174/(14/24)^0.5655 = 237.5
 ```
 
-### 4.4 Per-family routing — YES, but only on ideogram4
+> **REVISION — this two-point law was fitted, shipped in c424362, and is now
+> WITHDRAWN.** Two independent reasons, either sufficient on its own:
+>
+> 1. **The 27.2% win at N=46 carries no depth information.** The opponent on
+>    `84be9fcd` published `.gitattributes` + `last.safetensors` and nothing
+>    else — no `config.yaml`, no `__metadata__`, no checkpoint ladder. Their
+>    depth is unknown, so "341 beat them" is not evidence that 341 is a good
+>    depth. Fitting `p` through that point fits noise.
+> 2. **Step counts do not transfer across a 16× learning-rate gap.** Every
+>    ideogram4 config in this field runs `lr: 0.0004` constant (OBSERVED,
+>    `5FBmn1ax` ×3). `forge.ideogram_release_policy` runs *us* at `lr 2.5e-5`
+>    cosine-decayed to `2.5e-6`. Under Adam the per-coordinate displacement per
+>    step is ≈ lr, so the comparable quantity across two recipes is the lr
+>    integral: `174 × 4e-4 = 0.0696` for the champion versus `0.00245` for us at
+>    177 steps — **28.5× less parameter movement at "the same" depth** — and the
+>    EMA export costs another 2.3× on top (65.6× total). Reproducing his step
+>    count reproduces ~1.5% of his training.
+>
+> ideogram4 depth is therefore set from our own pipeline's measurable
+> constraints, not from the field. See §6.2.
+
+### 4.4 Per-family routing — NO (this section previously said "YES, but only on ideogram4")
 
 Same operator, same 1.00 h budget, same model type:
 
@@ -373,6 +413,28 @@ between two style tasks of near-identical size**, which is *not* family routing
 either — it looks like an unstable or exploratory chooser, and the deep arm
 lost. There is no evidence in this tournament for a design/product/logo/social
 depth router. Do not build one.
+
+> **REVISION — a style router is FEASIBLE but still rejected, and it is worth
+> writing down which of those two facts is load-bearing.**
+>
+> *Feasible.* The task family is never delivered to the miner container — the
+> CLI takes only `--task-id --model --dataset-zip --model-type
+> --expected-repo-name --hours-to-complete --trigger-word` (`forge/cli.py:32-42`)
+> — so a literal `family` switch is impossible. But **`trigger_word is None`
+> separates `style` from every other family 12/12** across the Aug-3 configs
+> that published one: both style tasks (`84be9fcd`, `b72da8c6`) carry no trigger
+> word, and all ten design/social/logo/product configs do (`AetherFlow UI`,
+> `AetherCanvas UI`, `PixelPulse`, `PixelCraft UI`, `AxiomScreens`,
+> `BrandEssence`, `AuraFlow`, `LuminaGlow Orb`, …). A style router is therefore
+> implementable from data we actually receive.
+>
+> *Still rejected.* Not on feasibility — on the target. The two style tasks
+> disagree with **each other** by 4.5× (341 won at N=46; ~1250 won at N=40), so
+> there is no style depth to route *to*. Routing on a clean signal toward an
+> unresolved value adds a one-task-per-branch free parameter to the
+> highest-variance row in the table, which is half the round-1 draw. Rejected.
+> If a future tournament produces a *second* style head-to-head with a shallow
+> arm present, revisit — the signal is already there and costs nothing to wire.
 
 ### 4.5 Checkpoint selection is real and is present in the field
 
@@ -430,16 +492,16 @@ those 11 unless stated.
 task      type       fam       N    h |   law   cap   NOW |  law*  cap*   REC | winner now/win rec/win  binds
 241cda6c  flux       product  15 0.75 |   870   726   726 |   870  1002   870 |    870    0.83    1.00  clock->size
 db5fefc5  flux       product  15 0.75 |   870   726   726 |   870  1002   870 |    750    0.97    1.16  clock->size
-1365fa1c  ideogram4  product  14 0.75 |   107   605   107 |   177   954   177 |    174    0.61    1.02  size->size
-b72da8c6  ideogram4  style    40 1.00 |   181   860   181 |   321  1348   321 |   1300    0.14    0.25  size->size
-84be9fcd  ideogram4  style    46 1.00 |   194   860   194 |   348  1348   348 |    341    0.57    1.02  size->size
-41025fb5  krea2      design   21 0.75 |  1122   824   824 |  1432  1336  1336 |   1000    0.82    1.34  clock->clock
-3e0fdcde  krea2      design   42 1.00 |  1587  1172  1172 |  1825  1888  1825 |   2012    0.58    0.91  clock->size
-db9f7244  krea2      design   43 1.00 |  1606  1172  1172 |  1840  1888  1840 |   2012    0.58    0.91  clock->size
-f6725c2b  krea2      design   50 1.00 |  1732  1172  1172 |  1939  1888  1888 |   2012    0.58    0.94  clock->clock
-7421f056  qwen-image design   28 1.25 |  1080   836   836 |   909   915   909 |    850    0.98    1.07  clock->size
-4782f46f  qwen-image logo     31 1.50 |  1137  1027  1027 |   957  1122   957 |    949    1.08    1.01  clock->size
-ff643470  qwen-image social   41 1.50 |  1307  1027  1027 |  1104  1122  1104 |   1095    0.94    1.01  clock->size
+1365fa1c  ideogram4  product  14 0.75 |   107   605   107 |   421   477   421 |    174    0.61     -    size->size
+b72da8c6  ideogram4  style    40 1.00 |   181   860   181 |   589   674   589 |   1300    0.14     -    size->size
+84be9fcd  ideogram4  style    46 1.00 |   194   860   194 |   616   674   616 |    341    0.57     -    size->size
+41025fb5  krea2      design   21 0.75 |  1122   824   824 |  1432  1484  1432 |   1000    0.82    1.43  clock->size
+3e0fdcde  krea2      design   42 1.00 |  1587  1172  1172 |  1825  2097  1825 |   2012    0.58    0.91  clock->size
+db9f7244  krea2      design   43 1.00 |  1606  1172  1172 |  1840  2097  1840 |   2012    0.58    0.91  clock->size
+f6725c2b  krea2      design   50 1.00 |  1732  1172  1172 |  1939  2097  1939 |   2012    0.58    0.96  clock->size
+7421f056  qwen-image design   28 1.25 |  1080   836   836 |   909   836   836 |    850    0.98    0.98  clock->clock
+4782f46f  qwen-image logo     31 1.50 |  1137  1027  1027 |   957  1023   957 |    949    1.08    1.01  clock->size
+ff643470  qwen-image social   41 1.50 |  1307  1027  1027 |  1104  1023  1023 |   1095    0.94    0.93  clock->clock
 b290d171  z-image    design   39 1.00 |  1402   860   860 |  1186  1573  1186 |   1188    0.72    1.00  clock->size
 b2582457  z-image    social   48 1.00 |  1556   860   860 |  1315  1573  1315 |   1317    0.65    1.00  clock->size
 ```
@@ -448,6 +510,21 @@ b2582457  z-image    social   48 1.00 |  1556   860   860 |  1315  1573  1315 | 
 cap; `NOW` = `min(law, cap)`. **In 11 of 14 tasks the clock cap is what
 truncates us, not the depth policy.** On z-image the size law wanted 1402/1556
 (right on the field) and the clock cut it to 860.
+
+> **REVISION (post-review).** The `cap*`/`REC` columns above are the SHIPPED
+> constants, not the ones this document first recommended. Two changed after an
+> adversarial review:
+>
+> * **`SEC_PER_IT["krea2"]` 1.5 → 1.35.** At 1.5 the clock still truncated the
+>   R1 shape (1432 → 1336) — i.e. the recommendation did not achieve its own
+>   stated goal of making the size law the binding constraint. 1.35 is the round
+>   value inside the threshold at which that stops happening (1.399 at 0.75 h);
+>   1.30 is indistinguishable in output. §6.1.
+> * **`SEC_PER_IT["qwen-image"]` 4.0 → 4.7 with `MARGIN_BY_TYPE["qwen-image"]
+>   = 0.98`.** MARGIN 0.92 applied globally raised the qwen cap 1027 → 1122
+>   without touching a rate constant that was already 14 % faster than the
+>   field's own reproduced measurement, and the result would have been killed on
+>   two of the three real qwen shapes. §5.1 and §6.4.
 
 ### 5.1 The clock is wrong — proven from completed field runs
 
@@ -461,13 +538,57 @@ achievable rate on tournament hardware.
   krea2         1.55 s/step             2.2                  1.42x     (our own measured: 1.265)
   ideogram4     2.05 s/step             3.0                  1.46x
   z-image       1.56 s/step             3.0                  1.92x
-  qwen-image    4.49 s/step             4.0                  0.89x  (already tight — do not lower)
+  qwen-image    4.49 s/step             4.0                  0.89x
   flux          1.71..4.27 s/step*      2.5                  ~1.25x  (*kohya epoch cadence, batch-1 inference)
 ```
 
 Combined with `MARGIN = 0.85` applied *on top of* a 480 s fixed reserve, forge
 discards ~40 % of every krea2/z-image budget. This is the mechanical cause of
 the entire krea2 and z-image gap.
+
+> **CORRECTION (post-review).** The qwen line above originally read
+> *"already tight — do not lower"*, and the whole table conflated two different
+> kinds of evidence. **A completed run gives a BOUND, not a rate.** It says the
+> miner was *no slower than* that; it says nothing about how much slack he had.
+> A **killed** run is the one that yields an actual rate.
+>
+> Recomputed against the real terminate gate — training is stopped at
+> `budget − EXPORT_RESERVE_S(180) − STOP_MARGIN_S(45)` and `STARTUP_S(300)` of
+> what is left is model load, so the step window is `W(h) = h·3600 − 525`:
+>
+> ```
+>   type        kind      s/step   artifact
+>   krea2       MEASURED   1.265   OURS — 5HLA2QWY forge_run.json, 823 steps in
+>                                  1041.1 s of toolkit_start..toolkit_end
+>   krea2       BOUND      1.519   5FBmn1ax AND 5FjDsFGA each completed 1432
+>                                  on the real R1 shape (2175/1432)
+>   qwen-image  MEASURED   4.676   5FW2Eaae AND 5FpdSckw, identical configs,
+>                                  both cfg 1150 on 7421f056 (h=1.25), both
+>                                  killed with their last save at 850 (3975/850)
+>   qwen-image  BOUND      4.452   5FBmn1ax completed 1095 in 1.5 h
+>   z-image     BOUND      1.538   5D2Qee4V completed 2000 in 1.0 h
+>   ideogram4   BOUND      2.019   5FBmn1ax completed 1523 in 1.0 h; DOUBLE it
+>                                  to 4.038 for our do_cfg batch-2 step
+>   flux        BOUND      2.500   rank-1 5FW2Eaae, 58 kohya epochs x N=15
+> ```
+>
+> **`SEC_PER_IT["qwen-image"] = 4.0` was therefore not "tight" — it was 14 %
+> FASTER than the field's own reproduced measurement**, and the only thing
+> hiding that was `MARGIN = 0.85` discarding 15 % of the budget. Raising MARGIN
+> to 0.92 globally removed the accidental compensation and left the type
+> planning work the field has never shown fits.
+>
+> Two qwen artifacts imply much slower rates (5FW2Eaae 6.96 on ff643470;
+> 5GU4Xkd3 8.13 on 4782f46f) and are **excluded**: neither is reproduced, and
+> each is contradicted by the *same operator* running far faster on another qwen
+> task in the same tournament, so they cannot be a stable property of the
+> hardware. A constant that survived 8.13 s/step would plan ~400 qwen steps
+> against a field that shipped 949–1095.
+>
+> Likewise the krea2 artifacts of 5EACrayt and 5FNLSgh8 are excluded from rate
+> estimation: both carry 504 text-encoder tensors (TE-LoRA, which we never
+> train), and 5FNLSgh8's kill implies 2.72 s/step — a config difference, not a
+> hardware rate.
 
 ---
 
@@ -480,31 +601,53 @@ STEP_TABLE = {
     #                base  n_ref    p    min    max
     "flux":      dict(base=1100, n_ref=24, p=0.50, min=500, max=2000),  # UNCHANGED
     "krea2":     dict(base=1500, n_ref=24, p=0.35, min=600, max=2200),  # was 1200/0.50/100/2000
-    "ideogram4": dict(base= 240, n_ref=24, p=0.57, min=120, max=1600),  # was  140/0.50/ 48/ 400
+    "ideogram4": dict(base= 500, n_ref=24, p=0.32, min=350, max= 620),  # was  140/0.50/ 48/ 400; the 240/0.57/120/1600 fit is WITHDRAWN — §6.2
     "z-image":   dict(base= 930, n_ref=24, p=0.50, min=350, max=1800),  # was 1100/0.50/400/2000
     "qwen-image":dict(base= 840, n_ref=24, p=0.51, min=300, max=1600),  # was 1000/0.50/400/3000
 }
 
 SEC_PER_IT = {"flux": 2.0,       # was 2.5
-              "krea2": 1.5,      # was 2.2  (our measured 1.265; field bound 1.55)
-              "ideogram4": 2.1,  # was 3.0  (field bound 2.05)
+              "krea2": 1.35,     # was 2.2, and 1.5 in the first version of this
+                                 # document.  1.5 still let the clock truncate
+                                 # the R1 shape 1432 -> 1336; 1.35 does not, and
+                                 # 1.30 is indistinguishable in output.  Our own
+                                 # measured rate is 1.265 GROSS OF STARTUP.
+              "ideogram4": 4.2,  # was 3.0. NOT the field bound: the 2.05 bound
+                                 # was measured on configs WITHOUT do_cfg. Ours
+                                 # sets do_cfg -> transformer at batch 2 every
+                                 # step + a second text-encoder forward, ~2x.
+                                 # (This line previously read 2.1 and disagreed
+                                 # with the shipped recipe.py.)
               "z-image": 1.8,    # was 3.0  (field bound 1.56)
-              "qwen-image": 4.0} # UNCHANGED (field bound 4.49 — the only tight one)
+              "qwen-image": 4.7} # was 4.0, and 4.0 was NOT "tight": it is 14%
+                                 # faster than the field's own reproduced
+                                 # measurement of 4.676 s/step (two operators,
+                                 # identical configs, both killed at 850/1150 on
+                                 # 7421f056).  See the §5.1 correction.
 
-MARGIN = 0.92  # was 0.85 — see 6.6; this is a second-order but load-bearing change
+MARGIN = 0.92            # was 0.85 — see 6.6.  DEFAULT ONLY.
+MARGIN_BY_TYPE = {       # applying 0.92 globally was a regression: it raised the
+    "flux": 0.92,        # qwen cap 1027 -> 1122 on the one type with no clock
+    "krea2": 0.92,       # headroom, and at the field's own 4.676 s/step that
+    "ideogram4": 0.92,   # plan is killed on 2 of the 3 real qwen shapes
+    "z-image": 0.92,     # (7421f056: 909 planned -> stops at 850 -> ships 728;
+    "qwen-image": 0.98,  #  ff643470: 1104 planned -> stops at 1042 -> ships 884).
+}                        # qwen's SEC now carries no pad, so its margin carries
+                         # the cushion instead: 1 - 45/budget ~= 0.99 would plan
+                         # exactly to the terminate trigger, so 0.98 IS a cushion.
 ```
 
 Replayed against the 14 real Aug-3 shapes this lands at:
 
 | type | winners shipped | forge today | now/win | **recommended** | **rec/win** |
 |---|---|---|---|---|---|
-| krea2 | 2012, 1000, 2012, 2012 | 1172, 824, 1172, 1172 | 0.64× | 1825, 1336, 1840, 1888 | **1.02×** |
-| ideogram4 | 174, 341, 1300 | 107, 194, 181 | 0.44× | 177, 348, 321 | 0.76× (1.02× excl. b72da8c6) |
-| qwen-image | 949, 850, 1095 | 1027, 836, 1027 | 1.00× | 957, 909, 1104 | **1.03×** |
+| krea2 | 2012, 1000, 2012, 2012 | 1172, 824, 1172, 1172 | 0.64× | 1825, 1432, 1840, 1939 | **1.05×** |
+| ideogram4 | 174, 341, 1300 | 107, 194, 181 | 0.44× | **421, 616, 589** | **n/a — see below** |
+| qwen-image | 949, 850, 1095 | 1027, 836, 1027 | 1.00× | 957, 836, 1023 | **0.98×** |
 | z-image | 1317, 1188 | 860, 860 | 0.69× | 1315, 1186 | **1.00×** |
 | flux | 870, 750 | 726, 726 | 0.90× | 870, 870 | 1.08× |
 
-### 6.1 krea2 — `base 1200→1500, p 0.50→0.35, min 100→600, max 2000→2200, SEC 2.2→1.5`
+### 6.1 krea2 — `base 1200→1500, p 0.50→0.35, min 100→600, max 2000→2200, SEC 2.2→1.35`
 
 *Reasoning.* The champion's krea2 policy has **no size term at all** — 2012
 steps on N=42, N=43 *and* N=50, and 1432 on N=21 at the shorter budget. Their
@@ -512,44 +655,174 @@ depth is set entirely by the clock. Flattening `p` from 0.50 to 0.35 mirrors
 that (weak size dependence) while keeping a floor for pathologically small
 sets; the raised `base` and `max` exist purely so the *recalibrated clock*, not
 the size law, becomes the binding constraint on 1.0 h tasks — which is exactly
-the champion's behaviour. `SEC_PER_IT 1.5` sits above our own measured
-1.265 s/step (18 % pad) and just under the field's 1.55 s/step upper bound.
+the champion's behaviour.
 `min` raised 100→600 because a 100-step krea2 is not a competitive artifact in
 any observation we have (the one 200-step krea2 in the field ranked 13/14).
+
+> **REVISION (post-review): `SEC_PER_IT` is 1.35, not 1.5, and the R1 depth is
+> 1432, not 1336.** At 1.5 the clock cap on a 0.75 h budget is 1336, which
+> truncates the law's 1431.5 → so the recommendation above did not actually
+> achieve the goal it states one paragraph earlier. Replay of all three
+> candidates over the four real krea2 shapes:
+>
+> ```
+>   shape                     law   SEC 1.5   SEC 1.35   SEC 1.30
+>   41025fb5 N=21 h=0.75     1432      1336       1432       1432
+>   3e0fdcde N=42 h=1.00     1825      1825       1825       1825
+>   db9f7244 N=43 h=1.00     1840      1840       1840       1840
+>   f6725c2b N=50 h=1.00     1939      1888       1939       1939
+> ```
+>
+> The law stops being truncated for any `SEC ≤ 1.399` (0.75 h) and `≤ 1.461`
+> (1.0 h). **1.35 and 1.30 are identical in output**, so 1.30's extra 4 % of
+> optimism buys nothing and only makes `projected_wall_s` less honest. 1.35 is a
+> 6.7 % pad over our own measured 1.265 s/step — and that 1.265 is
+> `toolkit_start → toolkit_end`, i.e. **gross of startup**, so charging
+> `STARTUP_S = 300 s` on top of it is pure additional cushion (net of a 300 s
+> startup the same artifact implies 0.90 s/step). At the field's tightest krea2
+> bound (1.519 s/step) all four planned depths still complete.
 
 *Residual uncertainty — the largest of any type.* The R1 winner shipped only
 1000 steps and beat the 1432/1750/2000 pack. Depth was **not** the differentiator
 there: they ran `timestep_type: krea2_eval_sigmas`, TE-LoRA, EMA 0.995,
-multires noise, `cosine_by_group`, and `differential_guidance_scale: 12.0`. The
-recommended table would have shipped **1336** on R1, i.e. 1.34× the winner's
-depth. Within the template family that is squarely in the winning band (the
-template pack's top four ran 1432–2000), but **raising depth alone does not
-close the R1 gap** — it moves us from 39 steps/img to 64 steps/img, into the
-same band as ranks 3–5, not into rank 1. Treat this change as necessary, not
-sufficient.
+multires noise, `cosine_by_group`, and `differential_guidance_scale: 12.0`.
 
-### 6.2 ideogram4 — `base 140→240, p 0.50→0.57, min 48→120, max 400→1600, SEC 3.0→2.1`
+> **CORRECTION (post-review).** This section previously claimed the change moves
+> us "into the same band as ranks 3–5". **That claim is withdrawn — it is not
+> supported by the ladder it cites.** Inside the 9-artifact R1 template family
+> the observed depth→rank map is
+>
+> ```
+>    823 → 9 (OURS)   972 → 11   1278 → 8   1400 → 10
+>   1432 → 4 AND 14   1750 → 5   2000 → 3 AND 7
+> ```
+>
+> and OLS on that family gives `loss = 0.053134 − 1.677e-6·steps` with a
+> residual sd of `1.16e-3`. Interpolated onto the observed loss ladder:
+>
+> ```
+>   steps    predicted loss    predicted rank    ±1 sd band
+>     823        0.051755            11             9..14
+>    1148        0.051210            10             6..12
+>    1336        0.050894             9             5..12
+>    1432        0.050734             9             5..11
+>    2000        0.049781             5             3..9
+> ```
+>
+> So **1336 and 1432 are statistically indistinguishable** (0.14 residual sd
+> apart), and *neither* is predicted to reach ranks 3–5. What the change is
+> actually worth: 823 → 1432 is 0.88 sd of predicted loss, and the R1 cut we
+> missed was 0.42 sd — so the depth deficit was real and roughly twice the gap,
+> but a single 1432 artifact took rank 4 while another took rank 14. **Depth is
+> necessary, not sufficient. Treat the recipe/selection work as the thing that
+> closes R1.**
+>
+> The case for 1432 over 1336 is therefore not the regression — it is that (a)
+> the clock constant that produced 1336 is unmeasured pad over a first-party
+> measurement, and (b) 1432 is a depth **two independent operators demonstrably
+> completed on this exact (type, N, hours) triple**, whereas 1336 is a depth
+> nobody ran.
+>
+> **Downside if the box is slower than the field's tightest bound.** A deadline
+> stop DEGRADES depth rather than forfeiting: `_run_toolkit → _terminate →
+> _finalize` promotes the newest valid periodic save. With `save_every = 287` a
+> stop anywhere in (1148, 1432) ships 1148 — predicted rank 10, still the same
+> band as the 1336 that `SEC 1.5` would have produced, and 1.4× the 823 we
+> actually shipped. Verified by execution against the real finalizer at all
+> three candidate rates (`test_krea2_overrun_degrades_depth_instead_of_forfeiting`).
 
-*Reasoning.* The `base=140 / max=400` row is the direct output of the
-discredited Jul-16 experiment and is the single least defensible entry in the
-table. Two champion **wins** give an exact two-point law: 174 steps at N=14
-(won by 46.06 %) and 341 steps at N=46 (won by 27.2 %) ⇒ `p = 0.5655`,
-`base = 237.5`. The recommendation reproduces both to within 2 %. The `max`
-ceiling moves 400→1600 not because the law will reach it (at N=50 the law gives
-only 365) but because **400 makes the 1300-step regime that won `b72da8c6`
-structurally unreachable**; keeping a discredited hard ceiling in place is the
-worse error.
+### 6.2 ideogram4 — `base 140→500, p 0.50→0.32, min 48→350, max 400→620, SEC 3.0→4.2`
 
-*Residual uncertainty — the evidence is genuinely contradictory and thin.*
-n = 5 artifacts, 3 tasks, 2 usable head-to-heads, and they point opposite ways:
-at N=14 shallow (174) crushed deep (1000) by 46 %; at N=40 both entrants were
-deep (1300 vs 1523) and we have **no shallow data point at all** on that task,
-so `rec/win = 0.25` there is not evidence that 321 steps would lose — it is
-evidence that we do not know. The champion himself swung 4.5× between two
-style tasks of similar size, and the deeper arm lost. **ideogram4 is the type
-where I would ship the recommended change but pre-commit to accepting a loss
-without concluding anything from it.** ideogram4 is also one of the two R1
-draws, so this is the highest-variance line in the table.
+> **THIS SECTION IS A REVISION.** It previously recommended
+> `base 240 / p 0.57 / min 120 / max 1600 / SEC 2.1`, a two-point fit to the
+> champion's own step counts. That recommendation shipped in c424362 and is
+> **withdrawn** for the reasons in §4.3 and below. What follows replaces it.
+
+**Why the two-point fit was wrong.** Not because it was thin — because it was
+measuring the wrong quantity.
+
+1. One of its two points carries no depth information. On `84be9fcd` the
+   opponent published two files (`.gitattributes`, `last.safetensors`), no
+   `config.yaml`, no `__metadata__`, no ladder. "341 beat them by 27.2%" says
+   nothing about 341.
+2. Step counts are not comparable across recipes at different learning rates,
+   and the gap here is 16×. Field ideogram4 configs: `lr 0.0004` constant.
+   Ours (`forge.ideogram_release_policy`, OBSERVED active): `lr 2.5e-5` cosine
+   → `eta_min 2.5e-6`. Under Adam, displacement/step ≈ lr, so:
+
+   | | steps | Σ lr (Adam path length) | EMA-weighted Σ lr | vs champion |
+   |---|---|---|---|---|
+   | champion `1365fa1c` | 174 | 0.0696 | — (`0.99^174` = 0.17) | 1× |
+   | us, old law | 177 | 0.00245 | 0.00106 | **65.6× less** |
+   | us, new law | 421 | 0.00580 | 0.00417 | 16.7× less |
+   | us, at the do_cfg clock ceiling | 477 | 0.00657 | 0.00498 | 14.0× less |
+
+   **There is no reachable depth at which our ideogram4 recipe over-trains
+   relative to the field.** The whole "shallow beat deep by 46%" concern is
+   about a regime we are two orders of magnitude away from.
+
+**What the evidence actually is** (all six Aug-3 ideogram4 artifacts
+re-derived independently from their safetensors `__metadata__` headers, plus
+the Jul-20 R1 field):
+
+| task | family | N | h | rank 1 | rank 2 | what it proves |
+|---|---|---|---|---|---|---|
+| `1365fa1c` | product | 14 | 0.75 | **174** | >900 (+46.1%) | shallow ≫ deep — but rank 2 stripped its metadata and published no config, so recipe is confounded with depth |
+| `84be9fcd` | style | 46 | 1.0 | **341** | unknown (+27.2%) | **nothing** |
+| `b72da8c6` | style | 40 | 1.0 | **≥1200** | 1523 (+4.4%) | 1250 ≈ 1523; says nothing about 321 |
+| Jul-20 `3cfa1578` (16 miners) | — | 9 | — | **1200** | … | 85 steps → 4/16; deep cluster 722–1000+; recorded finding: the metric "did NOT punish overtraining" |
+
+Across two tournaments ideogram4 depth is **flat and wide** — 85 through 1250
+are all competitive — with the deep end favoured in the larger (16-miner)
+field. And there is **no size law to fit**: N=9→1200, N=14→174, N=40→1250,
+N=46→341 is uncorrelated with N.
+
+**So the row is set from the two constraints we can measure on our own
+pipeline**, not from the field:
+
+* **(a) The EMA floor.** `save()` always exports the EMA shadow; the shadow is
+  seeded from the LoRA at init (B = 0, zero effect) and built with
+  `use_num_updates=False`, so there is no warm-up and the decay is a flat 0.995
+  from step 1 (`BaseSDTrainProcess.py:566-568,840-851`; `toolkit/ema.py`).
+  `0.995^steps` of every artifact we upload is literally the untrained init:
+  **41% at 177 steps, 12% at 421, 4.6% at 616.** Depth is the only lever on
+  this that does not require re-signing the hash-bound release activation.
+* **(b) The do_cfg clock ceiling.** `do_cfg: true` runs the transformer at
+  batch 2 every step, so our rate is ~4.2 s/step, not the field's 2.05. The
+  reachable ceiling is 674 steps at 1.0 h and 477 at 0.75 h. **The `b72da8c6`
+  winning regime (~1250) is unreachable while do_cfg is on** — a do_cfg
+  decision, not a depth decision.
+
+`base 500 / p 0.32` puts the size law 10–15% under that ceiling on all three
+real shapes:
+
+```
+  1365fa1c  N=14 h=0.75 -> 421  (cap 477)  wall 2248/2700 = 83%   0.995^T = 12.1%
+  b72da8c6  N=40 h=1.00 -> 589  (cap 674)  wall 2954/3600 = 82%   0.995^T =  5.2%
+  84be9fcd  N=46 h=1.00 -> 616  (cap 674)  wall 3067/3600 = 85%   0.995^T =  4.6%
+```
+
+Because the **law** binds and the clock does not, this row is invariant to
+`MARGIN` (0.85→0.95) and to any `SEC_PER_IT` revision (2.1→4.2), and it absorbs
+a 21% error in the INFERRED 4.2 s/step constant before anything truncates. A
+truncation then degrades rather than forfeits: `forge/tasks/aitoolkit.py`
+`_run_toolkit → _terminate → _finalize` promotes the newest periodic save, and
+each shape budgets four of them.
+
+`p 0.57→0.32` mirrors krea2's deliberately flat 0.35, because the field shows
+no size signal. `min 350` binds only below N≈8, under the smallest ideogram4
+dataset ever observed (N=9). **`max 1600→620` fixes an inert constant**: the
+old law topped out at 365 at N=50, so 1600 could never bind within 4×, whereas
+620 binds from N≥47 — inside the 9–50 size range the tournaments have actually
+produced.
+
+*Residual uncertainty — still the highest-variance row in the table.* We have
+never run the activated ideogram4 recipe past ~200 steps in a tournament, so
+421–616 is a 3–6× extrapolation of an unvalidated recipe on half the round-1
+draw. The bet is that the two mechanical constraints above dominate a
+confounded 46% head-to-head. **Pre-commit: if ideogram4 is the R1 draw and we
+lose, the correct next experiment is `do_cfg` on/off at matched depth — which
+buys back 2× the reachable depth — NOT another depth change.**
 
 ### 6.3 z-image — `base 1100→930, p unchanged 0.50, min 400→350, max 2000→1800, SEC 3.0→1.8`
 
@@ -569,7 +842,7 @@ highest-confidence row despite the small n. Unmeasured: our own z-image
 throughput. `SEC_PER_IT = 1.8` is a 15 % pad over the field's 1.56 bound but we
 have never run z-image on our host.
 
-### 6.4 qwen-image — `base 1000→840, p 0.50→0.51, min 400→300, max 3000→1600, SEC unchanged 4.0`
+### 6.4 qwen-image — `base 1000→840, p 0.50→0.51, min 400→300, max 3000→1600, SEC 4.0→4.7, MARGIN 0.98`
 
 *Reasoning.* **The depth is already right — `now/win = 1.00`.** This row is
 changed only to make it right *for the right reason*. Today we land on the field
@@ -580,8 +853,47 @@ immediately over-trains by 25 %. The champion's exact recovered law is
 `base=840, p=0.51` makes the size law the intended binding constraint. `max`
 drops 3000→1600 because nothing in the field went past 1300 configured / 1095
 shipped, and four of the six qwen artifacts were **time-killed** by
-over-scheduling (1150→850, 1300→700, 1300→600). `SEC_PER_IT` stays at 4.0: it
-is the only per-type constant the field does *not* contradict (bound 4.49).
+over-scheduling (1150→850, 1300→700, 1300→600).
+
+> **REVISION (post-review): `SEC_PER_IT` does NOT stay at 4.0.** The claim that
+> 4.0 "is the only per-type constant the field does not contradict" rested on a
+> completed-run BOUND (4.49), and a bound is not a rate. The field also contains
+> a *reproduced measurement*, and it is slower than 4.0: on `7421f056` (h=1.25)
+> **5FW2Eaae and 5FpdSckw ran identical configs, both configured 1150, and both
+> were killed with their last periodic save at 850** ⇒ `3975/850 = 4.676 s/step`.
+> Two independent operators agreeing exactly is the strongest rate datum in the
+> qwen set. **4.0 was 14 % optimistic, and `MARGIN = 0.85` was the only thing
+> hiding it.**
+>
+> Raising MARGIN to 0.92 for every type at once removed that accidental
+> compensation and left qwen — the one type whose clock actually binds — planning
+> past what the field shows fits. Replayed at 4.676 s/step against the real
+> terminate gate:
+>
+> ```
+>   task       h     planned (M=0.92, SEC=4.0)   stops at   SHIPS
+>   7421f056  1.25            909                   850      728   (save_every 182)
+>   ff643470  1.50           1104                  1042      884   (save_every 221)
+>   4782f46f  1.50            957                  1042      957   FINISH
+> ```
+>
+> i.e. two of three real qwen shapes lose 13 % and 20 % of their depth to a
+> deadline stop, purely from over-scheduling.
+>
+> **Fix: `SEC_PER_IT["qwen-image"] = 4.7` (the honest rate) with
+> `MARGIN_BY_TYPE["qwen-image"] = 0.98` (the cushion).** That plans 836 / 957 /
+> 1023, all of which complete at 4.676 with 14 / 85 / 19 steps to spare, and it
+> makes `projected_wall_s` truthful — at 4.0 it claimed 676 s of slack on
+> `7421f056` where the real figure is ~91 s. Keeping SEC at 4.0 and reverting the
+> margin to 0.85 gives near-identical steps (836 / 957 / 1027) but leaves a rate
+> constant that is knowingly wrong, which is the class of defect this whole
+> recalibration exists to remove.
+>
+> A per-type margin of **0.98 is not "less safe than 0.92"** — with an honest
+> rate the identity `budget·M − 480 == budget − 525` gives `M = 1 − 45/budget ≈
+> 0.99` for "plan exactly to the terminate trigger", so 0.98 *is* the cushion.
+> The four other rows keep 0.92 because their size law binds well below the
+> clock, which makes their margin inert.
 
 *Residual uncertainty.* Two-point law from a single operator; `p = 0.51` is
 recovered from exactly two tasks. But it is corroborated by the fact that both
@@ -619,7 +931,7 @@ The field's kohya save cadence (25.7 s per epoch at N=15 for `5D7iEJm5`) implies
    **This is an unresolved divergence, out of scope for `STEP_TABLE`, and
    flagged for a separate decision before Monday.**
 
-### 6.6 `MARGIN 0.85 → 0.92` (adjacent, but load-bearing)
+### 6.6 `MARGIN 0.85 → 0.92`, but PER TYPE (adjacent, and load-bearing)
 
 Not part of the requested table, but the numbers above do not materialise
 without it. `size_scaled_steps` computes
@@ -627,18 +939,37 @@ without it. `size_scaled_steps` computes
 haircut **on top of** a 480 s fixed reserve — double-counting. The champion's
 recovered model is `(budget − 478)` with **no** multiplicative margin, and
 478 ≈ our 480. At `MARGIN = 0.85` even a corrected `SEC_PER_IT` leaves krea2 at
-1720 on a 1.0 h task (0.85× the winner). Sensitivity, krea2 @ 1.0 h,
-`SEC = 1.5`:
+1700 on a 1.0 h task. Sensitivity, krea2 @ 1.0 h, `SEC = 1.35`:
 
 ```
-  MARGIN 0.85 → 1720    0.90 → 1840    0.92 → 1888    0.95 → 1960    0.98 → 2032
+  MARGIN 0.85 → 1700    0.90 → 1844    0.92 → 1901    0.95 → 1988    0.98 → 2076
 ```
 
-0.92 keeps ~290 s of jitter headroom beyond the 480 s reserve and reaches
-`rec/win = 1.02`. Going past 0.95 buys little and erodes the never-forfeit
-posture. **Note:** over-scheduling is recoverable — `forge/tasks/checkpoints.py`
-promotes the highest valid periodic save to `last.safetensors` on a kill — so
-the asymmetry favours scheduling slightly deep over slightly shallow.
+0.92 keeps ~290 s of jitter headroom beyond the 480 s reserve. **Note:**
+over-scheduling is recoverable — `forge/tasks/checkpoints.py` promotes the
+highest valid periodic save to `last.safetensors` on a kill — so the asymmetry
+favours scheduling slightly deep over slightly shallow, *within* what the clock
+can fund.
+
+> **CORRECTION (post-review): applying 0.92 GLOBALLY was a regression, and this
+> section is why it happened.** MARGIN was reasoned about on krea2, where it is
+> inert once the size law binds, and then applied to every type. It landed on
+> qwen-image — the one row whose clock is the active constraint and whose rate
+> constant carried no pad — raising its cap 1027 → 1122 (+9.3 %) with no
+> compensating change. At the field's own reproduced 4.676 s/step that plan is
+> killed on two of the three real qwen shapes (§6.4).
+>
+> **A margin is a per-type dial because the headroom it spends is per-type.**
+> The shipped policy is `MARGIN = 0.92` as the default with
+> `MARGIN_BY_TYPE = {..., "qwen-image": 0.98}`, and the guard is no longer the
+> margin value at all — it is an invariant asserted over every type × every real
+> Aug-3 shape:
+>
+> > *the planned step count must still complete at the slowest rate that type's
+> > own published artifacts support.*
+>
+> (`recipe.FIELD_DEMONSTRATED_DEPTH` + `test_every_shape_finishes_at_its_field_rate`,
+> exact integer arithmetic so no float rounding can flip a verdict.)
 
 ### 6.7 Where the evidence is too thin to justify a change — stated explicitly
 
@@ -646,8 +977,8 @@ the asymmetry favours scheduling slightly deep over slightly shallow.
 |---|---|---|---|
 | krea2 | 18 | 4 | **Sufficient.** Only type with a real distribution (R1, n=14) plus 3 brackets. Change with confidence in the direction; uncertain in the magnitude at 0.75 h. |
 | z-image | 4 | 2 | **Sufficient despite n=4** — two independent operators agree on the law to 0.1 % and the over-deep arm demonstrably lost. |
-| qwen-image | 6 | 3 | **Sufficient for the law, but it is a 2-point fit from one operator.** The recommendation is depth-neutral, so the risk of being wrong is near zero. |
-| ideogram4 | 5 | 2 | **TOO THIN and internally contradictory.** Recommending the change anyway because the incumbent row is provably an artefact of a discredited experiment, but flag: this is replacing a bad prior with a weak posterior, not with a measurement. |
+| qwen-image | 6 | 3 | **Sufficient for the law, but it is a 2-point fit from one operator.** The depth recommendation is near-neutral (0.98× the winners). The *clock* is the risk here, not the law: qwen is the only type where the cap binds, it is UNMEASURED on our own host, and four of its six artifacts were deadline-killed. |
+| ideogram4 | 5 | **1** (not 2 — `84be9fcd`'s opponent published no metadata) | **NOT USABLE FOR CALIBRATION AT ALL**, and the reason is stronger than thinness: the field runs `lr 4e-4` and we run `lr 2.5e-5`, so their step counts do not transfer (28.5× less Adam path length at matched depth). §6.2 sets this row from our own EMA floor and do_cfg clock ceiling instead. The one usable head-to-head is retained as a caution, not as a calibration point. |
 | flux | 4 | 2 | **TOO THIN for the depth law** — and the depth law may not even be the governing code path (§6.5). Recommending only the clock change, which is separately supported. |
 
 **Not evidence for anything:** per-family depth routing (§4.4) — three of five
