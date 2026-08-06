@@ -15,7 +15,7 @@ import os
 
 import yaml
 
-from forge import ideogram_release_policy, recipe, telemetry
+from forge import geometry, ideogram_release_policy, recipe, telemetry
 
 # Templates are shipped INSIDE the package (forge/templates/*.yaml) so they are
 # present under any deployment (source COPY, `pip install .` wheel, or local test)
@@ -152,6 +152,8 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
         steps, p["save"].get("save_every", 250)
     )
 
+    _apply_eval_geometry(p, spec)
+
     if spec.model_type == "ideogram4":
         mk = model.setdefault("model_kwargs", {})
         mk["text_encoder_path"] = _IDEOGRAM4_TE
@@ -174,6 +176,68 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
         # selected checkpoint. Template LR stands; the real gap is checkpoint
         # SELECTION for image exports (see postmortem handoff).
     return cfg
+
+
+def _apply_eval_geometry(process: dict, spec) -> None:
+    """Replace the inherited 3-copy ``resolution`` list with the scored geometry.
+
+    DEFAULT OFF for every model type.  All 24 published ai-toolkit configs in the
+    Aug-3 tournament — including the 8-win operator's — shipped the inherited
+    ``[512, 768, 1024]``, so this is an unvalidated deviation from the entire
+    field and must be opted into per type via ``FORGE_EVAL_GEOMETRY_TYPES``.
+    ideogram4 is structurally ineligible (the release policy hash-binds the
+    template list; see ``forge/geometry.py``).
+
+    Totally self-contained: any failure leaves the template's resolution exactly
+    as inherited, so a bug here can never degrade the rest of the override
+    contract (INV-1).
+    """
+    try:
+        if not geometry.enabled_for(spec.model_type):
+            return
+        dims = geometry.measure_images(spec.dataset_images_dir)
+        plan = geometry.plan(spec.model_type, dims)
+        if plan is None:
+            telemetry.event(
+                "eval_geometry_policy_inactive",
+                model_type=spec.model_type,
+                reason="no_measurable_images",
+            )
+            return
+        dataset = process["datasets"][0]
+        before = dataset.get("resolution")
+        # ONE scalar, not a list: a list is forked into one full dataset copy per
+        # entry (config_modules.py:preprocess_dataset_raw_config), which is the
+        # mechanism that put two thirds of our training signal at a scale the
+        # evaluator never looks at.
+        dataset["resolution"] = plan["resolution"]
+        # Written to state the truth rather than inherit a lie: the runtime
+        # overwrites this key with sd.get_bucket_divisibility() at dataset
+        # construction (data_loader.py:395), and `plan["bucket_tolerance"]` IS
+        # that forced value.  Emitting it makes the divisibility that governs the
+        # achievable geometry visible in the config we ship.
+        dataset["bucket_tolerance"] = plan["bucket_tolerance"]
+        telemetry.event(
+            "eval_geometry_policy_applied",
+            model_type=spec.model_type,
+            resolution_before=before,
+            resolution=plan["resolution"],
+            bucket_tolerance=plan["bucket_tolerance"],
+            images=plan["images"],
+            on_geometry=plan["on_geometry"],
+            on_geometry_pct=plan["on_geometry_pct"],
+            cohorts=plan["cohorts"],
+        )
+    except Exception as exc:  # noqa: BLE001 — geometry must never forfeit a task
+        try:
+            telemetry.event(
+                "eval_geometry_policy_inactive",
+                model_type=getattr(spec, "model_type", None),
+                reason="error",
+                error_type=type(exc).__name__,
+            )
+        except Exception:
+            pass
 
 
 def write_config(cfg: dict, path: str) -> None:

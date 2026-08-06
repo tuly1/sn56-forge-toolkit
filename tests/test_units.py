@@ -246,11 +246,13 @@ def test_recipe_step_scaling():
     s10 = recipe.size_scaled_steps("flux", 10, 1000, 2000)
     s50 = recipe.size_scaled_steps("flux", 50, 1000, 2000)
     assert s10 < s50
-    # krea2 emergency field-depth override: high ceiling, unchanged minimum.
-    assert recipe.size_scaled_steps("krea2", 1, 1000, 2000) == 245
-    assert recipe.size_scaled_steps("krea2", 500, 1000, 2000) == 2000  # max
-    # z-image now has its own law (champion base 1100 @ n_ref)
-    assert recipe.size_scaled_steps("z-image", 24, 1000, 2000) == 1100
+    # krea2 week-6 field recalibration: floor 600 (no 100-step krea2 was ever
+    # competitive; the one 200-step entrant in the R1 field ranked 13/14),
+    # ceiling 2200 (the champion clock-filled to 2012 on a 1.0 h task).
+    assert recipe.size_scaled_steps("krea2", 1, 1000, 2000) == 600  # min
+    assert recipe.size_scaled_steps("krea2", 500, 1000, 2000) == 2200  # max
+    # z-image law re-derived from TWO independent rank-1 operators (base 930).
+    assert recipe.size_scaled_steps("z-image", 24, 1000, 2000) == 930
     # unknown type -> template
     assert recipe.size_scaled_steps("sd3", 24, 1000, 2000) == 2000
     # budget cap drives well below scaled, never < 1
@@ -260,22 +262,25 @@ def test_recipe_step_scaling():
 
 
 def test_recipe_budget_cap_example():
-    # krea2 @ 24 imgs scales to the owner-ordered field-depth base.
+    # krea2 @ 24 imgs sits exactly on the week-6 base; at 1.0 h the clock cap is
+    # 1888, so the SIZE LAW binds — which is the point of the recalibration.
     v = recipe.size_scaled_steps("krea2", 24, 1.0, 2000)
-    assert v == 1172
+    assert v == 1500
     # the clock still binds on a tight budget
     v = recipe.size_scaled_steps("krea2", 24, 0.2, 2000)
-    assert v == 59
+    assert v == 121
 
 
 @pytest.mark.parametrize(
     ("hours", "expected"),
     [
-        (0.75, (775, 824, 824, 824, 824, 824)),
-        (1.0, (775, 1172, 1172, 1172, 1172, 1172)),
+        # cap @0.75 h = (0.75*3600*0.92 - 480)/1.5 = 1336
+        (0.75, (1104, 1336, 1336, 1336, 1336, 1336)),
+        # cap @1.0 h = (1.0*3600*0.92 - 480)/1.5 = 1888
+        (1.0, (1104, 1500, 1888, 1888, 1888, 1888)),
     ],
 )
-def test_krea_emergency_materialization_table(hours, expected):
+def test_krea_week6_materialization_table(hours, expected):
     sizes = (10, 24, 50, 100, 200, 500)
     actual = tuple(
         recipe.size_scaled_steps("krea2", n, hours, 2000) for n in sizes
@@ -292,8 +297,10 @@ def test_recipe_save_every():
     assert (86 - 1) // recipe.kill_safe_save_every(86, 250) == 3
     assert recipe.kill_safe_save_every(367, 200) == 74
     assert (367 - 1) // recipe.kill_safe_save_every(367, 200) == 4
-    # The owner-ordered 824-step Krea run retains four periodic recovery points;
-    # at 2.2 s/it, a deadline stop loses about six minutes of in-memory progress.
+    # The Aug-3 823-step Krea run's cadence, retained as a regression anchor:
+    # four periodic recovery points.  At our MEASURED 1.265 s/it (from that
+    # run's own published forge_run.json) a deadline stop there loses about
+    # three and a half minutes of in-memory progress.
     assert recipe.kill_safe_save_every(824, 250) == 165
     assert (824 - 1) // recipe.kill_safe_save_every(824, 250) == 4
     assert recipe.kill_safe_save_every(24, 250) == 12  # one mid-run recovery point

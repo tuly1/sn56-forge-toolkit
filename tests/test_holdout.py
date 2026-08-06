@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 import signal
 import sqlite3
@@ -700,8 +701,18 @@ def test_holdout_budget_gate_matches_recipe_and_keeps_multiple_candidates(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("FORGE_HOLDOUT_SELECTION_TYPES", "krea2")
-    assert not holdout.budget_allows("krea2", 2202.0)
-    assert holdout.budget_allows("krea2", 2203.0)
+    # Derived rather than hard-coded: this boundary is a function of
+    # recipe.MARGIN, and pinning it as a literal is exactly how the week-6
+    # MARGIN correction (0.85 -> 0.92) silently broke it.
+    boundary = (
+        holdout._MIN_TRAINING_WINDOW_S["krea2"]
+        + holdout._SCORING_RESERVE_S["krea2"]
+        + holdout.boundary_margin_s()
+        + recipe.STARTUP_S
+        + recipe.EXPORT_RESERVE_S
+    ) / recipe.MARGIN - recipe.EXPORT_RESERVE_S
+    assert not holdout.budget_allows("krea2", math.floor(boundary))
+    assert holdout.budget_allows("krea2", math.ceil(boundary))
 
     spec, _save_root, _holdout_dir = _spec(tmp_path, monkeypatch)
     hard_remaining = 2203.0 + recipe.EXPORT_RESERVE_S
@@ -728,9 +739,13 @@ def test_dormant_holdout_preserves_exact_recipe_budget_and_step_caps(monkeypatch
         def remaining_hard(self):
             return self.hard_remaining
 
+    # Week-6 recalibration: ideogram4 9 imgs @0.25 h is clock-bound
+    # ((900*0.92 - 480)/4.2 = 82, law 137); krea2 24 imgs @0.5 h is clock-bound
+    # ((1800*0.92 - 480)/1.5 = 784, law 1500).  Was 86 / 477 under the Jul-16
+    # rows and MARGIN 0.85.
     cases = (
-        ("ideogram4", "black-forest-labs/FLUX.1-Krea-dev", 9, 0.25, 86),
-        ("krea2", "krea/Krea-2-Raw", 24, 0.5, 477),
+        ("ideogram4", "black-forest-labs/FLUX.1-Krea-dev", 9, 0.25, 82),
+        ("krea2", "krea/Krea-2-Raw", 24, 0.5, 784),
     )
     for model_type, model, images, hours, expected_steps in cases:
         assert not holdout.enabled_for(model_type)

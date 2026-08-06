@@ -74,9 +74,21 @@ def _activation(*, owner_override: bool = False) -> dict:
     }
 
 
+# What `recipe.size_scaled_steps("ideogram4", 36, 0.75, ...)` materialises for
+# the fixture shape below.  Was 171 under the discredited Jul-16 row
+# (base 140 / p 0.50 / max 400); now 302 under the week-6 field calibration
+# (base 240 / p 0.57), which is the SIZE law — the 4.2 s/step clock cap on a
+# 0.75 h budget is 477, so it does not bind.  Pinned in ONE place so a depth
+# change shows up as a single deliberate edit rather than four silent ones; the
+# depth law itself is guarded in tests/test_week6_depth_geometry.py.
+PLANNED_STEPS = 302
+
+
 def _build(monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setattr(policy, "PRODUCTION_ACTIVATION", _activation())
-    return config.build_config(_spec(), num_images=36, hours_to_complete=0.75)
+    cfg = config.build_config(_spec(), num_images=36, hours_to_complete=0.75)
+    assert cfg["config"]["process"][0]["train"]["steps"] == PLANNED_STEPS
+    return cfg
 
 
 def _write_safetensors(path: Path, tag: str) -> bytes:
@@ -208,7 +220,7 @@ def test_active_recipe_matches_the_scored_production_projection(
         "ema_config": {"use_ema": True, "ema_decay": 0.995},
         "do_cfg": True,
         "cfg_scale": 10.0,
-        "steps": 171,
+        "steps": PLANNED_STEPS,
     }
     control = policy.checkpoint_control(cfg)
     assert control is not None
@@ -217,7 +229,7 @@ def test_active_recipe_matches_the_scored_production_projection(
         "fraction_denominator": 1,
         "selection_rule": policy.CHECKPOINT_MAPPING_RULE,
     }
-    assert control[1] == 171
+    assert control[1] == PLANNED_STEPS
 
     drifted = json.loads(json.dumps(cfg))
     drifted["config"]["process"][0]["train"]["lr"] = 0.0001
@@ -252,7 +264,7 @@ def test_exact_final_outranks_holdout_and_loss_divergence(
                     },
                     {
                         "checkpoint": final.name,
-                        "step": 171,
+                        "step": PLANNED_STEPS,
                         "score": 0.50,
                         "sha256": _sha256(final),
                     },
@@ -261,7 +273,11 @@ def test_exact_final_outranks_holdout_and_loss_divergence(
         ),
         encoding="utf-8",
     )
-    _write_loss_db(tmp_path / "loss_log.db", state, [0.1] * 70 + [0.9] * 101)
+    _write_loss_db(
+        tmp_path / "loss_log.db",
+        state,
+        [0.1] * 70 + [0.9] * (PLANNED_STEPS - 70),
+    )
 
     record = checkpoints.finalize(str(tmp_path), "irepo", state)
 
@@ -338,9 +354,9 @@ def test_aitoolkit_threads_policy_control_into_run_scope(
             return 2700.0
 
     aitoolkit.run(spec, Deadline())
-    assert captured["steps"] == 171
+    assert captured["steps"] == PLANNED_STEPS
     assert captured["model_type"] == "ideogram4"
-    assert captured["checkpoint_selected_step"] == 171
+    assert captured["checkpoint_selected_step"] == PLANNED_STEPS
     assert captured["checkpoint_target"]["fraction_numerator"] == 1
 
 
