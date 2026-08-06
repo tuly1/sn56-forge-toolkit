@@ -17,6 +17,19 @@ config:
       max_step_saves_to_keep: 4
       save_format: diffusers
     datasets:
+    # NO caption_dropout_rate — DELIBERATE, not an oversight.  75% of the score
+    # is blank-prompt reconstruction (validator/evaluation/evaluators/diffusion.py
+    # :203-318 at pin b026da04), which makes dropout look free.  Both Aug-3 rank-1
+    # z-image configs omit the key (toolkit default 0.0,
+    # toolkit/config_modules.py:919 at ai-toolkit pin 99be3d96):
+    #   gradients-io-tournaments/tournament-tourn_c54bb970b5d0aa91_20260803
+    #     -b290d171-127b-4f8c-aad1-7e77d684bc0b-5EACrayt/checkpoints/config.yaml
+    #     -b2582457-922e-43eb-a499-eeca232f921b-5FBmn1ax/checkpoints/config.yaml
+    # The mechanism IS live here (nothing caches text embeddings away, so
+    # dataloader_mixins.py:387 would fire) and costs no wall clock — z-image is
+    # depth-law bound with >20% slack.  It is unshipped on evidence alone, and
+    # is the cheapest available experiment the next time there is GPU time.
+    # Guarded by tests/test_blank_prompt_training.py.
     - folder_path: /dataset/images
       caption_ext: txt
       cache_latents_to_disk: true
