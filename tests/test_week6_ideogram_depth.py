@@ -41,6 +41,8 @@ Evidence:
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from forge import ideogram_release_policy, recipe
@@ -62,9 +64,22 @@ REAL_IDEOGRAM_TASKS = [
 ]
 IDS = [row[0] for row in REAL_IDEOGRAM_TASKS]
 
-# The EMA decay the activated release policy binds.  Not a free constant here:
-# it is read back out of the policy so this file fails if the policy moves.
-EMA_DECAY = 0.995
+# The EMA decay the activated release policy binds.  This is now GENUINELY read
+# out of the policy — the previous version of this line claimed to do that in a
+# comment while hardcoding 0.995, so the two could (and did) drift apart.
+EMA_DECAY = ideogram_release_policy._EXPECTED_RECIPE["train"]["ema_config"][
+    "ema_decay"
+]
+# The value that decay is expected to hold, pinned separately so a policy edit
+# still trips this file rather than being silently inherited through the line
+# above.  0.995 -> 0.99 is the Week-6 EMA-horizon amendment
+# (forge/ideogram_release_policy.WEEK6_EMA_AMENDMENT); the mechanism and the
+# per-shape recovery are guarded in tests/test_week6_ideogram_ema_horizon.py.
+EXPECTED_EMA_DECAY = 0.99
+
+# Our shipped schedule, needed by the attenuation model below.
+LR0 = 2.5e-5
+ETA_MIN = 2.5e-6
 
 
 def _cap(hours, margin, sec_per_it):
@@ -72,19 +87,92 @@ def _cap(hours, margin, sec_per_it):
     return int(train_s / sec_per_it) if train_s > 0 else 1
 
 
-def test_activated_policy_still_carries_the_lr_and_ema_this_law_assumes():
-    """The law below is derived FROM these two values; pin them.
+def exported_fraction(steps, decay, lr0=LR0, eta_min=ETA_MIN, cosine=True):
+    """Share of the trained LoRA delta that ``save()`` actually exports.
 
-    If ``lr`` ever returns to the field's 4e-4, or ``ema_decay`` drops to the
-    field's 0.99, the whole argument for this depth changes and the law must be
-    re-derived rather than silently inherited.
+    MODEL, NOT MEASUREMENT.  ``lora_up`` (B) is zero-initialised, so
+    ``B_k = sum_{j<=k} lr_j`` under Adam's ~lr per-coordinate displacement, and
+    the exported shadow obeys ``s_k = d*s_{k-1} + (1-d)*B_k`` with ``s_0 = 0``.
+    ``lora_down`` starts non-zero so ``A_ema ~= A_final`` to leading order, which
+    makes the exported adapter ``f = s_T/B_T`` times the trained one.  ASSUMPTION:
+    the update direction is stable enough that the shadow is a scaled endpoint
+    rather than a directional average — exact early, degrades late.
+
+    Anchored by ``test_the_attenuation_model_matches_its_published_anchors``.
+    """
+    b = 0.0
+    s = 0.0
+    for k in range(steps):
+        lr = (
+            eta_min + (lr0 - eta_min) * (1 + math.cos(math.pi * k / steps)) / 2
+            if cosine
+            else lr0
+        )
+        b += lr
+        s = decay * s + (1 - decay) * b
+    return s / b
+
+
+def test_activated_policy_still_carries_the_lr_and_ema_this_law_assumes():
+    """The law below is derived FROM these values; pin them.
+
+    THIS TRIPWIRE FIRED IN WEEK 6 AND WAS DISCHARGED, NOT DISARMED.  It was
+    written to go red if ``ema_decay`` ever moved to the field's 0.99 so that the
+    depth law would be re-derived rather than silently inherited.  It went red
+    when ``forge.ideogram_release_policy`` adopted 0.99, the re-derivation was
+    done (see ``exported_fraction`` above and
+    ``test_ideogram4_export_is_not_dominated_by_ema_attenuation`` below), and the
+    conclusion was that the SHIPPED DEPTHS DO NOT MOVE: 421/589/616 are set by
+    the size law and the do_cfg clock ceiling, and the EMA term is a floor those
+    depths clear with room at either decay.  What changed is that the floor is
+    now expressed in the quantity that actually binds.
+
+    ``lr`` is deliberately still pinned hard: it is the coupled decision the
+    Week-6 amendment did NOT take, and the depth law IS derived from it.
     """
     train = ideogram_release_policy._EXPECTED_RECIPE["train"]
     assert train["lr"] == 2.5e-5
     assert train["lr_scheduler"] == "cosine"
     assert train["lr_scheduler_params"] == {"eta_min": 2.5e-6}
-    assert train["ema_config"] == {"use_ema": True, "ema_decay": EMA_DECAY}
     assert train["do_cfg"] is True and train["cfg_scale"] == 10.0
+    assert train["ema_config"] == {"use_ema": True, "ema_decay": EXPECTED_EMA_DECAY}
+    assert EMA_DECAY == EXPECTED_EMA_DECAY
+    # The decay may only sit at a value carried by a named, individually hashed
+    # amendment record, so it cannot be moved again by an unaudited edit.
+    amendment = ideogram_release_policy.WEEK6_EMA_AMENDMENT
+    assert amendment["field"] == "config.process[0].train.ema_config.ema_decay"
+    assert amendment["amended_value"] == EXPECTED_EMA_DECAY
+    assert amendment["validated_value"] == 0.995
+    assert amendment in ideogram_release_policy._POLICY_BODY["amendments"]
+    assert (
+        ideogram_release_policy.PRODUCTION_ACTIVATION["amendment_sha256"]
+        == ideogram_release_policy.AMENDMENT_SHA256
+    )
+
+
+def test_the_attenuation_model_matches_its_published_anchors():
+    """Guard the model this file now asserts on against silent drift.
+
+    The constant-lr case has a closed form,
+    ``f = (1-d^T) - d(1 - T d^(T-1) + (T-1) d^T) / (T(1-d))``, and the two
+    anchors below are the figures derived independently three times in week 6
+    (unit report, adversarial review, correctness sweep).  A second copy of this
+    model lives in ``tests/test_week6_ideogram_ema_horizon.py``; both are pinned
+    to the same anchors, so an edit to either one is caught here.
+    """
+
+    def closed_form(steps, decay):
+        return (1 - decay**steps) - decay * (
+            1 - steps * decay ** (steps - 1) + (steps - 1) * decay**steps
+        ) / (steps * (1 - decay))
+
+    for steps, expected in ((177, 0.338689), (421, 0.584607)):
+        sim = exported_fraction(steps, 0.995, cosine=False)
+        assert sim == pytest.approx(expected, abs=5e-6)
+        assert sim == pytest.approx(closed_form(steps, 0.995), abs=1e-9)
+    # And the cosine values this file's floor is calibrated against.
+    assert exported_fraction(421, 0.99) == pytest.approx(0.8939, abs=5e-4)
+    assert exported_fraction(421, 0.995) == pytest.approx(0.7192, abs=5e-4)
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
@@ -128,12 +216,13 @@ def test_ideogram4_depth_is_invariant_to_margin_and_sec_per_it(row):
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
-def test_ideogram4_export_is_not_dominated_by_the_untrained_init(row):
+def test_ideogram4_export_is_not_dominated_by_ema_attenuation(row):
     """(a) EMA attenuation — the reason this law is deep and not shallow.
 
     ``setup_ema`` builds ``ExponentialMovingAverage`` from the LoRA parameters
     at init, with ``use_num_updates=False`` so the ``(1+n)/(10+n)`` warm-up is
-    DISABLED and the decay is a flat 0.995 from step 1.  ``save()`` then calls
+    DISABLED and the decay is flat from step 1 (0.99 since the Week-6
+    EMA-horizon amendment; it was 0.995 when this test was written).  ``save()`` then calls
     ``ema.eval()`` unconditionally, so every artifact we upload — periodic saves
     included — is the shadow, not the trained weights
     (``BaseSDTrainProcess.py:491,495-497`` save, ``:769-781`` setup_ema,
@@ -151,23 +240,27 @@ def test_ideogram4_export_is_not_dominated_by_the_untrained_init(row):
     ``(1-d)*sum_t d^(T-t)*theta_t / theta_T`` on the cumulative-lr path; a
     constant-lr path gives 34% / 58% / 69%).
 
-    The assertion below is therefore a DEPTH FLOOR expressed through a monotone
-    proxy, not a measurement of dilution, and the local name ``untrained_share``
-    is a misnomer left in place because this unit may only edit docstrings (see
-    the integration request in the week-6 correctness-sweep report).  The bound
-    0.15 corresponds to steps >= ~379.  Direction is unchanged by the
-    correction: deeper still means less attenuation.
+    THE ASSERTION NOW USES THE CORRECT QUANTITY (integrator, week-6 merge).  The
+    old proxy ``EMA_DECAY ** steps <= 0.15`` was retained through the
+    correctness-sweep unit because that unit could only edit docstrings.  At the
+    amended decay it is TOOTHLESS: ``0.99**T <= 0.15`` binds only at T >= 189,
+    while this law's shallowest shape ships 421, so the proxy could no longer
+    fail for any depth anyone would plausibly ship.  It is replaced by
+    ``exported_fraction``, where the floor genuinely binds — 0.85 corresponds to
+    T >= 338 at decay 0.99, and the retired two-point law's 177 steps at N=14
+    scores 0.664 and fails.
     """
     _task, _family, pairs, hours, _winner, expected = row
     steps = recipe.size_scaled_steps("ideogram4", pairs, hours, 2000)
     assert steps == expected
-    untrained_share = EMA_DECAY ** steps
-    assert untrained_share <= 0.15, (
-        f"{_task}: {100 * untrained_share:.0f}% of the export is untrained init"
+    exported = exported_fraction(steps, EMA_DECAY)
+    assert exported >= 0.85, (
+        f"{_task}: only {100 * exported:.0f}% of the trained delta is exported "
+        f"at {steps} steps / decay {EMA_DECAY}"
     )
     # And strictly better than what the c424362 two-point law would have shipped.
     old_law = int(round(240 * (pairs / 24) ** 0.57))
-    assert untrained_share < EMA_DECAY ** old_law
+    assert exported > exported_fraction(old_law, EMA_DECAY)
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)

@@ -168,13 +168,25 @@ def test_shipped_caption_dropout_is_never_inert(generated_configs, model_type):
 
     This is a PROPERTY, not a pinned value: any type may legitimately change its
     dropout or its caching, but never into this combination.
+
+    THE FLAG IS READ AT BOTH LEVELS (integrator, week-6 merge).  The first
+    version of this test read only `train.cache_text_embeddings`, which admitted
+    the exact defect it exists to prevent: the gate at dataloader_mixins.py:387
+    reads the DATASET's flag, and BaseSDTrainProcess.py:148-151 only propagates
+    train -> dataset when train is TRUE — it never clears a dataset-level flag.
+    A config with dataset-level caching on and train-level off is therefore
+    inert, and the train-only read passed it.  Effective caching is the OR.
     """
     dataset, train = _dataset_and_train(generated_configs[model_type])
     dropout = float(dataset.get("caption_dropout_rate", 0.0) or 0.0)
-    cached = bool(train.get("cache_text_embeddings", False))
+    cached = bool(train.get("cache_text_embeddings", False)) or bool(
+        dataset.get("cache_text_embeddings", False)
+    )
     assert not (dropout > 0 and cached), (
         f"{model_type}: caption_dropout_rate={dropout} is INERT because "
-        "train.cache_text_embeddings is true (dataloader_mixins.py:387). "
+        "cache_text_embeddings is true at the train and/or dataset level "
+        "(dataloader_mixins.py:387 reads dataset_config.cache_text_embeddings; "
+        "BaseSDTrainProcess.py:148-151 copies train->dataset but never clears). "
         "Either drop the dropout key or turn caching off — but read "
         "test_qwen_budget_cannot_absorb_a_live_text_encoder before turning "
         "caching off on qwen-image."
@@ -236,7 +248,9 @@ def test_qwen_keeps_cached_text_embeddings_and_ships_no_dropout(generated_config
 # 4. Why the qwen fix was rejected: the clock, quantified.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("task,pairs,hours", QWEN_CLOCK_BOUND_SHAPES)
-def test_qwen_budget_cannot_absorb_a_live_text_encoder(task, pairs, hours):
+def test_qwen_budget_cannot_absorb_a_live_text_encoder(
+    generated_configs, task, pairs, hours
+):
     """Disabling `cache_text_embeddings` must buy itself out of ~1% of slack.
 
     With caching ON the text encoder runs once per IMAGE during
@@ -246,19 +260,43 @@ def test_qwen_budget_cannot_absorb_a_live_text_encoder(task, pairs, hours):
     stays resident on the GPU (qwen_image.py:167-172, 221 — a qfloat8
     Qwen2.5-VL-7B with the visual tower stripped).
 
-    So the recurring cost of the "fix" is `(steps - n_images)` extra 7B text
+    So the recurring cost of the "fix" is `(steps - cached_items)` extra 7B text
     encoder forwards, and the whole budget for them is the slack the planner
     leaves between `steps * SEC_PER_IT` and the terminate trigger.
 
+    `cached_items` is `pairs * len(resolution)`, NOT `pairs` (integrator, week-6
+    merge).  `resolution: [512, 768, 1024]` in the qwen template is expanded by
+    toolkit/config_modules.py:1050-1062 into one dataset COPY per resolution, so
+    the setup-time cached pass covers 3N items, not N.  The correction moves the
+    per-forward budget UP (fewer extra forwards to amortise the same slack) —
+    i.e. it works against the rejection — and the rejection still holds.
+
     This test asserts the per-forward budget is under 100 ms, i.e. too tight to
-    bet a tournament on for an encoder we have NEVER timed on our own host.  If
-    a future recalibration opens real slack, this fails — and that is the
-    signal to revisit the decision, not to delete the test.
+    bet a tournament on for an encoder we have NEVER timed on our own host.
+
+    WHAT A FAILURE HERE ACTUALLY MEANS.  This quantity is dominated by the
+    planner, not by the encoder: when the wall-clock cap binds, slack collapses
+    to roughly `(1 - MARGIN_BY_TYPE['qwen-image']) * budget - STARTUP_S`.  So it
+    goes RED when we become MORE conservative (measured: margin 0.98 passes at
+    ~61/74 ms, 0.96 fails at ~171/183 ms), which is the opposite of a reason to
+    turn caching off.  If it fails, first check whether `MARGIN_BY_TYPE` or
+    `SEC_PER_IT` moved; re-derive this bound against the new planner. Do NOT
+    read a failure as authorisation to disable `cache_text_embeddings`, and
+    never on tournament eve — that still requires a measurement of the qwen
+    encoder on our own host, which we do not have.
     """
+    qwen_dataset, _train = _dataset_and_train(generated_configs["qwen-image"])
+    resolution = qwen_dataset.get("resolution", 512)
+    dataset_copies = len(resolution) if isinstance(resolution, list) else 1
+    assert dataset_copies == 3, (
+        "the qwen resolution list changed; re-derive the cached-item count "
+        f"(config_modules.py:1050-1062 forks one dataset copy per resolution): "
+        f"{resolution}"
+    )
     steps = recipe.size_scaled_steps("qwen-image", pairs, hours, 3000)
     window_s = recipe.training_deadline_s(hours) - recipe.STARTUP_S
     slack_s = window_s - steps * recipe.SEC_PER_IT["qwen-image"]
-    extra_forwards = steps - pairs
+    extra_forwards = steps - pairs * dataset_copies
 
     assert extra_forwards > 0
     assert slack_s > 0, f"{task}: planner already over-books the window"
@@ -266,8 +304,10 @@ def test_qwen_budget_cannot_absorb_a_live_text_encoder(task, pairs, hours):
     assert budget_per_forward_s < 0.100, (
         f"{task}: qwen now has {slack_s:.0f}s of slack over {extra_forwards} "
         f"extra text-encoder forwards ({budget_per_forward_s * 1000:.0f} ms "
-        "each). That is no longer obviously too tight — re-open the "
-        "cache_text_embeddings decision with a measurement."
+        f"each) at MARGIN_BY_TYPE={recipe.MARGIN_BY_TYPE['qwen-image']} and "
+        f"SEC_PER_IT={recipe.SEC_PER_IT['qwen-image']}. Re-derive this bound "
+        "against whichever of those two moved; this is NOT authorisation to "
+        "disable cache_text_embeddings."
     )
 
 
