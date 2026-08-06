@@ -15,6 +15,21 @@ config:
       max_step_saves_to_keep: 4
       save_format: diffusers
     datasets:
+    # NO caption_dropout_rate — it would be INERT here, and un-inerting it does
+    # not fit the clock.  `toolkit/dataloader_mixins.py:387` (ai-toolkit pin
+    # 99be3d96) gates the dropout roll on `not cache_text_embeddings`, and
+    # `jobs/process/BaseSDTrainProcess.py:149-151` copies `train.cache_text_
+    # embeddings` (true, below) onto every dataset.  The Aug-3 rank-1 config for
+    # task 7421f056 sets caption_dropout_rate 0.05 WITH caching on — a no-op.
+    # All three Aug-3 qwen winners cached text embeddings:
+    #   .../tournament-...-7421f056-...-5FW2Eaae/checkpoints/config.yaml
+    #   .../tournament-...-ff643470-...-5FBmn1ax/checkpoints/config.yaml
+    #   .../tournament-...-4782f46f-...-5FBmn1ax/checkpoints/config.yaml
+    # Turning caching off would put a resident Qwen2.5-VL-7B forward on every
+    # step (SDTrainer.py:1628-1647 instead of the cached branch at 1571-1588,
+    # and no unload via unloader.py:44) on the ONE type with ~1% clock slack:
+    # the planner leaves 46 s over 808 extra encoder forwards on 7421f056 and
+    # 67 s over 982 on ff643470.  See tests/test_blank_prompt_training.py.
     - folder_path: /dataset/images
       caption_ext: txt
       cache_latents_to_disk: true
