@@ -75,13 +75,17 @@ which is `steps / n_pairs`.
 | R5 `3e0fdcde` | design | 42 | 1.0 | 1587 | 1172 | **1172** | clock | 235 | 4+1 | 9.3 | 1e-4 | 48 min (80%) | 9 min |
 | R5 `f6725c2b` | design | 50 | 1.0 | 1732 | 1172 | **1172** | clock | 235 | 4+1 | 7.8 | 1e-4 | 48 min (80%) | 9 min |
 
-At the **OBSERVED** measured rate of **1.27 s/it** the same configs finish far early, and the
+At the **OBSERVED** measured rate of **1.26 s/it** the same configs finish far early, and the
 clock cap would not bind at all:
 
 | hrs | cap @2.2 s/it (what we schedule) | cap @1.27 s/it (what the box can do) | actual wall @1.27 | unused @1.27 |
 |---|---|---|---|---|
 | 0.75 | 824 | **1429** (law 1122 would fit whole) | 22 min (50%) | **22 min** |
 | 1.0 | 1172 | **2031** (law 1587-1732 would fit whole) | 30 min (50%) | **27 min** |
+
+*(The two cells above were computed at 1.27 s/it and `MARGIN = 0.85`; the corrected rate is
+1.259, which moves them to 1441 / 2049 — a 0.9 % difference that changes nothing. Retained as
+the historical pre-fix picture.)*
 
 > **REVISION (week-6 depth pass).** Closed, and with `SEC_PER_IT = 1.35` rather than the 1.5
 > this document's sibling first recommended. At 1.5 the 0.75 h cap is 1336, which still
@@ -91,11 +95,17 @@ clock cap would not bind at all:
 > candidates each), against winners 1000 / 2012 / 2012 / 2012.
 >
 > One number above is worth restating precisely, because it is the only first-party
-> measurement in this audit: **1.265 s/step is `toolkit_start → toolkit_end` ÷ 823, i.e. it
+> measurement in this audit: **1.259 s/step is `toolkit_start → toolkit_end` ÷ 823, i.e. it
 > already contains ai-toolkit's own startup.** The budget model charges `STARTUP_S = 300 s`
-> separately, so net of that the same artifact implies **0.90 s/step** and 1.35 is a 50 % pad,
-> not a 7 % one. The 7 % figure (1.35 / 1.265) is the conservative reading and is the one the
+> separately, so net of that the same artifact implies **0.895 s/step** and 1.35 is a 51 % pad,
+> not a 7 % one. The 7.2 % figure (1.35 / 1.259) is the conservative reading and is the one the
 > tests assert.
+>
+> **CORRECTION (week-6 correctness sweep, 2026-08-06):** this used to read "1.265" and "0.90".
+> The forge_run.json events are timestamps relative to `checkpoint_scope_started`
+> (`toolkit_start t=4.7`, `toolkit_end t=1041.1`), so the elapsed window is **1036.4 s**, not
+> 1041.1. Conservative direction, no constant moves. The stale 1041.1/823 is still baked into
+> two assertions in `tests/test_week6_depth_geometry.py` — filed as an integration request.
 
 **INFERRED:** every Aug-3 krea2 task left ~50% of its wall clock unused and ran 26-32% fewer
 steps than our own step law asked for, purely because `SEC_PER_IT["krea2"] = 2.2` is wrong by
@@ -386,17 +396,30 @@ The materialised ideogram4 config differs from the template on nine keys. Of tho
 * `ema_config {use_ema: true, ema_decay: 0.995}` is **LIVE and, at these step counts, dominant**:
   `ExponentialMovingAverage` is constructed with `use_num_updates=False`, so there is **no bias
   correction or warm-up**; the shadow is seeded from the LoRA at init (B = 0, i.e. zero effect),
-  and `save()` always exports the EMA weights (`BaseSDTrainProcess.py:495-497`;
-  `toolkit/ema.py:44-140,281-292`). After n steps the exported weights retain `0.995ⁿ` of the
-  *initial zero-effect* parameters:
+  and `save()` always exports the EMA weights (`BaseSDTrainProcess.py:491,495-497` save;
+  `:769-781` `setup_ema`; `:2031` call site; `toolkit/ema.py:43-72` `__init__`, `:100-152`
+  `update`, `:336-341` `eval`). The export is therefore an **attenuated** copy of the trained
+  delta:
 
-  | task | steps | `0.995^n` = share of the export that is the untrained init |
-  |---|---|---|
-  | R5 `1365fa1c` (14 pairs) | 107 | **58.5%** |
-  | R5 `b72da8c6` (40 pairs) | 181 | **40.5%** |
-  | R2 `84be9fcd` (46 pairs) | 194 | **37.9%** |
+  | task | steps | `0.995^n` (EMA memory horizon) | exported adapter as a share of the final iterate |
+  |---|---|---|---|
+  | R5 `1365fa1c` (14 pairs) | 107 | 58.5% | **~30%** (const-lr model 23%) |
+  | R5 `b72da8c6` (40 pairs) | 181 | 40.5% | **~44%** (const-lr model 34%) |
+  | R2 `84be9fcd` (46 pairs) | 194 | 37.9% | **~46%** (const-lr model 36%) |
 
-  **INFERRED:** the ideogram4 artefact we upload is roughly a 0.4-0.6-strength, lagged copy of
+  > **CORRECTION (week-6 correctness sweep, 2026-08-06).** The middle column used to be
+  > labelled *"share of the export that is the untrained init"*, and the text above it said the
+  > export retains `0.995ⁿ` of the *initial zero-effect* parameters. **Both are false.**
+  > `lora_up` is zero-initialised (`toolkit/lora_special.py:122` at the pin), so the adapter's
+  > effect at init is exactly zero and the EMA shadow has no untrained signal to retain.
+  > `0.995ⁿ` is the EMA's **memory horizon**, nothing more. The quantity that actually matters
+  > is the right-hand column: `(1−d)·Σ_t d^(T−t)·θ_t / θ_T` evaluated on the cumulative-lr path
+  > with `θ₀ = 0`. **INFERRED** — it assumes Adam displacement/step ≈ lr and a stable update
+  > direction, and it treats `B·A` attenuation as `B` attenuation (`A` is non-zero at init but
+  > contributes no effect while `B = 0`). It is not a measurement of our adapter. The same model
+  > reproduces the "EMA-weighted Σ lr" column in FIELD-DEPTH-LAW-AUDIT §6.2 exactly.
+
+  **INFERRED:** the ideogram4 artefact we upload is roughly a 0.3-0.5-strength, lagged copy of
   the LoRA we actually trained.
 
   > **REVISION (week-6 depth pass) — CONFIRMED, with the mechanism verified line by line, and
@@ -404,9 +427,11 @@ The materialised ideogram4 config differs from the template on nine keys. Of tho
   > and `setup_ema` does not override it, so `num_updates` stays `None` and the
   > `min(decay, (1+n)/(10+n))` warm-up in `update()` never runs — the decay is a flat 0.995 from
   > step 1. `shadow_params` is `[p.clone().detach() for p in parameters]` taken after
-  > `setup_ema()` (`BaseSDTrainProcess.py:2101-2102`), i.e. at LoRA init where B = 0. `save()`
+  > `setup_ema()` (`BaseSDTrainProcess.py:2031` — this citation previously read `:2101-2102`,
+  > which does not contain the call at pin `99be3d96`), i.e. at LoRA init where B = 0. `save()`
   > calls `self.ema.eval()` → `store()` + `copy_to()` unconditionally, so **every** export,
-  > periodic saves included, is the shadow. The dilution is real.
+  > periodic saves included, is the shadow. The attenuation is real; the "untrained init"
+  > framing was not.
   >
   > It is **not** fixable for Monday: `ema_decay` lives in
   > `ideogram_release_policy._EXPECTED_RECIPE`, which feeds `POLICY_SHA256`, which
@@ -416,18 +441,25 @@ The materialised ideogram4 config differs from the template on nine keys. Of tho
   > record is an owner-authority artefact and is not ours to re-sign.
   >
   > Mitigated instead through the one lever we own — depth. The new law
-  > (`base 500 / p 0.32`) takes the untrained-init share from **41% → 12%** at N=14 and
-  > **17.9% → 4.6%** at N=46. FIELD-DEPTH-LAW-AUDIT §6.2.
+  > (`base 500 / p 0.32`) raises the exported share of the trained delta from **~44% → ~72%**
+  > at N=14 (177 → 421 steps) and **~46% → ~83%** at N=46 (194 → 616 steps). *(These lines
+  > previously read "untrained-init share 41% → 12%" and "17.9% → 4.6%", i.e. `0.995^T`, which
+  > is the wrong quantity — see the correction above.)* FIELD-DEPTH-LAW-AUDIT §6.2.
 
 Net: ideogram4 ran 107-194 steps at an effective 2.5e-5 cosine-decayed to 2.5e-6, exported a
-40-60% EMA-diluted version of that, and left 75% of the clock unused. For scale, the Jul-20 R1
+~30-46%-strength EMA copy of that, and left 75% of the clock unused. For scale, the Jul-20 R1
 ideogram4 field (16 miners, task `3cfa1578`, SN56-WEEK3-POSTMORTEM §6a) had a deep cluster at
-722-1000+ steps and a 1200-step bracket winner. The `max: 400` ceiling in
-`STEP_TABLE["ideogram4"]` meant **no ideogram4 dataset size could ever reach that band**.
+722-1000+ steps; its **winner configured 378 steps** at `lr 2.5e-5` with EMA + cosine + TE, and
+the 1200/1650-step `lr 4e-4` arm placed 8th
+(`SN56-WEEK4-INDEPENDENT-REVIEW-2026-07-22.md` §2). *(This sentence previously said "a
+1200-step bracket winner"; no cited source supports that — see the D2 correction.)* The
+`max: 400` ceiling in `STEP_TABLE["ideogram4"]` meant **no ideogram4 dataset size could ever
+reach the deep cluster's band**.
 
 > **REVISION.** Superseded as of the week-6 depth pass: the law now ships **421 / 589 / 616**
-> on these three shapes, using 82-85% of the grant. It still does not reach 1200 — not because
-> of a ceiling, but because `do_cfg` halves our reachable depth (D6). Note also that matching
+> on these three shapes, using 82-85% of the grant. It still does not reach the Aug-3
+> `b72da8c6` winning band (~1250) — not because of a ceiling, but because `do_cfg` halves our
+> reachable depth (D6). It is, however, already above the Jul-20 R1 winner's 378. Note also that matching
 > the field's step counts is not the goal for this type: they run `lr 4e-4` and we run
 > `lr 2.5e-5`, so equal steps mean 28.5x less Adam path length.
 
@@ -469,15 +501,31 @@ resolution — the `@1024` copy is 1.8-1.9× the scored pixel count. Affects all
 materialised bucket equals `adjust_image_size(w,h)`; or drop to a single resolution entry and
 choose it to hit the evaluator size. §3.
 
-**D2 — ideogram4 is capped at ~200 steps and exports a 40-60% EMA-diluted LoRA.**
+**D2 — ideogram4 is capped at ~200 steps and exports a heavily EMA-attenuated LoRA.**
 `STEP_TABLE["ideogram4"] = base 140 / min 48 / max 400` comes from the discredited Jul-16
-"deep training never helped" experiment; the Jul-20 R1 field's deep cluster ran 722-1000+ and
-its bracket winner 1200. On top of that the release policy's `ema_decay 0.995` with no bias
-correction means 38-59% of every exported ideogram4 artefact is the untrained initialisation.
+"deep training never helped" experiment; the Jul-20 R1 field's deep cluster ran 722-1000+.
+On top of that the release policy's `ema_decay 0.995` with no bias correction means the export
+is only a fraction of the delta we actually trained: at 107-194 steps the exported adapter is
+≈30-46% of the final iterate (constant-lr model: 23-36%).
+
+> **TWO CORRECTIONS (week-6 correctness sweep, 2026-08-06).**
+> 1. This entry said "38-59% of every exported ideogram4 artefact is the untrained
+>    initialisation". **That is false.** `lora_up` is zero-initialised
+>    (`toolkit/lora_special.py:122` at pin `99be3d96`), so the adapter has *no* effect at init
+>    and there is no untrained signal for the EMA shadow to carry. `0.995^n` is the EMA's
+>    memory horizon, not an untrained share. The real defect is **attenuation of the trained
+>    delta**, and it is worse than the old wording implied at shallow depth: ≈30% retained at
+>    107 steps, ≈46% at 194, ≈72% at 421, ≈83% at 616 under our cosine 2.5e-5 -> 2.5e-6
+>    schedule (23% / 36% / 58% / 69% on a constant-lr path). INFERRED — see §4.3 for the model.
+> 2. "its bracket winner 1200" is unsupported. `SN56-WEEK3-POSTMORTEM` §6a does not say it,
+>    and `SN56-WEEK4-INDEPENDENT-REVIEW-2026-07-22.md` §2 records the Jul-20 R1 ideogram4
+>    **winner at 378 configured steps** (`lr 2.5e-5` + EMA + cosine + TE), with the
+>    1200/1650-step `lr 4e-4` arm at 8th. FIELD-DEPTH-LAW-AUDIT §6.2.
+
 Three of fourteen Aug-3 tasks — and R1 is drawn from `{krea2, ideogram4}`. §1, §4.3.
 
 > **STATUS: half fixed.** The depth half is closed — the law now ships 421/589/616 (82-85% of
-> the grant, up from 23-24%), which also drops the EMA dilution to 4.6-12%. The EMA half is
+> the grant, up from 23-24%), which raises EMA retention from ~30-46% to ~72-83%. The EMA half is
 > **open and deliberately not fixed for Monday**: `ema_decay` is inside the hash-bound
 > `ideogram_release_policy` recipe projection, and changing it invalidates the owner-signed
 > activation record and silently deactivates the whole policy. Recommended next, in order:
@@ -551,6 +599,23 @@ style tasks explicitly. Untested. §2.1.
 pre-encode pass over 3N images is not in `STARTUP_S = 300`.** Under-modelled startup makes the
 budget cap slightly optimistic for flux / z-image / qwen / ideogram4-under-policy. §3.
 
+**D15 — latent: two call sites still divide by the GLOBAL `recipe.MARGIN` after the per-type
+margin change.** `forge/tasks/aitoolkit.py:164` (`_recipe_hours`, which inflates the scorer
+reserve by `1/MARGIN` so the reserve survives the later `budget*MARGIN` haircut) and
+`forge/tasks/holdout.py:98` (`budget_allows`, which projects the training window as
+`hard_equivalent*MARGIN - reserve - boundary - STARTUP - EXPORT`) both read
+`recipe.MARGIN` rather than `recipe.margin_for(model_type)`. **Inert today**: the holdout
+producer is allow-listed to `{krea2, ideogram4}` (`holdout._IMPLEMENTED_TYPES`) and both sit at
+the 0.92 default, so `margin_for(t) == MARGIN`; and `FORGE_HOLDOUT_SELECTION_TYPES` is unset in
+production, so `_recipe_hours` reduces to `remaining_hard()/3600` regardless. **Silently wrong**
+the moment a type whose margin differs from the default enters the holdout set — qwen-image is
+at 0.98 — in which case `budget_allows` would under-project the training window by
+`0.06 × hard_budget` (~216 s on a 1.0 h task) and `_recipe_hours` would over-reserve by
+`(reserve + 45)·(1/0.92 − 1/0.98)` (~63 s at a 900 s reserve), both in the direction of
+refusing or shortening a split that would in fact fit. `budget_allows` already has `model_type` in scope; the fix
+is one call each. Filed as an integration request by the week-6 correctness sweep (neither file
+is owned by that unit). Not triggered on Monday.
+
 **D14 — latent risk: `size_scaled_steps` can return a sub-25-step run** when `budget_cap`
 undercuts `min`; `kill_safe_save_every` then yields a single mid-run recovery point. Not
 triggered by any Aug-3 shape (smallest cap was 605). §4.4.
@@ -558,6 +623,14 @@ triggered by any Aug-3 shape (smallest cap was 605). §4.4.
 ---
 
 ## 6. Corrections to previously stated findings
+
+> **Week-6 correctness sweep (2026-08-06)** applied four further corrections to this document,
+> each marked in place: the EMA "untrained init" mechanism (D2, §4.3), the EMA source citations
+> at pin `99be3d96` (§4.3), the Jul-20 R1 ideogram4 "1200-step bracket winner" provenance
+> (D2, §4.3), and our own krea2 rate 1.265 → 1.259 s/step (§1). It also added **D15**. It
+> changed no constant and no line of logic. The companion register is
+> FIELD-DEPTH-LAW-AUDIT "Known limitations and unfixed exposure".
+
 
 * The geometry note "divisibility 64" is **wrong**. `bucket_tolerance` is overwritten at dataset
   construction with `sd.get_bucket_divisibility()` — 16 for krea2/ideogram4/z-image, 32 for

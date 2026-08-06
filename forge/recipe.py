@@ -14,19 +14,35 @@ all 40 published artifacts across 14 tasks (`tourn_c54bb970b5d0aa91_20260803`),
   ops/experiments/week6/FIELD-DEPTH-LAW-AUDIT.md
   /Users/atulyashetty/Test/SN56-project/evidence/week6-field-depth-audit-20260806/
 
-Two premises that used to live in this file are FALSIFIED and have been deleted:
+Two premises that used to live in this file have been deleted.  ONE IS
+FALSIFIED; the other is UNSUPPORTED and the data lean the other way.  The
+distinction is deliberate — see the correctness sweep in
+FIELD-DEPTH-LAW-AUDIT "Known limitations and unfixed exposure".
 
-  1. "over-training is the #1 liability" / "deep training never helped".
-     That came from a Jul-16 probe over 8..128 steps on 12 photos — the wrong
-     regime entirely.  Five miners published their own per-checkpoint
-     reconstruction curves (`.krea2/.zimage/.flux_checkpoint_evaluations.json`,
-     already split into the validator's own text/no-text terms).  FIVE CURVES,
-     FIVE MINIMA AT THE DEEPEST CHECKPOINT EVALUATED — not one turns over.  On
-     the only open field of the tournament (R1 krea2, 14 ranked artifacts),
-     Spearman(steps, test_loss) inside the template recipe family (n=9) is
-     -0.605: deeper was better.  We shipped 823 steps (39/img) and placed 9/15;
-     the template pack's top four ran 1432-2000.
-  2. "krea2's do_differential_guidance adds a second guidance forward per step".
+  1. UNSUPPORTED (not falsified): "over-training is the #1 liability" / "deep
+     training never helped".  That came from a Jul-16 probe over 8..128 steps
+     on 12 photos — the wrong regime entirely.  What replaces it is weaker than
+     this file used to claim:
+       * FIVE published per-checkpoint reconstruction curves
+         (`.krea2/.zimage/.flux_checkpoint_evaluations.json`, already split into
+         the validator's own text/no-text terms) — but from only TWO operators
+         (5EACrayt x3, 5FNLSgh8 x2), so they are not five independent samples.
+         FOUR of the five put their minimum at the deepest checkpoint
+         evaluated.  The fifth DOES turn over, and it is on this exact R1 krea2
+         shape: 5FNLSgh8 scored 800 -> 0.032265 and its 1000-step export ->
+         0.032689 (+1.3%) and shipped the 800.  Two of the four also have
+         interior bumps (flux ep20-30, z-image @750).
+       * On the only open field of the tournament (R1 krea2, 14 ranked
+         artifacts), Spearman(steps, test_loss) inside the template recipe
+         family (n=9) is -0.605, exact permutation p = 0.045 one-sided / 0.091
+         two-sided.  The three excluded artifacts (504 TE tensors) are ranks 1,
+         2 and 13; keeping rank 13 gives rho = -0.646 (p = 0.024), so the
+         exclusion is CONSERVATIVE, not cherry-picked.
+     We shipped 823 steps (39/img) and placed 9/15; the template pack's top four
+     ran 1432-2000.  Read this as "the shallow premise is unsupported and the
+     data lean deeper", not as proof that deeper is better.
+  2. FALSIFIED: "krea2's do_differential_guidance adds a second guidance forward
+     per step".
      That code is unreachable: `do_differential_guidance` is nested inside
      `if self.train_config.do_guidance_loss:` (SDTrainer.py:692 guard at indent
      8 vs :734 at indent 12) and we never set `do_guidance_loss`.  It has never
@@ -70,10 +86,18 @@ STEP_TABLE = {
     # clock was wrong (see SEC_PER_IT).  The audit rates flux depth evidence TOO
     # THIN to move (n=4 artifacts, 2 head-to-heads) and the step counts are
     # INFERRED, not observed, because kohya records epochs.  Deliberately left
-    # alone.  NOTE: `forge/tasks/flux_kohya.py` routes standalone-checkpoint
-    # FLUX bases to kohya, where depth comes from
-    # `flux_kohya_config.MAX_TRAIN_STEPS`, NOT from this row — a separate open
-    # decision (FIELD-DEPTH-LAW-AUDIT §6.5).
+    # alone.  NOTE, AND THIS IS BIGGER THAN "a small clock fix": on a
+    # standalone-checkpoint FLUX base the validator runs
+    # `ops/docker/standalone-image-trainer.dockerfile`, which sets
+    # `FORGE_FLUX_BACKEND=kohya`; `dispatch.for_model_type` then routes to
+    # `forge/tasks/flux_kohya.py` and depth comes from
+    # `flux_kohya_config.budgeted_train_steps` (75 durable steps / 1576.6 s x
+    # 0.80 headroom, ceiling `MAX_TRAIN_STEPS = 250`), NOT from this row:
+    # 94 steps at 0.75 h, 128 at 1.0 h, 196 at 1.5 h, at train_batch_size 4 x
+    # grad_accum 2.  Aug-3 task db5fefc5 (dataautogpt3/FLUX-MonochromeManga)
+    # takes that path; 241cda6c (rayonlabs/FLUX.1-dev) does not.  So HALF the
+    # observed flux draw never consults STEP_TABLE at all — an open decision
+    # (FIELD-DEPTH-LAW-AUDIT §6.5 + "Known limitations").
     "flux": dict(base=1100, n_ref=_N_REF, p=0.50, min=500, max=2000),
     # krea2 — was base=1200 p=0.50 min=100 max=2000 (0.64x the field winners).
     # The 8-win operator 5FBmn1ax's krea2 policy is a PURE CLOCK-FILL with NO
@@ -98,9 +122,13 @@ STEP_TABLE = {
     #    cosine_by_group), and 1432 produced rank 4 for one operator and rank 14
     #    for another.
     #  * Depth is real but WEAK relative to recipe variance.  OLS inside the
-    #    9-artifact R1 template family is loss = 0.053134 - 1.677e-6*steps with
-    #    residual sd 1.16e-3, so 823 -> 1432 moves predicted loss by 1.0e-3
-    #    (0.88 sd) while 1336 -> 1432 moves it by only 1.6e-4 (0.14 sd).
+    #    9-artifact R1 template family is loss = 0.053134 - 1.677e-6*steps
+    #    (reproduced exactly), so 823 -> 1432 moves predicted loss by 1.0e-3 and
+    #    1336 -> 1432 by only 1.6e-4.  Expressed in residual sd, STATE THE
+    #    CONVENTION because it changes the headline: the quoted sd 1.16e-3
+    #    divides by n, giving 0.88 sd and 0.14 sd; the usual OLS residual sd
+    #    (n-2 df) is 1.32e-3, giving 0.78 sd and 0.12 sd.  The n-divisor version
+    #    makes the depth effect look ~13% more significant than it is.
     # Interpolating that fit onto the observed R1 loss ladder puts 1432 at rank
     # ~9 (+-1 sd band 5..11), against the rank 9 we actually took at 823.  So the
     # honest claim is: this removes a self-inflicted depth deficit and puts us at
@@ -123,8 +151,14 @@ STEP_TABLE = {
     #     champion, 1365fa1c : 174 steps x 4e-4 constant   = 0.0696
     #     us at the old law's 177 steps                    = 0.00245  (28.5x less)
     #     ...and `save()` exports the EMA, a lagged average rather than the
-    #     final iterate, which costs another 2.3x at that depth
+    #     final iterate, which retains only 43.4% of the path at that depth
+    #     (1/0.434 = 2.3x) under OUR cosine 2.5e-5 -> 2.5e-6 schedule
     #                                                      = 0.00106  (65.6x less)
+    #     [INFERRED, not measured: the 43.4% is the EMA weight
+    #      (1-d)*sum_t d^(T-t)*theta_t / theta_T computed on the cumulative-lr
+    #      path with theta_0 = 0, i.e. it assumes displacement/step ~ lr and a
+    #      stable update direction.  Under a CONSTANT lr the same formula gives
+    #      33.9%.  Neither is a measurement of our adapter.]
     # Shipping "177 because the champion shipped 174" does not reproduce his
     # shallow optimum; it ships ~1.5% of his parameter movement.  That single
     # factor invalidates the two-point fit, so it is gone.
@@ -143,14 +177,26 @@ STEP_TABLE = {
     #       BOTH arms deep, no shallow arm.  It says 1250 ~= 1523; it does NOT
     #       say that 321 would have lost.
     #   Jul-20 R1 3cfa1578 ideogram4, N=9, SIXTEEN miners — the largest
-    #       ideogram4 sample we have (SN56-WEEK3-POSTMORTEM.md §6a): we ran the
-    #       shortest run in the field (85 steps) and placed 4/16; the deep
-    #       cluster was 722-1000+, the bracket winner 1200, and the recorded
-    #       finding is that the img2img metric "did NOT punish overtraining".
-    # Net across two tournaments: ideogram4 depth is FLAT and WIDE — 85 to 1250
-    # are all competitive — with the deep end favoured in the larger field.
-    # There is NO size law to fit: N=9 -> 1200, N=14 -> 174, N=40 -> 1250,
-    # N=46 -> 341 is uncorrelated with size.
+    #       ideogram4 sample we have: we ran the shortest run in the field
+    #       (85 steps) and placed 4/16; the deep cluster was 722-1000+ and the
+    #       recorded finding is that the img2img metric "did NOT punish
+    #       overtraining" (SN56-WEEK3-POSTMORTEM.md §6a).
+    #       CORRECTION (week-6 sweep): this row used to end "...the bracket
+    #       winner 1200".  NO CITED SOURCE SAYS THAT, and our own
+    #       SN56-WEEK4-INDEPENDENT-REVIEW-2026-07-22.md §2 says the opposite:
+    #       on 3cfa1578 the R1 WINNER configured 378 steps at lr 2.5e-5 with
+    #       EMA + cosine + TE training, while the lr-4e-4 arm that configured
+    #       1200/1650 ranked 8th.  The "1200" appears to have been imported
+    #       from the Jul-27 KREA2 R1 table (task 73013636), a different type and
+    #       a different tournament.
+    #       This matters more than a citation slip: that 378-step winner is the
+    #       ONLY field artifact anywhere in OUR OWN lr/EMA/scheduler family, and
+    #       it sits BELOW the 421/589/616 this row now ships.  Our law at N=9
+    #       returns 365, which is close to it; the divergence is at large N.
+    # Net across two tournaments: ideogram4 depth is FLAT and WIDE — 85 to 1523
+    # all placed 1st or 2nd somewhere — with NO consistent direction once the
+    # Jul-20 winner is read correctly.  There is NO size law to fit: N=9 -> 378,
+    # N=14 -> 174, N=40 -> 1250, N=46 -> 341 is uncorrelated with size.
     #
     # NO FAMILY SPLIT, and NOT because it is infeasible.  `spec.trigger_word is
     # None` separates `style` from every other family 12/12 across the Aug-3
@@ -164,13 +210,27 @@ STEP_TABLE = {
     #
     # THE ROW BELOW IS THEREFORE NOT A FIT TO THE FIELD.  It is set from the two
     # constraints we can measure on OUR OWN pipeline:
-    #  (a) EMA FLOOR.  ai-toolkit seeds the EMA shadow from the LoRA at init
-    #      (B = 0, i.e. zero effect), constructs it with `use_num_updates=False`
-    #      so there is no warm-up or bias correction, and `save()` ALWAYS
-    #      exports the EMA (`BaseSDTrainProcess.py:566-568,840-851`;
-    #      `toolkit/ema.py` __init__/update).  So 0.995^T of every artifact we
-    #      upload is the untrained init: 41% at 177 steps, 12% at 421, 4.6% at
-    #      616.  Depth is the ONLY lever on this that does not require
+    #  (a) EMA ATTENUATION (this was previously written as an "EMA floor" and
+    #      the mechanism was stated WRONG; the direction survives, the framing
+    #      does not).  ai-toolkit seeds the EMA shadow from the LoRA at init,
+    #      constructs it with `use_num_updates=False` so there is no warm-up or
+    #      bias correction, and `save()` ALWAYS exports the EMA
+    #      (`BaseSDTrainProcess.py:491,495-497` save; `:769-781` setup_ema;
+    #      `:2031` call site; `toolkit/ema.py:43-72` __init__, `:100-152`
+    #      update, `:336-341` eval).
+    #      WHY THE OLD WORDING WAS FALSE: `lora_up` is ZERO-INITIALISED
+    #      (`toolkit/lora_special.py:122`), so the adapter's effect at init is
+    #      exactly zero.  `0.995^T` is NOT "the untrained-initialisation share
+    #      of the export" — there is no untrained signal to retain.  It is the
+    #      EMA's memory horizon.
+    #      WHAT IT ACTUALLY COSTS: the export is an attenuated copy of the
+    #      trained delta.  Under our cosine 2.5e-5 -> 2.5e-6 schedule the
+    #      exported adapter is ~43% of the final iterate at 177 steps, ~72% at
+    #      421, ~82% at 589, ~83% at 616 (INFERRED — see the model note above;
+    #      under a constant lr the same formula gives 34% / 58% / 68% / 69%).
+    #      So the penalty is real and depth still fixes it, but the old numbers
+    #      ("41% untrained at 177, 4.6% at 616") described a quantity that does
+    #      not exist.  Depth is the ONLY lever on this that does not require
     #      re-signing the hash-bound release activation record.
     #  (b) CLOCK CEILING AT OUR COST.  `do_cfg: true` runs the transformer at
     #      batch 2 every step, so SEC_PER_IT is 4.2 for us, not the field's
@@ -183,23 +243,41 @@ STEP_TABLE = {
     # hidden: on a 0.75 h grant the law crosses the 477 cap at N~21, so a SHORT
     # R1 ideogram task with a mid-size dataset is clock-bound at 477 (432 if the
     # margin reverts to 0.85).  That is the do_cfg tax being visible, not a
-    # miscalibration; it is still 1.3x the withdrawn law and it keeps four
-    # periodic candidates.  Every 1.0 h shape up to N=50 stays law-bound.
-    # Because the law binds on the real shapes and the
-    # clock does not, this row is invariant to MARGIN and to any SEC_PER_IT
-    # revision, and it absorbs a 21% error in the INFERRED 4.2 s/step constant
-    # before anything truncates (the tightest shape, 84be9fcd at 616 steps,
-    # breaks only above 5.06 s/step = 2.47x the field's own no-do_cfg bound);
-    # a truncation then DEGRADES rather than forfeits
-    # (`forge/tasks/aitoolkit.py` _run_toolkit -> _terminate -> _finalize
-    # promotes the newest periodic save, and there are four of them).
+    # miscalibration; it is 1.3x the withdrawn law at N=50 and 2.1x at N=21, and
+    # it keeps four periodic candidates.  Every 1.0 h shape up to N=50 stays
+    # law-bound.
+    # Because the law binds on the real shapes and the clock does not, this row
+    # is invariant to MARGIN and to any SEC_PER_IT revision over the range the
+    # tests grid.  HOW MUCH ERROR IT ABSORBS — corrected, because the previous
+    # figure ("21%, breaks only above 5.06 s/step = 2.47x the field bound")
+    # IGNORED MARGIN and so overstated the cushion:
+    #   PLANNING truncation (the constant is wrong -> we plan fewer steps).
+    #   `size_scaled_steps` caps at (budget*0.92 - 480)/SEC, so the law survives
+    #   only while SEC stays below
+    #       84be9fcd 616 steps @1.0h : 4.597  (+9.5% over 4.2, 2.28x the 2.019
+    #                                          field no-do_cfg bound)  <-- tightest
+    #       1365fa1c 421 steps @0.75h: 4.760  (+13.3%)
+    #       b72da8c6 589 steps @1.0h : 4.808  (+14.5%)
+    #   RUNTIME kill (the box is actually slower -> the deadline stops us).  The
+    #   terminate gate is budget - 180 - 45, less STARTUP_S, so the real rate at
+    #   which the tightest shape stops short is 3075/616 = 4.992 (+18.9%).
+    # The old 5.06 was neither of these (it dropped STOP_MARGIN_S as well).
+    # A truncation DEGRADES rather than forfeits (`forge/tasks/aitoolkit.py`
+    # _run_toolkit -> _terminate -> _finalize promotes the newest periodic save,
+    # and there are four of them).
     # p 0.57 -> 0.32 because the field shows no size signal at all; this mirrors
     # krea2's deliberately flat 0.35 rather than a 2-point fit.  min 120 -> 350
     # binds only below N~8, under the smallest ideogram4 dataset ever observed
     # (N=9, Jul-20).  max 1600 -> 620: 1600 was INERT (the old law topped out at
-    # 365 at N=50, so it could never bind within 4x), whereas 620 binds from
-    # N >= 47, inside the observed 9-50 range, and caps extrapolation of a
-    # recipe we have never run past ~200 steps in a tournament.
+    # 365 at N=50, so it could never bind within 4x), whereas 620 first CHANGES
+    # the output at N = 48 — not 47, as this comment used to say: at N=47 the
+    # law returns 619.975, which rounds to 620 with or without the cap, so the
+    # cap is a no-op there.  BE HONEST ABOUT HOW LITTLE THIS DOES: 620 binds
+    # only at N = 48, 49, 50 (the top of the observed range) and changes depth
+    # by 4 / 8 / 12 steps respectively.  It is barely more than decoration; it
+    # is kept because it caps extrapolation of a recipe we have never run past
+    # ~200 steps in a tournament, not because it moves any real shape.
+    # (`test_step_table_max_binding_sizes` pins the crossover at 48.)
     # PRE-COMMIT: this is a reasoned bet, not a measurement.  If ideogram4 is
     # the R1 draw and we lose, the correct next experiment is do_cfg on/off at
     # matched depth (which buys back 2x the reachable depth), NOT another depth
@@ -221,7 +299,10 @@ STEP_TABLE = {
     # accident, because the size law wants 1137/1307 and SEC_PER_IT=4.0 happens
     # to cut it to 1027.  Fix the clock without fixing the law and qwen instantly
     # over-trains by 25%.  The champion's exact recovered law is
-    #     steps = 834 * (N/24)^0.51   (949 and 1104 vs published 949 and 1095)
+    #     steps = 834 * (N/24)^0.51   -> 950 and 1096 vs his published 949 and
+    #                                    1095 (this line previously read "949 and
+    #                                    1104"; 1104 is what OUR base=840 returns
+    #                                    at N=41, not what his 834 returns)
     # so base=840/p=0.51 makes the SIZE LAW the intended binding constraint.
     # `max` 3000 -> 1600: nothing in the field went past 1300 configured / 1095
     # shipped, and FOUR of the six qwen artifacts were deadline-killed by
@@ -251,10 +332,15 @@ STEP_TABLE = {
 # FINISH into a kill.
 #
 #   type        evidence used for the constant                          -> SEC
-#   krea2       OUR OWN 823 steps in 1041.1 s of toolkit_start..end on
-#               the tournament host (5HLA2QWY forge_run.json) = 1.265
-#               s/step GROSS OF STARTUP; field BOUND 1.519 (5FBmn1ax and
-#               5FjDsFGA each completed 1432 on the real R1 shape)      -> 1.35
+#   krea2       OUR OWN 823 steps in 1036.4 s of toolkit_start..end on
+#               the tournament host (5HLA2QWY forge_run.json: toolkit_start
+#               t=4.7 -> toolkit_end t=1041.1, both RELATIVE TO scope start,
+#               so the ELAPSED window is 1036.4 s) = 1.259 s/step GROSS OF
+#               STARTUP.  This file previously read "823 steps in 1041.1 s
+#               = 1.265", which used an end TIMESTAMP as a duration; the
+#               error was 0.5% and in the conservative direction.
+#               Field BOUND 1.519 (5FBmn1ax and 5FjDsFGA each completed
+#               1432 on the real R1 shape)                              -> 1.35
 #   qwen-image  TWO INDEPENDENT operators (5FW2Eaae, 5FpdSckw) with
 #               identical configs both configured 1150 on 7421f056
 #               (h=1.25) and were both killed with their last save at
@@ -267,17 +353,40 @@ STEP_TABLE = {
 #   flux        BOUND 2.500 (rank-1 5FW2Eaae, 58 kohya epochs x N=15 =
 #               870 steps in 0.75 h).  INFERRED — kohya logs epochs.    -> 2.00
 #
-# TWO qwen artifacts imply far slower rates (5FW2Eaae 6.96 on ff643470,
-# 5GU4Xkd3 8.13 on 4782f46f) and are NOT used.  Neither is reproduced, and each
-# is contradicted by the SAME operator running much faster on another qwen task
-# in the same tournament (5FW2Eaae is the 4.68 datum above), so they cannot be a
-# stable property of the hardware or the architecture.  A constant that survived
-# 8.13 s/step would plan ~400 qwen steps against a field that shipped 949-1095 —
-# the exact failure this recalibration exists to undo.
+# TWO qwen artifacts imply far slower rates (5FW2Eaae 6.96 s/step on ff643470,
+# 5GU4Xkd3 8.13 on 4782f46f) and are NOT used to SET the constant.  THE HONEST
+# STATEMENT OF WHY, because the previous one was a non-sequitur:
+#   * NOT a measurement-quality argument.  All three qwen kills — the 850 that
+#     gives 4.676, and both of these — ran `save_every: 50`, so all three locate
+#     the kill inside one 50-step interval.  Same precision.
+#   * NOT "each is contradicted by the SAME operator on another qwen task".
+#     That holds for exactly ONE of them.  5FW2Eaae entered two qwen tasks with
+#     configs identical on every recorded field except the step target (rank
+#     128/128, lr 1e-4, adamw8bit, res [512,768,1024], batch 1, EMA 0.995,
+#     timestep weighted, save_every 50) and implies 4.676 s/step on 7421f056 and
+#     6.964 on ff643470.  5GU4Xkd3 entered only ONE qwen task in this
+#     tournament, so nothing of his contradicts his 8.13.
+#   * What that pair actually demonstrates is ~1.5x PER-TASK THROUGHPUT VARIANCE
+#     for one operator on one recipe (6.964/4.676 = 1.49x).  That is a RISK TO
+#     PRICE, not a disqualification.  4.7 is used because the two-operator 4.676
+#     is the best point estimate — not because the slow observations are refuted.
+# EXPOSURE IF THE SLOW TAIL IS REAL (replayed against the real terminate gate):
+#     ff643470 h=1.5  plan 1023 save_every 205: @6.96 -> 700 steps, SHIPS 615
+#                                               @8.13 -> 600 steps, SHIPS 410
+#     7421f056 h=1.25 plan  836 save_every 168: @6.96 -> 570 steps, SHIPS 504
+#     4782f46f h=1.5  plan  957 save_every 192: @6.96 -> 700 steps, SHIPS 576
+# i.e. 40-60% of planned depth, DEGRADED not forfeited.  A constant built to
+# survive 8.13 would instead plan ~400 qwen steps against a field that shipped
+# 949-1095 — the failure this recalibration exists to undo.  The trade is stated,
+# not hidden.
 #
 # The krea2 artifacts of 5EACrayt and 5FNLSgh8 are also excluded: both carry 504
-# text-encoder tensors (they train a TE-LoRA, which we never do), and 5FNLSgh8's
-# kill implies 2.72 s/step — a config difference, not a hardware rate.
+# text-encoder tensors (they train a TE-LoRA, which we never do).  CORRECTION to
+# an earlier claim in this file: 5FNLSgh8 was NOT time-killed at 800 and does not
+# imply "2.72 s/step".  Its own `.krea2_checkpoint_evaluations.json` scores
+# 200/400/600/800 AND a distinct 1000-step `last` export, so the run COMPLETED
+# its configured 1000 and its selector promoted the 800 (audit §4.5 hash match).
+# It yields NO rate datum at all.
 SEC_PER_IT = {
     # flux 2.5 -> 2.0.  Field cadence implies ~1.7 s/step at batch 1; 2.0 is an
     # ~18% pad and restores the size law (870) as the binding constraint.
@@ -301,15 +410,20 @@ SEC_PER_IT = {
     # (1.0 h); 1.35 sits 3.6% inside that threshold, and 1.30 buys nothing beyond
     # it while making `projected_wall_s` 4% more optimistic.  So 1.35.
     #
-    # SAFETY.  1.35 is a 6.7% pad over our own measured 1.265 s/step, and that
-    # 1.265 is GROSS OF STARTUP (it is toolkit_start -> toolkit_end for 823
+    # SAFETY.  1.35 is a 7.2% pad over our own measured 1.259 s/step, and that
+    # 1.259 is GROSS OF STARTUP (it is toolkit_start -> toolkit_end for 823
     # steps), so charging STARTUP_S=300 on top of it is pure additional cushion:
-    # net of a 300 s startup our measured rate is (1041.1-300)/823 = 0.90 s/step.
+    # net of a 300 s startup our measured rate is (1036.4-300)/823 = 0.895
+    # s/step.
     # At the field's own tightest krea2 bound (1.519 s/step, from two independent
     # operators each completing 1432 steps on the real R1 shape) every planned
-    # krea2 depth here still completes — 1432 exactly fills the 0.75 h window by
-    # construction, and 1825/1840/1939 sit 4-10% inside the 2024-step 1.0 h
-    # window.  See `FIELD_DEMONSTRATED_DEPTH` and the guard test.
+    # krea2 depth here still completes — but SAY HOW TIGHT THAT IS on R1: 1432
+    # fills the 0.75 h window EXACTLY by construction (2175/1432 = 1.51885), so
+    # the R1 plan truncates at ANY rate above 1.51885 s/step.  That is 20.6% over
+    # our own measured 1.259 — a real cushion, but it is a single knife-edge, and
+    # the guard test only passes because `field_demonstrated_steps` is exact
+    # integer arithmetic.  The 1.0 h shapes are not tight: 1825/1840/1939 sit
+    # 4-10% inside the 2024-step window.  See `FIELD_DEMONSTRATED_DEPTH`.
     #
     # DOWNSIDE IF WE ARE SLOWER THAN THAT.  A deadline stop DEGRADES depth, it
     # does not forfeit: `_run_toolkit -> _terminate -> _finalize` promotes the
@@ -345,8 +459,11 @@ SEC_PER_IT = {
     # strongest rate datum in the qwen set, so 4.7 is the honest constant.
     # This matters beyond the cap: `projected_wall_s` and `first_save_wall_s` —
     # the kill-safety projections — are only meaningful if this is a real rate.
-    # At 4.0 the projection claimed 676 s of slack on 7421f056 where the true
-    # slack is ~91 s.
+    # For the shipped 836-step plan on 7421f056, `budget - projected_wall_s` is
+    # 676 s at a 4.0 constant and 91 s at 4.7.  (Neither is "the true slack":
+    # against the terminate gate at the field's measured 4.676 the plan lands
+    # 14 steps / ~66 s early.  The point is that a constant chosen for comfort
+    # makes the projection lie by ~10 minutes.)
     # The compensating change is MARGIN_BY_TYPE["qwen-image"]; the two constants
     # are calibrated JOINTLY and the guard test pins the composite, not either
     # one alone.  Four of six qwen artifacts were deadline-killed — this type has
@@ -370,8 +487,16 @@ EXPORT_RESERVE_S = 180.0  # mirrors cli._EXPORT_RESERVE_SECONDS
 # `budget*MARGIN - STARTUP_S - EXPORT_RESERVE_S`, i.e. it took a 15% haircut ON
 # TOP OF a 480 s fixed reserve — double-counting.  The champion's recovered
 # model is `(budget - 478)` with NO multiplicative margin, and 478 ~= our 480.
-# Sensitivity (krea2 @ 1.0 h, SEC 1.35): 0.85->1700, 0.90->1844, 0.92->1901,
-# 0.95->1988.  0.92 keeps ~290 s of jitter headroom BEYOND the 480 s reserve.
+# Sensitivity — the CLOCK CAP for krea2 @ 1.0 h at SEC 1.35, i.e.
+# int((3600*M - 480)/1.35):  0.85->1911, 0.90->2044, 0.92->2097, 0.95->2177,
+# 0.98->2257.  (This line used to read 1700/1844/1901/1988; those numbers do not
+# reproduce from any shipped constant — the slope implied by the series is
+# 3600/SEC = 2892, i.e. SEC ~= 1.245, against a ~944 s fixed reserve.  Corrected
+# 2026-08-06 by the week-6 correctness sweep.)  The krea2 law returns at most
+# 1939 in the observed size range, so at every margin >= 0.85 the LAW binds and
+# this cap is inert for krea2 — which is the intent, and is why the wrong
+# numbers changed no decision.
+# 0.92 keeps ~290 s of jitter headroom BEYOND the 480 s reserve.
 # The asymmetry favours scheduling slightly deep: over-scheduling is recoverable
 # because `forge/tasks/checkpoints.py` promotes the highest valid periodic save
 # to `last.safetensors` on a kill, whereas under-scheduling is not recoverable.
