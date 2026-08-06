@@ -45,11 +45,29 @@ On the GPU host, like ``run_krea_ladder.py``.  ``--host`` names that host and
 its pinned checkouts; execute mode refuses to run anywhere else.  ``plan``
 (dry-run) is host-independent and uses zero GPU.
 
+FIXTURES
+--------
+It consumes ``ops/experiments/week6/build_fixtures.py`` manifests directly
+(``<out-root>/<group>/<task-id>/manifest.json``).  That builder emits two byte
+trees per side; ``--fixture-variant`` chooses between them and the choice is
+recorded in the fixture identity, in every cell key, and in the predeclaration:
+
+* ``source`` (default) — the harvested bytes verbatim.  Field-faithful: the
+  tournament's training container received exactly these, and the pinned
+  evaluator applies ``adjust_image_size`` to held-out images itself.
+* ``validator_geometry`` — the same pairs after that transform.  A sensitivity
+  arm, never the default.
+
+Because the builder emits directories and the pinned Forge path consumes
+``/cache/datasets/<task-id>_tourn.zip``, the training cell zips the chosen
+train directory deterministically (fixed order, fixed 1980 timestamps, no
+compression) after verifying every byte against the manifest.
+
 USAGE
 -----
     # dry run: validate everything, cost it, write the predeclaration
     python3 ops/experiments/week6/run_two_arm.py plan \\
-        --fixture <fixture-manifest.json> \\
+        --fixture <fixtures>/discovery/<task-id>/manifest.json \\
         --arm ops/experiments/week6/arms/leader_derived.json \\
         --arm ops/experiments/week6/arms/incumbent.json \\
         --arm ops/experiments/week6/arms/zero_lora_control.json \\
@@ -86,6 +104,19 @@ from typing import Any, Callable, Sequence
 SCHEMA = 1
 KIND = "forge-week6-two-arm-experiment"
 FIXTURE_KINDS = ("forge-week6-real-fixture", "forge-week6-real-fixture-planonly")
+# ops/experiments/week6/build_fixtures.py emits this manifest per task; the
+# runner consumes it directly through _adapt_builder_manifest().
+BUILDER_MANIFEST_SCHEMA = "sn56.week6.fixture-manifest"
+# Which byte tree of the builder's output an arm trains and is scored on.
+# "source"             = the harvested bytes verbatim.  This is what the
+#                        tournament's training container actually received, and
+#                        the pinned evaluator applies adjust_image_size to the
+#                        held-out images itself, so it is also the faithful
+#                        scoring input.
+# "validator_geometry" = the same pairs after the validator's own resize/crop.
+#                        A sensitivity arm, not the default.
+FIXTURE_VARIANTS = ("source", "validator_geometry")
+DEFAULT_FIXTURE_VARIANT = "source"
 ARM_KIND = "forge-week6-arm"
 HOST_KIND = "forge-week6-gpu-host"
 PREDECLARATION_KIND = "forge-week6-two-arm-predeclaration"
@@ -323,7 +354,7 @@ def _resolve(base: Path, value: str) -> Path:
 
 
 @dataclass(frozen=True)
-class HoldoutRow:
+class PairRow:
     index: int
     image: str
     image_sha256: str
@@ -340,11 +371,16 @@ class HoldoutRow:
         }
 
 
+# Historical alias: the holdout rows were the first users of this record.
+HoldoutRow = PairRow
+
+
 @dataclass(frozen=True)
 class Fixture:
     path: Path
     manifest_sha256: str
     fixture_id: str
+    variant: str
     task_id: str
     model: str
     model_type: str
@@ -352,11 +388,13 @@ class Fixture:
     hours_to_complete: float
     plan_only: bool
     train_pairs: int
+    train_dir: Path | None
+    train_rows: tuple[PairRow, ...]
     train_archive: Path | None
     train_archive_sha256: str | None
     holdout_pairs: int
     holdout_dir: Path | None
-    holdout_rows: tuple[HoldoutRow, ...]
+    holdout_rows: tuple[PairRow, ...]
     source: dict[str, Any]
 
     @property
@@ -365,9 +403,23 @@ class Fixture:
             return None
         return canonical_hash([row.identity() for row in self.holdout_rows])
 
+    @property
+    def train_dataset_sha256(self) -> str | None:
+        """Identity of the exact bytes the arms train on.
+
+        Rows when the fixture ships a directory (the builder's shape), the
+        archive hash when it ships a prebuilt zip.  Either way this is what the
+        training cell key is bound to, so a changed training set can never
+        silently reuse a completed cell.
+        """
+        if self.train_rows:
+            return canonical_hash([row.identity() for row in self.train_rows])
+        return self.train_archive_sha256
+
     def identity(self) -> dict[str, Any]:
         return {
             "fixture_id": self.fixture_id,
+            "variant": self.variant,
             "task_id": self.task_id,
             "model": self.model,
             "model_type": self.model_type,
@@ -377,17 +429,167 @@ class Fixture:
             "manifest_path": str(self.path),
             "manifest_sha256": self.manifest_sha256,
             "train_pairs": self.train_pairs,
+            "train_dir": (str(self.train_dir) if self.train_dir else None),
+            "train_dataset_sha256": self.train_dataset_sha256,
             "train_archive_sha256": self.train_archive_sha256,
             "holdout_pairs": self.holdout_pairs,
+            "holdout_dir": (str(self.holdout_dir) if self.holdout_dir else None),
             "holdout_dataset_sha256": self.holdout_dataset_sha256,
             "source": self.source,
         }
 
 
-def load_fixture(path: Path) -> Fixture:
+def _pair_rows(entries: Sequence[dict[str, Any]], label: str) -> tuple[PairRow, ...]:
+    rows: list[PairRow] = []
+    seen_images: set[str] = set()
+    seen_stems: set[str] = set()
+    for index, row in enumerate(entries):
+        require(isinstance(row, dict), f"{label} row {index} is not an object")
+        image = row.get("image")
+        require(
+            isinstance(image, str)
+            and image == os.path.basename(image)
+            and image not in ("", ".", "..")
+            and image not in seen_images,
+            f"{label} row {index} 'image' must be a unique bare filename",
+        )
+        stem, extension = os.path.splitext(str(image))
+        require(
+            extension and stem and stem not in seen_stems,
+            f"{label} row {index} image stem must be unique and non-empty",
+        )
+        prompt = row.get("prompt", f"{stem}.txt")
+        require(
+            prompt == f"{stem}.txt",
+            f"{label} row {index} prompt must be '<image stem>.txt'",
+        )
+        seen_images.add(str(image))
+        seen_stems.add(stem)
+        rows.append(
+            PairRow(
+                index=index,
+                image=str(image),
+                image_sha256=_sha256_field(
+                    row.get("image_sha256"), f"{label} row {index} image_sha256"
+                ),
+                prompt=str(prompt),
+                prompt_sha256=_sha256_field(
+                    row.get("prompt_sha256"), f"{label} row {index} prompt_sha256"
+                ),
+            )
+        )
+    return tuple(rows)
+
+
+def _adapt_builder_manifest(
+    raw: dict[str, Any], *, path: Path, variant: str
+) -> dict[str, Any]:
+    """Map ops/experiments/week6/build_fixtures.py output onto this schema.
+
+    The builder emits both byte trees (``source`` and ``validator_geometry``)
+    for both sides.  Choosing between them is a scientific decision, so the
+    choice is an explicit argument, is recorded in the fixture identity, and
+    flows into every cell key and into the predeclaration.
+    """
+    require(
+        variant in FIXTURE_VARIANTS,
+        f"fixture variant must be one of {FIXTURE_VARIANTS}",
+    )
+    task = raw.get("task")
+    require(isinstance(task, dict), "builder manifest has no 'task' block")
+    images = raw.get("images")
+    require(isinstance(images, list) and images, "builder manifest has no images")
+
+    sides: dict[str, list[dict[str, Any]]] = {"train": [], "holdout": []}
+    for record in images:
+        require(isinstance(record, dict), "builder image record is not an object")
+        side = record.get("split")
+        require(side in sides, f"builder image record has an unknown split: {side!r}")
+        outputs = record.get("outputs")
+        require(isinstance(outputs, dict), "builder image record has no outputs")
+        image_rel = outputs.get(f"{variant}_image")
+        caption_rel = outputs.get(f"{variant}_caption")
+        require(
+            isinstance(image_rel, str) and isinstance(caption_rel, str),
+            f"builder image record has no {variant} outputs",
+        )
+        if variant == "source":
+            image_sha = (record.get("source") or {}).get("sha256")
+        else:
+            image_sha = (record.get("preprocessed") or {}).get("sha256")
+        caption_sha = (record.get("caption") or {}).get("sha256")
+        sides[side].append(
+            {
+                "image": os.path.basename(str(image_rel)),
+                "image_sha256": image_sha,
+                "prompt": os.path.basename(str(caption_rel)),
+                "prompt_sha256": caption_sha,
+                "_dir": os.path.dirname(str(image_rel)),
+            }
+        )
+
+    directories = {}
+    for side, entries in sides.items():
+        require(entries, f"builder manifest has no {side} images")
+        dirs = {entry.pop("_dir") for entry in entries}
+        require(
+            len(dirs) == 1,
+            f"builder {side}/{variant} rows span more than one directory: {dirs}",
+        )
+        directories[side] = dirs.pop()
+
+    group = str(raw.get("group") or "fixture")
+    task_id = str(task.get("task_id"))
+    return {
+        "schema": SCHEMA,
+        "kind": "forge-week6-real-fixture",
+        "plan_only": False,
+        "fixture_id": f"{group}-{task_id}",
+        "task_id": task_id,
+        "model": task.get("base_model"),
+        "model_type": task.get("model_type"),
+        "trigger_word": task.get("trigger_phrase"),
+        "hours_to_complete": task.get("hours_to_complete"),
+        "train": {
+            "pairs": len(sides["train"]),
+            "dir": directories["train"],
+            "rows": sides["train"],
+        },
+        "holdout": {
+            "pairs": len(sides["holdout"]),
+            "dir": directories["holdout"],
+            "rows": sides["holdout"],
+        },
+        "source": {
+            "adapted_from": BUILDER_MANIFEST_SCHEMA,
+            "adapted_from_path": str(path),
+            "builder_version": raw.get("builder_version"),
+            "builder_source_sha256": raw.get("builder_source_sha256"),
+            "builder_seed": raw.get("seed"),
+            "group": group,
+            "variant": variant,
+            "variant_meaning": (
+                "byte-verbatim harvested pairs"
+                if variant == "source"
+                else "pairs after the pinned validator's adjust_image_size"
+            ),
+            "harvest": raw.get("harvest"),
+            "dedup": (raw.get("dedup") or {}).get("n_multi_member_groups"),
+            "split_determinism": (raw.get("split") or {}).get("determinism"),
+            "task": task,
+        },
+    }
+
+
+def load_fixture(path: Path, *, variant: str = DEFAULT_FIXTURE_VARIANT) -> Fixture:
     path = Path(os.path.abspath(os.path.expanduser(str(path))))
+    manifest_sha256 = sha256_file(path)
     raw = read_json(path)
     base = path.parent
+    adapted_variant = "native"
+    if raw.get("schema") == BUILDER_MANIFEST_SCHEMA:
+        raw = _adapt_builder_manifest(raw, path=path, variant=variant)
+        adapted_variant = variant
     require(raw.get("schema") == SCHEMA, f"fixture schema must be {SCHEMA}")
     kind = raw.get("kind")
     require(kind in FIXTURE_KINDS, f"fixture kind must be one of {FIXTURE_KINDS}")
@@ -421,24 +623,37 @@ def load_fixture(path: Path) -> Fixture:
     train_pairs = _positive_int(train.get("pairs"), "train.pairs", upper=100_000)
     train_archive: Path | None = None
     train_archive_sha: str | None = None
+    train_dir: Path | None = None
+    train_rows: tuple[PairRow, ...] = ()
     if plan_only:
         require(
-            "archive_path" not in train,
-            "a plan-only fixture must not declare a training archive",
+            "archive_path" not in train and not train.get("rows"),
+            "a plan-only fixture must not declare training bytes",
+        )
+    elif isinstance(train.get("archive_path"), str):
+        train_archive = _resolve(base, train["archive_path"])
+        train_archive_sha = _sha256_field(
+            train.get("archive_sha256"), "train.archive_sha256"
         )
     else:
         require(
-            isinstance(train.get("archive_path"), str),
-            "train.archive_path is required on an executable fixture",
+            isinstance(train.get("dir"), str),
+            "an executable fixture needs train.dir + train.rows (or a prebuilt "
+            "train.archive_path)",
         )
-        train_archive = _resolve(base, train["archive_path"])
-        train_archive_sha = _sha256_field(train.get("archive_sha256"), "train.archive_sha256")
+        train_dir = _resolve(base, train["dir"])
+        raw_train = train.get("rows")
+        require(
+            isinstance(raw_train, list) and len(raw_train) == train_pairs,
+            "train.rows must be a list with exactly train.pairs entries",
+        )
+        train_rows = _pair_rows(raw_train, "train")
 
     holdout = raw.get("holdout")
     require(isinstance(holdout, dict), "fixture 'holdout' must be an object")
     holdout_pairs = _positive_int(holdout.get("pairs"), "holdout.pairs", upper=100_000)
     holdout_dir: Path | None = None
-    rows: list[HoldoutRow] = []
+    rows: tuple[PairRow, ...] = ()
     if plan_only:
         require(
             not holdout.get("rows"),
@@ -455,42 +670,16 @@ def load_fixture(path: Path) -> Fixture:
             isinstance(raw_rows, list) and len(raw_rows) == holdout_pairs,
             "holdout.rows must be a list with exactly holdout.pairs entries",
         )
-        seen_images: set[str] = set()
-        seen_stems: set[str] = set()
-        for index, row in enumerate(raw_rows):
-            require(isinstance(row, dict), f"holdout row {index} is not an object")
-            image = row.get("image")
-            require(
-                isinstance(image, str)
-                and image == os.path.basename(image)
-                and image not in ("", ".", "..")
-                and image not in seen_images,
-                f"holdout row {index} 'image' must be a unique bare filename",
+        rows = _pair_rows(raw_rows, "holdout")
+        if train_rows:
+            overlap = sorted(
+                {row.image_sha256 for row in rows}
+                & {row.image_sha256 for row in train_rows}
             )
-            stem, extension = os.path.splitext(image)
             require(
-                extension and stem and stem not in seen_stems,
-                f"holdout row {index} image stem must be unique and non-empty",
-            )
-            prompt = row.get("prompt", f"{stem}.txt")
-            require(
-                prompt == f"{stem}.txt",
-                f"holdout row {index} prompt must be '<image stem>.txt'",
-            )
-            seen_images.add(image)
-            seen_stems.add(stem)
-            rows.append(
-                HoldoutRow(
-                    index=index,
-                    image=image,
-                    image_sha256=_sha256_field(
-                        row.get("image_sha256"), f"holdout row {index} image_sha256"
-                    ),
-                    prompt=str(prompt),
-                    prompt_sha256=_sha256_field(
-                        row.get("prompt_sha256"), f"holdout row {index} prompt_sha256"
-                    ),
-                )
+                not overlap,
+                "the holdout shares image bytes with the training set "
+                f"({len(overlap)} sha256 collisions); the split is not a split",
             )
 
     source = raw.get("source", {})
@@ -498,8 +687,9 @@ def load_fixture(path: Path) -> Fixture:
 
     return Fixture(
         path=path,
-        manifest_sha256=sha256_file(path),
+        manifest_sha256=manifest_sha256,
         fixture_id=fixture_id,
+        variant=adapted_variant,
         task_id=task_id,
         model=str(model),
         model_type=model_type,
@@ -507,11 +697,13 @@ def load_fixture(path: Path) -> Fixture:
         hours_to_complete=hours,
         plan_only=plan_only,
         train_pairs=train_pairs,
+        train_dir=train_dir,
+        train_rows=train_rows,
         train_archive=train_archive,
         train_archive_sha256=train_archive_sha,
         holdout_pairs=holdout_pairs,
         holdout_dir=holdout_dir,
-        holdout_rows=tuple(rows),
+        holdout_rows=rows,
         source=source,
     )
 
@@ -873,9 +1065,10 @@ def train_cell_inputs(
         "experiment_schema": SCHEMA,
         "fixture": {
             "fixture_id": fixture.fixture_id,
+            "variant": fixture.variant,
             "task_id": fixture.task_id,
             "manifest_sha256": fixture.manifest_sha256,
-            "train_archive_sha256": fixture.train_archive_sha256,
+            "train_dataset_sha256": fixture.train_dataset_sha256,
             "train_pairs": fixture.train_pairs,
             "model": fixture.model,
             "model_type": fixture.model_type,
@@ -915,6 +1108,7 @@ def score_cell_inputs(
         "experiment_schema": SCHEMA,
         "fixture": {
             "fixture_id": fixture.fixture_id,
+            "variant": fixture.variant,
             "manifest_sha256": fixture.manifest_sha256,
             "holdout_dataset_sha256": fixture.holdout_dataset_sha256,
             "holdout_pairs": fixture.holdout_pairs,
@@ -1255,6 +1449,7 @@ def _path_checks(
     entries: list[tuple[str, Path | None]] = [
         ("fixture manifest", fixture.path),
         ("fixture train archive", fixture.train_archive),
+        ("fixture train dir", fixture.train_dir),
         ("fixture holdout dir", fixture.holdout_dir),
         ("evaluator harness", EVALUATOR_PATH),
         ("ladder helpers", LADDER_PATH),
@@ -1304,7 +1499,9 @@ def predeclaration(plan: dict[str, Any]) -> dict[str, Any]:
         "decision_rule": DECISION_RULE,
         "bound_to": {
             "fixture_id": fixture["fixture_id"],
+            "fixture_variant": fixture["variant"],
             "fixture_manifest_sha256": fixture["manifest_sha256"],
+            "train_dataset_sha256": fixture["train_dataset_sha256"],
             "holdout_dataset_sha256": fixture["holdout_dataset_sha256"],
             "holdout_pairs": fixture["holdout_pairs"],
             "arms": arms,
@@ -1465,26 +1662,34 @@ def preflight(
             "disables its score-critical settings; refusing.",
         )
     verified = verify_holdout_dir(fixture)
+    train_verified: dict[str, Any] | None = None
+    if fixture.train_dir is not None:
+        train_verified = verify_pair_dir(
+            Path(str(fixture.train_dir)), fixture.train_rows, label="train"
+        )
     return {
         "hostname": observed_host,
         "ai_toolkit_head": toolkit_head,
         "holdout": verified,
+        "train": train_verified,
+        "fixture_variant": fixture.variant,
     }
 
 
-def verify_holdout_dir(fixture: Fixture) -> dict[str, Any]:
-    """The holdout directory must be exactly the manifest, byte for byte."""
-    require(fixture.holdout_dir is not None, "fixture has no holdout directory")
-    directory = Path(fixture.holdout_dir)
-    require(directory.is_dir(), f"holdout dir is not a directory: {directory}")
+def verify_pair_dir(
+    directory: Path, rows: Sequence[PairRow], *, label: str
+) -> dict[str, Any]:
+    """A dataset directory must be exactly the manifest, byte for byte."""
+    directory = Path(directory)
+    require(directory.is_dir(), f"{label} dir is not a directory: {directory}")
     expected: dict[str, str] = {}
-    for row in fixture.holdout_rows:
+    for row in rows:
         expected[row.image] = row.image_sha256
         expected[row.prompt] = row.prompt_sha256
     actual_names = sorted(entry.name for entry in directory.iterdir())
     require(
         actual_names == sorted(expected),
-        "holdout directory contents differ from the fixture manifest: "
+        f"{label} directory contents differ from the fixture manifest: "
         f"unexpected={sorted(set(actual_names) - set(expected))} "
         f"missing={sorted(set(expected) - set(actual_names))}",
     )
@@ -1492,19 +1697,58 @@ def verify_holdout_dir(fixture: Fixture) -> dict[str, Any]:
         path = directory / name
         require(
             path.is_file() and not path.is_symlink(),
-            f"holdout entry is not a regular file: {path}",
+            f"{label} entry is not a regular file: {path}",
         )
         actual = sha256_file(path)
         require(
             actual == declared,
-            f"holdout byte mismatch for {name}: manifest {declared}, disk {actual}",
+            f"{label} byte mismatch for {name}: manifest {declared}, disk {actual}",
         )
-    return {
-        "dir": str(directory),
-        "files": len(expected),
-        "holdout_dataset_sha256": fixture.holdout_dataset_sha256,
-        "verified": True,
-    }
+    return {"dir": str(directory), "files": len(expected), "verified": True}
+
+
+def verify_holdout_dir(fixture: Fixture) -> dict[str, Any]:
+    require(fixture.holdout_dir is not None, "fixture has no holdout directory")
+    result = verify_pair_dir(
+        Path(str(fixture.holdout_dir)), fixture.holdout_rows, label="holdout"
+    )
+    result["holdout_dataset_sha256"] = fixture.holdout_dataset_sha256
+    return result
+
+
+def build_train_archive(fixture: Fixture, destination: Path) -> str:
+    """Zip the fixture's training directory deterministically.
+
+    The pinned Forge path consumes ``/cache/datasets/<task>_tourn.zip``, but the
+    fixture builder emits directories.  Bridging that is staging, not training:
+    fixed member order, fixed 1980-01-01 timestamps, fixed permissions, and no
+    compression, so the same rows always produce the same bytes.
+    """
+    import zipfile
+
+    require(fixture.train_dir is not None, "fixture has no training directory")
+    directory = Path(str(fixture.train_dir))
+    verify_pair_dir(directory, fixture.train_rows, label="train")
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise ExperimentError(f"refusing to overwrite a staged archive: {destination}")
+    temp = destination.parent / f".{destination.name}.tmp"
+    if temp.exists():
+        temp.unlink()
+    names = sorted(
+        {name for row in fixture.train_rows for name in (row.image, row.prompt)}
+    )
+    with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name in names:
+            info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            info.create_system = 3
+            archive.writestr(info, (directory / name).read_bytes())
+    digest = sha256_file(temp)
+    os.link(temp, destination)
+    temp.unlink()
+    return digest
 
 
 def run_train_cell(
@@ -1548,6 +1792,8 @@ def run_train_cell(
         "train-cell",
         "--fixture",
         str(fixture.path),
+        "--fixture-variant",
+        fixture.variant if fixture.variant in FIXTURE_VARIANTS else DEFAULT_FIXTURE_VARIANT,
         "--arm",
         str(arm.path),
         "--host",
@@ -2256,7 +2502,7 @@ def bind_config(
 
 
 def train_cell_main(args: argparse.Namespace) -> int:
-    fixture = load_fixture(Path(args.fixture))
+    fixture = load_fixture(Path(args.fixture), variant=args.fixture_variant)
     arm = load_arm(Path(args.arm))
     host = load_host(Path(args.host))
     require(arm.trains, "train-cell requires a training arm")
@@ -2305,22 +2551,39 @@ def train_cell_main(args: argparse.Namespace) -> int:
 
     staged_zip = Path(spec.cached_zip_path)
     staged_zip.parent.mkdir(parents=True, exist_ok=True)
-    archive = Path(str(fixture.train_archive))
-    if staged_zip.exists():
-        actual = sha256_file(staged_zip)
-        require(
-            actual == fixture.train_archive_sha256,
-            f"staged dataset {staged_zip} is sha256 {actual}, fixture declares "
-            f"{fixture.train_archive_sha256}",
-        )
+    archive_source: str
+    if fixture.train_archive is not None:
+        archive = Path(str(fixture.train_archive))
+        archive_source = f"prebuilt fixture archive {archive}"
+        if staged_zip.exists():
+            actual = sha256_file(staged_zip)
+            require(
+                actual == fixture.train_archive_sha256,
+                f"staged dataset {staged_zip} is sha256 {actual}, fixture declares "
+                f"{fixture.train_archive_sha256}",
+            )
+        else:
+            shutil.copyfile(archive, staged_zip)
+            actual = sha256_file(staged_zip)
+            require(
+                actual == fixture.train_archive_sha256,
+                f"staged dataset copy hashed {actual}, expected "
+                f"{fixture.train_archive_sha256}",
+            )
+        staged_zip_sha = actual
     else:
-        shutil.copyfile(archive, staged_zip)
-        actual = sha256_file(staged_zip)
-        require(
-            actual == fixture.train_archive_sha256,
-            f"staged dataset copy hashed {actual}, expected "
-            f"{fixture.train_archive_sha256}",
+        archive_source = (
+            f"deterministic zip of {fixture.train_dir} "
+            f"(variant {fixture.variant}, {fixture.train_pairs} pairs)"
         )
+        if staged_zip.exists():
+            # A previous arm on this host already staged the identical rows.
+            verify_pair_dir(
+                Path(str(fixture.train_dir)), fixture.train_rows, label="train"
+            )
+            staged_zip_sha = sha256_file(staged_zip)
+        else:
+            staged_zip_sha = build_train_archive(fixture, staged_zip)
 
     frozen = read_yaml(Path(str(arm.config_path)))
     captured: dict[str, Any] = {}
@@ -2444,11 +2707,15 @@ def train_cell_main(args: argparse.Namespace) -> int:
             "save_every": arm.save_every,
         },
         "dataset": {
-            "train_archive_path": str(archive),
-            "train_archive_sha256": fixture.train_archive_sha256,
+            "fixture_variant": fixture.variant,
+            "train_dir": (str(fixture.train_dir) if fixture.train_dir else None),
+            "train_archive_source": archive_source,
+            "train_dataset_sha256": fixture.train_dataset_sha256,
             "staged_zip": str(staged_zip),
+            "staged_zip_sha256": staged_zip_sha,
             "train_pairs_declared": fixture.train_pairs,
             "num_images_seen_by_recipe": captured["num_images"],
+            "train_pairs_match": captured["num_images"] == fixture.train_pairs,
             "images_dir": ladder._fingerprint_path(Path(spec.dataset_images_dir)),
             "holdout_reservation_disabled": True,
         },
@@ -2479,6 +2746,17 @@ def train_cell_main(args: argparse.Namespace) -> int:
         },
         "telemetry": telemetry_record,
     }
+    if captured["num_images"] != fixture.train_pairs:
+        # Forge re-runs its own perceptual dedup on the staged zip. If that
+        # removes rows the fixture builder kept, the arm did not train on the
+        # declared split and the receipt would be a false statement.
+        write_json_exclusive(directory / "train-pairs-mismatch.json", receipt)
+        raise ExperimentError(
+            f"arm {arm.arm_id} trained on {captured['num_images']} pairs but the "
+            f"fixture declares {fixture.train_pairs}; Forge's dedup and the "
+            "fixture builder's dedup disagree. Evidence: "
+            f"{directory}/train-pairs-mismatch.json"
+        )
     write_json_exclusive(directory / RESULT_NAME, receipt)
     print(
         json.dumps(
@@ -2502,6 +2780,18 @@ def train_cell_main(args: argparse.Namespace) -> int:
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fixture", required=True)
+    parser.add_argument(
+        "--fixture-variant",
+        choices=FIXTURE_VARIANTS,
+        default=DEFAULT_FIXTURE_VARIANT,
+        help=(
+            "which byte tree of a build_fixtures.py manifest to use. "
+            "'source' (default) is the field-faithful arm: the tournament "
+            "container received the harvested bytes verbatim and the pinned "
+            "evaluator applies adjust_image_size to held-out images itself. "
+            "Recorded in the fixture identity and in every cell key."
+        ),
+    )
     parser.add_argument("--arm", action="append", default=[], required=True)
     parser.add_argument("--host", "--gpu-host", dest="host", required=True)
     parser.add_argument("--workdir", required=True)
@@ -2547,7 +2837,10 @@ def _cost_from(args: argparse.Namespace, host: Host) -> CostModel:
 
 
 def _load_all(args: argparse.Namespace) -> tuple[Fixture, list[Arm], Host, CostModel]:
-    fixture = load_fixture(Path(args.fixture))
+    fixture = load_fixture(
+        Path(args.fixture),
+        variant=getattr(args, "fixture_variant", DEFAULT_FIXTURE_VARIANT),
+    )
     arms = [load_arm(Path(path)) for path in args.arm]
     host = load_host(Path(args.host))
     return fixture, arms, host, _cost_from(args, host)
@@ -2677,6 +2970,9 @@ def build_parser() -> argparse.ArgumentParser:
         "train-cell", help="internal: one seeded training arm (invoked by 'run')"
     )
     train_parser.add_argument("--fixture", required=True)
+    train_parser.add_argument(
+        "--fixture-variant", choices=FIXTURE_VARIANTS, default=DEFAULT_FIXTURE_VARIANT
+    )
     train_parser.add_argument("--arm", required=True)
     train_parser.add_argument("--host", required=True)
     train_parser.add_argument("--hours", required=True)

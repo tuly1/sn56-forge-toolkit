@@ -1216,6 +1216,150 @@ def test_shipped_arm_specs_and_configs_load(tmp_path):
     assert control.role == "zero_lora_control"
 
 
+# ---------------------------------------------------------------------------
+# build_fixtures.py manifest adapter
+# ---------------------------------------------------------------------------
+
+
+def _builder_manifest(tmp_path: Path, *, train=2, holdout=3) -> Path:
+    """A manifest shaped exactly like ops/experiments/week6/build_fixtures.py's."""
+    root = tmp_path / "fixtures" / "discovery" / "task-xyz"
+    images = []
+    for index in range(train + holdout):
+        side = "train" if index < train else "holdout"
+        stem = f"{index:03d}"
+        source_image = _write(root / side / "source" / f"{stem}.png", f"src{index}".encode())
+        caption = _write(root / side / "source" / f"{stem}.txt", f"cap{index}".encode())
+        geometry = _write(
+            root / side / "validator_geometry" / f"{stem}.png", f"geo{index}".encode()
+        )
+        _write(root / side / "validator_geometry" / f"{stem}.txt", f"cap{index}".encode())
+        images.append(
+            {
+                "stem": stem,
+                "split": side,
+                "source": {"sha256": source_image},
+                "caption": {"sha256": caption},
+                "preprocessed": {"sha256": geometry},
+                "outputs": {
+                    "source_image": f"{side}/source/{stem}.png",
+                    "source_caption": f"{side}/source/{stem}.txt",
+                    "validator_geometry_image": f"{side}/validator_geometry/{stem}.png",
+                    "validator_geometry_caption": f"{side}/validator_geometry/{stem}.txt",
+                },
+            }
+        )
+    manifest = {
+        "schema": "sn56.week6.fixture-manifest",
+        "schema_version": 1,
+        "builder_version": "1.0.0",
+        "builder_source_sha256": "9" * 64,
+        "group": "discovery",
+        "seed": 20260806,
+        "task": {
+            "task_id": "task-xyz",
+            "model_type": "krea2",
+            "base_model": "krea/Krea-2-Raw",
+            "hours_to_complete": 0.75,
+            "trigger_phrase": "AetherFlow UI",
+        },
+        "harvest": {"access": "read-only"},
+        "dedup": {"n_multi_member_groups": 0},
+        "split": {"determinism": "sha256 ranking, no RNG, no clock"},
+        "images": images,
+    }
+    path = root / "manifest.json"
+    _write_json(path, manifest)
+    return path
+
+
+def test_builder_manifest_is_consumed_directly(tmp_path):
+    path = _builder_manifest(tmp_path)
+    fixture = R.load_fixture(path)
+    assert fixture.variant == "source"
+    assert fixture.task_id == "task-xyz"
+    assert fixture.model == "krea/Krea-2-Raw"
+    assert fixture.trigger_word == "AetherFlow UI"
+    assert fixture.hours_to_complete == 0.75
+    assert (fixture.train_pairs, fixture.holdout_pairs) == (2, 3)
+    assert fixture.train_dir.name == "source" and fixture.train_dir.parent.name == "train"
+    assert fixture.holdout_dir.parent.name == "holdout"
+    assert R.verify_holdout_dir(fixture)["verified"] is True
+    assert R.verify_pair_dir(fixture.train_dir, fixture.train_rows, label="train")["files"] == 4
+
+
+def test_fixture_variant_selects_a_different_byte_tree_and_a_different_key(tmp_path):
+    path = _builder_manifest(tmp_path)
+    source = R.load_fixture(path, variant="source")
+    geometry = R.load_fixture(path, variant="validator_geometry")
+    assert source.train_dataset_sha256 != geometry.train_dataset_sha256
+    assert source.holdout_dataset_sha256 != geometry.holdout_dataset_sha256
+    arm = R.load_arm(build_environment(tmp_path / "env").arm_paths["arm_a"])
+    host = R.load_host(build_environment(tmp_path / "env2").host_path)
+    key_source = R.cell_key(
+        R.train_cell_inputs(fixture=source, arm=arm, host=host, hours=0.75)
+    )
+    key_geometry = R.cell_key(
+        R.train_cell_inputs(fixture=geometry, arm=arm, host=host, hours=0.75)
+    )
+    assert key_source != key_geometry
+    # The variant is bound into the predeclaration, so it cannot be swapped
+    # after results exist without tripping the drift check.
+    assert source.identity()["variant"] == "source"
+    assert geometry.identity()["variant"] == "validator_geometry"
+
+
+def test_train_archive_is_deterministic(tmp_path):
+    path = _builder_manifest(tmp_path)
+    fixture = R.load_fixture(path)
+    first = R.build_train_archive(fixture, tmp_path / "a" / "train.zip")
+    second = R.build_train_archive(fixture, tmp_path / "b" / "train.zip")
+    assert first == second
+    assert first == R.sha256_file(tmp_path / "a" / "train.zip")
+    import zipfile
+
+    with zipfile.ZipFile(tmp_path / "a" / "train.zip") as archive:
+        names = archive.namelist()
+        assert names == sorted(names)
+        assert set(names) == {"000.png", "000.txt", "001.png", "001.txt"}
+        assert {info.date_time for info in archive.infolist()} == {(1980, 1, 1, 0, 0, 0)}
+    with pytest.raises(R.ExperimentError, match="refusing to overwrite"):
+        R.build_train_archive(fixture, tmp_path / "a" / "train.zip")
+
+
+def test_train_archive_refuses_tampered_bytes(tmp_path):
+    path = _builder_manifest(tmp_path)
+    fixture = R.load_fixture(path)
+    (Path(fixture.train_dir) / "000.png").write_bytes(b"tampered")
+    with pytest.raises(R.ExperimentError, match="train byte mismatch"):
+        R.build_train_archive(fixture, tmp_path / "c" / "train.zip")
+
+
+def test_a_split_that_shares_bytes_is_rejected(tmp_path):
+    path = _builder_manifest(tmp_path)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    leak = manifest["images"][0]["source"]["sha256"]
+    manifest["images"][-1]["source"]["sha256"] = leak
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(R.ExperimentError, match="not a split"):
+        R.load_fixture(path)
+
+
+def test_the_real_built_fixture_loads_if_present():
+    real = Path(
+        "/Users/atulyashetty/Test/SN56-project/evidence/week6-fixtures-20260806"
+        "/discovery/41025fb5-8473-40c6-a88d-20c0bb303edc/manifest.json"
+    )
+    if not real.is_file():
+        pytest.skip("the week-6 fixture build is not present on this machine")
+    fixture = R.load_fixture(real)
+    assert fixture.task_id == "41025fb5-8473-40c6-a88d-20c0bb303edc"
+    assert fixture.model_type == "krea2"
+    assert fixture.trigger_word == "AetherFlow UI"
+    assert fixture.holdout_pairs >= 2
+    assert R.verify_holdout_dir(fixture)["verified"] is True
+
+
 def test_end_to_end_with_a_fake_gpu_produces_a_full_analysis(tmp_path):
     env = build_environment(tmp_path, holdout_images=6)
     losses = {

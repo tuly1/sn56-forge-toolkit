@@ -22,6 +22,7 @@
     "task_meta_sha256": "5981747729e025ac902e4115aa8c6c0acdb70b5d14b4e95352ea1533218150d1",
     "observed_task_facts": "21 image/caption pairs, all 1024x768 PNG, krea2, ds design_aetherflow_ui, trigger phrase 'AetherFlow UI' present verbatim in 21/21 captions, 0.75 h grant (task-meta.json).",
     "split_arithmetic": "18 train / 3 holdout = the validator's public ceil(total * 0.10) holdout rule applied to 21 pairs. INFERRED counts only; WHICH pairs land in the holdout is the fixture builder's decision and is not made here.",
+    "superseded_by": "ops/experiments/week6/build_fixtures.py has since produced the real fixture for this task (12 train / 9 holdout at seed 20260806); run_two_arm consumes that manifest directly. This file survives only to cost a task before its fixture exists, and as the negative test that execution refuses a plan-only descriptor.",
     "not_evidence": "This file is a planning stand-in. It is not a fixture, it does not authorize training on harvested tournament images, and no score may cite it."
   }
 }
