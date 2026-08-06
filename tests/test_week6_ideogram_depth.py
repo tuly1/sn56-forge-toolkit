@@ -18,9 +18,13 @@ Under Adam the per-coordinate displacement per step is ~lr, so matching a step
 count across a 16x lr gap matches nothing.  The two constraints that DO bind on
 our own pipeline are asserted here instead:
 
-  (a) the EMA floor  — ``save()`` always exports the EMA shadow, which is seeded
-      at the zero-effect init and never bias-corrected, so ``0.995**steps`` of
-      every artifact we upload is untrained init;
+  (a) EMA attenuation — ``save()`` always exports the EMA shadow, which is
+      seeded at the zero-effect init and never bias-corrected, so the export is
+      an ATTENUATED copy of the trained delta and the attenuation shrinks with
+      depth.  (This bullet used to say ``0.995**steps`` of the export "is
+      untrained init".  That is FALSE: ``lora_up`` is zero-initialised
+      (``toolkit/lora_special.py:122``), so the init contributes no adapter
+      effect at all.  See the per-test docstring below.)
   (b) the do_cfg clock ceiling — ``do_cfg: true`` runs the transformer at batch
       2, so our per-step cost is ~2x the field's and the reachable depth is
       correspondingly halved.
@@ -29,6 +33,10 @@ Evidence:
   ops/experiments/week6/FIELD-DEPTH-LAW-AUDIT.md            §6.2
   ops/experiments/week6/PIPELINE-MATERIALIZATION-AUDIT.md   §4.3, D6
   SN56-project/SN56-WEEK3-POSTMORTEM.md                     §6a (Jul-20, 16 miners)
+  SN56-project/SN56-WEEK4-INDEPENDENT-REVIEW-2026-07-22.md  §2 (the Jul-20 R1
+      ideogram4 WINNER configured 378 steps at lr 2.5e-5 + EMA + cosine + TE —
+      the only field artifact in our own recipe family, and it sits BELOW the
+      421/589/616 this law ships)
 """
 
 from __future__ import annotations
@@ -121,20 +129,34 @@ def test_ideogram4_depth_is_invariant_to_margin_and_sec_per_it(row):
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
 def test_ideogram4_export_is_not_dominated_by_the_untrained_init(row):
-    """(a) the EMA floor — the reason this law is deep and not shallow.
+    """(a) EMA attenuation — the reason this law is deep and not shallow.
 
     ``setup_ema`` builds ``ExponentialMovingAverage`` from the LoRA parameters
-    at init, where B = 0 (zero effect), with ``use_num_updates=False`` so the
-    ``(1+n)/(10+n)`` warm-up is DISABLED and the decay is a flat 0.995 from
-    step 1.  ``save()`` then calls ``ema.eval()`` unconditionally, so every
-    artifact we upload — periodic saves included — is the shadow, not the
-    trained weights (``BaseSDTrainProcess.py:566-568,840-851``;
-    ``toolkit/ema.py``).  ``0.995**steps`` is therefore the share of the export
-    that is literally the untrained initialisation.
+    at init, with ``use_num_updates=False`` so the ``(1+n)/(10+n)`` warm-up is
+    DISABLED and the decay is a flat 0.995 from step 1.  ``save()`` then calls
+    ``ema.eval()`` unconditionally, so every artifact we upload — periodic saves
+    included — is the shadow, not the trained weights
+    (``BaseSDTrainProcess.py:491,495-497`` save, ``:769-781`` setup_ema,
+    ``:2031`` call site; ``toolkit/ema.py:43-72,100-152,336-341``).
 
-    The old law shipped 177 steps at N=14 => 41% untrained.  Anything under
-    ~15% is acceptable; the 0.75 h shapes cannot do better than ~12% while
-    do_cfg holds the clock ceiling at 477.
+    WHAT THIS TEST ACTUALLY PINS, stated precisely because the previous version
+    of this docstring was wrong.  It said ``0.995**steps`` is "the share of the
+    export that is literally the untrained initialisation".  It is not:
+    ``lora_up`` is ZERO-initialised (``toolkit/lora_special.py:122``), so the
+    adapter has no effect at init and there is no untrained signal for the
+    shadow to retain.  ``0.995**steps`` is the EMA's MEMORY HORIZON, and the
+    real cost is ATTENUATION of the trained delta — under our cosine
+    2.5e-5 -> 2.5e-6 schedule the export is ~43% of the final iterate at 177
+    steps, ~72% at 421 and ~83% at 616 (INFERRED from
+    ``(1-d)*sum_t d^(T-t)*theta_t / theta_T`` on the cumulative-lr path; a
+    constant-lr path gives 34% / 58% / 69%).
+
+    The assertion below is therefore a DEPTH FLOOR expressed through a monotone
+    proxy, not a measurement of dilution, and the local name ``untrained_share``
+    is a misnomer left in place because this unit may only edit docstrings (see
+    the integration request in the week-6 correctness-sweep report).  The bound
+    0.15 corresponds to steps >= ~379.  Direction is unchanged by the
+    correction: deeper still means less attenuation.
     """
     _task, _family, pairs, hours, _winner, expected = row
     steps = recipe.size_scaled_steps("ideogram4", pairs, hours, 2000)
@@ -153,10 +175,27 @@ def test_ideogram4_fits_the_budget_at_the_do_cfg_corrected_rate(row):
     """(b) the do_cfg clock ceiling — the reason this law is not deeper still.
 
     Asserted at the honest 4.2 s/step, and then again at the rate that would
-    make us miss the deadline, which must be >=20% worse than modelled.  The
-    tightest real shape is 84be9fcd (616 steps in 1.0 h): it truncates only
-    above 5.06 s/step, i.e. 1.21x the modelled rate and 2.47x the field's own
-    2.05 s/step bound for a config without do_cfg.
+    make us miss the deadline, which must be >=20% worse than modelled.
+
+    THREE DIFFERENT THRESHOLDS EXIST HERE and the previous docstring blurred
+    them into one ("truncates only above 5.06 s/step ... 2.47x the field bound"),
+    which made the cushion look about twice as large as it is:
+
+      * PLANNING truncation — the SEC_PER_IT CONSTANT is wrong, so the cap
+        ``(budget*MARGIN - 480)/SEC`` falls below the law.  On the tightest real
+        shape (84be9fcd, 616 steps @ 1.0 h) that happens above **4.597 s/step**
+        = +9.5% over 4.2 = 2.28x the field's 2.019 no-do_cfg bound.  The other
+        two shapes break at 4.760 (421 @ 0.75 h) and 4.808 (589 @ 1.0 h).
+      * RUNTIME kill — the BOX is slower, so the terminate gate stops us.  That
+        gate is ``budget - 180 - 45``, less ``STARTUP_S``, so the tightest shape
+        stops short above **4.992 s/step** (+18.9%).  This is what the assertion
+        below approximates.
+      * The retired 5.06 was the runtime threshold with ``STOP_MARGIN_S``
+        dropped as well, quoted as if it were the constant-error budget.
+
+    ``breaking_rate`` below still omits ``STOP_MARGIN_S`` (it is a 45 s / ~1.4%
+    optimism on a 1.0 h budget); the assertion is a floor, so the direction is
+    safe, but the number it computes is 5.065, not 4.992.
     """
     _task, _family, pairs, hours, _winner, expected = row
     steps = recipe.size_scaled_steps("ideogram4", pairs, hours, 2000)
@@ -255,10 +294,20 @@ def test_ideogram4_bounds_can_actually_bind():
     """``max`` must not be decoration.
 
     The c424362 row carried ``max: 1600`` while the law topped out at 365 at
-    N=50 — it could never bind within 4x, so it encoded nothing.  620 binds from
-    N>=47, i.e. INSIDE the 9-50 dataset-size range the tournaments have actually
-    produced (f6725c2b ran N=50).  ``min`` is the opposite kind of bound: it
-    guards the unobserved small tail, below the N=9 minimum ever seen.
+    N=50 — it could never bind within 4x, so it encoded nothing.  620 first
+    CHANGES the shipped depth at **N = 48** — not N=47, as this docstring used
+    to say: at N=47 the law returns 619.975, which rounds to 620 with or without
+    the cap.  ``test_step_table_max_binding_sizes`` pins the crossover at 48.
+
+    And be honest about the size of the effect: 620 binds only at N = 48, 49, 50
+    and changes depth by 4 / 8 / 12 steps.  It is inside the observed range
+    (f6725c2b ran N=50) but it is very nearly decoration; it is kept as a cap on
+    extrapolating a recipe we have never run past ~200 steps in a tournament.
+    ``min`` is the opposite kind of bound: it guards the unobserved small tail,
+    below the N=9 minimum ever seen.
+
+    NOTE the assertion is ``pure(46) < max <= pure(50)``, which is satisfied by
+    the N=47 no-op as well — it does not by itself pin 48.
     """
     law = recipe.STEP_TABLE["ideogram4"]
 
