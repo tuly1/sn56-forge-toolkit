@@ -47,9 +47,9 @@ from forge.data.schema import ImageSpec
 # policy (ideogram4; see forge/geometry.py) and must keep the template list.
 # --------------------------------------------------------------------------- #
 REAL_TASKS = [
-    ("41025fb5", 1, "krea2", "design", 21, 0.75, 1000, 824, 1336, 268,
+    ("41025fb5", 1, "krea2", "design", 21, 0.75, 1000, 824, 1432, 287,
      887, (21, 21), {(1024, 768): 21}),
-    ("7421f056", 2, "qwen-image", "design", 28, 1.25, 850, 836, 909, 182,
+    ("7421f056", 2, "qwen-image", "design", 28, 1.25, 850, 836, 836, 168,
      887, (28, 28), {(1024, 768): 28}),
     ("84be9fcd", 2, "ideogram4", "style", 46, 1.0, 341, 194, 616, 124,
      None, None, {(1408, 768): 45, (768, 1376): 1}),
@@ -61,7 +61,7 @@ REAL_TASKS = [
      873, (0, 15), {(1195, 896): 15}),
     ("db9f7244", 3, "krea2", "design", 43, 1.0, 2012, 1172, 1840, 369,
      758, (26, 43), {(768, 1376): 18, (1408, 768): 17, (1376, 768): 8}),
-    ("ff643470", 4, "qwen-image", "social", 41, 1.5, 1095, 1027, 1104, 221,
+    ("ff643470", 4, "qwen-image", "social", 41, 1.5, 1095, 1027, 1023, 205,
      887, (41, 41), {(1024, 768): 41}),
     ("1365fa1c", 5, "ideogram4", "product", 14, 0.75, 174, 107, 421, 85,
      None, None, {(1195, 896): 13, (1376, 768): 1}),
@@ -73,7 +73,7 @@ REAL_TASKS = [
      887, (48, 48), {(1024, 768): 48}),
     ("b72da8c6", 5, "ideogram4", "style", 40, 1.0, 1300, 181, 589, 118,
      None, None, {(1024, 768): 40}),
-    ("f6725c2b", 5, "krea2", "design", 50, 1.0, 2012, 1172, 1888, 378,
+    ("f6725c2b", 5, "krea2", "design", 50, 1.0, 2012, 1172, 1939, 388,
      887, (50, 50), {(1024, 768): 50}),
 ]
 
@@ -156,6 +156,42 @@ def test_step_table_is_the_week6_field_calibration():
     }
 
 
+def test_step_table_max_binding_sizes():
+    """Each row's `max` must be honest about whether it can bind at all.
+
+    Observed tournament dataset sizes are N = 9..50.  A `max` that the law
+    cannot reach within 4x that range is a ceiling on extrapolation, not a
+    policy — which is what made the short-lived ideogram4 `max=1600` an inert
+    change (its law topped out at 365 at N=50).  Pinning the crossover N here
+    means a row that silently becomes decoration fails a test instead of
+    reading as a decision.
+    """
+    crossover = {}
+    for model_type, row in recipe.STEP_TABLE.items():
+        first = next(
+            (
+                n
+                for n in range(1, 401)
+                if row["base"] * (n / row["n_ref"]) ** row["p"] >= row["max"]
+            ),
+            None,
+        )
+        crossover[model_type] = first
+    assert crossover == {
+        # The one row whose `max` is ACTIVE inside the observed size range.
+        "ideogram4": 48,
+        # Backstops against pathological N, and labelled as such in recipe.py.
+        "krea2": 72,
+        "flux": 80,
+        "qwen-image": 85,
+        "z-image": 90,
+    }
+    # Nothing may be inert the way ideogram4's 1600 was: unreachable within 4x
+    # the largest observed dataset.
+    for model_type, first in crossover.items():
+        assert first is not None and first <= 200, model_type
+
+
 def test_discredited_jul16_premises_are_not_reintroduced():
     """The two false claims that caused the miscalibration must stay deleted.
 
@@ -190,34 +226,108 @@ def test_discredited_jul16_premises_are_not_reintroduced():
 
 
 @pytest.mark.parametrize(
-    ("model_type", "field_bound", "note"),
+    ("model_type", "rate", "kind", "note"),
     [
-        # Hard upper bounds on the ACHIEVABLE rate: for any miner whose SHIPPED
-        # steps reached their CONFIGURED steps, the run fit the budget, so
-        # s/step <= (hours*3600 - 478)/shipped.
-        ("krea2", 1.55, "our own measured rate on the tournament host is 1.265"),
-        ("z-image", 1.56, "a field miner completed 2000 steps in the same 1.0 h"),
-        ("qwen-image", 4.49, "the only constant the field does not contradict"),
-        ("flux", 1.71, "INFERRED from 5D7iEJm5's 25.7 s/epoch at N=15"),
+        # Rates read out of the published artifacts with the SAME arithmetic the
+        # module documents: W(h) = h*3600 - 225 (terminate trigger) - 300
+        # (STARTUP_S), then W(h)/shipped.
+        #
+        # The two kinds are NOT interchangeable, and reading them as if they were
+        # is how qwen-image ended up 14% optimistic:
+        #   MEASURED — a run that was KILLED, or our own instrumented run.  This
+        #              IS a rate.  SEC_PER_IT below it is planning work nobody
+        #              has shown fits, so MEASURED sets a hard FLOOR.
+        #   BOUND    — a run that COMPLETED.  It only says the true rate was at
+        #              most this; the miner may have had time to spare.  A bound
+        #              cannot set a floor.  It is used the other way round, as a
+        #              limit on how conservative we are allowed to be.
+        ("krea2", 1041.1 / 823, "MEASURED",
+         "OUR OWN 823 steps in 1041.1 s on the tournament host (5HLA2QWY)"),
+        ("qwen-image", 3975 / 850, "MEASURED",
+         "5FW2Eaae and 5FpdSckw, identical configs, both killed at 850/1150"),
+        ("z-image", 3075 / 2000, "BOUND",
+         "5D2Qee4V completed 2000 steps in the same 1.0 h"),
+        ("flux", 2175 / 870, "BOUND",
+         "rank-1 5FW2Eaae, 58 kohya epochs x N=15, INFERRED"),
+        ("ideogram4", 2 * 3075 / 1523, "BOUND",
+         "5FBmn1ax completed 1523 in 1.0 h; DOUBLED for our do_cfg batch-2 step"),
     ],
 )
-def test_sec_per_it_tracks_the_field_bound(model_type, field_bound, note):
-    """The per-type constant must sit in a narrow band around the field bound.
+def test_sec_per_it_is_never_faster_than_its_own_evidence(
+    model_type, rate, kind, note
+):
+    """A rate constant may pad its evidence; it may never outrun a measurement.
 
-    Direction matters and is easy to get backwards: a LARGER constant means
-    FEWER planned steps.  Below the bound is aggressive (risks a deadline stop);
-    far above it is what threw away ~40% of every krea2 and z-image budget for
-    five weeks.  Both failure modes are bounded here.
+    Direction matters and is easy to get backwards: a SMALLER constant means
+    MORE planned steps.  Both failure modes are bounded here — being under a
+    MEASURED rate is what would have got qwen killed on two of three real shapes,
+    and being far over any of them is what threw away ~40% of every krea2 and
+    z-image budget for five weeks.
     """
-    ratio = recipe.SEC_PER_IT[model_type] / field_bound
-    assert 0.88 <= ratio <= 1.20, f"{model_type}: {ratio:.3f}x the bound — {note}"
+    sec = recipe.SEC_PER_IT[model_type]
+    if kind == "MEASURED":
+        assert sec >= rate, (
+            f"{model_type}: {sec} s/step is FASTER than the MEASURED "
+            f"{rate:.3f} — {note}"
+        )
+    assert sec / rate <= 1.20, (
+        f"{model_type}: {sec / rate:.3f}x its evidence — that much pad is how "
+        f"depth was thrown away for five weeks ({note})"
+    )
+
+
+def test_krea2_rate_sits_between_our_measurement_and_the_field_bound():
+    """The one type with BOTH kinds of evidence, and they bracket the constant.
+
+    Our own instrumented run says 1.265 s/step; the field's tightest krea2 bound
+    says the champion was no slower than 1.519 on the same shape.  1.35 is inside
+    that bracket: padded over what we measured, and still faster than the slowest
+    rate consistent with a completed field run — so the clock never truncates the
+    size law while remaining a rate the field has shown is achievable.
+    """
+    ours = 1041.1 / 823
+    field_bound = 2175 / 1432  # 5FBmn1ax/5FjDsFGA completed 1432 in 0.75 h
+    assert ours < recipe.SEC_PER_IT["krea2"] < field_bound
 
 
 def test_krea2_sec_per_it_pads_our_own_measurement():
-    """5HLA2QWY (us) published 1041.1 s for 823 steps = 1.265 s/step."""
-    measured = 1041.1 / 823
-    assert recipe.SEC_PER_IT["krea2"] > measured
-    assert recipe.SEC_PER_IT["krea2"] / measured == pytest.approx(1.19, abs=0.02)
+    """5HLA2QWY (us) published 1041.1 s for 823 steps = 1.265 s/step.
+
+    That 1041.1 s is `toolkit_start -> toolkit_end`, i.e. GROSS OF STARTUP, so
+    the constant is padded twice: 1.35 is 6.7% over the gross rate, and the
+    budget model then charges STARTUP_S = 300 s on top of it.  Net of a 300 s
+    startup the same artifact implies 0.90 s/step.
+    """
+    gross = 1041.1 / 823
+    assert recipe.SEC_PER_IT["krea2"] > gross
+    assert recipe.SEC_PER_IT["krea2"] / gross == pytest.approx(1.07, abs=0.02)
+    net_of_startup = (1041.1 - recipe.STARTUP_S) / 823
+    assert recipe.SEC_PER_IT["krea2"] / net_of_startup == pytest.approx(1.50, abs=0.03)
+
+
+def test_krea2_rate_makes_the_size_law_bind_not_the_clock():
+    """The krea2 1.5 -> 1.35 decision, restated as the property it buys.
+
+    1.5 was the only one of the three candidates (1.5 / 1.35 / 1.30) that let
+    the clock truncate the law, and it truncated exactly the R1 shape: 1432 (two
+    field operators completed exactly that depth there) down to 1336, a depth
+    nobody in the field ran.  1.35 and 1.30 are identical in output, so 1.30's
+    extra optimism buys nothing and costs `projected_wall_s` 4% of its honesty.
+    """
+    thresholds = []
+    for row in REAL_TASKS:
+        if row[2] != "krea2":
+            continue
+        pairs, hours, after = row[4], row[5], row[8]
+        law = _pure_law("krea2", pairs)
+        assert after == law, f"{row[0]}: clock truncated the krea2 law to {after}"
+        window = hours * 3600.0 * recipe.margin_for("krea2") - 480.0
+        thresholds.append(window / law)
+    # The largest rate at which every real krea2 shape is still size-bound.
+    # 0.75 h/N=21 gives 1.399 and 1.0 h/N=50 gives 1.461, so the binding
+    # threshold is 1.399 and 1.35 sits 3.6% inside it.
+    assert min(thresholds) == pytest.approx(1.399, abs=0.005)
+    assert recipe.SEC_PER_IT["krea2"] < min(thresholds)
 
 
 def test_ideogram4_sec_per_it_is_deliberately_above_the_field_bound():
@@ -251,6 +361,52 @@ def test_margin_stops_double_counting_the_fixed_reserve():
     assert 250.0 <= headroom <= 400.0
 
 
+def test_margin_is_per_type_because_the_headroom_it_spends_is_per_type():
+    """0.92 GLOBALLY was a regression, and it landed on exactly one type.
+
+    Four of the five rows have a size law that binds well below the clock, so
+    their margin is inert.  qwen-image is the one type where the clock is the
+    active constraint AND whose rate constant carries no pad, so a global
+    +8% margin went straight into planned steps: the qwen cap rose 1027 -> 1122
+    and two of the three real qwen shapes stopped being able to finish.  The
+    guard against a repeat is `test_every_shape_finishes_at_its_field_rate`.
+    """
+    assert set(recipe.MARGIN_BY_TYPE) == set(recipe.SEC_PER_IT)
+    for model_type, margin in recipe.MARGIN_BY_TYPE.items():
+        assert recipe.margin_for(model_type) == margin
+        assert 0.80 <= margin <= 0.99
+    # Unknown types and junk fall back to the default rather than raising.
+    assert recipe.margin_for("not-a-type") == recipe.MARGIN
+    assert recipe.margin_for(None) == recipe.MARGIN
+    # Only qwen-image departs from the default, and it departs upward, because
+    # its SEC_PER_IT is the measurement rather than a padded one.
+    departures = {
+        model_type: margin
+        for model_type, margin in recipe.MARGIN_BY_TYPE.items()
+        if margin != recipe.MARGIN
+    }
+    assert departures == {"qwen-image": 0.98}
+    # A margin of 1 - STOP_MARGIN_S/budget would plan exactly to the terminate
+    # trigger; qwen's 0.98 is strictly inside that, i.e. it is a cushion.
+    for hours in (1.25, 1.5):
+        plan_to_the_wall = 1.0 - recipe.STOP_MARGIN_S / (hours * 3600.0)
+        assert recipe.margin_for("qwen-image") < plan_to_the_wall
+
+
+def test_stop_margin_mirrors_the_production_terminate_gate():
+    """`aitoolkit._run_toolkit` terminates at `remaining() <= boundary_margin_s()`.
+
+    `recipe.training_deadline_s` is only the real deadline if this stays equal to
+    the value the runner actually gates on; drift would silently make every
+    finish/kill projection in this file optimistic.
+    """
+    from forge.tasks import aitoolkit, holdout
+
+    assert recipe.STOP_MARGIN_S == holdout.boundary_margin_s()
+    assert recipe.STOP_MARGIN_S == aitoolkit._STOP_MARGIN_S
+    assert recipe.training_deadline_s(1.0) == 3600.0 - 180.0 - 45.0
+
+
 def _pure_law(model_type, pairs):
     row = recipe.STEP_TABLE[model_type]
     scaled = row["base"] * (pairs / row["n_ref"]) ** row["p"]
@@ -259,7 +415,9 @@ def _pure_law(model_type, pairs):
 
 def _clock_cap(model_type, hours):
     train_s = (
-        hours * 3600.0 * recipe.MARGIN - recipe.STARTUP_S - recipe.EXPORT_RESERVE_S
+        hours * 3600.0 * recipe.margin_for(model_type)
+        - recipe.STARTUP_S
+        - recipe.EXPORT_RESERVE_S
     )
     return int(train_s / recipe.SEC_PER_IT[model_type])
 
@@ -304,14 +462,24 @@ def test_projected_wall_clock_fits_the_budget(row, dataset_dirs, monkeypatch):
     steps = cfg["config"]["process"][0]["train"]["steps"]
     assert steps == after
     budget = hours * 3600.0
+    margin = recipe.margin_for(model_type)
     wall = recipe.projected_wall_s(model_type, steps)
-    assert wall <= budget * recipe.MARGIN + 1.0, f"{task}: {wall:.0f}s of {budget:.0f}s"
+    assert wall <= budget * margin + 1.0, f"{task}: {wall:.0f}s of {budget:.0f}s"
     # `wall` already contains the 180 s export reserve, so the remainder is pure
-    # jitter headroom.  MARGIN sets its floor; the tightest real shape (the
-    # clock-bound krea2 tasks) keeps exactly that and nothing less.
+    # jitter headroom.  MARGIN sets its floor.
     slack = budget - wall
-    assert slack >= budget * (1.0 - recipe.MARGIN) - 1.0
-    assert slack >= 200.0, f"{task}: only {slack:.0f}s of headroom"
+    assert slack >= budget * (1.0 - margin) - 1.0
+    # The load-bearing property is not a round number of seconds of slack — it is
+    # that TRAINING ends before `_run_toolkit` terminates it, which happens
+    # `EXPORT_RESERVE_S + STOP_MARGIN_S` before the hard kill.  Asserting the
+    # magic 200 s instead is what let the qwen regression through: at the old
+    # optimistic 4.0 s/step every qwen row cleared 200 s of "slack" that the real
+    # rate did not have.
+    train_end = recipe.STARTUP_S + steps * recipe.SEC_PER_IT[model_type]
+    assert train_end <= recipe.training_deadline_s(hours), (
+        f"{task}: training ends at {train_end:.0f}s, terminated at "
+        f"{recipe.training_deadline_s(hours):.0f}s"
+    )
 
 
 @pytest.mark.parametrize("row", REAL_TASKS, ids=IDS)
@@ -339,9 +507,15 @@ def test_first_periodic_save_is_kill_safe(row, dataset_dirs, monkeypatch):
 @pytest.mark.parametrize(
     ("model_type", "expected"),
     [
-        ("krea2", 1.02),
+        # krea2 exceeds 1.0 only because of the R1 shape, where the rank-1
+        # artifact is the shallowest thing on the task (1000) and six others
+        # completed 1278-2000; our 1432 is the champion's own depth there.
+        ("krea2", 1.05),
         ("z-image", 1.00),
-        ("qwen-image", 1.03),
+        # qwen 1.03 -> 0.975: the clock, calibrated to the field's own
+        # reproduced 4.68 s/step, will not fund 1104 on ff643470.  Planning it
+        # anyway ships 884 (see test_every_shape_finishes_at_its_field_rate).
+        ("qwen-image", 0.975),
         ("flux", 1.08),
         # ideogram4 IS DELIBERATELY ABSENT.  Matching the field winners' STEP
         # COUNTS is not a valid target for this type: every field ideogram4
@@ -370,7 +544,148 @@ def test_every_type_moved_off_the_shallow_edge_of_its_band():
             # learning rate.  Asserted separately against our own constraints.
             continue
         assert after >= before or model_type == "qwen-image"
-        assert 0.85 <= after / winner <= 1.40, f"{row[0]} {model_type}"
+        # 41025fb5 is the one shape whose rank-1 artifact is also its SHALLOWEST
+        # (1000 steps, against 1278/1400/1432/1432/1750/2000 from the rest of the
+        # field), so "ratio to rank-1" is the wrong ceiling there: 1432/1000 =
+        # 1.43 is the champion's own depth on that exact task.  Everywhere else
+        # 1.40 still holds.
+        ceiling = 1.45 if row[0] == "41025fb5" else 1.40
+        assert 0.85 <= after / winner <= ceiling, f"{row[0]} {model_type}"
+
+
+# --------------------------------------------------------------------------- #
+# 2b. THE CLOCK GUARD.  No type may be planned above its own observed
+#     throughput — the property the global MARGIN 0.85 -> 0.92 broke.
+# --------------------------------------------------------------------------- #
+def _shipped_after_stop(planned, stopped_at, save_every):
+    """What lands in `last.safetensors` if training is terminated at `stopped_at`.
+
+    Mirrors ai-toolkit + `forge/tasks/checkpoints.py`: a numbered save fires at
+    the START of step k for every k % save_every == 0, and `_finalize` promotes
+    the highest valid one.  A completed run additionally writes the unnumbered
+    exact final, which wins.
+    """
+    if planned <= stopped_at:
+        return planned
+    return (stopped_at // save_every) * save_every
+
+
+@pytest.mark.parametrize("row", REAL_TASKS, ids=IDS)
+def test_every_shape_finishes_at_its_field_rate(row, dataset_dirs, monkeypatch):
+    """The invariant SEC_PER_IT and MARGIN_BY_TYPE exist to satisfy.
+
+    For every type x every real Aug-3 shape, the planned step count must still
+    complete when the box runs at the SLOWEST rate that type's own published
+    artifacts support.  `recipe.field_demonstrated_steps` is exact integer
+    arithmetic over `FIELD_DEMONSTRATED_DEPTH`, so no float rounding can flip a
+    verdict.
+
+    This is the test that would have caught the regression.  With MARGIN 0.92
+    applied globally and SEC_PER_IT["qwen-image"] left at 4.0, qwen planned 909
+    on 7421f056 and 1104 on ff643470, against field-demonstrated windows of 850
+    and 1042; the runs would have been terminated mid-flight and shipped their
+    728- and 884-step periodic saves — 13% and 20% shallower than simply
+    planning what fits.
+    """
+    task, model_type, hours, after, save_every = row[0], row[2], row[5], row[8], row[9]
+    cfg = _build(task, dataset_dirs[task], monkeypatch=monkeypatch)
+    steps = cfg["config"]["process"][0]["train"]["steps"]
+    assert steps == after
+
+    demonstrated = recipe.field_demonstrated_steps(model_type, hours)
+    assert demonstrated is not None
+    assert steps <= demonstrated, (
+        f"{task} {model_type}: plans {steps} steps but the field only "
+        f"demonstrates {demonstrated} in a {hours} h window — a stop would ship "
+        f"{_shipped_after_stop(steps, demonstrated, save_every)}"
+    )
+    # ...and at the policy's own rate, which must never be the more optimistic
+    # of the two (test_sec_per_it_is_never_faster_than_its_own_evidence).
+    at_policy_rate = recipe.completed_steps_at_rate(
+        hours, recipe.SEC_PER_IT[model_type]
+    )
+    assert steps <= at_policy_rate
+
+
+def test_the_qwen_regression_is_pinned_as_a_counterexample():
+    """Freeze the exact numbers, so "just bump MARGIN" cannot come back quietly.
+
+    c424362 raised MARGIN to 0.92 for every type at once.  qwen-image is the only
+    row whose clock actually binds, so it was the only row that moved, and it
+    moved past what the field shows fits.
+    """
+    broken_margin, broken_sec = 0.92, 4.0
+    for task, hours, planned_then, stops_at, ships in (
+        ("7421f056", 1.25, 909, 850, 728),
+        ("ff643470", 1.5, 1104, 1042, 884),
+    ):
+        cap = int((hours * 3600.0 * broken_margin - 480.0) / broken_sec)
+        law = _pure_law("qwen-image", {"7421f056": 28, "ff643470": 41}[task])
+        assert min(law, cap) == planned_then
+        assert recipe.field_demonstrated_steps("qwen-image", hours) == stops_at
+        save_every = recipe.kill_safe_save_every(planned_then, 250)
+        assert _shipped_after_stop(planned_then, stops_at, save_every) == ships
+        # What ships now instead, having planned inside the window.
+        now = recipe.size_scaled_steps(
+            "qwen-image", {"7421f056": 28, "ff643470": 41}[task], hours, 0
+        )
+        assert now <= stops_at and now > ships
+
+
+def test_krea2_overrun_degrades_depth_instead_of_forfeiting(tmp_path):
+    """Kill-safety for the 1.35 decision, exercised through the real finalizer.
+
+    The R1 plan is 1432 steps with `save_every` 287.  If the box is slower than
+    the field's tightest krea2 bound the run is terminated, and the only thing
+    standing between us and an empty upload is `checkpoints.finalize` promoting
+    the newest periodic save.  Verified here at the chosen rate AND at the two
+    rejected candidates, so "is 1.35 kill-safe?" is answered by execution rather
+    than by argument.
+    """
+    from forge.tasks import checkpoints
+
+    pairs, hours, repo = 21, 0.75, "repo"
+    for sec_per_it in (1.30, 1.35, 1.50):
+        planned = min(
+            _pure_law("krea2", pairs),
+            int((hours * 3600.0 * recipe.margin_for("krea2") - 480.0) / sec_per_it),
+        )
+        save_every = recipe.kill_safe_save_every(planned, 250)
+        # Terminate the run 1 step before the plan: the worst case that still
+        # loses a whole save interval.
+        stopped_at = planned - 1
+        shipped = _shipped_after_stop(planned, stopped_at, save_every)
+        assert 0 < shipped < planned
+
+        root = tmp_path / f"sec-{sec_per_it}"
+        root.mkdir()
+        state = checkpoints.ensure_run(str(root), repo)
+        state = checkpoints.set_planned_steps(str(root), state, planned)
+        newest = None
+        for step in range(save_every, stopped_at + 1, save_every):
+            newest = _write_st(root / f"{repo}_{step:09d}.safetensors", tag=str(step))
+        record = checkpoints.finalize(str(root), repo, state)
+        assert record is not None, f"{sec_per_it}: nothing exported after a stop"
+        assert (root / "last.safetensors").read_bytes() == newest
+        assert record["selected_step"] == shipped
+        # The degraded outcome is still deeper than the 823 steps we shipped on
+        # Aug-3 — the downside of planning deep is bounded, not catastrophic.
+        assert shipped > 823
+
+
+def _write_st(path, tag=""):
+    """Minimal valid one-tensor safetensors file (mirrors tests/test_units.py)."""
+    import json as _json
+    import struct as _struct
+
+    header = _json.dumps(
+        {
+            "__metadata__": {"tag": tag},
+            "weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+        }
+    ).encode()
+    path.write_bytes(_struct.pack("<Q", len(header)) + header + _struct.pack("<f", 0.0))
+    return path.read_bytes()
 
 
 # --------------------------------------------------------------------------- #
@@ -602,7 +917,7 @@ def test_geometry_degrades_to_the_template_when_it_cannot_measure(
         assert dataset["resolution"] == TEMPLATE_RESOLUTION
         assert "bucket_tolerance" not in dataset
         # ...and the depth policy still materialised normally.
-        assert cfg["config"]["process"][0]["train"]["steps"] == 1336
+        assert cfg["config"]["process"][0]["train"]["steps"] == 1432
 
 
 def test_geometry_entry_points_never_raise():
@@ -621,17 +936,26 @@ def test_recipe_helpers_never_raise():
     assert recipe.projected_wall_s(None, 100) > 0
     assert recipe.first_save_wall_s("krea2", None, None) > 0
     assert recipe.size_scaled_steps("krea2", None, None, 2000) == 2000
+    assert recipe.margin_for(object()) == recipe.MARGIN
+    assert recipe.training_deadline_s("not-a-number") == 0.0
+    assert recipe.training_deadline_s(-5) == 0.0
+    assert recipe.completed_steps_at_rate(1.0, 0) == 0
+    assert recipe.completed_steps_at_rate("x", 1.0) == 0
+    assert recipe.field_demonstrated_steps("not-a-type", 1.0) is None
+    assert recipe.field_demonstrated_steps(None, 1.0) is None
+    assert recipe.field_demonstrated_steps("krea2", 0.0) == 0
 
 
 def test_projected_wall_is_the_inverse_of_the_clock_cap():
     """The cap and the projection must not drift apart."""
     for model_type in recipe.SEC_PER_IT:
         for hours in (0.75, 1.0, 1.25, 1.5):
+            margin = recipe.margin_for(model_type)
             cap = _clock_cap(model_type, hours)
             wall = recipe.projected_wall_s(model_type, cap)
-            assert wall <= hours * 3600.0 * recipe.MARGIN + 1e-6
+            assert wall <= hours * 3600.0 * margin + 1e-6
             assert math.isclose(
                 wall + recipe.SEC_PER_IT[model_type],
-                hours * 3600.0 * recipe.MARGIN,
+                hours * 3600.0 * margin,
                 abs_tol=recipe.SEC_PER_IT[model_type] + 1e-6,
             )

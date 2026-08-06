@@ -263,21 +263,24 @@ def test_recipe_step_scaling():
 
 def test_recipe_budget_cap_example():
     # krea2 @ 24 imgs sits exactly on the week-6 base; at 1.0 h the clock cap is
-    # 1888, so the SIZE LAW binds — which is the point of the recalibration.
+    # 2097, so the SIZE LAW binds — which is the point of the recalibration.
     v = recipe.size_scaled_steps("krea2", 24, 1.0, 2000)
     assert v == 1500
     # the clock still binds on a tight budget
     v = recipe.size_scaled_steps("krea2", 24, 0.2, 2000)
-    assert v == 121
+    assert v == 135
 
 
 @pytest.mark.parametrize(
     ("hours", "expected"),
     [
-        # cap @0.75 h = (0.75*3600*0.92 - 480)/1.5 = 1336
-        (0.75, (1104, 1336, 1336, 1336, 1336, 1336)),
-        # cap @1.0 h = (1.0*3600*0.92 - 480)/1.5 = 1888
-        (1.0, (1104, 1500, 1888, 1888, 1888, 1888)),
+        # cap @0.75 h = (0.75*3600*0.92 - 480)/1.35 = 1484
+        (0.75, (1104, 1484, 1484, 1484, 1484, 1484)),
+        # cap @1.0 h = (1.0*3600*0.92 - 480)/1.35 = 2097.  At the four REAL
+        # Aug-3 krea2 sizes (21/42/43/50) the law binds and the clock does not;
+        # these synthetic 100/200/500-image shapes are far outside the 10-50
+        # tournament range and are here to pin the clamp order, not a policy.
+        (1.0, (1104, 1500, 1939, 2097, 2097, 2097)),
     ],
 )
 def test_krea_week6_materialization_table(hours, expected):

@@ -45,6 +45,21 @@ from __future__ import annotations
 # Provenance tags used below:
 #   OBSERVED  = read out of a published artifact's metadata / config
 #   INFERRED  = derived (e.g. kohya writes epochs, not steps)
+#
+# WHAT `max` IS FOR, stated once so no row has to claim more than it delivers.
+# Observed tournament dataset sizes are N = 9..50 (Jul-20 and Aug-3 harvests).
+# The N at which each `max` first binds is:
+#   ideogram4  48   ACTIVE inside the observed range
+#   krea2      72   backstop only
+#   flux       80   backstop only
+#   qwen-image 85   backstop only
+#   z-image    90   backstop only
+# So four of the five are ceilings on EXTRAPOLATION, not policy, and changing
+# them cannot move any real tournament shape.  A `max` set where it can never
+# bind within 4x the observed range is not a decision, it is decoration — the
+# reason ideogram4's short-lived `max=1600` was withdrawn (its law topped out at
+# 365 at N=50).  `test_step_table_max_binding_sizes` pins this table, so a row
+# that quietly becomes inert fails a test.
 _N_REF = 24  # ~mid of the 10-50 pair range
 
 STEP_TABLE = {
@@ -68,19 +83,29 @@ STEP_TABLE = {
     #               across 8x the dataset-size range)
     #     h=0.75 -> 1432, published 1432 on N=21
     # p is flattened 0.50 -> 0.35 to mirror that near-size-independence while
-    # keeping a floor for pathologically small sets; `base`/`max` are raised so
-    # the RECALIBRATED CLOCK (not the size law) becomes the binding constraint
-    # on 1.0 h tasks, which is exactly the champion's behaviour.  `min` 100->600
-    # because no 100-step krea2 is competitive in anything we observed — the one
-    # 200-step krea2 in the R1 field ranked 13/14.  Replay on the four real
-    # Aug-3 krea2 shapes: 1825/1336/1840/1888 vs winners 2012/1000/2012/2012
-    # = 1.02x (was 0.64x).
-    # RESIDUAL UNCERTAINTY, largest of any row: the R1 winner shipped only 1000
-    # steps and beat the 1432/1750/2000 pack — with an entirely different recipe
-    # (krea2_eval_sigmas timesteps, TE-LoRA, EMA 0.995, multires noise,
-    # cosine_by_group, differential_guidance_scale 12).  Depth is necessary, not
-    # sufficient; this moves us from 39 to ~64 steps/img, i.e. into the band of
-    # ranks 3-5, not into rank 1.
+    # keeping a floor for pathologically small sets.  `min` 100->600 because no
+    # 100-step krea2 is competitive in anything we observed — the one 200-step
+    # krea2 in the R1 field ranked 13/14.  At N=21 the law returns 1431.5 -> 1432,
+    # which is EXACTLY the depth 5FBmn1ax configured and completed on the real R1
+    # shape (and 5FjDsFGA independently completed the same 1432 there).
+    # Replay on the four real Aug-3 krea2 shapes with SEC_PER_IT["krea2"]=1.35:
+    # 1432/1825/1840/1939 vs winners 1000/2012/2012/2012 = 1.05x (was 0.64x); the
+    # size law now binds on all four, which is the intent (see SEC_PER_IT).
+    # RESIDUAL UNCERTAINTY, largest of any row.  Two things are true at once:
+    #  * Depth is NOT sufficient.  The R1 winner shipped only 1000 steps and beat
+    #    the 1432/1750/2000 pack with an entirely different recipe
+    #    (krea2_eval_sigmas timesteps, TE-LoRA, EMA 0.995, multires noise,
+    #    cosine_by_group), and 1432 produced rank 4 for one operator and rank 14
+    #    for another.
+    #  * Depth is real but WEAK relative to recipe variance.  OLS inside the
+    #    9-artifact R1 template family is loss = 0.053134 - 1.677e-6*steps with
+    #    residual sd 1.16e-3, so 823 -> 1432 moves predicted loss by 1.0e-3
+    #    (0.88 sd) while 1336 -> 1432 moves it by only 1.6e-4 (0.14 sd).
+    # Interpolating that fit onto the observed R1 loss ladder puts 1432 at rank
+    # ~9 (+-1 sd band 5..11), against the rank 9 we actually took at 823.  So the
+    # honest claim is: this removes a self-inflicted depth deficit and puts us at
+    # a depth two operators demonstrably completed on this exact shape.  It does
+    # NOT on its own predict a top-5 finish; the selection/recipe work does.
     "krea2": dict(base=1500, n_ref=_N_REF, p=0.35, min=600, max=2200),
     # ideogram4 — was base=140 p=0.50 min=48 max=400 (the discredited Jul-16
     # experiment), then base=240 p=0.57 min=120 max=1600, a two-point fit to the
@@ -205,33 +230,94 @@ STEP_TABLE = {
 }
 
 # --- wall-time budget model ------------------------------------------------
-# s/step used to cap the size law.  These are now PER-TYPE MEASUREMENTS with an
+# s/step used to cap the size law.  These are PER-TYPE MEASUREMENTS with an
 # explicit pad, not the "guesses to be replaced" they used to be.
 #
-# Two independent sources of truth:
-#   (a) OUR OWN MEASUREMENT on the tournament host.  Our Aug-3 artifact is
-#       byte-identified as hotkey 5HLA2QWY via its published forge_run.json:
-#       toolkit_start -> toolkit_end = 1041.1 s for 823 krea2 steps
-#       = 1.265 s/step.
-#   (b) FIELD UPPER BOUNDS.  For any miner whose shipped step count REACHED its
-#       configured step count, the run completed inside the budget, so
-#       s/step <= (hours*3600 - 478)/shipped_steps is a hard upper bound on the
-#       achievable rate on tournament hardware:
-#         krea2      <= 1.55   (forge had 2.2  -> 1.42x too slow)
-#         ideogram4  <= 2.05   (forge had 3.0  -> 1.46x too slow)
-#         z-image    <= 1.56   (forge had 3.0  -> 1.92x too slow)
-#         qwen-image <= 4.49   (forge had 4.0  -> the ONLY tight one; unchanged)
-#         flux       ~ 1.71    (INFERRED from 5D7iEJm5's 25.7 s/epoch at N=15)
+# HOW A RATE IS READ OUT OF A PUBLISHED ARTIFACT.  `forge/tasks/aitoolkit.py`
+# terminates ai-toolkit when `deadline.remaining() <= _STOP_MARGIN_S`, i.e. at
+# `budget - EXPORT_RESERVE_S - STOP_MARGIN_S`, and STARTUP_S of what is left is
+# model load + latent/text-embed warmup.  So the optimizer-step window is
+#
+#     W(h) = h*3600 - EXPORT_RESERVE_S - STOP_MARGIN_S - STARTUP_S = h*3600 - 525
+#
+# and for any published artifact whose config.yaml and checkpoint ladder are
+# both readable:
+#     shipped == configured (run COMPLETED) => s/step <= W(h)/shipped   [BOUND]
+#     shipped <  configured (run KILLED)    => s/step ~= W(h)/shipped   [POINT]
+# The killed form is a direct measurement, accurate to one save interval; the
+# completed form is only an upper bound (the miner may have had time to spare).
+# `FIELD_DEMONSTRATED_DEPTH` below stores the completed-form evidence in the
+# exact integer arithmetic the guard test uses, so no float rounding can flip a
+# FINISH into a kill.
+#
+#   type        evidence used for the constant                          -> SEC
+#   krea2       OUR OWN 823 steps in 1041.1 s of toolkit_start..end on
+#               the tournament host (5HLA2QWY forge_run.json) = 1.265
+#               s/step GROSS OF STARTUP; field BOUND 1.519 (5FBmn1ax and
+#               5FjDsFGA each completed 1432 on the real R1 shape)      -> 1.35
+#   qwen-image  TWO INDEPENDENT operators (5FW2Eaae, 5FpdSckw) with
+#               identical configs both configured 1150 on 7421f056
+#               (h=1.25) and were both killed with their last save at
+#               850 => 3975/850 = 4.68 s/step, a REPRODUCED POINT
+#               measurement.  Champion BOUND on the same type is 4.45.  -> 4.70
+#   z-image     BOUND 1.538 (5D2Qee4V completed 2000 in 1.0 h).
+#               UNMEASURED on our host.                                 -> 1.80
+#   ideogram4   BOUND 2.019 (5FBmn1ax completed 1523 in 1.0 h), DOUBLED
+#               because our config sets do_cfg (see below).             -> 4.20
+#   flux        BOUND 2.500 (rank-1 5FW2Eaae, 58 kohya epochs x N=15 =
+#               870 steps in 0.75 h).  INFERRED — kohya logs epochs.    -> 2.00
+#
+# TWO qwen artifacts imply far slower rates (5FW2Eaae 6.96 on ff643470,
+# 5GU4Xkd3 8.13 on 4782f46f) and are NOT used.  Neither is reproduced, and each
+# is contradicted by the SAME operator running much faster on another qwen task
+# in the same tournament (5FW2Eaae is the 4.68 datum above), so they cannot be a
+# stable property of the hardware or the architecture.  A constant that survived
+# 8.13 s/step would plan ~400 qwen steps against a field that shipped 949-1095 —
+# the exact failure this recalibration exists to undo.
+#
+# The krea2 artifacts of 5EACrayt and 5FNLSgh8 are also excluded: both carry 504
+# text-encoder tensors (they train a TE-LoRA, which we never do), and 5FNLSgh8's
+# kill implies 2.72 s/step — a config difference, not a hardware rate.
 SEC_PER_IT = {
     # flux 2.5 -> 2.0.  Field cadence implies ~1.7 s/step at batch 1; 2.0 is an
     # ~18% pad and restores the size law (870) as the binding constraint.
     # INFERRED, not measured — kohya logs epochs.
     "flux": 2.0,
-    # krea2 2.2 -> 1.5.  Above OUR OWN measured 1.265 s/step (a 19% pad) and
-    # just under the field's 1.55 bound.  The old 2.2 was justified by
+    # krea2 2.2 -> 1.35 (was 1.5 at c424362).  The old 2.2 was justified by
     # `do_differential_guidance`, an unreachable branch that has never executed
     # (see the module docstring).
-    "krea2": 1.5,
+    #
+    # WHY 1.35 AND NOT 1.5 OR 1.3.  The three candidates were replayed over all
+    # four real Aug-3 krea2 shapes.  1.35 and 1.30 are IDENTICAL in output —
+    # both make the SIZE LAW the binding constraint everywhere, which is the
+    # stated intent of the krea2 row — while 1.5 is the only one of the three
+    # that still lets the clock truncate it:
+    #     shape                     law   SEC1.5   SEC1.35   SEC1.30
+    #     41025fb5 N=21 h=0.75     1432     1336      1432      1432
+    #     3e0fdcde N=42 h=1.00     1825     1825      1825      1825
+    #     db9f7244 N=43 h=1.00     1840     1840      1840      1840
+    #     f6725c2b N=50 h=1.00     1939     1888      1939      1939
+    # The law stops being truncated for any SEC <= 1.399 (0.75 h) and <= 1.460
+    # (1.0 h); 1.35 sits 3.6% inside that threshold, and 1.30 buys nothing beyond
+    # it while making `projected_wall_s` 4% more optimistic.  So 1.35.
+    #
+    # SAFETY.  1.35 is a 6.7% pad over our own measured 1.265 s/step, and that
+    # 1.265 is GROSS OF STARTUP (it is toolkit_start -> toolkit_end for 823
+    # steps), so charging STARTUP_S=300 on top of it is pure additional cushion:
+    # net of a 300 s startup our measured rate is (1041.1-300)/823 = 0.90 s/step.
+    # At the field's own tightest krea2 bound (1.519 s/step, from two independent
+    # operators each completing 1432 steps on the real R1 shape) every planned
+    # krea2 depth here still completes — 1432 exactly fills the 0.75 h window by
+    # construction, and 1825/1840/1939 sit 4-10% inside the 2024-step 1.0 h
+    # window.  See `FIELD_DEMONSTRATED_DEPTH` and the guard test.
+    #
+    # DOWNSIDE IF WE ARE SLOWER THAN THAT.  A deadline stop DEGRADES depth, it
+    # does not forfeit: `_run_toolkit -> _terminate -> _finalize` promotes the
+    # newest valid periodic save.  On the R1 shape `kill_safe_save_every(1432)`
+    # is 287, so a stop anywhere in (1148, 1432) ships 1148 — still 1.4x the 823
+    # we actually shipped on Aug-3, and the fit below puts 1148 at rank ~10, the
+    # same band the 1336 that SEC=1.5 would have produced.  The bet is bounded.
+    "krea2": 1.35,
     # ideogram4 3.0 -> 4.2.  NOTE THIS GOES UP, AND IT IS THE ONE PLACE THE TWO
     # WEEK-6 AUDITS DISAGREE.  The field bound of 2.05 s/step was measured on
     # field configs, which do NOT set `do_cfg`.  OUR config does:
@@ -249,11 +335,29 @@ SEC_PER_IT = {
     # (=> <= 1.56 s/step); 1.8 is a 15% pad.  UNMEASURED ON OUR HOST — we have
     # never run z-image ourselves.  This is the least-verified reduction here.
     "z-image": 1.8,
-    # qwen-image UNCHANGED at 4.0.  The only per-type constant the field does
-    # NOT contradict (bound 4.49).  Four of six qwen artifacts were
-    # deadline-killed; do not make this more optimistic.
-    "qwen-image": 4.0,
+    # qwen-image 4.0 -> 4.7.  4.0 was carried forward as "the only constant the
+    # field does not contradict", but that was read off the champion's COMPLETED
+    # run (an upper BOUND of 4.45), and a bound is not a rate.  The field also
+    # contains a reproduced POINT measurement, and it is slower than 4.0: on
+    # 7421f056 (h=1.25) 5FW2Eaae and 5FpdSckw both configured 1150, both ran the
+    # same config, and both were killed with their last periodic save at 850 =>
+    # 3975/850 = 4.68 s/step.  Two independent operators agreeing exactly is the
+    # strongest rate datum in the qwen set, so 4.7 is the honest constant.
+    # This matters beyond the cap: `projected_wall_s` and `first_save_wall_s` —
+    # the kill-safety projections — are only meaningful if this is a real rate.
+    # At 4.0 the projection claimed 676 s of slack on 7421f056 where the true
+    # slack is ~91 s.
+    # The compensating change is MARGIN_BY_TYPE["qwen-image"]; the two constants
+    # are calibrated JOINTLY and the guard test pins the composite, not either
+    # one alone.  Four of six qwen artifacts were deadline-killed — this type has
+    # the least headroom in the table and is UNMEASURED on our own host.
+    "qwen-image": 4.7,
 }
+# The extra cushion `forge/tasks/aitoolkit.py` gates termination on, on top of
+# the export reserve: training is stopped at `hard_stop - (180 + 45)`.  Mirrors
+# `forge.tasks.holdout.boundary_margin_s()`; imported there rather than here to
+# keep this module import-free, and pinned equal in the tests.
+STOP_MARGIN_S = 45.0
 # Fixed reserves.  STARTUP_S covers base-model load + latent/text-embed warmup.
 # It is mildly UNDER-modelled today when `cache_latents_to_disk` is on and the
 # template's 3-copy `resolution` list is in force, because the VAE pre-encode
@@ -266,13 +370,132 @@ EXPORT_RESERVE_S = 180.0  # mirrors cli._EXPORT_RESERVE_SECONDS
 # `budget*MARGIN - STARTUP_S - EXPORT_RESERVE_S`, i.e. it took a 15% haircut ON
 # TOP OF a 480 s fixed reserve — double-counting.  The champion's recovered
 # model is `(budget - 478)` with NO multiplicative margin, and 478 ~= our 480.
-# Sensitivity (krea2 @ 1.0 h, SEC 1.5): 0.85->1720, 0.90->1840, 0.92->1888,
-# 0.95->1960.  0.92 keeps ~290 s of jitter headroom BEYOND the 480 s reserve.
-# Going past 0.95 buys little and erodes the never-forfeit posture.  The
-# asymmetry favours scheduling slightly deep: over-scheduling is recoverable
+# Sensitivity (krea2 @ 1.0 h, SEC 1.35): 0.85->1700, 0.90->1844, 0.92->1901,
+# 0.95->1988.  0.92 keeps ~290 s of jitter headroom BEYOND the 480 s reserve.
+# The asymmetry favours scheduling slightly deep: over-scheduling is recoverable
 # because `forge/tasks/checkpoints.py` promotes the highest valid periodic save
 # to `last.safetensors` on a kill, whereas under-scheduling is not recoverable.
+#
+# THIS IS THE DEFAULT ONLY.  Applying 0.92 GLOBALLY was a regression: it raised
+# the qwen cap 1027 -> 1122 (+9.3%) without touching SEC_PER_IT["qwen-image"],
+# and qwen is the one type with no clock headroom.  Replayed at the field's own
+# reproduced qwen rate (4.68 s/step) the global 0.92 was killed on two of the
+# three real qwen shapes: 7421f056 planned 909, stopped at 850, shipped its
+# 728-step save; ff643470 planned 1104, stopped at 1042, shipped 884.  A margin
+# is a per-type dial because the headroom it is spending is per-type.
 MARGIN = 0.92
+# Per-type override of MARGIN.  READ THIS WITH SEC_PER_IT — the pair is what is
+# calibrated, and the invariant they exist to satisfy is the one the guard test
+# asserts: for every type x every real Aug-3 shape, the planned step count must
+# still complete at that type's own field-observed rate.
+#
+#   type        SEC_PER_IT vs its evidence      MARGIN  why
+#   flux        2.00 vs 1.71 inferred (+17%)      0.92  law binds; clock inert
+#   krea2       1.35 vs 1.265 measured (+7%)      0.92  law binds on all 4 shapes
+#   ideogram4   4.20 vs 2.019x2 field (+4%)       0.92  law binds on all 3 shapes
+#   z-image     1.80 vs 1.538 field (+17%)        0.92  law binds on both shapes
+#   qwen-image  4.70 vs 4.676 reproduced (+0.5%)  0.98  CLOCK BINDS — see below
+#
+# qwen is the only row where the clock is the active constraint, so it is the
+# only row where MARGIN does real work, and its SEC carries essentially no pad
+# (the rate is the measurement).  With an honest rate the arithmetic identity
+# `budget*M - 480 == budget - 525` gives M = 1 - 45/budget ~= 0.99 for "plan
+# exactly to the terminate trigger", so 0.98 IS the cushion, not an absence of
+# one: it plans 836 steps into a window the field demonstrated holds 850, and
+# 1023 into one it demonstrated holds 1042.  Setting qwen to 0.92 instead would
+# plan 778/954/954 — safe, but 7% below what the same evidence says fits, on the
+# type where the Aug-3 winners shipped 850/949/1095.
+MARGIN_BY_TYPE = {
+    "flux": 0.92,
+    "krea2": 0.92,
+    "ideogram4": 0.92,
+    "z-image": 0.92,
+    "qwen-image": 0.98,
+}
+
+# Deepest run the Aug-3 field is KNOWN to have completed for each type, with the
+# budget it completed in: `(hours, steps, provenance)`.  Because the run finished,
+# `steps` optimizer steps demonstrably fit inside `W(hours) = hours*3600 - 525`.
+# Scaling that linearly is the strictest defensible statement the field supports
+# about achievable throughput, and it is the acceptance criterion for every
+# constant above: we never plan more steps than the field demonstrated, in the
+# same window, at the same architecture.  Kept as integers so the guard test is
+# exact integer arithmetic with no float knife-edge.
+#
+# qwen-image is deliberately NOT the deepest completed run (5FBmn1ax's 1095 in
+# 1.5 h).  It is the reproduced KILL at 850 in 1.25 h, which is slower and is a
+# measurement rather than a bound — see the SEC_PER_IT header.
+FIELD_DEMONSTRATED_DEPTH = {
+    "flux": (0.75, 870, "5FW2Eaae 241cda6c rank 1, 58 kohya epochs x N=15"),
+    "krea2": (0.75, 1432, "5FBmn1ax + 5FjDsFGA 41025fb5, cfg 1432 shipped 1432"),
+    "ideogram4": (1.0, 761, "5FBmn1ax b72da8c6 cfg 1523 shipped 1523, HALVED "
+                            "for our do_cfg batch-2 step (2.019 -> 4.038 s/step)"),
+    "z-image": (1.0, 2000, "5D2Qee4V b290d171, cfg 2000 shipped 2000"),
+    "qwen-image": (1.25, 850, "5FW2Eaae + 5FpdSckw 7421f056, cfg 1150 both "
+                              "killed with their last save at 850"),
+}
+
+
+def margin_for(model_type):
+    """Per-type clock margin, falling back to the global default.  Never raises."""
+    try:
+        return float(MARGIN_BY_TYPE.get((model_type or "").strip().lower(), MARGIN))
+    except Exception:
+        return MARGIN
+
+
+def training_deadline_s(hours_to_complete):
+    """Seconds from container start to the moment `_run_toolkit` terminates.
+
+    `aitoolkit._run_toolkit` stops training when `deadline.remaining()` (already
+    net of the export reserve) falls to `_STOP_MARGIN_S`.  This is the real wall
+    the plan has to fit inside — `MARGIN` is a policy dial, this is physics.
+    Never raises (INV-1).
+    """
+    try:
+        budget = max(0.0, float(hours_to_complete) * 3600.0)
+        return max(0.0, budget - EXPORT_RESERVE_S - STOP_MARGIN_S)
+    except Exception:
+        return 0.0
+
+
+def completed_steps_at_rate(hours_to_complete, sec_per_it):
+    """Optimizer steps that land before the terminate trigger, at ``sec_per_it``.
+
+    The inverse of the budget model, expressed against the REAL deadline rather
+    than `budget*MARGIN`, so "does this plan actually finish at rate R?" is one
+    call instead of a hand-derivation.  Never raises (INV-1).
+    """
+    try:
+        rate = float(sec_per_it)
+        if rate <= 0:
+            return 0
+        window = training_deadline_s(hours_to_complete) - STARTUP_S
+        return max(0, int(window / rate))
+    except Exception:
+        return 0
+
+
+def field_demonstrated_steps(model_type, hours_to_complete):
+    """Steps the field demonstrably completed, scaled to ``hours_to_complete``.
+
+    Exact integer arithmetic on `FIELD_DEMONSTRATED_DEPTH`: the reference run
+    fitted `steps` into `W(ref_hours)`, so the same throughput fits
+    `steps * W(hours) // W(ref_hours)` into this budget.  Returns None when the
+    type has no field evidence.  Never raises (INV-1).
+    """
+    try:
+        entry = FIELD_DEMONSTRATED_DEPTH.get((model_type or "").strip().lower())
+        if entry is None:
+            return None
+        ref_hours, ref_steps = entry[0], entry[1]
+        ref_window = int(round(training_deadline_s(ref_hours) - STARTUP_S))
+        window = int(round(training_deadline_s(hours_to_complete) - STARTUP_S))
+        if ref_window <= 0 or window <= 0:
+            return 0
+        return window * int(ref_steps) // ref_window
+    except Exception:
+        return None
 
 
 def size_scaled_steps(model_type, num_images, hours_to_complete, template_steps):
@@ -288,7 +511,7 @@ def size_scaled_steps(model_type, num_images, hours_to_complete, template_steps)
 
         sit = SEC_PER_IT.get(mt, 3.0)
         budget_s = max(0.0, float(hours_to_complete) * 3600.0)
-        train_s = budget_s * MARGIN - STARTUP_S - EXPORT_RESERVE_S
+        train_s = budget_s * margin_for(mt) - STARTUP_S - EXPORT_RESERVE_S
         budget_cap = int(train_s / sit) if train_s > 0 else 1
         return max(1, min(scaled, budget_cap))  # cap may push below `min`
     except Exception:
