@@ -55,6 +55,7 @@ def _activation(*, owner_override: bool = False) -> dict:
         "schema": 1,
         "kind": policy.ACTIVATION_KIND,
         "policy_sha256": policy.POLICY_SHA256,
+        "amendment_sha256": policy.AMENDMENT_SHA256,
         "formal_ideogram_decision_sha256": "a" * 64,
         "scored_exact_final_sha256": "b" * 64,
         "selected_arm": "I-J20",
@@ -191,9 +192,17 @@ def test_literal_production_activation_is_hash_bound_owner_override() -> None:
     )
     assert active["selection_basis"] == "null_result_owner_override"
     assert active["owner_override"] is True
+    # Re-signed for the Week-6 EMA-horizon amendment.  The record no longer
+    # authorises the bare I-J20-D2 port: it authorises that port PLUS exactly
+    # one named amendment, and `amendment_sha256` is what scopes it.
+    assert active["amendment_sha256"] == policy.AMENDMENT_SHA256
     assert active["activation_sha256"] == (
-        "0ae20f8d2e1f98be906a7d94231c8721c3f891708c9b6f0e4273b603152d08b7"
+        "b7e436971430f04e216ddf5a4f1599a3f8de2f21e2f9462c1d67245aa0386ba2"
     )
+    # The port itself is unchanged: deployment is still NOT authorised by the
+    # record, so re-signing did not widen the authority it carries.
+    assert active["deployment_authorized"] is False
+    assert active["release_authorized"] is True
 
 
 def test_active_recipe_matches_the_scored_production_projection(
@@ -225,7 +234,9 @@ def test_active_recipe_matches_the_scored_production_projection(
         "text_encoder_lr": 0.0000001,
         "lr_scheduler": "cosine",
         "lr_scheduler_params": {"eta_min": 0.0000025},
-        "ema_config": {"use_ema": True, "ema_decay": 0.995},
+        # 0.995 -> 0.99 (Week-6 EMA-horizon amendment).  Guarded in detail by
+        # tests/test_week6_ideogram_ema_horizon.py.
+        "ema_config": {"use_ema": True, "ema_decay": 0.99},
         "do_cfg": True,
         "cfg_scale": 10.0,
         "steps": PLANNED_STEPS,
