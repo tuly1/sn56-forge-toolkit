@@ -1,0 +1,166 @@
+# =============================================================================
+# WEEK-6 HEAD-TO-HEAD, ARM A: LEADER-DERIVED krea2
+# =============================================================================
+# Derived from the Aug-3 R1 leader (hotkey 5EACrayt) on task
+# 41025fb5-8473-40c6-a88d-20c0bb303edc (krea2, ds design_aetherflow_ui,
+# trigger "AetherFlow UI", 21 pairs, 0.75 h budget). Our miner (5HLA2QWY)
+# placed 9/14 on this task, 0.97% behind the top-8 cut.
+#
+# PRIMARY SOURCE (OBSERVED — fetched and hashed 2026-08-06):
+#   https://huggingface.co/gradients-io-tournaments/tournament-tourn_c54bb970b5d0aa91_20260803-41025fb5-8473-40c6-a88d-20c0bb303edc-5EACrayt/blob/a28c6a0f64c06bf81e191515a1d80e04fc793b44/checkpoints/config.yaml
+#   repo revision  a28c6a0f64c06bf81e191515a1d80e04fc793b44
+#   config.yaml    sha256 50fe6eec02281d0e8acf0ea7d3d3b15b3b320a1ad0b6b6d450e17930dbd5dc1c
+# CORROBORATION (OBSERVED): hotkey 5FNLSgh8 published a byte-identical recipe
+#   (identical after normalizing its own hotkey out of the two path strings);
+#   revision 1851de5a890ec98467cc7e640b6bf48008930190,
+#   sha256 b4224ee6aea7e544fd7d866491814a0618c3a4158a273eae67898b57e4345b10.
+#   Two of fourteen R1 entrants shipped this exact recipe.
+#
+# RUNTIME REQUIREMENT — READ THIS FIRST:
+#   This arm REQUIRES our owned ai-toolkit fork
+#     tuly1/sn56-ai-toolkit-mirror @ 71e133b4e73a716d1094f22355a46be07953b828
+#     (tag sn56-week6-lane-a-runtime-v2; PR head 242e9235dac40cc17e2358cff4d067485ab1029d)
+#   It CANNOT be run on the incumbent runtime pin
+#   ostris/ai-toolkit@99be3d96a2468d3a5228a4eb05ba67e63c586b4e, where four of
+#   the settings below are parsed and then silently discarded. See
+#   ops/experiments/week6/RECIPE-PROVENANCE.md section "Silently-inert traps".
+#   `sn56_strict_krea_fields: true` makes the fork fail closed on any unknown
+#   or unsupported score-critical train field, so a typo aborts instead of
+#   quietly reverting to a default.
+#
+# DELIBERATE DEVIATIONS FROM THE LEADER (both forced, both documented):
+#   1. NO text-encoder training. The leader set train_text_encoder: true /
+#      text_encoder_lr: 2.5e-07 and exported 504 `lora_te.model.language_model...`
+#      tensors (OBSERVED in its last.safetensors header). Pinned ComfyUI
+#      (Comfy-Org/ComfyUI@091b70edda0c062fc9338a1d7e8e2f94f4c0ad0b) does not map
+#      that dotted prefix, so those tensors never load at evaluation. Excluded by
+#      standing project decision.
+#   2. Consequently `min_lr_by_initial_lr` drops the leader's '0.00000025' entry.
+#      With train_text_encoder false the LoRA network builds exactly ONE optimizer
+#      param group (toolkit/kohya_lora.py:1015 only appends a text_encoder group
+#      when text_encoder_loras is non-empty), and toolkit/scheduler.py
+#      _validate_cosine_by_group RAISES "Unused min_lr_by_initial_lr entry: 2.5E-7"
+#      if the key is left in. VERIFIED by executing the shipped validator
+#      (toolkit/scheduler.py sha256 ab38788258851cfb70a82af16bd1a85a0313ee9259135536af9b7e480c2d4602).
+#
+# STEP BUDGET: 1000 — identical in both arms. See RECIPE-PROVENANCE.md
+# "Step budget" for the full justification. Short version: 1000 is the leader's
+# OBSERVED value (config steps: 1000, and its artifact's __metadata__ carries
+# training_info {"step": 1000, "epoch": 18}), it sits inside our own krea2 step
+# law's clamp [100, 2000], and holding it equal across arms removes compute as a
+# confound so this experiment measures recipe shape only.
+#
+# OPERATOR MUST REBIND before launch (these five are environment bindings, not
+# recipe; forge.config._apply_overrides rewrites exactly these in production):
+#   config.name, process[0].training_folder, process[0].trigger_word,
+#   process[0].datasets[0].folder_path, process[0].model.name_or_path
+# Fixture images/captions for this task live (read-only) at
+#   /Users/atulyashetty/Test/SN56-project/evidence/week6-tournament-dataset-harvest-20260806/tasks/41025fb5-8473-40c6-a88d-20c0bb303edc/pairs
+# =============================================================================
+job: extension
+config:
+  name: last                       # LEADER: config.name "last". Forge overrides to expected_repo_name in production.
+  process:
+  - type: diffusion_trainer
+    training_folder: /app/checkpoints/41025fb5-8473-40c6-a88d-20c0bb303edc   # ENV BINDING
+    device: cuda
+    trigger_word: AetherFlow UI    # OBSERVED task trigger phrase (leader config + task-meta.json)
+    network:
+      # LEADER: network {type: lora, linear: 32, linear_alpha: 32}. Identical to
+      # our incumbent's rank/alpha, and to 6 of the 7 published R1 configs
+      # (5D2Qee4V used 40/40). NOT a differentiator; held equal across arms.
+      type: lora
+      linear: 32
+      linear_alpha: 32
+    save:
+      dtype: bf16                  # LEADER + all 7 published R1 configs.
+      save_every: 200              # LEADER: save.save_every 200. At 1000 steps -> candidates at 200/400/600/800 + final.
+      max_step_saves_to_keep: 6    # LEADER: save.max_step_saves_to_keep 6.
+      save_format: diffusers       # LEADER + all 7 published R1 configs.
+      push_to_hub: false           # OUR CHOICE: lab runs must never publish. Not present in the leader config.
+    datasets:
+    - folder_path: /dataset/images/41025fb5-8473-40c6-a88d-20c0bb303edc/img   # ENV BINDING
+      caption_ext: txt             # LEADER.
+      caption_dropout_rate: 0.05   # LEADER (and 6 of 7 published R1 configs).
+      cache_latents_to_disk: true  # LEADER: true. Our incumbent uses false. Throughput/IO only —
+                                   # no random augmentation is configured, so the cached latents are
+                                   # the same tensors the uncached path would compute. INFERRED from
+                                   # source reading, NOT measured; see RECIPE-PROVENANCE.md.
+      is_reg: false                # LEADER.
+      resolution: [512, 768, 1024] # LEADER, and all 7 published R1 configs used exactly this list.
+    train:
+      # --- fork opt-in: makes the four contested settings below actually execute,
+      #     and makes any unknown score-critical field fatal instead of silent ---
+      sn56_strict_krea_fields: true   # OUR FORK ONLY. Not a leader setting; it is the switch that
+                                      # stops leader settings from being silently discarded.
+      batch_size: 1                   # LEADER (and all 7 published R1 configs).
+      steps: 1000                     # LEADER: steps 1000; artifact metadata training_info.step == 1000.
+      gradient_accumulation: 1        # LEADER (and all 7).
+      train_unet: true                # LEADER.
+      train_text_encoder: false       # DEVIATION #1 — leader had true. See header.
+      gradient_checkpointing: true    # LEADER (and all 7).
+      noise_scheduler: flowmatch      # LEADER (and all 7).
+      optimizer: adamw8bit            # LEADER (6 of 7; 5GKoYQm7 used automagic).
+      optimizer_params:
+        weight_decay: 0.0001          # LEADER (and 6 of 7).
+      timestep_type: krea2_eval_sigmas  # LEADER. Samples the 25 evaluator sigma levels
+                                        # (25 steps, denoise 0.8, simple scheduler, shift 1.15)
+                                        # derived in toolkit/samplers/custom_flowmatch_sampler.py.
+                                        # Only 5EACrayt and 5FNLSgh8 used it; the other 5 used linear.
+      content_or_style: balanced      # NOT in the leader config -> ai-toolkit default 'balanced'
+                                      # (toolkit/config_modules.py:363). Written explicitly so the
+                                      # two arms are textually comparable; effective value unchanged.
+      unload_text_encoder: false      # NOT in the leader config -> default false. Explicit for comparability.
+      cache_text_embeddings: false    # LEADER: false. (Must stay false: the differential-guidance
+                                      # forward needs a live text encoder.)
+      lr: 0.0001                      # LEADER.
+      unet_lr: 0.0001                 # LEADER.
+      lr_scheduler: cosine_by_group   # LEADER. Fork-only; the incumbent runtime has no such scheduler.
+      lr_scheduler_params:
+        min_lr_by_initial_lr:
+          '0.0001': 1.0e-05           # LEADER: floor 1e-05 for the 1e-04 (unet) group.
+                                      # Leader's second entry '0.00000025': 0.0 REMOVED — see DEVIATION #2.
+                                      # total_iters is NOT written here: jobs/process/BaseSDTrainProcess.py:2183
+                                      # injects total_iters = train.steps, and the strict validator rejects
+                                      # the key if present in YAML (VERIFIED).
+      ema_config:
+        use_ema: true                 # LEADER: use_ema true. Our incumbent template has false.
+        ema_decay: 0.995              # LEADER: 0.995. Incumbent template: 0.99.
+      skip_first_sample: true         # NOT in the leader config -> default false. OUR CHOICE, matched to our
+                                      # incumbent; inert because disable_sampling is true.
+      force_first_sample: false       # Same: default false, written explicitly for comparability.
+      disable_sampling: true          # LEADER: true (and no sampling budget is worth spending).
+      dtype: bf16                     # LEADER (and all 7).
+      loss_type: mse                  # NOT in the leader config -> ai-toolkit default 'mse'
+                                      # (toolkit/config_modules.py:514). Written explicitly. 5FBmn1ax used mae.
+      do_differential_guidance: true      # LEADER: true.
+      differential_guidance_scale: 12.0   # LEADER: 12.0. Field spread: 12.0 (5EACrayt, 5FNLSgh8),
+                                          # 3 (5FBmn1ax), 2 (the other four). THIS IS THE LARGEST
+                                          # SINGLE NUMERIC DIVERGENCE between the leader and our incumbent.
+      multires_noise_iterations: 6    # LEADER: 6. Fork-only; INERT on the incumbent runtime
+                                      # (toolkit/training_semantics.py resolve_multires_noise_config
+                                      # returns (0, 0.3) whenever strict_krea_fields is false).
+      multires_noise_discount: 0.3    # LEADER: 0.3.
+      noise_offset: 0.0               # LEADER: explicit 0.0 (== ai-toolkit default). Kept explicit
+                                      # because it is score-critical and we want it on the record.
+    logging:
+      log_every: 1                    # LEADER: logging.log_every 1.
+    model:
+      name_or_path: /cache/models/krea--Krea-2-Raw   # ENV BINDING (leader's observed value shown)
+      arch: krea2                     # LEADER (and all 7).
+      quantize: false                 # LEADER (and all 7).
+      quantize_te: false              # LEADER: quantize_te false.
+      low_vram: false                 # LEADER (and all 7).
+      model_kwargs:
+        text_encoder_path: /cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct  # LEADER, and identical to the value
+                                      # forge.config._KREA2_TE injects for krea2. Required on the airgapped box.
+        vae_path: /cache/models/krea--Krea-2-Raw                       # LEADER; forge injects spec.cached_model_dir.
+        # DELIBERATELY NOT COPIED: the leader also set
+        #   checkpoint_filename: raw.safetensors
+        # Our Aug-3 production run trained to completion WITHOUT it (OBSERVED: our
+        # published artifact 5HLA2QWY carries training_info step 823), so it is not
+        # required, and hardcoding a filename that may not exist in our cache
+        # layout would turn a lab run into a load failure. See RECIPE-PROVENANCE.md.
+meta:
+  name: krea2_lora
+  version: '1.0'

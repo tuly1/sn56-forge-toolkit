@@ -1,0 +1,162 @@
+# =============================================================================
+# WEEK-6 HEAD-TO-HEAD, ARM B: INCUMBENT krea2 (control)
+# =============================================================================
+# This is what we actually shipped on Aug-3 for task
+# 41025fb5-8473-40c6-a88d-20c0bb303edc, with ONE change: the step count is
+# pinned to 1000 to match Arm A. Nothing else was altered — the point of this
+# arm is to be an honest control, including its warts.
+#
+# PRIMARY SOURCE (OBSERVED — local, at the immutable production release pin):
+#   sn56-forge-toolkit@084ea914c6c5cbac4fa26a2138bd7195ebd71488
+#   forge/templates/base_diffusion_krea2.yaml
+#     sha256 2425632d493e6ee9a0387f92ba840553b019cbbd09182bbacc159a7469b40b93
+#   forge/recipe.py
+#     sha256 79a72c5d05ec7f5414fd549f68be7b2f04d48bdcde5abeca332316aabd83a34b
+#   Every value below that is not annotated otherwise is copied verbatim from
+#   that template.
+#
+# WHAT OUR STEP LAW ACTUALLY PRODUCED FOR THIS TASK (OBSERVED — computed by
+# importing forge.recipe at the pin, not by hand):
+#   size-law target            = 1122   (1200 * (21/24)**0.5, clamped to [100, 2000])
+#   size_scaled_steps(...)     =  824   (wall-time cap at SEC_PER_IT 2.2 s/step wins)
+#   kill_safe_save_every(824)  =  165
+# That 165 exactly reproduces the checkpoint ladder in our own published
+# artifact (last_000000165 / 000000330 / 000000495 / 000000660), and its
+# last.safetensors __metadata__ reads training_info {"step": 823, "epoch": 15}.
+# So the control's real-world identity is confirmed end to end.
+#
+# THE ONE CHANGE — steps 824 -> 1000:
+#   Required for a fair comparison; see RECIPE-PROVENANCE.md "Step budget".
+#   Note the consequence: under our own conservative 2.2 s/step constant, 1000
+#   steps would need 0.876 h and our policy would therefore NEVER schedule it
+#   inside this task's 0.75 h grant. The leader ran 1000 steps in that same
+#   grant. Our timing constant, not our step law, is what capped us at 824.
+#
+# RUNTIME: runs on EITHER the incumbent pin
+#   ostris/ai-toolkit@99be3d96a2468d3a5228a4eb05ba67e63c586b4e
+# or the owned fork @71e133b4 with sn56_strict_krea_fields absent/false. Both
+# execute this file identically. `sn56_strict_krea_fields` is deliberately NOT
+# set here: turning it on would change the control's behaviour (see below) and
+# would also reject four of the template's own train keys.
+#
+# TWO SETTINGS IN THIS FILE ARE INERT ON OUR RUNTIME. They are kept because
+# removing them would make this a different config from the one we shipped:
+#   * do_differential_guidance: true / differential_guidance_scale: 2
+#     VERIFIED at the incumbent pin: SDTrainer.py nests the
+#     `if self.train_config.do_differential_guidance:` branch INSIDE
+#     `if self.train_config.do_guidance_loss:`. do_guidance_loss is absent from
+#     this template and defaults to False (toolkit/config_modules.py:580), so
+#     differential guidance never fires. On the fork the predicate is
+#     `do_differential_guidance and (do_guidance_loss or strict_krea_fields)`
+#     (toolkit/training_semantics.py:183) — still inert without the strict flag.
+#     => Our shipped "scale 2" has never been applied to a single training step.
+#   * lokr_full_rank / lokr_factor — LoKr-only knobs under network.type "lora".
+# See RECIPE-PROVENANCE.md "Silently-inert traps".
+#
+# OPERATOR MUST REBIND before launch (same five as Arm A):
+#   config.name, process[0].training_folder, process[0].trigger_word,
+#   process[0].datasets[0].folder_path, process[0].model.name_or_path
+# =============================================================================
+job: extension
+config:
+  name: last                       # Forge overrides to expected_repo_name in production (name MUST == repo).
+  process:
+  - type: diffusion_trainer
+    training_folder: /app/checkpoints/41025fb5-8473-40c6-a88d-20c0bb303edc   # ENV BINDING
+    sqlite_db_path: ./aitk_db.db
+    device: cuda
+    trigger_word: AetherFlow UI    # ENV BINDING (template ships null; forge injects spec.trigger_word)
+    performance_log_every: 10
+    network:
+      type: lora
+      linear: 32
+      linear_alpha: 32
+      lokr_full_rank: true         # INERT under type: lora (LoKr-only). Template value, kept.
+      lokr_factor: -1              # INERT under type: lora (LoKr-only). Template value, kept.
+      network_kwargs:
+        ignore_if_contains: []
+    save:
+      dtype: bf16
+      save_every: 201              # OUR POLICY, not the template's 200: forge.recipe.kill_safe_save_every(1000, 200)
+                                   # returns 201 (1000//5 + 1). Computed, not chosen. Candidates land at
+                                   # 201/402/603/804 + final, i.e. the same count as Arm A's 200 cadence.
+      max_step_saves_to_keep: 100  # Template value.
+      save_format: diffusers
+      push_to_hub: false
+    datasets:
+    - folder_path: /dataset/images/41025fb5-8473-40c6-a88d-20c0bb303edc/img   # ENV BINDING
+      mask_path: null
+      mask_min_value: 0.1
+      default_caption: ""
+      caption_ext: txt
+      caption_dropout_rate: 0.05
+      cache_latents_to_disk: false # Template value. Arm A uses true (leader). Throughput/IO only —
+                                   # no random augmentation is configured in either arm.
+      is_reg: false
+      network_weight: 1
+      resolution: [512, 768, 1024] # Identical to Arm A and to all 7 published R1 configs.
+      controls: []
+      shrink_video_to_frames: true
+      num_frames: 1
+      flip_x: false
+      flip_y: false
+      num_repeats: 1
+    train:
+      batch_size: 1
+      bypass_guidance_embedding: false
+      steps: 1000                  # THE ONE CHANGE (template 2000; our policy materialized 824 on Aug-3).
+                                   # Pinned to 1000 to equal Arm A. Inside our krea2 clamp [100, 2000].
+      gradient_accumulation: 1
+      train_unet: true
+      train_text_encoder: false    # Template value — and unchanged from what we shipped. Our Aug-3
+                                   # artifact carries 512 tensors and ZERO lora_te tensors (OBSERVED),
+                                   # confirming the control never trained a text encoder.
+      gradient_checkpointing: true
+      noise_scheduler: flowmatch
+      optimizer: adamw8bit
+      timestep_type: linear        # Template value. Arm A uses krea2_eval_sigmas — a primary contrast.
+      content_or_style: balanced
+      optimizer_params:
+        weight_decay: 0.0001
+      unload_text_encoder: false
+      cache_text_embeddings: false
+      lr: 0.0001                   # Same as the leader's lr/unet_lr. NOT a differentiator.
+      ema_config:
+        use_ema: false             # Template value. Arm A: true @ decay 0.995 — a primary contrast.
+        ema_decay: 0.99
+      skip_first_sample: true
+      force_first_sample: false
+      disable_sampling: true
+      dtype: bf16
+      diff_output_preservation: false           # Template value. NOTE: this key is rejected outright by the
+      diff_output_preservation_multiplier: 1    # fork's strict Krea schema, which is one reason this arm
+      diff_output_preservation_class: person    # does not and cannot set sn56_strict_krea_fields.
+      switch_boundary_every: 1                  # Same — not in the strict allowlist.
+      loss_type: mse
+      do_differential_guidance: true   # INERT on our runtime (see header). Kept: it is what we shipped.
+      differential_guidance_scale: 2   # INERT on our runtime (see header). Leader used 12.0.
+      # NOT PRESENT, deliberately: lr_scheduler (-> default 'constant'),
+      # multires_noise_* (-> 0 iterations, inactive), unet_lr / text_encoder_lr
+      # (-> both default to lr). This mirrors the shipped template exactly.
+    logging:
+      log_every: 1
+      use_ui_logger: true
+    model:
+      name_or_path: /cache/models/krea--Krea-2-Raw   # ENV BINDING (template ships /cache/models; forge
+                                                     # injects spec.cached_model_dir — the DIR, never a file)
+      quantize: false
+      qtype: qfloat8
+      quantize_te: false
+      qtype_te: qfloat8
+      arch: krea2
+      low_vram: false
+      model_kwargs:
+        text_encoder_path: /cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct  # forge.config._KREA2_TE injects this
+        vae_path: /cache/models/krea--Krea-2-Raw                       # forge injects spec.cached_model_dir
+      compile: false
+      layer_offloading: false
+      layer_offloading_text_encoder_percent: 1
+      layer_offloading_transformer_percent: 1
+meta:
+  name: krea2_lora
+  version: '1.0'
