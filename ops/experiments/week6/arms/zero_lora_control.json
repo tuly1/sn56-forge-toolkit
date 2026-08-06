@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "kind": "forge-week6-arm",
+  "arm_id": "zero_lora",
+  "role": "zero_lora_control",
+  "label": "Arm Z - all-zero LoRA control: attaches, changes nothing, trains nothing",
+  "candidate_path": "/mnt/sn56-evidence/checkpoints/.scorer-staged/ZERO/zero-lora-from-D1-K1-final.safetensors",
+  "candidate_sha256": "074d96516ccd6fa01fd42b17623aa2b83a79647133779a42acc908af708a6b8a",
+  "zero_lora_record_path": "/mnt/sn56-evidence/checkpoints/.scorer-staged/ZERO/zero-lora-from-D1-K1-final.record.json",
+  "notes": [
+    "Built by SN56-project/evidence/week5-krea-recovery-scores-20260731/build_zero_lora_baseline.py; this runner never fabricates weights, it only verifies the builder's record (512 tensors, all diffusion_model.*, proven finite and all-zero) and that the artifact still hashes to candidate_sha256.",
+    "candidate_path/zero_lora_record_path are the GPU-host staging paths recorded in the builder's own record. On any other host, copy both files there or edit these two paths (the sha256 pin is what makes that safe).",
+    "The control doubles as an attachment canary: an all-zero LoRA whose keys the pinned ComfyUI cannot load proves the namespace mapping is wrong before any arm is believed.",
+    "A local copy of both files exists at SN56-project/evidence/week5-krea-recovery-scores-20260731/zero-lora-from-D1-K1-final.{safetensors,record.json} with the same sha256."
+  ]
+}

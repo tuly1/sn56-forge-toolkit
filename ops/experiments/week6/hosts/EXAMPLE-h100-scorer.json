@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "kind": "forge-week6-gpu-host",
+  "host_id": "EXAMPLE-h100-scorer",
+  "hostname": null,
+  "ai_toolkit_dir": "/app/ai-toolkit",
+  "comfy_root": "/workspace/krea-stage1/ComfyUI",
+  "comfy_python": "/workspace/krea-stage1/venv/bin/python",
+  "god_root": "/workspace/krea-stage1/G.O.D",
+  "god_commit": "b026da04b6179cf82945e8736590dd923114342b",
+  "comfy_commit": "091b70edda0c062fc9338a1d7e8e2f94f4c0ad0b",
+  "tooling_commit": "5d3194f4d4158ab31df7a060e1e4c56fa03f320c",
+  "base_name": "krea2_raw_fp8_scaled.safetensors",
+  "comfy_port": 8188,
+  "gpu_hourly_usd": 2.0,
+  "notes": [
+    "EXAMPLE / TEMPLATE. It is not a provisioned host: copy it, set the real paths, and set 'hostname' to the box's socket.gethostname() so execute mode refuses to run anywhere else. hostname:null disables that check and is only for costing.",
+    "The three commits are OBSERVED: they are the pins recorded in every week-5 exact-score record produced by ops/calibration/evaluate_krea_local.py, together with base_name krea2_raw_fp8_scaled.safetensors. The evaluator re-verifies all three and refuses a dirty tree.",
+    "comfy_python must be the ComfyUI venv interpreter; the evaluator proves the venv identity itself.",
+    "This is NOT the Hetzner production miner. Never point this at 65.108.77.230."
+  ]
+}

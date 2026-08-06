@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "kind": "forge-week6-arm",
+  "arm_id": "incumbent",
+  "role": "train",
+  "label": "Arm B - what we shipped on Aug-3, steps pinned to 1000 to match Arm A",
+  "expected_repo_name": "week6-incumbent",
+  "config_path": "../incumbent_krea2.yaml",
+  "config_sha256": "492c1fbcd0a1097a7651355a29ee5fdb821576ad0f2fb1ad1938f5711b2c5fab",
+  "ai_toolkit_commit": "71e133b4e73a716d1094f22355a46be07953b828",
+  "training_seed": 42565431,
+  "notes": [
+    "This arm declares the SAME ai-toolkit commit as Arm A on purpose: the fork executes this config identically to the incumbent pin 99be3d96 (it sets no sn56_strict_krea_fields), so pinning one runtime for both arms removes the runtime as a confound. If that equivalence is ever disproved, split the runtimes and say so in the write-up - do not quietly change this file after results exist.",
+    "steps (1000) and save_every (201) are read from the frozen YAML."
+  ]
+}

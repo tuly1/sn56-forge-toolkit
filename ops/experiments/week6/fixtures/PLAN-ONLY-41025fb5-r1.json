@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "kind": "forge-week6-real-fixture-planonly",
+  "plan_only": true,
+  "fixture_id": "W6-R1-41025fb5-PLANONLY",
+  "task_id": "41025fb5-8473-40c6-a88d-20c0bb303edc",
+  "model": "krea/Krea-2-Raw",
+  "model_type": "krea2",
+  "trigger_word": "AetherFlow UI",
+  "hours_to_complete": 0.75,
+  "train": {
+    "pairs": 18
+  },
+  "holdout": {
+    "pairs": 3
+  },
+  "source": {
+    "what_this_is": "A PLAN-ONLY descriptor of the Aug-3 R1 task, used to cost the two-arm experiment before the real fixture exists. It carries counts and task identity ONLY: no split, no bytes, no hashes of individual pairs. run_two_arm refuses to execute it.",
+    "harvest": "SN56-project/evidence/week6-tournament-dataset-harvest-20260806/tasks/41025fb5-8473-40c6-a88d-20c0bb303edc",
+    "harvest_manifest_sha256": "a543d0b874421690d8605bf90160eacabbfea1ded5f8f019a9aaf48327137d92",
+    "task_sha256sums_sha256": "5d7e212f000d1407bd06e0fa1c76c74e1a4deae30f245c6d7a55e8c2943fbd3c",
+    "task_meta_sha256": "5981747729e025ac902e4115aa8c6c0acdb70b5d14b4e95352ea1533218150d1",
+    "observed_task_facts": "21 image/caption pairs, all 1024x768 PNG, krea2, ds design_aetherflow_ui, trigger phrase 'AetherFlow UI' present verbatim in 21/21 captions, 0.75 h grant (task-meta.json).",
+    "split_arithmetic": "18 train / 3 holdout = the validator's public ceil(total * 0.10) holdout rule applied to 21 pairs. INFERRED counts only; WHICH pairs land in the holdout is the fixture builder's decision and is not made here.",
+    "not_evidence": "This file is a planning stand-in. It is not a fixture, it does not authorize training on harvested tournament images, and no score may cite it."
+  }
+}

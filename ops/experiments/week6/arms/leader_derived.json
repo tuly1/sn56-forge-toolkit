@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "kind": "forge-week6-arm",
+  "arm_id": "leader_derived",
+  "role": "train",
+  "label": "Arm A - Aug-3 R1 leader's own published recipe (5EACrayt), TE training dropped",
+  "expected_repo_name": "week6-leader-derived",
+  "config_path": "../leader_derived_krea2.yaml",
+  "config_sha256": "66c00cb3c9389098d52e79573ed07ba556973f975d271c0cd13e12af5b89f261",
+  "ai_toolkit_commit": "71e133b4e73a716d1094f22355a46be07953b828",
+  "training_seed": 42565431,
+  "notes": [
+    "ai_toolkit_commit is the owned fork (tag sn56-week6-lane-a-runtime-v2). On the incumbent pin 99be3d96 four of this recipe's score-critical settings parse and are then silently discarded, so the runner refuses to launch this arm anywhere else.",
+    "training_seed 42565431 is the seed constant already used by forge.tasks.holdout; both training arms MUST carry the same value or the comparison is confounded.",
+    "steps (1000) and save_every (200) are read from the frozen YAML, not from this file."
+  ]
+}
