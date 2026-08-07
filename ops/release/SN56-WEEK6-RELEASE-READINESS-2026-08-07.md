@@ -2,7 +2,7 @@
 
 **Prepared:** 2026-08-07 · **Role:** integrator (four units merged, adjudicated, verified)
 **Integration branch:** `claude/week6-real-fixture-experiment`
-**Merged HEAD:** `a7452fd4d43c4d5b131acca0f1d93e9d6c5ce3df`
+**Merged HEAD:** `6f6730faf1a16e0ee182c4656af962d4c0242ce5`
 **Cut from:** `550af2c` (itself cut from production pin `084ea914c6c5cbac4fa26a2138bd7195ebd71488`)
 **Test state:** **465 passed, 0 failed** from a clean `git archive` of HEAD into a temp dir (base `550af2c` = 434 passed)
 **Posture:** read-only against production throughout. Hetzner untouched, no service restarted, no pin moved, no funds touched, no GPU spend, nothing pushed to any remote.
@@ -150,7 +150,7 @@ Nothing below has been done. Steps 1 and 4–7 are **OWNER ACTIONS** and are cal
 | # | When | Step | Who |
 |---|---|---|---|
 | 1 | **Now** | **Decide whether to deploy at all.** If the answer is no, stop here — §1's "after" column does not apply and X1 is realised. This is a judgement call about shipping an un-GPU-validated recipe change on tournament eve, and it is not mine to make. | **OWNER** |
-| 2 | On a deploy decision | Re-run the full suite from a clean archive of the release SHA and record the count. Current: **465 passed, 0 failed** at `a7452fd`. | engineer |
+| 2 | On a deploy decision | Re-run the full suite from a clean archive of the release SHA and record the count. Current: **465 passed, 0 failed** at `6f6730f`. | engineer |
 | 3 | On a deploy decision | Build the image from the release SHA and verify the ai-toolkit pin assertion in `ops/docker/standalone-image-trainer.dockerfile:82` still hard-fails on anything but `99be3d96a2468d3a5228a4eb05ba67e63c586b4e`. **Do not** substitute the ai-toolkit fork; it is not in the image and cannot be used Monday. | engineer |
 | 4 | On a deploy decision | **Issue the release certificate** and flip `deployment_authorized`. It is `False` today by design; the re-signed `PRODUCTION_ACTIVATION` carries `release_authorized: True` but **explicitly not deployment**. | **OWNER** |
 | 5 | After 4 | **Endpoint repoint** on Hetzner: served pin `084ea914` → the release SHA, then re-run `sn56-preentry-probe-v2.sh` and confirm `endpoint.pin` shows the new SHA exactly once and the prior pin is absent. | **OWNER** |
@@ -164,7 +164,7 @@ Nothing below has been done. Steps 1 and 4–7 are **OWNER ACTIONS** and are cal
 
 ## 6. End-to-end verification of the merged result
 
-Real emission path, real Aug-3 shapes, clean archive of `a7452fd`. Wall clock walked at each type's **field-observed slowest** rate against the real terminate gate (`budget − EXPORT_RESERVE_S − STOP_MARGIN_S`), charging the full `STARTUP_S = 300`.
+Real emission path, real Aug-3 shapes, clean archive of `6f6730f`. Wall clock walked at each type's **field-observed slowest** rate against the real terminate gate (`budget − EXPORT_RESERVE_S − STOP_MARGIN_S`), charging the full `STARTUP_S = 300`.
 
 | Task | Type | R | N | h | steps | save@ | 1st save | proj. wall | % budget | @ field-slowest | salvage | forfeit? |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|
@@ -217,7 +217,7 @@ The Aug-3 entry was eliminated in R1. Against the R1 shape (`41025fb5`, krea2, N
 
 ## 8. Provenance
 
-- Merged HEAD `a7452fd4d43c4d5b131acca0f1d93e9d6c5ce3df` on `claude/week6-real-fixture-experiment`. Not pushed to any remote.
+- Merged HEAD `6f6730faf1a16e0ee182c4656af962d4c0242ce5` on `claude/week6-real-fixture-experiment`. Not pushed to any remote.
 - Merged units: `claude/week6-correctness-sweep` (`48a2cd4`), `claude/week6-unitc-blank-prompt` (`b3b089a`), `claude/week6-unitA-ideogram-ema` (`5b124a0`). Dropped: `claude/week6-flux-kohya-depth` (`6883dec`) — branch retained, not merged.
 - **No file was touched by two units.** Union of merged paths is disjoint; all three merges were clean with zero conflicts.
 - Ideogram policy identity: `POLICY_ID = week6-ideogram-exact-final-ema-horizon-v1`, `POLICY_SHA256 = fcf9ad8a…68138f91`, `AMENDMENT_SHA256 = 88442e05…debfdb4`; shipped activation validates; `release_authorized: True`, `deployment_authorized: False`.
