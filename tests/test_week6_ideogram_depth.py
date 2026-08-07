@@ -49,20 +49,50 @@ from forge import ideogram_release_policy, recipe
 
 
 # task, family, n_pairs, hours, rank-1 miner's shipped depth, what we now ship
+#
+# "SHIPPED" IS RESOLVED BY LFS CONTENT HASH, NOT BY FILENAME.  Several operators
+# publish a `checkpoints/last.safetensors` that is byte-identical to a numbered
+# rung of their own ladder — they trained deep and shipped a shallower selection.
+# Taking the deepest published checkpoint as "shipped" overstates the field, and
+# this table did that on two of its three rows before 2026-08-06.
 REAL_IDEOGRAM_TASKS = [
     # 1365fa1c: the ONLY clean shallow-vs-deep head-to-head in ideogram4.
-    # 174 (rank 1) beat >900 (rank 2) by 46.1% — but the deep arm stripped its
+    # 174 (rank 1) beat 800 (rank 2) by 46.1% — but the deep arm stripped its
     # metadata and published no config, so it is not a depth-only comparison.
+    # CORRECTED: the deep arm is 800, not ">900".  5GU4Xkd3 trained to 900
+    # (metadata on last_000000900) and its `last.safetensors` has the same LFS
+    # oid as its `last_000000800.safetensors`.
     ("1365fa1c", "product", 14, 0.75, 174, 421),
-    # b72da8c6: BOTH arms deep (>=1200 rank 1 vs 1523 rank 2, +4.4%).  No
-    # shallow arm exists on this task, so it cannot show that a shallow run
-    # would lose — only that 1250 ~= 1523.
-    ("b72da8c6", "style", 40, 1.0, 1300, 589),
-    # 84be9fcd: 341 (rank 1) vs an opponent who published TWO FILES, no
+    # b72da8c6: BOTH arms deep (1100 rank 1 vs 1523 rank 2, +4.4%).  No shallow
+    # arm exists on this task, so it cannot show that a shallow run would lose —
+    # only that 1100 ~= 1523.
+    # CORRECTED 1300 -> 1100: the rank-1 5GU4Xkd3 trained to 1200 and its
+    # `last.safetensors` has the same LFS oid as `last_000001100.safetensors`.
+    # The rank-2 5FBmn1ax is exact (config `steps: 1523`, metadata step 1523)
+    # and is the ONLY ideogram4 config in the field with no `ema_config` block —
+    # the same operator ran EMA 0.99 on the two tasks he WON, so depth and EMA
+    # are confounded within his own three runs.
+    ("b72da8c6", "style", 40, 1.0, 1100, 589),
+    # 84be9fcd: 341 (rank 1) vs an opponent who published ONE FILE, no
     # __metadata__ and no checkpoint ladder.  ZERO depth information.
     ("84be9fcd", "style", 46, 1.0, 341, 616),
 ]
 IDS = [row[0] for row in REAL_IDEOGRAM_TASKS]
+
+# The Jul-20 R1 ideogram4 task (3cfa1578), N=11 h=0.75, SIXTEEN miners — the
+# largest ideogram4 sample in existence and the only one at an R1 shape.
+# `image_text_pairs` in api.gradients.io/auditing/tasks/3cfa1578-... is 11; the
+# "N=9" that appeared in earlier week-6 notes is wrong.
+JUL20_R1_N_PAIRS = 11
+JUL20_R1_HOURS = 0.75
+# 5FNLSgh8, rank 1 of 16, test_loss 0.0502341.  Shipped 378 steps at lr 2.5e-5
+# with `cosine_by_group` + `use_ema: true` / `ema_decay: 0.995` + TE-LoRA on a
+# rank-32 network.  THE ONLY FIELD ARTIFACT IN OUR OWN lr/EMA/SCHEDULER FAMILY,
+# across both tournaments.
+JUL20_IN_FAMILY_WINNER_STEPS = 378
+# 5EACrayt, rank 13 of 16, test_loss 0.0965093 — the SAME 378 steps, the same
+# schedule, the same EMA, the same TE-LoRA, the same rank, at lr 5e-5.
+JUL20_MATCHED_DEPTH_CONTROL_STEPS = 378
 
 # The EMA decay the activated release policy binds.  This is now GENUINELY read
 # out of the policy — the previous version of this line claimed to do that in a
@@ -373,14 +403,102 @@ def test_where_the_clock_takes_over_from_the_law_is_known_and_bounded():
 
 
 def test_ideogram4_law_is_flat_because_the_field_has_no_size_signal():
-    """N=9 -> 1200, N=14 -> 174, N=40 -> ~1250, N=46 -> 341 across two
+    """N=11 -> 378, N=14 -> 174, N=40 -> 1100, N=46 -> 341 across two
     tournaments: the winners' depth is uncorrelated with dataset size.  The
     exponent therefore mirrors krea2's deliberately flat 0.35 rather than the
     0.57 that a 2-point fit to one operator produced.
+
+    The four winning depths are not merely noisy, they are MUTUALLY
+    INCONSISTENT under any power law: the two closest points in N are the
+    furthest apart in depth (N=40 -> 1100 and N=46 -> 341 is 15% more data for
+    3.23x fewer steps, a local exponent of -8.4).  `p` is therefore near-flat
+    because N is the wrong instrument, not because a flat exponent fits.
     """
     law = recipe.STEP_TABLE["ideogram4"]
     assert law["p"] <= 0.40
     assert abs(law["p"] - recipe.STEP_TABLE["krea2"]["p"]) <= 0.05
+
+    # No power law through any two of the Aug-3 three lands near the third.
+    winners = {14: 174, 46: 341, 40: 1100}
+    ns = sorted(winners)
+    for i in range(len(ns)):
+        for j in range(i + 1, len(ns)):
+            n1, n2 = ns[i], ns[j]
+            p = math.log(winners[n2] / winners[n1]) / math.log(n2 / n1)
+            (n3,) = [n for n in ns if n not in (n1, n2)]
+            predicted = winners[n1] * (n3 / n1) ** p
+            ratio = predicted / winners[n3]
+            assert not (0.7 <= ratio <= 1.4), (
+                f"a size law through N={n1},{n2} would predict N={n3} to within "
+                f"{ratio:.2f}x — if this ever passes, re-open the size-law "
+                f"question, because it means the field acquired a size signal"
+            )
+
+
+def test_ideogram4_matches_the_only_in_family_field_winner():
+    """The R1-shape anchor this row is actually calibrated against.
+
+    Every OTHER ideogram4 artifact in the field runs `lr: 0.0004` constant, 16x
+    our peak, so its step count is not transferable (that is the whole premise
+    of this file).  Exactly ONE is not like that: 5FNLSgh8 on the Jul-20 R1 task
+    3cfa1578 ran lr 2.5e-5 with a cosine schedule, EMA on, and a rank-32 LoRA —
+    our family — and WON, 1 of 16, at 378 steps on N=11 h=0.75.
+
+    That is the R1 shape, ideogram4 is half the R1 draw, and it is the only
+    depth in either tournament produced by a recipe like ours.  So it is the one
+    number this row must not drift away from, and nothing else in this file
+    pins the SMALL-N end.
+
+    HOW STRONG THE ANCHOR IS, honestly: n=1.  The band is deliberately wide
+    (0.75x..1.35x) — it is a tripwire against a rewrite that lands 4x away, not
+    a claim that 390 is optimal.  For calibration, the production pin 084ea914
+    (base=140 p=0.50) returns 95 here, which is 0.25x and would fail.
+    """
+    shipped = recipe.size_scaled_steps(
+        "ideogram4", JUL20_R1_N_PAIRS, JUL20_R1_HOURS, 1000
+    )
+    ratio = shipped / JUL20_IN_FAMILY_WINNER_STEPS
+    assert 0.75 <= ratio <= 1.35, (
+        f"N={JUL20_R1_N_PAIRS} h={JUL20_R1_HOURS} ships {shipped} steps against "
+        f"the only in-family field winner's {JUL20_IN_FAMILY_WINNER_STEPS} "
+        f"({ratio:.2f}x)"
+    )
+    # The anchor must be the LAW, not the clock: if the clock were binding here
+    # the agreement would be an accident of SEC_PER_IT (which is UNMEASURED for
+    # ideogram4) rather than a property of the depth policy.
+    law = recipe.STEP_TABLE["ideogram4"]
+    pure = law["base"] * (JUL20_R1_N_PAIRS / law["n_ref"]) ** law["p"]
+    assert shipped == int(round(max(law["min"], min(law["max"], pure))))
+
+
+def test_ideogram4_is_not_below_every_depth_that_ever_won():
+    """Directional guard: do not re-ship a law that is under the whole field.
+
+    The production pin 084ea914 (base=140 p=0.50 min=48 max=400) returned
+    95/107/181/194 against winning depths of 378/174/1100/341 at N=11/14/40/46 —
+    every residual the same sign, i.e. a BIAS, not scatter.  Our two tournament
+    results to date were both on the shallow side of their fields, and the one
+    catastrophic ideogram4 artifact on record (5FjDsFGA, Jul-20, +421% loss vs
+    rank 1) is a SHALLOW one at 200 steps; there is no observed deep-side
+    catastrophe anywhere in this type.
+
+    This does NOT assert that deeper is better — Spearman(steps, loss) over the
+    16-artifact Jul-20 field is +0.18 (p = 0.49), i.e. no detectable effect in
+    either direction, and the matched-depth pair at 378/378 finished rank 1 and
+    rank 13 on lr alone.  It asserts only that we are not uniformly beneath a
+    field whose depth we cannot explain.
+    """
+    winners = {11: 378, 14: 174, 40: 1100, 46: 341}
+    hours = {11: 0.75, 14: 0.75, 40: 1.0, 46: 1.0}
+    below = [
+        n
+        for n, w in winners.items()
+        if recipe.size_scaled_steps("ideogram4", n, hours[n], 1000) < w
+    ]
+    assert len(below) < len(winners), (
+        "the law is below EVERY winning ideogram4 depth ever observed "
+        f"(shapes {sorted(below)}) — that is the 084ea914 failure mode"
+    )
 
 
 def test_ideogram4_bounds_can_actually_bind():

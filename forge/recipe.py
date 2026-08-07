@@ -163,40 +163,83 @@ STEP_TABLE = {
     # shallow optimum; it ships ~1.5% of his parameter movement.  That single
     # factor invalidates the two-point fit, so it is gone.
     #
-    # WHAT THE FIELD ACTUALLY SUPPORTS — re-derived independently from the
-    # safetensors `__metadata__` headers of all SIX Aug-3 ideogram4 artifacts:
-    #   1365fa1c product N=14 h=0.75: 174 (rank 1) vs >900 (rank 2, +46.1% loss)
+    # WHAT THE FIELD ACTUALLY SUPPORTS — re-derived independently (2026-08-06,
+    # PRE-COMMIT AUDIT) from the safetensors `__metadata__` headers AND the LFS
+    # content hashes of all SIX Aug-3 ideogram4 artifacts plus all SIXTEEN
+    # Jul-20 ones, scored against `api.gradients.io/auditing/tasks/<task_id>`.
+    #
+    # READ `last.safetensors` BY CONTENT HASH, NOT BY NAME.  Three of the 22
+    # artifacts publish a `last.safetensors` that is BYTE-IDENTICAL to a
+    # numbered rung of their own checkpoint ladder (equal LFS oid), i.e. the
+    # operator ran deep and then SELECTED a shallower rung to ship.  Reading the
+    # deepest published checkpoint as "what they shipped" overstates the field's
+    # depth, and this row previously did exactly that on two of its three
+    # anchors.  Corrected below; both corrections move DOWN.
+    #   1365fa1c product N=14 h=0.75: 174 (rank 1) vs 800 (rank 2, +46.1% loss)
     #       The ONLY clean shallow-vs-deep head-to-head anywhere in ideogram4,
-    #       and shallow won big.  But the deep arm published NO config and
-    #       stripped its metadata (its depth is only bounded by a last_000000900
-    #       checkpoint), so the 46% cannot be attributed to depth alone.
-    #   84be9fcd style N=46 h=1.0: 341 (rank 1) vs UNKNOWN (rank 2 published two
-    #       files, no `__metadata__`, no checkpoint ladder).  This point carries
+    #       and shallow won big.  CORRECTED: the deep arm (5GU4Xkd3) is not
+    #       ">900" — it trained to 900 and its `last.safetensors` is byte-equal
+    #       to its own `last_000000800.safetensors`, so it SHIPPED 800 out of a
+    #       nine-rung ladder it could have picked 100 from.  It published no
+    #       config, so the 46% still cannot be attributed to depth alone — and
+    #       the fact that its own selector preferred 800 is evidence about its
+    #       selector, not about the shape.
+    #   84be9fcd style N=46 h=1.0: 341 (rank 1) vs UNKNOWN (rank 2 published one
+    #       file, no `__metadata__`, no checkpoint ladder).  This point carries
     #       ZERO DEPTH INFORMATION and must not be used to calibrate anything.
-    #   b72da8c6 style N=40 h=1.0: >=1200 (rank 1) vs 1523 (rank 2, +4.4%).
-    #       BOTH arms deep, no shallow arm.  It says 1250 ~= 1523; it does NOT
-    #       say that 321 would have lost.
-    #   Jul-20 R1 3cfa1578 ideogram4, N=9, SIXTEEN miners — the largest
-    #       ideogram4 sample we have: we ran the shortest run in the field
-    #       (85 steps) and placed 4/16; the deep cluster was 722-1000+ and the
-    #       recorded finding is that the img2img metric "did NOT punish
-    #       overtraining" (SN56-WEEK3-POSTMORTEM.md §6a).
-    #       CORRECTION (week-6 sweep): this row used to end "...the bracket
-    #       winner 1200".  NO CITED SOURCE SAYS THAT, and our own
-    #       SN56-WEEK4-INDEPENDENT-REVIEW-2026-07-22.md §2 says the opposite:
-    #       on 3cfa1578 the R1 WINNER configured 378 steps at lr 2.5e-5 with
-    #       EMA + cosine + TE training, while the lr-4e-4 arm that configured
-    #       1200/1650 ranked 8th.  The "1200" appears to have been imported
-    #       from the Jul-27 KREA2 R1 table (task 73013636), a different type and
-    #       a different tournament.
-    #       This matters more than a citation slip: that 378-step winner is the
-    #       ONLY field artifact anywhere in OUR OWN lr/EMA/scheduler family, and
-    #       it sits BELOW the 421/589/616 this row now ships.  Our law at N=9
-    #       returns 365, which is close to it; the divergence is at large N.
-    # Net across two tournaments: ideogram4 depth is FLAT and WIDE — 85 to 1523
-    # all placed 1st or 2nd somewhere — with NO consistent direction once the
-    # Jul-20 winner is read correctly.  There is NO size law to fit: N=9 -> 378,
-    # N=14 -> 174, N=40 -> 1250, N=46 -> 341 is uncorrelated with size.
+    #   b72da8c6 style N=40 h=1.0: 1100 (rank 1) vs 1523 (rank 2, +4.4%).
+    #       CORRECTED, and this is the number the week-6 review carried wrong in
+    #       both directions (">=1200", "~1250", "1300"): the rank-1 5GU4Xkd3
+    #       trained to 1200 and shipped a `last.safetensors` byte-equal to its
+    #       `last_000001100.safetensors` = 1100.  The rank-2 5FBmn1ax config
+    #       says `steps: 1523` and its metadata says step 1523, so that arm is
+    #       exact.  BOTH arms deep, no shallow arm.  It says 1100 ~= 1523; it
+    #       does NOT say that 321 would have lost.  NOTE the rank-2 config on
+    #       this task is the ONLY ideogram4 config in the field with NO
+    #       `ema_config` block at all — the same operator ran EMA 0.99 on the
+    #       two tasks he WON (at 174 and 341) and no EMA on the one he lost, so
+    #       depth and EMA are confounded inside his own three runs.
+    #   Jul-20 R1 3cfa1578 ideogram4, N=11 (not 9 — `image_text_pairs` in the
+    #       auditing record), h=0.75, SIXTEEN miners.  This is the largest
+    #       ideogram4 sample in existence AND it is at the R1 shape, so it is
+    #       weighted hardest here.  Full ladder re-derived; the two results that
+    #       matter:
+    #       (i) THE ONLY MATCHED-DEPTH COMPARISON IN THE WHOLE IDEOGRAM4 RECORD.
+    #           5FNLSgh8 and 5EACrayt both shipped EXACTLY 378 steps with the
+    #           same `cosine_by_group` schedule, the same `ema_decay 0.995`, the
+    #           same TE-LoRA and the same rank-32 network.  They differ in `lr`
+    #           (2.5e-5 vs 5e-5) and they finished RANK 1 (0.0502341) and RANK
+    #           13 (0.0965093) — +92.1% loss at IDENTICAL depth.  For scale, the
+    #           entire depth-driven spread across ranks 1..15 is +116.8%.  So at
+    #           this shape lr moves the metric almost as far as the whole depth
+    #           range does, and DEPTH IS NOT THE OPERATIVE VARIABLE.
+    #       (ii) Spearman(shipped steps, test_loss) over all 16 = +0.184
+    #           (two-sided permutation p = 0.49; +0.313 dropping the one 0.2618
+    #           blow-up, +0.418 also dropping the two artifacts whose depth is
+    #           inferred from a kill).  POSITIVE means deeper is if anything
+    #           WORSE here.  Contrast krea2, where the same statistic on the
+    #           Aug-3 R1 field is -0.605 (p = 0.045).  THE TWO TYPES POINT IN
+    #           OPPOSITE DIRECTIONS; do not carry the krea2 lesson across.
+    #       Our own entry (5HLA2QWY) shipped 86 steps and placed 4/16 — but at
+    #       lr 1e-4 with `use_ema: false`, i.e. NOT the recipe this row now
+    #       serves, so it is not evidence that 86 is safe for us today.
+    #       The 378-step rank 1 IS in our recipe family (lr 2.5e-5 + cosine +
+    #       EMA), and it is the ONLY field artifact anywhere that is.
+    #       (Supersedes the week-6 sweep's reading, which had the right artifact
+    #       but the wrong N and called 378 "BELOW the 421/589/616 this row
+    #       ships" — at 378's OWN shape, N=11, this row ships 390, i.e. +3.2%.)
+    # Net across two tournaments: ideogram4 depth is FLAT and WIDE — 86 to 1523
+    # all placed 1st or 2nd or mid-pack somewhere — with NO consistent
+    # direction.  There is NO size law to fit: N=11 -> 378, N=14 -> 174,
+    # N=40 -> 1100, N=46 -> 341 is uncorrelated with size, and the arithmetic is
+    # not close.  Fit a power law `steps = A*N**p` to any two of the Aug-3
+    # three and it misses the third by 3.5x, 4.1x, or 41829x; OLS on all three
+    # in log space gives R^2 = 0.50 with a 2.54x multiplicative residual sd.
+    # The killer is that the two CLOSEST points in N are the FURTHEST apart in
+    # depth: N=40 -> 1100 and N=46 -> 341 means 15% more data and 3.23x fewer
+    # steps, a local exponent of -8.4.  No monotone function of N can do that,
+    # so N is the wrong instrument and `p` should be near-flat for that reason
+    # rather than fitted.
     #
     # NO FAMILY SPLIT, and NOT because it is infeasible.  `spec.trigger_word is
     # None` separates `style` from every other family 12/12 across the Aug-3
@@ -206,7 +249,9 @@ STEP_TABLE = {
     # disagree with EACH OTHER by 4.5x — 341 won at N=46, ~1250 won at N=40 —
     # so there is no style depth to route TO.  Adding a one-task-per-branch
     # parameter to the highest-variance row in this table, which is half the R1
-    # draw, is the worst available trade.
+    # draw, is the worst available trade.  (The "~1250" above is the pre-audit
+    # reading of b72da8c6; the shipped winner was 1100.  341 vs 1100 is 3.2x,
+    # which does not rescue the router.)
     #
     # THE ROW BELOW IS THEREFORE NOT A FIT TO THE FIELD.  It is set from the two
     # constraints we can measure on OUR OWN pipeline:
@@ -267,8 +312,8 @@ STEP_TABLE = {
     # and there are four of them).
     # p 0.57 -> 0.32 because the field shows no size signal at all; this mirrors
     # krea2's deliberately flat 0.35 rather than a 2-point fit.  min 120 -> 350
-    # binds only below N~8, under the smallest ideogram4 dataset ever observed
-    # (N=9, Jul-20).  max 1600 -> 620: 1600 was INERT (the old law topped out at
+    # binds only below N~10, under the smallest ideogram4 dataset ever observed
+    # (N=11, Jul-20).  max 1600 -> 620: 1600 was INERT (the old law topped out at
     # 365 at N=50, so it could never bind within 4x), whereas 620 first CHANGES
     # the output at N = 48 — not 47, as this comment used to say: at N=47 the
     # law returns 619.975, which rounds to 620 with or without the cap, so the
@@ -278,10 +323,51 @@ STEP_TABLE = {
     # is kept because it caps extrapolation of a recipe we have never run past
     # ~200 steps in a tournament, not because it moves any real shape.
     # (`test_step_table_max_binding_sizes` pins the crossover at 48.)
-    # PRE-COMMIT: this is a reasoned bet, not a measurement.  If ideogram4 is
-    # the R1 draw and we lose, the correct next experiment is do_cfg on/off at
-    # matched depth (which buys back 2x the reachable depth), NOT another depth
-    # change.
+    #
+    # DEPTH RE-ADJUDICATED 2026-08-06, PRE-TOURNAMENT, AND HELD.  The open
+    # question was whether to revert this row to the production pin
+    # (084ea914 base=140 p=0.50 min=48 max=400) before the Aug-10 tournament,
+    # because R1 is a coin flip between krea2 and ideogram4 and this row carries
+    # ~half that draw.  The full 22-artifact re-derivation above says HOLD, on
+    # four grounds, in descending weight:
+    #  1. THE ONLY IN-FAMILY ANCHOR AGREES WITH THIS ROW AND NOT WITH THE
+    #     REVERT.  One field artifact in two tournaments shares our lr/EMA/
+    #     scheduler (5FNLSgh8, Jul-20 3cfa1578, lr 2.5e-5 + cosine + EMA + TE).
+    #     It won, at 378 steps, at N=11 h=0.75 — the R1 shape.  This row returns
+    #     390 there (+3.2%); the revert returns 95 (-74.9%, 4.0x too shallow).
+    #     `test_ideogram4_matches_the_only_in_family_field_winner` pins it.
+    #  2. THE REVERT IS BELOW EVERY WINNING DEPTH EVER OBSERVED FOR THIS TYPE.
+    #     Winners 378/174/1100/341 at N=11/14/40/46; the revert ships
+    #     95/107/181/194, i.e. 0.25x/0.61x/0.16x/0.57x.  All four residuals have
+    #     the same sign, so it is not scatter, it is bias.  RMS log-distance to
+    #     the four winners: this row 0.617, the revert 1.195.  Our two tournament
+    #     losses to date (Jul-20 ideogram 86 steps, Aug-3 krea2 823 steps) were
+    #     both on the shallow side of the field, and the single catastrophic
+    #     artifact in the whole ideogram4 record (5FjDsFGA, +421% loss) is a
+    #     SHALLOW one at 200 steps.  There is no observed deep-side catastrophe.
+    #  3. AT LARGE N THIS ROW IS ALREADY THE MINIMAX POSITION between the two
+    #     irreconcilable style anchors: sqrt(341*1100) = 612, and the row ships
+    #     616 at N=46 and 589 at N=40 (log residuals +0.59 / -0.62, almost
+    #     exactly symmetric).  When two anchors disagree by 3.2x, sitting at
+    #     their geometric mean IS the best-worst-case, and no single number can
+    #     do better without knowing which one generalises.
+    #  4. DEPTH IS NOT THE OPERATIVE VARIABLE ANYWAY, so a depth revert buys
+    #     little even if it were right: the matched-depth pair at 378/378 ranked
+    #     1 and 13 on lr alone, and Spearman(steps, loss) over the 16-artifact
+    #     R1-shaped field is +0.18 (p = 0.49).  Spending a pre-tournament change
+    #     on the coefficient the data says is inert, four days out, on a reviewed
+    #     tree, is the wrong trade.
+    # WHAT IS BEING SACRIFICED, SAID PLAINLY.  On 1365fa1c (N=14 h=0.75) this
+    # row ships 421 against a 174 that won and an 800 that lost by 46%, i.e. it
+    # sits nearer the losing arm in log-distance (+0.88 vs -0.64).  If the true
+    # story is "ideogram4 punishes depth at tiny N regardless of lr", this row
+    # is wrong and the revert was right.  That story is not supported — it is
+    # contradicted by the in-family anchor and by the +0.18 rank correlation —
+    # but it is not refuted either, because no one has ever run OUR recipe at
+    # 174 steps.  Held as the better-worst-case, not as a measurement.
+    # STILL TRUE PRE-COMMIT: if ideogram4 is the R1 draw and we lose, the
+    # correct next experiment is do_cfg on/off at matched depth (which buys back
+    # 2x the reachable depth), NOT another depth change.
     "ideogram4": dict(base=500, n_ref=_N_REF, p=0.32, min=350, max=620),
     # z-image — was base=1100 p=0.50 min=400 max=2000.  Cleanest result in the
     # audit: TWO DIFFERENT rank-1 operators with different recipes imply the

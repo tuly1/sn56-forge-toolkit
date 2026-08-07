@@ -71,7 +71,13 @@ REAL_TASKS = [
      747, (31, 31), {(1408, 768): 31}),
     ("b2582457", 5, "z-image", "social", 48, 1.0, 1317, 860, 1315, 264,
      887, (48, 48), {(1024, 768): 48}),
-    ("b72da8c6", 5, "ideogram4", "style", 40, 1.0, 1300, 181, 589, 118,
+    # 1300 -> 1100 (2026-08-06 pre-tournament re-derivation).  The rank-1
+    # 5GU4Xkd3 trained to 1200 and published a `checkpoints/last.safetensors`
+    # whose LFS oid is EQUAL to its own `last_000001100.safetensors`, i.e. it
+    # SELECTED and shipped the 1100 rung.  Neither 1300 nor ">=1200" is what any
+    # artifact contains.  ideogram4 is excluded from the winner-ratio assertions
+    # below, so this column is documentation for this row — but it was wrong.
+    ("b72da8c6", 5, "ideogram4", "style", 40, 1.0, 1100, 181, 589, 118,
      None, None, {(1024, 768): 40}),
     ("f6725c2b", 5, "krea2", "design", 50, 1.0, 2012, 1172, 1939, 388,
      887, (50, 50), {(1024, 768): 50}),
