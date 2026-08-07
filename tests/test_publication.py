@@ -128,6 +128,17 @@ def test_telemetry_public_projection_is_strict_and_hash_bound(tmp_path):
         }
     ]
     assert set(public["events"][0]) == {"t", "name", "failure_class"}
+    # Scan the public projection MINUS the private-record digest.  That digest is
+    # a deliberately-public sha256 hex string, and short decimal tokens like
+    # b"367" collide with it by chance: on the untouched parent commit this
+    # assertion failed 5 times in 300 runs (~1.7%), always on b"367" landing
+    # inside the hex.  Excluding the digest keeps the whole intent — no private
+    # value may reach schema, kind or events — without the false positive.
+    # The digest itself is separately verified against the private bytes above.
+    scanned = public_bytes.replace(
+        public["private_record_sha256"].encode("ascii"), b"<digest>"
+    )
+    assert b"<digest>" in scanned
     for forbidden in (
         b"private-task",
         b"krea2",
@@ -140,7 +151,7 @@ def test_telemetry_public_projection_is_strict_and_hash_bound(tmp_path):
         b"hf_",
         b"train_curve",
     ):
-        assert forbidden not in public_bytes
+        assert forbidden not in scanned
     assert not (root / "forge_run.full.json").exists()
 
 
