@@ -192,12 +192,13 @@ def test_literal_production_activation_is_hash_bound_owner_override() -> None:
     )
     assert active["selection_basis"] == "null_result_owner_override"
     assert active["owner_override"] is True
-    # Re-signed for the Week-6 EMA-horizon amendment.  The record no longer
-    # authorises the bare I-J20-D2 port: it authorises that port PLUS exactly
-    # one named amendment, and `amendment_sha256` is what scopes it.
+    # Re-signed a SECOND time, for the VACATION of the Week-6 EMA-horizon
+    # amendment.  The record once again authorises the bare I-J20-D2 port —
+    # `_POLICY_BODY["amendments"]` is empty — and `amendment_sha256` now scopes
+    # the signature to the vacation record rather than to a live divergence.
     assert active["amendment_sha256"] == policy.AMENDMENT_SHA256
     assert active["activation_sha256"] == (
-        "b7e436971430f04e216ddf5a4f1599a3f8de2f21e2f9462c1d67245aa0386ba2"
+        "04261257fadfc780fe70f557b1f5b6c6672e09631b804d51d9d28863f0ba348c"
     )
     # The port itself is unchanged: deployment is still NOT authorised by the
     # record, so re-signing did not widen the authority it carries.
@@ -234,9 +235,10 @@ def test_active_recipe_matches_the_scored_production_projection(
         "text_encoder_lr": 0.0000001,
         "lr_scheduler": "cosine",
         "lr_scheduler_params": {"eta_min": 0.0000025},
-        # 0.995 -> 0.99 (Week-6 EMA-horizon amendment).  Guarded in detail by
+        # Back at the I-J20-D2 / 5FNLSgh8 anchor value: the Week-6 0.99
+        # amendment is VACATED.  Guarded in detail by
         # tests/test_week6_ideogram_ema_horizon.py.
-        "ema_config": {"use_ema": True, "ema_decay": 0.99},
+        "ema_config": {"use_ema": True, "ema_decay": 0.995},
         "do_cfg": True,
         "cfg_scale": 10.0,
         "steps": PLANNED_STEPS,
