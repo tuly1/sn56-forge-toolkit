@@ -242,7 +242,10 @@ def test_missing_caption_empty_file(tmp_path):
 # --------------------------------------------------------------------------- #
 def test_recipe_step_scaling():
     # no budget pressure (large hours)
-    assert recipe.size_scaled_steps("flux", 24, 1000, 2000) == 1100
+    # 1100 -> 1024: `base` is the law's value AT n_ref, and the flux anchor is
+    # 58 kohya epochs over the 13 images train_data.zip actually holds (754),
+    # not over the auditing record's 15 (870).  See recipe.py's flux row.
+    assert recipe.size_scaled_steps("flux", 24, 1000, 2000) == 1024
     s10 = recipe.size_scaled_steps("flux", 10, 1000, 2000)
     s50 = recipe.size_scaled_steps("flux", 50, 1000, 2000)
     assert s10 < s50
@@ -251,8 +254,10 @@ def test_recipe_step_scaling():
     # ceiling 2200 (the champion clock-filled to 2012 on a 1.0 h task).
     assert recipe.size_scaled_steps("krea2", 1, 1000, 2000) == 600  # min
     assert recipe.size_scaled_steps("krea2", 500, 1000, 2000) == 2200  # max
-    # z-image law re-derived from TWO independent rank-1 operators (base 930).
-    assert recipe.size_scaled_steps("z-image", 24, 1000, 2000) == 930
+    # z-image law re-derived from TWO independent rank-1 operators; 930 -> 984
+    # when both are read at the n_train they trained on (43 and 35, not 48 and
+    # 39).  984 reproduces BOTH shipped depths exactly, 1317 and 1188.
+    assert recipe.size_scaled_steps("z-image", 24, 1000, 2000) == 984
     # unknown type -> template
     assert recipe.size_scaled_steps("sd3", 24, 1000, 2000) == 2000
     # budget cap drives well below scaled, never < 1
@@ -265,7 +270,7 @@ def test_recipe_budget_cap_example():
     # krea2 @ 24 imgs sits exactly on the week-6 base; at 1.0 h the clock cap is
     # 2097, so the SIZE LAW binds — which is the point of the recalibration.
     v = recipe.size_scaled_steps("krea2", 24, 1.0, 2000)
-    assert v == 1500
+    assert v == 1584
     # the clock still binds on a tight budget
     v = recipe.size_scaled_steps("krea2", 24, 0.2, 2000)
     assert v == 135
@@ -275,12 +280,15 @@ def test_recipe_budget_cap_example():
     ("hours", "expected"),
     [
         # cap @0.75 h = (0.75*3600*0.92 - 480)/1.35 = 1484
-        (0.75, (1104, 1484, 1484, 1484, 1484, 1484)),
+        (0.75, (1166, 1484, 1484, 1484, 1484, 1484)),
         # cap @1.0 h = (1.0*3600*0.92 - 480)/1.35 = 2097.  At the four REAL
-        # Aug-3 krea2 sizes (21/42/43/50) the law binds and the clock does not;
+        # Aug-3 krea2 shapes the law binds and the clock does not -- and the
+        # sizes to quote are n_train 18/37/38/45, NOT the auditing record's
+        # 21/42/43/50, because the validator withholds ceil(0.10*N) before the
+        # zip is built (recipe.py, WEEK-6 ABSCISSA CORRECTION);
         # these synthetic 100/200/500-image shapes are far outside the 10-50
         # tournament range and are here to pin the clamp order, not a policy.
-        (1.0, (1104, 1500, 1939, 2097, 2097, 2097)),
+        (1.0, (1166, 1584, 2048, 2097, 2097, 2097)),
     ],
 )
 def test_krea_week6_materialization_table(hours, expected):
@@ -326,12 +334,12 @@ def test_config_flux():
     assert p["training_folder"] == "/app/checkpoints/t1"
     assert p["datasets"][0]["folder_path"] == "/dataset/images"
     assert p["model"]["name_or_path"] == "/cache/models/stabilityai--x"
-    assert p["train"]["steps"] == 1100
+    assert p["train"]["steps"] == 1024
     assert p["trigger_word"] == "tok"
     # arch preserved
     assert p["model"]["is_flux"] is True
-    # Four periodic candidates plus final: floor(1100/5) + 1 = 221.
-    assert p["save"]["save_every"] == 221
+    # Four periodic candidates plus final: floor(1024/5) + 1 = 205.
+    assert p["save"]["save_every"] == 205
 
 
 def test_config_krea2():
@@ -339,8 +347,28 @@ def test_config_krea2():
     cfg = config.build_config(s, num_images=24, hours_to_complete=1000)
     p = cfg["config"]["process"][0]
     assert cfg["config"]["name"] == "krepo"
+    # `do_differential_guidance` is pinned only so the template cannot change
+    # shape unnoticed.  IT IS A DEAD KEY AND MUST NOT BE READ AS LOAD-BEARING:
+    # at ai-toolkit pin 99be3d96 the branch that consumes it
+    # (extensions_built_in/sd_trainer/SDTrainer.py:734-737) is NESTED inside
+    # `if self.train_config.do_guidance_loss:` at :692, and `do_guidance_loss`
+    # defaults False (toolkit/config_modules.py:568), is never assigned anywhere
+    # in the tree, is absent from all 45 published field configs, and is absent
+    # from all of our templates.  So `differential_guidance_scale` never runs —
+    # which is why the mae-vs-mse matched pair on Aug-3 41025fb5 has TWO
+    # effective residual differences (loss_type, caption_dropout_rate), not the
+    # three a raw key-diff suggests.  Verified independently at the merge.
     assert p["train"]["do_differential_guidance"] is True
-    assert p["train"]["loss_type"] == "mse"
+    # WEEK-6: mse -> mae.  The decisive artifact is Aug-3 41025fb5, where
+    # 5FBmn1ax and 5FjDsFGA published configs that are byte-equal except
+    # loss_type / caption_dropout_rate / differential_guidance_scale (inert, see
+    # above) / save_every (inert to the exported weights — both completed 1432
+    # steps and shipped a `last.safetensors` whose LFS oid matches no rung of
+    # its own ladder).  mae ranked 4 at 0.048934, mse ranked 14 at 0.053039:
+    # +8.39%, against a same-recipe noise floor of 2.145% measured on 7421f056.
+    # See forge/templates/base_diffusion_krea2.yaml for the full citation and
+    # the honest count of the replication.
+    assert p["train"]["loss_type"] == "mae"
     assert p["network"]["lokr_full_rank"] is True
     mk = p["model"]["model_kwargs"]
     assert mk["text_encoder_path"] == "/cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct"

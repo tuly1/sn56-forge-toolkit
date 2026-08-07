@@ -35,7 +35,10 @@ from forge.data.schema import ImageSpec
 # --------------------------------------------------------------------------- #
 # The fourteen real Aug-3 task shapes.
 #
-# task / round / model_type / family / n_pairs / hours_to_complete
+# task / round / model_type / family
+#   / n_pairs        = `image_text_pairs` in the auditing record (the FULL set)
+#   / n_train        = images inside train_data.zip = WHAT THE CONTAINER GETS
+#   / hours_to_complete
 #   / rank-1 miner's shipped steps
 #   / steps forge shipped on the Aug-3 pin 084ea914 (BEFORE)
 #   / steps forge ships now (AFTER)
@@ -45,31 +48,58 @@ from forge.data.schema import ImageSpec
 #
 # `None` resolution == the type is structurally excluded from the geometry
 # policy (ideogram4; see forge/geometry.py) and must keep the template list.
+#
+# THE `n_train` COLUMN IS NEW (2026-08-07) AND IT IS THE REASON THIS FILE WAS
+# GREEN WHILE THE CONTAINER SHIPPED SOMETHING ELSE.  The validator withholds a
+# 10% holdout for its own scoring and hands the miner only the remainder, so
+# `image_text_pairs` is NOT the number `recipe.size_scaled_steps` receives:
+#
+#     forge/tasks/aitoolkit.py:56  total_pairs = pairs inside train_data.zip
+#     forge/tasks/aitoolkit.py:78  pairs = total_pairs - holdout_pairs  (0 in prod)
+#     forge/tasks/aitoolkit.py:97  build_config(spec, num_images=pairs, ...)
+#
+# Every value below is OBSERVED, not modelled: the zip END-OF-CENTRAL-DIRECTORY
+# of each task's `training_data` URL was read by HTTP range request (directory
+# only, no image payload).  All fourteen satisfy n_train == N - ceil(0.10*N)
+# exactly.  `_build` now passes n_train, so a regression in the plumbing fails
+# here instead of in a tournament.
+#
+# KNOWN GAP, STATED RATHER THAN PAPERED OVER: the `dims` histogram and therefore
+# the two geometry columns are still the FULL n_pairs distribution, because
+# WHICH images the validator withholds is not recoverable from any artifact we
+# hold (the zip directory gives names and byte sizes, not pixel dimensions).
+# That affects only the geometry columns, which no depth assertion reads;
+# `num_images` — the only input the depth law takes — is exact.
 # --------------------------------------------------------------------------- #
 REAL_TASKS = [
-    ("41025fb5", 1, "krea2", "design", 21, 0.75, 1000, 824, 1432, 287,
+    ("41025fb5", 1, "krea2", "design", 21, 18, 0.75, 1000, 824, 1432, 287,
      887, (21, 21), {(1024, 768): 21}),
-    ("7421f056", 2, "qwen-image", "design", 28, 1.25, 850, 836, 836, 168,
+    ("7421f056", 2, "qwen-image", "design", 28, 25, 1.25, 850, 836, 836, 168,
      887, (28, 28), {(1024, 768): 28}),
-    ("84be9fcd", 2, "ideogram4", "style", 46, 1.0, 341, 194, 616, 124,
+    ("84be9fcd", 2, "ideogram4", "style", 46, 41, 1.0, 341, 183, 614, 123,
      None, None, {(1408, 768): 45, (768, 1376): 1}),
-    ("b290d171", 2, "z-image", "design", 39, 1.0, 1188, 860, 1186, 238,
+    ("b290d171", 2, "z-image", "design", 39, 35, 1.0, 1188, 860, 1188, 238,
      747, (37, 39), {(1408, 768): 37, (768, 1376): 2}),
-    ("db5fefc5", 2, "flux", "product", 15, 0.75, 750, 726, 870, 175,
+    # WINNER COLUMN CORRECTED 750 -> 650 and 870 -> 754.  kohya records EPOCHS,
+    # so these are `epochs x images`, and the image count is 13 (the zip), not
+    # 15 (the auditing record): 5D7iEJm5 ran 50 epochs, 5FW2Eaae ran 58.  This
+    # is the one type where the abscissa error also corrupted the ANCHOR, which
+    # is why flux depth moves DOWN here while every other type moves up.
+    ("db5fefc5", 2, "flux", "product", 15, 13, 0.75, 650, 726, 754, 151,
      873, (0, 15), {(1195, 896): 15}),
-    ("241cda6c", 3, "flux", "product", 15, 0.75, 870, 726, 870, 175,
+    ("241cda6c", 3, "flux", "product", 15, 13, 0.75, 754, 726, 754, 151,
      873, (0, 15), {(1195, 896): 15}),
-    ("db9f7244", 3, "krea2", "design", 43, 1.0, 2012, 1172, 1840, 369,
+    ("db9f7244", 3, "krea2", "design", 43, 38, 1.0, 2012, 1172, 1860, 373,
      758, (26, 43), {(768, 1376): 18, (1408, 768): 17, (1376, 768): 8}),
-    ("ff643470", 4, "qwen-image", "social", 41, 1.5, 1095, 1027, 1023, 205,
+    ("ff643470", 4, "qwen-image", "social", 41, 36, 1.5, 1095, 1027, 1023, 205,
      887, (41, 41), {(1024, 768): 41}),
-    ("1365fa1c", 5, "ideogram4", "product", 14, 0.75, 174, 107, 421, 85,
+    ("1365fa1c", 5, "ideogram4", "product", 14, 12, 0.75, 174, 99, 414, 83,
      None, None, {(1195, 896): 13, (1376, 768): 1}),
-    ("3e0fdcde", 5, "krea2", "design", 42, 1.0, 2012, 1172, 1825, 366,
+    ("3e0fdcde", 5, "krea2", "design", 42, 37, 1.0, 2012, 1172, 1843, 369,
      887, (42, 42), {(1024, 768): 42}),
-    ("4782f46f", 5, "qwen-image", "logo", 31, 1.5, 949, 1027, 957, 192,
+    ("4782f46f", 5, "qwen-image", "logo", 31, 27, 1.5, 949, 1027, 947, 190,
      747, (31, 31), {(1408, 768): 31}),
-    ("b2582457", 5, "z-image", "social", 48, 1.0, 1317, 860, 1315, 264,
+    ("b2582457", 5, "z-image", "social", 48, 43, 1.0, 1317, 860, 1317, 264,
      887, (48, 48), {(1024, 768): 48}),
     # 1300 -> 1100 (2026-08-06 pre-tournament re-derivation).  The rank-1
     # 5GU4Xkd3 trained to 1200 and published a `checkpoints/last.safetensors`
@@ -77,11 +107,16 @@ REAL_TASKS = [
     # SELECTED and shipped the 1100 rung.  Neither 1300 nor ">=1200" is what any
     # artifact contains.  ideogram4 is excluded from the winner-ratio assertions
     # below, so this column is documentation for this row — but it was wrong.
-    ("b72da8c6", 5, "ideogram4", "style", 40, 1.0, 1100, 181, 589, 118,
+    ("b72da8c6", 5, "ideogram4", "style", 40, 36, 1.0, 1100, 171, 589, 118,
      None, None, {(1024, 768): 40}),
-    ("f6725c2b", 5, "krea2", "design", 50, 1.0, 2012, 1172, 1939, 388,
+    ("f6725c2b", 5, "krea2", "design", 50, 45, 1.0, 2012, 1172, 1974, 395,
      887, (50, 50), {(1024, 768): 50}),
 ]
+
+# The validator's split rule, OBSERVED to hold on all fourteen rows above.  A
+# helper rather than a comment so the claim is executable.
+def _validator_n_train(n_pairs):
+    return n_pairs - math.ceil(0.10 * n_pairs)
 
 TEMPLATE_RESOLUTION = [512, 768, 1024]
 IDS = [f"{row[0]}-{row[2]}" for row in REAL_TASKS]
@@ -104,7 +139,7 @@ def dataset_dirs(tmp_path_factory):
     root = tmp_path_factory.mktemp("week6-shapes")
     out = {}
     for row in REAL_TASKS:
-        task, dims = row[0], row[12]
+        task, dims = row[0], row[13]
         d = root / task
         d.mkdir()
         index = 0
@@ -121,7 +156,7 @@ def dataset_dirs(tmp_path_factory):
 
 def _build(task, images_dir, *, geometry_types=None, monkeypatch=None):
     row = next(r for r in REAL_TASKS if r[0] == task)
-    _t, _r, model_type, _fam, pairs, hours = row[:6]
+    _t, _r, model_type, _fam, _n_pairs, n_train, hours = row[:7]
     if geometry_types is None:
         monkeypatch.delenv("FORGE_EVAL_GEOMETRY_TYPES", raising=False)
     else:
@@ -133,7 +168,10 @@ def _build(task, images_dir, *, geometry_types=None, monkeypatch=None):
         expected_repo_name=f"tournament-week6-{task}",
         images_dir=images_dir,
     )
-    return build_config(spec, num_images=pairs, hours_to_complete=hours)
+    # n_train, NOT n_pairs.  `forge/tasks/aitoolkit.py:97` passes the count of
+    # pairs it unpacked from train_data.zip; passing the auditing record's N
+    # here is what let this suite certify depths the container never emitted.
+    return build_config(spec, num_images=n_train, hours_to_complete=hours)
 
 
 # --------------------------------------------------------------------------- #
@@ -142,35 +180,85 @@ def _build(task, images_dir, *, geometry_types=None, monkeypatch=None):
 def test_step_table_is_the_week6_field_calibration():
     """The exact table. Changing a number here must be a deliberate, argued act."""
     assert recipe.STEP_TABLE == {
-        # UNCHANGED: uncapped this returns 870 at N=15 — exactly the rank-1
-        # miner's shipped depth on task 241cda6c. Evidence rated TOO THIN to move.
-        "flux": dict(base=1100, n_ref=24, p=0.50, min=500, max=2000),
+        # 1100 -> 1024.  The rank-1 miner ran 58 kohya EPOCHS over the 13 images
+        # in train_data.zip = 754 steps, not the 870 that 58 x N=15 implies.
+        # 1024*sqrt(13/24) = 754.  Both the abscissa AND the anchor were wrong,
+        # and they pointed opposite ways: at 1100 we emitted 810, i.e. 7.4% DEEP
+        # of the anchor, while looking 6.9% short of a documented 870 that no
+        # miner ever ran.
+        "flux": dict(base=1024, n_ref=24, p=0.50, min=500, max=2000),
         # 5FBmn1ax's krea2 policy is pure clock-fill: 2012 steps on N=42, 43 AND
         # 50 (8x the size range, identical depth), 1432 at h=0.75.
-        "krea2": dict(base=1500, n_ref=24, p=0.35, min=600, max=2200),
+        # 1500 -> 1584 = 1432/(18/24)^0.35: the R1 task hands the container 18
+        # images, so 1500 emitted 1356 while this file asserted 1432.
+        "krea2": dict(base=1584, n_ref=24, p=0.35, min=600, max=2200),
         # NOT a fit to the field: the champion runs lr 4e-4 constant and we run
         # 2.5e-5 cosine, so his step counts are not transferable (28.5x less lr
-        # integral at matched steps).  Set instead from our own EMA floor
-        # (0.995^T untrained init in every export) and our own do_cfg clock
-        # ceiling.  See the recipe.py comment.
-        "ideogram4": dict(base=500, n_ref=24, p=0.32, min=350, max=620),
-        # Two INDEPENDENT rank-1 operators: 1317@N=48 and 1188@N=39 both imply
-        # base 931/932 at p=0.5. Agreement to 0.1%.
-        "z-image": dict(base=930, n_ref=24, p=0.50, min=350, max=1800),
-        # 5FBmn1ax: steps = 834*(N/24)^0.51 reproduces 949 and 1095 exactly.
-        "qwen-image": dict(base=840, n_ref=24, p=0.51, min=300, max=1600),
+        # integral at matched steps).  Set instead from our own EMA attenuation
+        # and our own do_cfg clock ceiling, and normalised to the ONE in-family
+        # field winner.  500 -> 517 = 378/(9/24)^0.32 — an abscissa correction
+        # only; p/min/max are untouched and the HELD adjudication is unchanged.
+        "ideogram4": dict(base=517, n_ref=24, p=0.32, min=350, max=620),
+        # Two INDEPENDENT rank-1 operators: 1317 and 1188 at n_train 43 and 35
+        # imply base 983.9 / 983.8 at p=0.5 — agreement to 0.01%, TIGHTER than
+        # the 0.11% the same two artifacts showed when fitted at N=48/39 (931 /
+        # 932).  base 984 reproduces both winners EXACTLY.
+        "z-image": dict(base=984, n_ref=24, p=0.50, min=350, max=1800),
+        # 5FBmn1ax: 892*(n/24)^0.51 gives 947 and 1097 at n_train 27 and 36,
+        # against his published 949 and 1095 (+-0.2%).  `p` held at 0.51; the
+        # exponent re-recovered at the corrected abscissa is 0.497, worth <=0.4%
+        # over the whole observed range.
+        "qwen-image": dict(base=892, n_ref=24, p=0.51, min=300, max=1600),
     }
+
+
+def test_the_validator_holdout_rule_that_sets_the_abscissa():
+    """n_train == N - ceil(0.10*N) on all fourteen real Aug-3 tasks.
+
+    OBSERVED, not modelled.  The `n_train` column was read out of each task's
+    `train_data.zip` END-OF-CENTRAL-DIRECTORY over HTTP range requests (zip
+    directory only; no image payload fetched, and the quarantined `test_data`
+    archives were not touched).  Fourteen out of fourteen, no exceptions.
+
+    This is pinned as a test because the entire refit rests on it: if the
+    validator ever changes its holdout fraction, every `base` in STEP_TABLE is
+    stale by (new/old)**p and NOTHING ELSE WOULD NOTICE.
+    """
+    for row in REAL_TASKS:
+        task, n_pairs, n_train = row[0], row[4], row[5]
+        assert n_train == _validator_n_train(n_pairs), task
+        # The `ceil` makes the withheld share strictly more than 10% at small N:
+        # the observed band is 0.857 (N=21 and N=14) to 0.900 (N=40 and N=50).
+        assert 0.85 <= n_train / n_pairs <= 0.90, task
+
+    # And the reason the fix is a recalibration rather than plumbing: the map is
+    # NOT invertible, so a container holding n_train images cannot recover N.
+    # The collision at 18 is our own R1 shape.
+    collisions = {}
+    for n_pairs in range(2, 120):
+        collisions.setdefault(_validator_n_train(n_pairs), []).append(n_pairs)
+    assert collisions[18] == [20, 21]
+    assert any(len(v) > 1 for v in collisions.values())
 
 
 def test_step_table_max_binding_sizes():
     """Each row's `max` must be honest about whether it can bind at all.
 
-    Observed tournament dataset sizes are N = 9..50.  A `max` that the law
-    cannot reach within 4x that range is a ceiling on extrapolation, not a
-    policy — which is what made the short-lived ideogram4 `max=1600` an inert
-    change (its law topped out at 365 at N=50).  Pinning the crossover N here
-    means a row that silently becomes decoration fails a test instead of
-    reading as a decision.
+    Observed tournament dataset sizes are N = 9..50, i.e. n_train = 8..45, and
+    THE CROSSOVER IS QUOTED IN n_train BECAUSE THAT IS THE LAW'S ARGUMENT.  A
+    `max` that the law cannot reach within 4x that range is a ceiling on
+    extrapolation, not a policy — which is what made the short-lived ideogram4
+    `max=1600` an inert change (its law topped out at 365 at N=50).  Pinning the
+    crossover here means a row that silently becomes decoration fails a test
+    instead of reading as a decision.
+
+    THE ABSCISSA REFIT DID NOT MOVE THREE OF THESE IN REAL TERMS.  ideogram4,
+    qwen-image and z-image previously crossed at N = 48 / 85 / 90, and
+    n_train(48)=43, n_train(85)=76, n_train(90)=81 — exactly the values below.
+    Those three `max` values still bite at the same real dataset, which is the
+    check that the refit changed units and not policy.  krea2 (72 -> 69 in N
+    terms) and flux (80 -> 103) did move, because their refits were not pure
+    unit changes; both stay far outside anything ever observed.
     """
     crossover = {}
     for model_type, row in recipe.STEP_TABLE.items():
@@ -184,13 +272,14 @@ def test_step_table_max_binding_sizes():
         )
         crossover[model_type] = first
     assert crossover == {
-        # The one row whose `max` is ACTIVE inside the observed size range.
-        "ideogram4": 48,
-        # Backstops against pathological N, and labelled as such in recipe.py.
-        "krea2": 72,
-        "flux": 80,
-        "qwen-image": 85,
-        "z-image": 90,
+        # The one row whose `max` is ACTIVE at the top of the observed range
+        # (n_train 43 == the N=48 task).
+        "ideogram4": 43,
+        # Backstops against pathological n, and labelled as such in recipe.py.
+        "krea2": 62,
+        "qwen-image": 76,
+        "z-image": 81,
+        "flux": 92,
     }
     # Nothing may be inert the way ideogram4's 1600 was: unreachable within 4x
     # the largest observed dataset.
@@ -324,8 +413,8 @@ def test_krea2_rate_makes_the_size_law_bind_not_the_clock():
     for row in REAL_TASKS:
         if row[2] != "krea2":
             continue
-        pairs, hours, after = row[4], row[5], row[8]
-        law = _pure_law("krea2", pairs)
+        n_train, hours, after = row[5], row[6], row[9]
+        law = _pure_law("krea2", n_train)
         assert after == law, f"{row[0]}: clock truncated the krea2 law to {after}"
         window = hours * 3600.0 * recipe.margin_for("krea2") - 480.0
         thresholds.append(window / law)
@@ -349,8 +438,8 @@ def test_ideogram4_sec_per_it_is_deliberately_above_the_field_bound():
     for row in REAL_TASKS:
         if row[2] != "ideogram4":
             continue
-        pairs, hours, after = row[4], row[5], row[8]
-        law = _pure_law("ideogram4", pairs)
+        n_train, hours, after = row[5], row[6], row[9]
+        law = _pure_law("ideogram4", n_train)
         cap = _clock_cap("ideogram4", hours)
         assert law < cap, "ideogram4 must be size-bound, not clock-bound"
         assert after == law
@@ -434,20 +523,26 @@ def _clock_cap(model_type, hours):
 @pytest.mark.parametrize("row", REAL_TASKS, ids=IDS)
 def test_materialized_steps(row, dataset_dirs, monkeypatch):
     """The real build_config, on the real shape, must ship the audited depth."""
-    task, _rnd, model_type, _fam, pairs, hours = row[:6]
-    before, after = row[7], row[8]
+    task, _rnd, model_type, _fam, _n_pairs, n_train, hours = row[:7]
+    before, after = row[8], row[9]
     cfg = _build(task, dataset_dirs[task], monkeypatch=monkeypatch)
     steps = cfg["config"]["process"][0]["train"]["steps"]
     assert steps == after, f"{task}: expected {after}, got {steps} (was {before})"
     assert steps == recipe.size_scaled_steps(
-        model_type, pairs, hours, cfg["config"]["process"][0]["train"]["steps"]
+        model_type, n_train, hours, cfg["config"]["process"][0]["train"]["steps"]
     )
+    # ...and it is NOT what the law returns at the auditing record's N.  That
+    # equality is the bug this column exists to prevent, so assert the
+    # inequality wherever the two differ at all (they coincide only where the
+    # clock cap binds both).
+    at_full_n = recipe.size_scaled_steps(model_type, _n_pairs, hours, steps)
+    assert at_full_n >= steps
 
 
 @pytest.mark.parametrize("row", REAL_TASKS, ids=IDS)
 def test_save_cadence_leaves_four_periodic_candidates(row, dataset_dirs, monkeypatch):
     task = row[0]
-    after, save_every = row[8], row[9]
+    after, save_every = row[9], row[10]
     cfg = _build(task, dataset_dirs[task], monkeypatch=monkeypatch)
     process = cfg["config"]["process"][0]
     assert process["save"]["save_every"] == save_every
@@ -462,7 +557,7 @@ def test_save_cadence_leaves_four_periodic_candidates(row, dataset_dirs, monkeyp
 @pytest.mark.parametrize("row", REAL_TASKS, ids=IDS)
 def test_projected_wall_clock_fits_the_budget(row, dataset_dirs, monkeypatch):
     """Planned wall clock, incl. startup + export reserve, must fit with margin."""
-    task, hours, after = row[0], row[5], row[8]
+    task, hours, after = row[0], row[6], row[9]
     model_type = row[2]
     cfg = _build(task, dataset_dirs[task], monkeypatch=monkeypatch)
     steps = cfg["config"]["process"][0]["train"]["steps"]
@@ -496,7 +591,7 @@ def test_first_periodic_save_is_kill_safe(row, dataset_dirs, monkeypatch):
     the FIRST one has to stay deep inside the budget even when the box runs much
     slower than the policy models.  Asserted at the policy rate AND at 2x it.
     """
-    task, hours, after, save_every = row[0], row[5], row[8], row[9]
+    task, hours, after, save_every = row[0], row[6], row[9], row[10]
     model_type = row[2]
     cfg = _build(task, dataset_dirs[task], monkeypatch=monkeypatch)
     process = cfg["config"]["process"][0]
@@ -516,7 +611,12 @@ def test_first_periodic_save_is_kill_safe(row, dataset_dirs, monkeypatch):
         # krea2 exceeds 1.0 only because of the R1 shape, where the rank-1
         # artifact is the shallowest thing on the task (1000) and six others
         # completed 1278-2000; our 1432 is the champion's own depth there.
-        ("krea2", 1.05),
+        # 1.05 -> 1.06 in the abscissa refit: the three 1.0 h shapes each moved
+        # ~5% closer to the 2012 they are measured against, and the R1 ratio is
+        # pinned at exactly 1432/1000 by construction.
+        ("krea2", 1.06),
+        # EXACTLY 1.00 now, on both shapes, not on average: base 984 reproduces
+        # 1188 at n_train 35 and 1317 at n_train 43 to the step.
         ("z-image", 1.00),
         # qwen 1.03 -> 0.975: the clock, calibrated to the field's own
         # reproduced 4.68 s/step, will not fund 1104 on ff643470.  Planning it
@@ -533,7 +633,7 @@ def test_first_periodic_save_is_kill_safe(row, dataset_dirs, monkeypatch):
 )
 def test_shipped_depth_now_tracks_the_field_winners(model_type, expected):
     ratios = [
-        row[8] / row[6] for row in REAL_TASKS if row[2] == model_type
+        row[9] / row[7] for row in REAL_TASKS if row[2] == model_type
     ]
     assert sum(ratios) / len(ratios) == pytest.approx(expected, abs=0.01)
 
@@ -541,7 +641,7 @@ def test_shipped_depth_now_tracks_the_field_winners(model_type, expected):
 def test_every_type_moved_off_the_shallow_edge_of_its_band():
     """Before: only qwen-image was inside the winners' band. After: all five."""
     for row in REAL_TASKS:
-        model_type, winner, before, after = row[2], row[6], row[7], row[8]
+        model_type, winner, before, after = row[2], row[7], row[8], row[9]
         if row[0] == "b72da8c6":
             continue  # the one uninformative task; see the parametrised test
         if model_type == "ideogram4":
@@ -593,7 +693,9 @@ def test_every_shape_finishes_at_its_field_rate(row, dataset_dirs, monkeypatch):
     728- and 884-step periodic saves — 13% and 20% shallower than simply
     planning what fits.
     """
-    task, model_type, hours, after, save_every = row[0], row[2], row[5], row[8], row[9]
+    task, model_type, hours, after, save_every = (
+        row[0], row[2], row[6], row[9], row[10]
+    )
     cfg = _build(task, dataset_dirs[task], monkeypatch=monkeypatch)
     steps = cfg["config"]["process"][0]["train"]["steps"]
     assert steps == after
@@ -619,23 +721,76 @@ def test_the_qwen_regression_is_pinned_as_a_counterexample():
     c424362 raised MARGIN to 0.92 for every type at once.  qwen-image is the only
     row whose clock actually binds, so it was the only row that moved, and it
     moved past what the field shows fits.
+
+    THE NUMBERS MOVED IN THE ABSCISSA REFIT and that is expected: this is a
+    counterfactual on TODAY's law ("what would the broken margin plan now"),
+    not a recording of what commit c424362 emitted.  Fed the n_train the
+    container actually receives, and with `base` refitted to match, the plans
+    are 911 and 1097 where they used to read 909 and 1104.  The conclusion is
+    unchanged and so is the mechanism: both still overrun the window the field
+    demonstrated, and both still degrade to a periodic save rather than forfeit.
     """
     broken_margin, broken_sec = 0.92, 4.0
+    n_train = {"7421f056": 25, "ff643470": 36}
     for task, hours, planned_then, stops_at, ships in (
-        ("7421f056", 1.25, 909, 850, 728),
-        ("ff643470", 1.5, 1104, 1042, 884),
+        ("7421f056", 1.25, 911, 850, 732),
+        ("ff643470", 1.5, 1097, 1042, 880),
     ):
         cap = int((hours * 3600.0 * broken_margin - 480.0) / broken_sec)
-        law = _pure_law("qwen-image", {"7421f056": 28, "ff643470": 41}[task])
+        law = _pure_law("qwen-image", n_train[task])
         assert min(law, cap) == planned_then
         assert recipe.field_demonstrated_steps("qwen-image", hours) == stops_at
         save_every = recipe.kill_safe_save_every(planned_then, 250)
         assert _shipped_after_stop(planned_then, stops_at, save_every) == ships
         # What ships now instead, having planned inside the window.
-        now = recipe.size_scaled_steps(
-            "qwen-image", {"7421f056": 28, "ff643470": 41}[task], hours, 0
-        )
+        now = recipe.size_scaled_steps("qwen-image", n_train[task], hours, 0)
         assert now <= stops_at and now > ships
+
+
+@pytest.mark.parametrize("row", REAL_TASKS, ids=IDS)
+def test_no_shape_can_forfeit_even_far_below_its_modelled_rate(row):
+    """INV-2 at the refitted depths: a slow box DEGRADES, it never ships nothing.
+
+    The abscissa refit made four of five types deeper, so the question "did we
+    just buy a forfeit path?" has to be answered by replay rather than by
+    argument.  Every real Aug-3 shape is run against the terminate gate at 1x,
+    1.25x, 1.5x, 2x and 3x its type's policy rate — 3x is far outside anything
+    any artifact supports (the worst field observation anywhere is qwen's 8.13
+    s/step, 1.73x its policy 4.7) — and in every cell a numbered periodic save
+    must already be on disk.
+
+    THE ONE SHAPE THAT LOSES CUSHION IN THIS COMMIT is 41025fb5: planning 1432
+    instead of 1356 moves the rate at which R1 truncates from 1.604 to 1.519
+    s/step.  That is deliberate and is exactly the knife-edge recipe.py's
+    SEC_PER_IT["krea2"] block documents — 1432 fills the 0.75 h window by
+    construction, because it IS the depth two operators completed there.  It
+    still degrades to 1148 rather than forfeiting, which is what this asserts.
+    """
+    model_type, hours, planned, save_every = row[2], row[6], row[9], row[10]
+    policy_rate = recipe.SEC_PER_IT[model_type]
+    window = recipe.training_deadline_s(hours) - recipe.STARTUP_S
+
+    for multiple in (1.0, 1.25, 1.5, 2.0, 3.0):
+        rate = policy_rate * multiple
+        reached = recipe.completed_steps_at_rate(hours, rate)
+        shipped = _shipped_after_stop(planned, reached, save_every)
+        assert shipped > 0, (
+            f"{row[0]} {model_type}: at {multiple}x the policy rate "
+            f"({rate:.2f} s/step) the run reaches step {reached} and the first "
+            f"periodic save is at {save_every} — NOTHING WOULD BE EXPORTED"
+        )
+        # ...and it must land inside the window, not merely be scheduled.
+        first_save_s = recipe.STARTUP_S + min(save_every, planned) * rate
+        assert first_save_s <= recipe.training_deadline_s(hours), (
+            f"{row[0]} {model_type}: at {multiple}x the first periodic save "
+            f"projects to {first_save_s:.0f}s, past the terminate gate at "
+            f"{recipe.training_deadline_s(hours):.0f}s"
+        )
+    assert window > 0
+
+    # At 1x the plan must actually complete: that is the whole point of pairing
+    # SEC_PER_IT with MARGIN_BY_TYPE.
+    assert recipe.completed_steps_at_rate(hours, policy_rate) >= planned
 
 
 def test_krea2_overrun_degrades_depth_instead_of_forfeiting(tmp_path):
@@ -782,7 +937,7 @@ def test_resolution_fields_default_off(row, dataset_dirs, monkeypatch):
 def test_resolution_fields_with_policy_on(row, dataset_dirs, monkeypatch):
     """With the switch on, one scalar resolution + the true bucket divisibility."""
     task, model_type = row[0], row[2]
-    expected_resolution, coverage = row[10], row[11]
+    expected_resolution, coverage = row[11], row[12]
     cfg = _build(task, dataset_dirs[task], geometry_types="*", monkeypatch=monkeypatch)
     dataset = cfg["config"]["process"][0]["datasets"][0]
     if expected_resolution is None:  # ideogram4: structurally excluded
@@ -801,7 +956,7 @@ def test_geometry_policy_lifts_on_geometry_share_across_all_shapes():
     incumbent_hits = incumbent_total = 0
     policy_hits = policy_total = 0
     for row in REAL_TASKS:
-        model_type, dims = row[2], row[12]
+        model_type, dims = row[2], row[13]
         divisibility = geometry.BUCKET_DIVISIBILITY[model_type]
         flat = [wh for wh, count in dims.items() for _ in range(count)]
         # Incumbent: three dataset copies, one per resolution entry.
@@ -918,7 +1073,8 @@ def test_geometry_degrades_to_the_template_when_it_cannot_measure(
             expected_repo_name="tournament-week6-degraded",
             images_dir=images_dir,
         )
-        cfg = build_config(spec, num_images=21, hours_to_complete=0.75)
+        # 21 -> 18: the R1 task's n_train, i.e. what the container is handed.
+        cfg = build_config(spec, num_images=18, hours_to_complete=0.75)
         dataset = cfg["config"]["process"][0]["datasets"][0]
         assert dataset["resolution"] == TEMPLATE_RESOLUTION
         assert "bucket_tolerance" not in dataset

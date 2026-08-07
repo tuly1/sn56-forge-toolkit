@@ -75,27 +75,32 @@ def _activation(*, owner_override: bool = False) -> dict:
     }
 
 
-# What `recipe.size_scaled_steps("ideogram4", 14, 0.75, ...)` materialises for
+# What `recipe.size_scaled_steps("ideogram4", 12, 0.75, ...)` materialises for
 # the fixture shape below.  Was 107 under the discredited Jul-16 row
 # (base 140 / p 0.50 / max 400), briefly 177 under the withdrawn two-point fit
-# to the champion's step counts, and is now 421 under `base 500 / p 0.32`.
+# to the champion's step counts, then 421 under `base 500 / p 0.32` — and is
+# now 414 under `base 517 / p 0.32`.
 #
-# The fixture shape moved 36 -> 14 pairs at the same 0.75 h ON PURPOSE.  14/0.75
-# is the REAL Aug-3 `1365fa1c` shape, and at that shape the SIZE LAW binds
-# (421 against a 477 clock cap), so this constant is invariant to `MARGIN` and
-# to `SEC_PER_IT["ideogram4"]`.  At 36 pairs the CLOCK binds instead (477 at
-# MARGIN 0.92, 432 at 0.85), which would have coupled this release-policy
-# contract to a constant another unit is actively revising.
+# THE SIZE ARGUMENT IS n_train, NOT `image_text_pairs` (2026-08-07).  The
+# fixture shape moved 36 -> 14 pairs at the same 0.75 h ON PURPOSE, because
+# 14/0.75 is the REAL Aug-3 `1365fa1c` shape — but the container is handed
+# 14 - ceil(1.4) = 12 of those images (OBSERVED: that task's train_data.zip
+# holds 12 image/caption pairs), so 12 is what `build_config` must be called
+# with here.  At that shape the SIZE LAW binds (414 against a 477 clock cap),
+# so this constant is invariant to `MARGIN` and to `SEC_PER_IT["ideogram4"]`.
+# At 36 pairs the CLOCK binds instead (477 at MARGIN 0.92, 432 at 0.85), which
+# would have coupled this release-policy contract to a constant another unit is
+# actively revising.
 #
 # Pinned in ONE place so a depth change shows up as a single deliberate edit
 # rather than four silent ones; the depth law itself is guarded in
 # tests/test_week6_ideogram_depth.py and tests/test_week6_depth_geometry.py.
-PLANNED_STEPS = 421
+PLANNED_STEPS = 414
 
 
 def _build(monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setattr(policy, "PRODUCTION_ACTIVATION", _activation())
-    cfg = config.build_config(_spec(), num_images=14, hours_to_complete=0.75)
+    cfg = config.build_config(_spec(), num_images=12, hours_to_complete=0.75)
     assert cfg["config"]["process"][0]["train"]["steps"] == PLANNED_STEPS
     return cfg
 
@@ -192,12 +197,13 @@ def test_literal_production_activation_is_hash_bound_owner_override() -> None:
     )
     assert active["selection_basis"] == "null_result_owner_override"
     assert active["owner_override"] is True
-    # Re-signed for the Week-6 EMA-horizon amendment.  The record no longer
-    # authorises the bare I-J20-D2 port: it authorises that port PLUS exactly
-    # one named amendment, and `amendment_sha256` is what scopes it.
+    # Re-signed a SECOND time, for the VACATION of the Week-6 EMA-horizon
+    # amendment.  The record once again authorises the bare I-J20-D2 port —
+    # `_POLICY_BODY["amendments"]` is empty — and `amendment_sha256` now scopes
+    # the signature to the vacation record rather than to a live divergence.
     assert active["amendment_sha256"] == policy.AMENDMENT_SHA256
     assert active["activation_sha256"] == (
-        "b7e436971430f04e216ddf5a4f1599a3f8de2f21e2f9462c1d67245aa0386ba2"
+        "04261257fadfc780fe70f557b1f5b6c6672e09631b804d51d9d28863f0ba348c"
     )
     # The port itself is unchanged: deployment is still NOT authorised by the
     # record, so re-signing did not widen the authority it carries.
@@ -234,9 +240,10 @@ def test_active_recipe_matches_the_scored_production_projection(
         "text_encoder_lr": 0.0000001,
         "lr_scheduler": "cosine",
         "lr_scheduler_params": {"eta_min": 0.0000025},
-        # 0.995 -> 0.99 (Week-6 EMA-horizon amendment).  Guarded in detail by
+        # Back at the I-J20-D2 / 5FNLSgh8 anchor value: the Week-6 0.99
+        # amendment is VACATED.  Guarded in detail by
         # tests/test_week6_ideogram_ema_horizon.py.
-        "ema_config": {"use_ema": True, "ema_decay": 0.99},
+        "ema_config": {"use_ema": True, "ema_decay": 0.995},
         "do_cfg": True,
         "cfg_scale": 10.0,
         "steps": PLANNED_STEPS,

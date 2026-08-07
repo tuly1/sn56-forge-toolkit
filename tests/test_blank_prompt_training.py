@@ -96,17 +96,21 @@ AITOOLKIT_TYPES = ("flux", "krea2", "ideogram4", "z-image", "qwen-image")
 
 # One real Aug-3 shape per type, from the harvest task-meta.json:
 #   type -> (task, n_pairs, hours_to_complete, (width, height))
+# The size column is n_train — the images inside train_data.zip, which is what
+# `forge/tasks/aitoolkit.py` unpacks and passes to `build_config`.  The
+# auditing record's `image_text_pairs` is ~11% larger (the validator withholds
+# ceil(0.10*N) for its own scoring) and is shown after each row for tracing.
 REAL_SHAPE = {
-    "flux": ("db5fefc5", 15, 0.75, (1195, 896)),
-    "krea2": ("41025fb5", 21, 0.75, (1024, 768)),
-    "ideogram4": ("84be9fcd", 46, 1.0, (1408, 768)),
-    "z-image": ("b290d171", 39, 1.0, (1408, 768)),
-    "qwen-image": ("7421f056", 28, 1.25, (1024, 768)),
+    "flux": ("db5fefc5", 13, 0.75, (1195, 896)),      # N=15
+    "krea2": ("41025fb5", 18, 0.75, (1024, 768)),     # N=21
+    "ideogram4": ("84be9fcd", 41, 1.0, (1408, 768)),  # N=46
+    "z-image": ("b290d171", 35, 1.0, (1408, 768)),    # N=39
+    "qwen-image": ("7421f056", 25, 1.25, (1024, 768)),  # N=28
 }
 
 # The two real qwen shapes where the CLOCK, not the depth law, is the binding
-# constraint: (task, n_pairs, hours).  See recipe.MARGIN_BY_TYPE's header.
-QWEN_CLOCK_BOUND_SHAPES = [("7421f056", 28, 1.25), ("ff643470", 41, 1.5)]
+# constraint: (task, n_train, hours).  See recipe.MARGIN_BY_TYPE's header.
+QWEN_CLOCK_BOUND_SHAPES = [("7421f056", 25, 1.25), ("ff643470", 36, 1.5)]
 
 
 @dataclass(frozen=True)
