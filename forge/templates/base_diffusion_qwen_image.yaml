@@ -5,6 +5,58 @@ config:
   - type: diffusion_trainer
     training_folder: /app/checkpoints
     device: cuda
+    # RANK 32 IS HELD DELIBERATELY.  The Aug-3 qwen field ran 128/141/149 and a
+    # blind audit read that as a 4x capacity deficit.  Investigated 2026-08-07
+    # against the qwen record of BOTH retrievable tournaments (7 tasks, 13
+    # entrants; Jul-27 recovered live from the public API + HF because its
+    # DATASETS expired but its ARTIFACTS did not).  Applied at the week-6
+    # integration merge from ops/integration-requests/unit4-qwen-capacity.md,
+    # with items 1 and 4 CORRECTED — see the note at the end.  Three reasons:
+    #  1. RANK DOES NOT SEPARATE WINNERS.  Rank 128 took 5 of the 7 first
+    #     places; rank >128 took 2, both `5FBmn1ax` on Aug-3, both against
+    #     opponents DEADLINE-KILLED at 600/1300 and 700/1300.  The most
+    #     rank-disadvantaged head-to-head in the record is Jul-27 `5722b124`:
+    #     rank 128 SHIPPED 275 steps and beat rank 152 at 1197 by 8.4%.  Rank
+    #     here is an inherited ai-toolkit per-architecture default (published
+    #     verbatim by 4 different hotkeys), not a tuned edge -- `5FBmn1ax`
+    #     himself runs rank 32 on krea2, ideogram4 AND z-image.
+    #  2. ONE OF THOSE TWO WINS IS NOISE.  On `7421f056` two entrants published
+    #     configs identical after removing hotkey-bearing paths and both were
+    #     killed at step 850; their losses differ by 2.145%.  The rank-149 win
+    #     on `ff643470` was by 0.82%.
+    #  3. THE COUPLED CHANGE IS MAGNITUDE-NEUTRAL.  alpha == rank here and in
+    #     every field config, so the LoRA scale is 1.0 and ||dW|| ~
+    #     sqrt(rank)*lr*steps -- which is exactly what the field's recovered
+    #     lr = 1.0877e-3/sqrt(rank) law exists to hold invariant.  Rank 128 with
+    #     the coupled lr buys only extra DIRECTIONS, and 75% of the score is a
+    #     prompt-free reconstruction MSE at denoise 0.93 (constants.py:25-32,
+    #     diffusion.py:203-209/311-314, tasks.py:280-298) -- a first-moment,
+    #     prior-location objective that cannot use them.  Rank 32 already gives
+    #     294,912,000 trainable params against N=28-50, i.e. 6-10M per image.
+    # COST, FOR THE RECORD: rank 128 would FIT (our own measured 2.903 s/step
+    # at rank 32 -- 2978.1 s for 1026 completed steps,
+    # evidence/hyperstack-qwen-forge-operational-20260724 -- leaves room for
+    # 1425-1748 steps against plans of 836-1023).  Its real price is +6.1% step
+    # time, a 4x artifact (0.59 -> 2.36 GB, needing ~13 MB/s of the 180 s export
+    # reserve vs 3.3 MB/s today) and ~9 GB more periodic-save I/O on the one
+    # type with ~91 s of modelled slack.  Affordable, but unbought -- and this
+    # week the slack is spent on `ema_config` instead (see `train:` below).
+    # TWO CORRECTIONS THE INTEGRATOR MADE TO THE REQUEST, both verified here:
+    #   * item 1 claimed 5722b124 was the only task where entrants at two ranks
+    #     BOTH COMPLETED, at 300 vs 1197.  False: the winner's artifact metadata
+    #     says step 275, so nobody completed.  The direction is unchanged and
+    #     the ratio is 4.35x, not 3.99x.
+    #   * item 4 ("we are not behind -- E = lr*sqrt(rank)*steps puts us inside
+    #     the winners' 0.339..1.191 band") is WITHDRAWN: the band's lower edge
+    #     came from that same wrong depth, the winner set omitted five entrants
+    #     whose depths are readable from `__metadata__.training_info`, and it
+    #     compares our PLANNED depth against depths the winners CHOSE TO SHIP.
+    #     The hold decision never rested on it.  The qwen gap the record does
+    #     support is checkpoint SELECTION and `do_cfg` (13/13 in the field,
+    #     absent from ours), not rank.
+    # See SN56-WEEK6-QWEN-CAPACITY-ANALYSIS-2026-08-07.md and
+    # tests/test_qwen_capacity.py, which FAILS if rank is raised without
+    # re-pricing SEC_PER_IT["qwen-image"].
     network:
       type: lora
       linear: 32
@@ -100,10 +152,18 @@ config:
       # actually shipped WITH decay 0.995, on the same three Aug-3 qwen shapes:
       #   task      ours (recipe.size_scaled_steps)   field (shipped)
       #   7421f056   836  0.766 lin / 0.858 sqrt       850  0.769 / 0.861  rk1+rk2
-      #   4782f46f   957  0.794 / 0.879                949  0.792 / 0.878  rk1
+      #   4782f46f   947  0.792 / 0.878                949  0.792 / 0.878  rk1
       #   ff643470  1023  0.807 / 0.888               1095  0.819 / 0.897  rk1
-      # We land within 15 steps / 1.3 percentage points of the winners on every
-      # shape, so 0.995 here is not an extrapolation and there is NO case for
+      # CORRECTED AT THE WEEK-6 INTEGRATION MERGE (2026-08-07): the middle row
+      # read 957, which the law never emitted at any abscissa.  With the week-6
+      # abscissa correction (`size_scaled_steps` is handed n_train = 27, not the
+      # auditing record's N = 31) it is 947 — two steps off the rank-1 artifact.
+      # Step gaps to the winners are 14 / 2 / 72, and export-fraction gaps are
+      # 0.4 / 0.0 / 1.3 percentage points, so the earlier "within 15 steps on
+      # every shape" was wrong on ff643470 and only the FRACTION claim holds
+      # there; `test_our_qwen_depths_sit_inside_the_field_demonstrated_ema_
+      # envelope` has always asserted the honest bounds (<= 75 steps, < 0.015).
+      # So 0.995 here is not an extrapolation and there is NO case for
       # inventing a depth-matched decay (~0.991, tau≈107) that no artifact ever
       # ran.  The haircut only leaves the demonstrated envelope if qwen depth
       # drops below ~600 (0.685 lin / 0.791 sqrt); at that point 0.99 — the only

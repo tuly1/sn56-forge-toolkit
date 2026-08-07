@@ -347,8 +347,28 @@ def test_config_krea2():
     cfg = config.build_config(s, num_images=24, hours_to_complete=1000)
     p = cfg["config"]["process"][0]
     assert cfg["config"]["name"] == "krepo"
+    # `do_differential_guidance` is pinned only so the template cannot change
+    # shape unnoticed.  IT IS A DEAD KEY AND MUST NOT BE READ AS LOAD-BEARING:
+    # at ai-toolkit pin 99be3d96 the branch that consumes it
+    # (extensions_built_in/sd_trainer/SDTrainer.py:734-737) is NESTED inside
+    # `if self.train_config.do_guidance_loss:` at :692, and `do_guidance_loss`
+    # defaults False (toolkit/config_modules.py:568), is never assigned anywhere
+    # in the tree, is absent from all 45 published field configs, and is absent
+    # from all of our templates.  So `differential_guidance_scale` never runs —
+    # which is why the mae-vs-mse matched pair on Aug-3 41025fb5 has TWO
+    # effective residual differences (loss_type, caption_dropout_rate), not the
+    # three a raw key-diff suggests.  Verified independently at the merge.
     assert p["train"]["do_differential_guidance"] is True
-    assert p["train"]["loss_type"] == "mse"
+    # WEEK-6: mse -> mae.  The decisive artifact is Aug-3 41025fb5, where
+    # 5FBmn1ax and 5FjDsFGA published configs that are byte-equal except
+    # loss_type / caption_dropout_rate / differential_guidance_scale (inert, see
+    # above) / save_every (inert to the exported weights — both completed 1432
+    # steps and shipped a `last.safetensors` whose LFS oid matches no rung of
+    # its own ladder).  mae ranked 4 at 0.048934, mse ranked 14 at 0.053039:
+    # +8.39%, against a same-recipe noise floor of 2.145% measured on 7421f056.
+    # See forge/templates/base_diffusion_krea2.yaml for the full citation and
+    # the honest count of the replication.
+    assert p["train"]["loss_type"] == "mae"
     assert p["network"]["lokr_full_rank"] is True
     mk = p["model"]["model_kwargs"]
     assert mk["text_encoder_path"] == "/cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct"

@@ -90,19 +90,37 @@ SHIPPED_EMA = {
 FIELD_QWEN_EMA_DECAY = 0.995
 
 # --------------------------------------------------------------------------- #
-# The real Aug-3 shapes for our three types, straight from the harvest
-# task-audit records: task / model_type / n_pairs / hours_to_complete.
+# The real Aug-3 shapes for our three types: task / model_type / n_train /
+# hours_to_complete / emitted steps.
+#
+# ABSCISSA CORRECTED AT THE WEEK-6 INTEGRATION MERGE (2026-08-07).  This table
+# was written against the auditing record's `image_text_pairs` (N).  THE
+# CONTAINER NEVER SEES N — the validator withholds a 10% scoring holdout and
+# ships the miner `N - ceil(0.10*N)` pairs inside `train_data.zip`, so
+# `forge/tasks/aitoolkit.py:56-97` hands `size_scaled_steps` the SMALLER number.
+# OBSERVED by reading the zip end-of-central-directory of all 14 Aug-3
+# `training_data` URLs (central directory only, no image payload): 14/14 exact,
+# reproduced independently three times (unit 1, its reviewer, the integrator).
+#   task      N   n_train      task      N   n_train
+#   41025fb5  21  18           b290d171  39  35
+#   db9f7244  43  38           b2582457  48  43
+#   3e0fdcde  42  37           7421f056  28  25
+#   f6725c2b  50  45           4782f46f  31  27
+#                              ff643470  41  36
+# The expected step counts are refitted with it (forge/recipe.py STEP_TABLE
+# "WEEK-6 ABSCISSA CORRECTION"); every krea2/z-image value moves +5.6..+5.8%
+# and qwen's two clock-bound shapes do not move at all.
 # --------------------------------------------------------------------------- #
 REAL_SHAPES = [
-    ("41025fb5", "krea2", 21, 0.75, 1432),
-    ("db9f7244", "krea2", 43, 1.0, 1840),
-    ("3e0fdcde", "krea2", 42, 1.0, 1825),
-    ("f6725c2b", "krea2", 50, 1.0, 1939),
-    ("b290d171", "z-image", 39, 1.0, 1186),
-    ("b2582457", "z-image", 48, 1.0, 1315),
-    ("7421f056", "qwen-image", 28, 1.25, 836),
-    ("4782f46f", "qwen-image", 31, 1.5, 957),
-    ("ff643470", "qwen-image", 41, 1.5, 1023),
+    ("41025fb5", "krea2", 18, 0.75, 1432),
+    ("db9f7244", "krea2", 38, 1.0, 1860),
+    ("3e0fdcde", "krea2", 37, 1.0, 1843),
+    ("f6725c2b", "krea2", 45, 1.0, 1974),
+    ("b290d171", "z-image", 35, 1.0, 1188),
+    ("b2582457", "z-image", 43, 1.0, 1317),
+    ("7421f056", "qwen-image", 25, 1.25, 836),
+    ("4782f46f", "qwen-image", 27, 1.5, 947),
+    ("ff643470", "qwen-image", 36, 1.5, 1023),
 ]
 
 

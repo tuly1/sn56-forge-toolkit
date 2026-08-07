@@ -221,16 +221,32 @@ def test_rank_128_holds_the_majority_of_qwen_first_places():
     assert min(row[1] for row in QWEN_FIELD) == 128
 
 
-def test_lower_rank_won_the_only_completed_head_to_head():
-    """Jul-27 `5722b124` (N=48, h=1.5) is the ONLY qwen task where entrants at
-    two different ranks both completed their configured plan.  Rank 128 at 300
-    steps beat rank 152 at 1197 steps by 8.4%."""
-    winner = 0.09613764286492714  # 5FpdSckw, rank 128, 300 steps, completed
-    loser = 0.10422607737567503  # 5GU4Xkd3, rank 152, 1197 steps, completed
+def test_lower_rank_won_the_deepest_disadvantaged_head_to_head():
+    """Jul-27 `5722b124` (N=48, h=1.5): rank 128 shipped 275 steps and beat rank
+    152 at 1197 steps by 8.4%.
+
+    CORRECTED AT THE WEEK-6 INTEGRATION MERGE (2026-08-07), and the test renamed
+    with it.  This was billed as "the ONLY qwen task where entrants at two
+    different ranks BOTH COMPLETED their configured plan", asserting
+    `1197/300 == 3.99`.  That is false.  `5FpdSckw`'s config says `steps: 300`,
+    but the shipped artifact's own metadata says otherwise — read by HTTP range
+    request over the first 8 bytes (LE uint64 header length) plus the header
+    JSON of
+    `.../20260727-5722b124-...-5FpdSckw/checkpoints/last.safetensors`:
+        __metadata__.training_info = {"step": 275, "epoch": 2}
+    against `5GU4Xkd3`'s {"step": 1197, "epoch": 9}.  It did NOT complete, and
+    there is NO task in the record where a high-rank and a low-rank entrant both
+    completed.  The DIRECTION survives and is if anything stronger — 4.35x fewer
+    steps, and still an 8.4% win — but the claim as written was wrong and must
+    not be recycled.
+    """
+    winner = 0.09613764286492714  # 5FpdSckw, rank 128, SHIPPED 275 steps
+    loser = 0.10422607737567503  # 5GU4Xkd3, rank 152, SHIPPED 1197 steps
     assert winner < loser
     assert (loser / winner - 1) == pytest.approx(0.0841, abs=5e-4)
-    # ...and the winner used 4x fewer steps, so this is not a depth artifact.
-    assert 1197 / 300 == pytest.approx(3.99, abs=0.01)
+    # ...and the winner shipped 4.35x fewer steps, so this is not a depth
+    # artifact in the high-rank entrant's favour.
+    assert 1197 / 275 == pytest.approx(4.353, abs=0.01)
 
 
 def test_high_rank_margin_is_inside_the_same_recipe_noise_floor():
@@ -252,40 +268,38 @@ def test_high_rank_margin_is_inside_the_same_recipe_noise_floor():
     )
 
 
-def test_our_planned_effective_magnitude_sits_inside_the_winner_band():
-    """There is no 4x deficit.  Because ||dW|| ~ sqrt(rank)*lr*steps, the 4x
-    rank gap is at most 2x in magnitude, and our step count recovers part of it.
-    Our three planned shapes land inside the field winners' own 3.5x-wide band,
-    ABOVE its shallowest member."""
-    winners = [
-        _effective_magnitude(rank, lr, steps)
-        for _, rank, lr, steps, first in QWEN_FIELD
-        if first and steps is not None
-    ]
-    assert len(winners) == 4
-    lo, hi = min(winners), max(winners)
-    assert lo == pytest.approx(0.339, abs=2e-3)  # jul27 5722b124, rank 128, 300
-    assert hi == pytest.approx(1.191, abs=2e-3)  # aug03 ff643470, rank 149, 1095
-
-    proc = _template()
-    rank = proc["network"]["linear"]
-    lr = proc["train"]["lr"]
-    for label, (n, hours) in REAL_QWEN_SHAPES.items():
-        steps = recipe.size_scaled_steps(
-            "qwen-image", n, hours, proc["train"]["steps"]
-        )
-        E = _effective_magnitude(rank, lr, steps)
-        assert lo <= E <= hi, (
-            f"{label}: planned effective magnitude {E:.3f} left the field "
-            f"winners' band [{lo:.3f}, {hi:.3f}] -- the 'we are not behind' "
-            f"finding no longer holds"
-        )
-    # Specifically: we are ABOVE the shallowest winner, not below it.
-    shallowest_shape = min(
-        recipe.size_scaled_steps("qwen-image", n, h, proc["train"]["steps"])
-        for n, h in REAL_QWEN_SHAPES.values()
-    )
-    assert _effective_magnitude(rank, lr, shallowest_shape) / lo > 1.35
+# WITHDRAWN AT THE WEEK-6 INTEGRATION MERGE (2026-08-07):
+# `test_our_planned_effective_magnitude_sits_inside_the_winner_band`.
+#
+# It asserted that our planned `E = lr*sqrt(rank)*steps` sits inside the field
+# winners' band [0.339, 1.191] and 1.40x above its shallowest member, and it was
+# offered as the unit's central positive claim ("we are not behind").  It is
+# withdrawn rather than re-tuned, for three independent reasons:
+#
+#  1. THE BAND'S LOWER EDGE IS COMPUTED FROM A DEPTH THAT DID NOT HAPPEN.  It
+#     used `5722b124 / 5FpdSckw` at 300 steps, taken from that entrant's config.
+#     Its shipped artifact carries `training_info = {"step": 275, "epoch": 2}`
+#     (range-read of the safetensors header; verified independently by the
+#     reviewer and again by the integrator).  See
+#     `test_lower_rank_won_the_deepest_disadvantaged_head_to_head` above.
+#  2. THE WINNER SET IS INCOMPLETE.  `assert len(winners) == 4` excluded every
+#     entrant that published no numbered ladder, but those depths ARE readable
+#     from `__metadata__.training_info` — the reviewer recovered five more,
+#     moving the band to roughly [0.226, 1.245].  The integrator verified the
+#     technique on 5722b124 but did NOT re-verify the other five, so no
+#     corrected band is asserted here.
+#  3. IT IS A CATEGORY ERROR EVEN WITH CORRECT NUMBERS.  Our E is computed from
+#     a FIXED PLANNED depth; the winners' E is computed from the depth they
+#     CHOSE TO SHIP, and several of them shipped far inside their own clock.
+#     Comparing the two says nothing about capacity and quietly reassures us
+#     about the wrong lever.  The qwen gap the record actually supports is
+#     checkpoint SELECTION and `do_cfg` (13/13 in the field, absent from ours),
+#     not rank -- see the week-6 release note's week-7 list.
+#
+# The HOLD-rank-32 decision does not rest on this test; it rests on
+# `test_rank_128_holds_the_majority_of_qwen_first_places`,
+# `test_high_rank_margin_is_inside_the_same_recipe_noise_floor` and
+# `test_coupled_lr_at_rank_128_is_magnitude_neutral`, none of which are affected.
 
 
 def test_coupled_lr_at_rank_128_is_magnitude_neutral():

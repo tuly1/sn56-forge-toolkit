@@ -140,6 +140,16 @@ DOUBLED_LR_CONFIG_SHA256 = (
     "eeb914952cf4672f8b83a0f2e54237319b1b828d003273a7bb35dc7803128f30"
 )  # 5EACrayt
 ANCHOR_STEPS = 378
+# The abscissa the anchor's own container was handed.  The auditing record for
+# 3cfa1578 says `image_text_pairs` = 11; the validator withholds ceil(0.10*11)=2
+# before building train_data.zip, so the law is evaluated at 9.  That tournament
+# is too old to re-probe (its presigns are dead), but it is confirmed by a live
+# production measurement: on Jul-20 this row was `base=140 p=0.50` with the
+# clock inert and our own entry 5HLA2QWY shipped 86 steps — 140*(9/24)^0.5 = 86,
+# while 140*(11/24)^0.5 = 95.  Feeding 11 here made this file certify 403 steps
+# at the anchor's shape; at the real abscissa the refitted row returns 378, i.e.
+# it reproduces the anchor EXACTLY, which is what base=517 was fitted for.
+ANCHOR_N_TRAIN = 9
 ANCHOR_LR = 2.5e-5
 ANCHOR_DECAY = 0.995
 ANCHOR_LOSS = 0.0502341  # rank 1 of 16   (forge/recipe.py:211-212)
@@ -521,13 +531,16 @@ def test_the_ema_model_reproduces_the_independently_derived_numbers() -> None:
 def test_shipped_decay_reproduces_the_in_family_anchor_strength() -> None:
     """At the anchor's own shape we must land on the anchor, not past it.
 
-    `recipe.size_scaled_steps` ships 390 steps at the anchor's N=11 / h=0.75
-    against its 378, so depth is nearly matched and the decay is what decides
-    exported strength.  0.995 lands within ~5%; 0.99 overshoots by ~33%.
+    `recipe.size_scaled_steps` ships EXACTLY the anchor's 378 steps at its own
+    shape (n_train 9 / h 0.75) after the week-6 abscissa refit, so depth is
+    matched and the decay ALONE decides exported strength.  0.995 lands within
+    ~5%; 0.99 overshoots by ~33%.  (This docstring previously said "390 steps at
+    N=11" — the law was being evaluated at the auditing record's N instead of the
+    abscissa the container receives.)
     """
     lr = our_cosine_lr()
-    ours = recipe.size_scaled_steps("ideogram4", 11, 0.75, 2000)
-    assert 370 <= ours <= 410, f"anchor-shape depth moved to {ours}"
+    ours = recipe.size_scaled_steps("ideogram4", ANCHOR_N_TRAIN, 0.75, 2000)
+    assert ours == ANCHOR_STEPS, f"anchor-shape depth moved to {ours}"
 
     anchor = exported_strength(ANCHOR_STEPS, ANCHOR_DECAY, lr)
     at_shipped = exported_strength(ours, SHIPPED_DECAY, lr) / anchor
@@ -546,7 +559,7 @@ def test_the_rejected_decay_prices_above_our_elimination_margin() -> None:
     We were eliminated in Aug-3 R1 by 0.97%.  ideogram4 is ~half the R1 draw.
     """
     lr = our_cosine_lr()
-    ours = recipe.size_scaled_steps("ideogram4", 11, 0.75, 2000)
+    ours = recipe.size_scaled_steps("ideogram4", ANCHOR_N_TRAIN, 0.75, 2000)
     anchor = exported_strength(ANCHOR_STEPS, ANCHOR_DECAY, lr)
 
     cost_shipped = strength_penalty(
@@ -691,13 +704,31 @@ def test_checkpoint_control_rejects_a_binding_without_the_amendment(
 def test_no_other_model_type_enables_ema_at_this_commit() -> None:
     """`save()`-exports-the-shadow applies to ANY type that turns EMA on.
 
-    Today ideogram4 is the only one, and only because this policy module turns
-    it on — every shipped template has `use_ema: false`.  If a future template
-    enables EMA, the same attenuation applies and the decay must be chosen
-    against that type's own step counts AND its own evaluator gain, not
-    inherited from here: ideogram4's 0.995 is calibrated to a ~7x amplifier that
-    no other type has.
+    This tripwire fired at the week-6 integration merge and WAS DISCHARGED, NOT
+    DISARMED.  `base_diffusion_qwen_image.yaml` now enables EMA, and the bill it
+    demanded — a decay argued against THAT type's own step counts and its own
+    evaluator gain — was paid:
+
+      * EVALUATOR GAIN.  qwen-image is one of the three types where the
+        blank-prompt condition has positive == negative == "" (G.O.D pin
+        b026da04 `diffusion.py:311-314`), so CFG is an exact no-op on 75% of the
+        score and the adapter passes through at 1x.  It has NO amplifier, so
+        ideogram4's ~7x reasoning explicitly does not transfer — and does not
+        need to, because the qwen decay is not inherited from here.
+      * STEP COUNTS.  0.995 is what all 13 config-bearing qwen entrants across
+        both tournaments ran, and our depths land on theirs: 836/947/1023
+        against the winners' shipped 850/949/1095, i.e. export fractions within
+        0.4-1.3 percentage points.  It is an interpolation, not an extrapolation.
+
+      `tests/test_loss_and_ema_policy.py` carries both arguments as assertions.
+
+    Every OTHER template must still be EMA-off, and a third type turning it on
+    must come back here and pay the same bill.
     """
+    # model_type -> the decay it is allowed to run, with the file that argues it.
+    ARGUED_EMA_DECAYS = {
+        "base_diffusion_qwen_image.yaml": 0.995,  # tests/test_loss_and_ema_policy.py
+    }
     root = Path(recipe.__file__).resolve().parent / "templates"
     enabled = {}
     for path in sorted(root.glob("base_diffusion_*.yaml")):
@@ -705,10 +736,15 @@ def test_no_other_model_type_enables_ema_at_this_commit() -> None:
         ema = train.get("ema_config")
         if ema is not None and ema.get("use_ema"):
             enabled[path.name] = ema
-    assert enabled == {}, (
-        "a template now enables EMA; that type's exports are the EMA shadow "
-        "(BaseSDTrainProcess.py:491-497) and need their own decay decision"
+    assert set(enabled) == set(ARGUED_EMA_DECAYS), (
+        "a template turned EMA on/off without updating this record; that type's "
+        "exports are the EMA shadow (BaseSDTrainProcess.py:491-497) and need "
+        "their own decay decision"
     )
+    for name, ema in enabled.items():
+        assert ema["ema_decay"] == ARGUED_EMA_DECAYS[name], (name, ema)
+    # ideogram4's decay still comes from the policy module, never the template.
+    assert "base_diffusion_ideogram4.yaml" not in enabled
 
 
 def test_the_policy_only_touches_ideogram4(monkeypatch: pytest.MonkeyPatch) -> None:

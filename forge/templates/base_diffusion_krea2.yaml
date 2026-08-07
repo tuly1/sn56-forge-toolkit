@@ -80,18 +80,33 @@ config:
       #     12.0, and shipped last.safetensors byte-identical to their own
       #     .krea2-best.safetensors chosen by .krea2_checkpoint_evaluations.json.
       #     EMA cannot be isolated from that bundle.
+      #     SAY THE UNCOMFORTABLE PART OUT LOUD (added at the week-6 integration
+      #     merge): those two also carry NO `loss_type` key, which at pin
+      #     99be3d96 means EFFECTIVE MSE (config_modules.py:502).  So on krea2
+      #     this template now sits on the OPPOSITE side of the rank-1 and rank-2
+      #     finishers on BOTH of this block's levers — mae where they run mse,
+      #     EMA-off where they run EMA 0.995.  That is a deliberate bet that the
+      #     depth-matched, terminal-export, two-key-apart pair below is a cleaner
+      #     read of loss_type than a 6-key-apart comparison against a bundle we
+      #     cannot reproduce (we have no checkpoint selector, no cosine_by_group
+      #     and no krea2_eval_sigmas).  If we ever land the selector, this whole
+      #     block should be re-argued against that bundle rather than the pair.
       #   * COST, quantified at the pinned runtime: the shadow is seeded at init
       #     (toolkit/ema.py:61-64 `p.clone().detach()`) and lora_up is zero-init
       #     (toolkit/lora_special.py:122), so with fixed decay (setup_ema at
       #     jobs/process/BaseSDTrainProcess.py:769-781 never passes
       #     use_num_updates, so ema.py:57 + :118-123 keeps decay constant) the exported
       #     shadow is the trained delta attenuated by the EMA lag.  At krea2's
-      #     planned 1432 / 1825 / 1840 / 1939 steps on the four real Aug-3 krea2
-      #     shapes, under this template's constant LR (no lr_scheduler key ->
-      #     'constant', config_modules.py:367), decay 0.995 would export lora_up
-      #     at 0.861-0.897 of its live magnitude on a linear-growth trajectory
-      #     and 0.924-0.945 on a sqrt one — a 6-14% haircut on our DEEPEST type
-      #     for no measured gain.
+      #     planned 1432 / 1843 / 1860 / 1974 steps on the four real Aug-3 krea2
+      #     shapes (restated at the week-6 corrected abscissa n_train =
+      #     18/37/38/45; this line read 1432/1825/1840/1939 against N), under
+      #     this template's constant LR (no lr_scheduler key -> 'constant',
+      #     config_modules.py:367), decay 0.995 would export lora_up at
+      #     0.861-0.899 of its live magnitude on a linear-growth trajectory
+      #     and 0.924-0.946 on a sqrt one — a 6-14% haircut on our DEEPEST type
+      #     for no measured gain.  Pinned by
+      #     tests/test_loss_and_ema_policy.py::
+      #     test_ema_would_have_cost_real_depth_on_krea2_and_zimage.
       # `ema_decay` is inert while use_ema is false (config_modules.py:527
       # replaces the whole block with {'use_ema': False}); it is kept so the
       # emitted key set does not change shape.  Guarded by
@@ -139,11 +154,35 @@ config:
       # Same sign, smaller and dirtier.  5FBmn1ax then switched mse -> mae for
       # Aug-3 on this type and on qwen/z-image, and kept mse on ideogram4.
       #
-      # HONEST LIMIT: within this field loss_type is COLLINEAR with
-      # differential_guidance_scale (3 travels with mae, 2 with mse) and with
-      # caption_dropout_rate (absent vs 0.05).  The public record cannot separate
-      # the three.  Only loss_type moves here — differential_guidance_scale and
-      # caption_dropout_rate are other units' levers and are left untouched.
+      # HONEST LIMIT — RESTATED AT THE WEEK-6 INTEGRATION MERGE (2026-08-07),
+      # because the earlier version of this paragraph overstated the confound by
+      # counting a dead key.  It claimed loss_type was collinear with BOTH
+      # differential_guidance_scale (3 vs 2) and caption_dropout_rate (absent vs
+      # 0.05), "and the public record cannot separate the three".
+      #
+      # differential_guidance_scale IS INERT AND NEVER RAN IN EITHER ARM.  At
+      # ai-toolkit pin 99be3d96 the consuming branch
+      # (extensions_built_in/sd_trainer/SDTrainer.py:734-737) is nested inside
+      # `if self.train_config.do_guidance_loss:` at :692; that flag defaults
+      # False (toolkit/config_modules.py:568), is assigned nowhere in the tree,
+      # appears in ZERO of the 45 published field configs, and is absent from all
+      # of our templates.  Verified independently at the merge.
+      #
+      # So the Aug-3 matched pair has exactly TWO effective residual differences:
+      # loss_type and caption_dropout_rate.  Which way does the second one cut?
+      # The mse arm is the one that HAD caption_dropout 0.05, and dropout is if
+      # anything an advantage under this metric — 75% of the score is generated
+      # with the prompt forced to "" (tasks.py:280-298), which is exactly the
+      # condition caption dropout trains for, and both the rank-1 and rank-2
+      # entrants on this task run 0.05.  On that reading the losing arm carried a
+      # help and still lost by 8.39%, so 8.39% is a LOWER bound on loss_type.
+      # STATED PLAINLY: we cannot prove that reading, and the cell we now ship —
+      # mae WITH caption_dropout 0.05 — is a cell no field artifact ever ran.
+      # What we are doing is moving one of the two keys that separate a rank-4
+      # run from a rank-14 run onto the winning side, and keeping the other key
+      # at the value the top two finishers on that same task both used.
+      #
+      # Only loss_type moves here; caption_dropout_rate is left untouched.
       #
       # MECHANISM (why this is not just "train the metric you are scored on"):
       # the score is per-pixel RGB MSE of a 25-step img2img RECONSTRUCTION at

@@ -112,10 +112,26 @@ EMA_DECAY = ideogram_release_policy._EXPECTED_RECIPE["train"]["ema_config"][
 ]
 # The value that decay is expected to hold, pinned separately so a policy edit
 # still trips this file rather than being silently inherited through the line
-# above.  0.995 -> 0.99 is the Week-6 EMA-horizon amendment
-# (forge/ideogram_release_policy.WEEK6_EMA_AMENDMENT); the mechanism and the
-# per-shape recovery are guarded in tests/test_week6_ideogram_ema_horizon.py.
-EXPECTED_EMA_DECAY = 0.99
+# above.
+#
+# WEEK-6 INTEGRATION (2026-08-07): 0.99 -> 0.995.  The Week-6 EMA-horizon
+# amendment was VACATED by unit 3 and this pin follows it back to the value the
+# in-family field anchor ran (5FNLSgh8, Jul-20 3cfa1578, rank 1 of 16, published
+# config sha256 bf852a1a...7201a954c: `steps: 378`, `ema_decay: 0.995`).  The
+# integrator re-derived the decision rather than inheriting it — see
+# `test_ideogram4_export_stays_inside_the_measured_strength_band` below, whose
+# assertion had to be rewritten because the old one was expressed in a quantity
+# that rejects the anchor itself.
+EXPECTED_EMA_DECAY = 0.995
+# The lr the SAME task's rank-13-of-16 entrant ran at the SAME depth (5EACrayt,
+# config sha256 eeb91495...03128f30 — byte-identical to the anchor except lr
+# 2.5e-5 -> 5.0e-5 and the matching min_lr keys).  test_loss 0.0965093 against
+# the anchor's 0.0502341: +92.1% for 2x the exported adapter strength, at
+# identical depth, in our own recipe family.  This is the ONLY controlled
+# adapter-strength measurement in the entire ideogram4 record and it is what
+# the strength band below is anchored on.
+MATCHED_PAIR_OVERSTRENGTH_LR = 5.0e-5
+MATCHED_PAIR_OVERSTRENGTH_RATIO = 2.0  # = 5.0e-5 / 2.5e-5 at identical depth
 
 # Our shipped schedule, needed by the attenuation model below.
 LR0 = 2.5e-5
@@ -140,6 +156,11 @@ def exported_fraction(steps, decay, lr0=LR0, eta_min=ETA_MIN, cosine=True):
 
     Anchored by ``test_the_attenuation_model_matches_its_published_anchors``.
     """
+    return _shadow_and_path(steps, decay, lr0, eta_min, cosine)[2]
+
+
+def _shadow_and_path(steps, decay, lr0=LR0, eta_min=ETA_MIN, cosine=True):
+    """(exported shadow magnitude, trained magnitude, their ratio)."""
     b = 0.0
     s = 0.0
     for k in range(steps):
@@ -150,22 +171,52 @@ def exported_fraction(steps, decay, lr0=LR0, eta_min=ETA_MIN, cosine=True):
         )
         b += lr
         s = decay * s + (1 - decay) * b
-    return s / b
+    return s, b, s / b
+
+
+def exported_strength(steps, decay, lr0=LR0):
+    """ABSOLUTE magnitude of the exported (shadow) adapter, not a fraction.
+
+    THIS IS THE QUANTITY THE EVALUATOR SEES, and it is why this file no longer
+    asserts on ``exported_fraction``.  On ideogram4 the validator's
+    ``DualModelGuider`` takes its NEGATIVE branch from a separate, never-LoRA'd
+    checkpoint (G.O.D pin b026da04 ``comfy_workflows/lora_ideogram4.json``:
+    ``model_negative`` <- ``Unconditional_checkpoint_loader`` ->
+    ``ideogram4_unconditional_fp8_scaled.safetensors``), so a LoRA that moves its
+    branch by ``d`` moves the scored prediction by ``c*d`` with c ~= 6.8
+    arc-averaged over cfg 8 falling to ``max(cfg-3,1)=5`` from ``start_percent``
+    0.7 (``diffusion.py:235-236``).  Optimal strength therefore scales as 1/c and
+    the overshoot penalty as c^2 — magnitude is the axis that matters here, and
+    ATTENUATION IS HOW WE HIT IT, not a defect to be minimised.
+
+    The eta_min of the shipped schedule is 0.1*lr, so scaling lr scales the whole
+    path; that is exactly the perturbation the matched pair applied.
+    """
+    return _shadow_and_path(steps, decay, lr0, eta_min=0.1 * lr0)[0]
 
 
 def test_activated_policy_still_carries_the_lr_and_ema_this_law_assumes():
     """The law below is derived FROM these values; pin them.
 
-    THIS TRIPWIRE FIRED IN WEEK 6 AND WAS DISCHARGED, NOT DISARMED.  It was
-    written to go red if ``ema_decay`` ever moved to the field's 0.99 so that the
-    depth law would be re-derived rather than silently inherited.  It went red
-    when ``forge.ideogram_release_policy`` adopted 0.99, the re-derivation was
-    done (see ``exported_fraction`` above and
-    ``test_ideogram4_export_is_not_dominated_by_ema_attenuation`` below), and the
-    conclusion was that the SHIPPED DEPTHS DO NOT MOVE: 421/589/616 are set by
-    the size law and the do_cfg clock ceiling, and the EMA term is a floor those
-    depths clear with room at either decay.  What changed is that the floor is
-    now expressed in the quantity that actually binds.
+    THIS TRIPWIRE FIRED TWICE IN WEEK 6 AND WAS DISCHARGED BOTH TIMES.  It was
+    written to go red if ``ema_decay`` ever moved off 0.995 so that the depth law
+    would be re-derived rather than silently inherited.  It fired when
+    ``forge.ideogram_release_policy`` adopted the field's 0.99, and it fired
+    again at the week-6 integration merge when unit 3 VACATED that amendment and
+    put the decay back on 0.995.
+
+    THE SECOND DISCHARGE FOUND A DEFECT IN THE FIRST.  The re-derivation done
+    when 0.99 landed expressed the guard as ``exported_fraction >= 0.85``, a
+    floor calibrated at decay 0.99 (T >= 338).  That framing treats EMA
+    attenuation as pure loss.  It is not: the in-family rank-1 anchor
+    (5FNLSgh8, 378 steps, decay 0.995) exports ``f = 0.685``, so THE 0.85 FLOOR
+    REJECTS THE ONE ARTIFACT THIS WHOLE ROW IS CALIBRATED TO REPRODUCE.  A guard
+    that fails the target is a broken guard, not a mis-tuned constant, so it was
+    replaced rather than re-tuned — see
+    ``test_ideogram4_export_stays_inside_the_measured_strength_band``.
+
+    The SHIPPED DEPTHS still do not move: 414/589/614 are set by the size law and
+    the do_cfg clock ceiling at either decay.
 
     ``lr`` is deliberately still pinned hard: it is the coupled decision the
     Week-6 amendment did NOT take, and the depth law IS derived from it.
@@ -177,13 +228,21 @@ def test_activated_policy_still_carries_the_lr_and_ema_this_law_assumes():
     assert train["do_cfg"] is True and train["cfg_scale"] == 10.0
     assert train["ema_config"] == {"use_ema": True, "ema_decay": EXPECTED_EMA_DECAY}
     assert EMA_DECAY == EXPECTED_EMA_DECAY
-    # The decay may only sit at a value carried by a named, individually hashed
-    # amendment record, so it cannot be moved again by an unaudited edit.
+    # The amendment record is retained as a VACATED record rather than deleted,
+    # so the audit trail shows the field moved and moved back, and the shipped
+    # decay is once again the I-J20-D2 port's own validated value with no live
+    # divergence.  A future re-adoption of 0.99 must land a NEW amendment.
     amendment = ideogram_release_policy.WEEK6_EMA_AMENDMENT
     assert amendment["field"] == "config.process[0].train.ema_config.ema_decay"
+    assert amendment["status"] == "vacated"
+    # Vacated means the record no longer carries a divergence at all: BOTH the
+    # validated and the amended value are back on the anchor's 0.995, so the
+    # emitted recipe is the I-J20-D2 port with zero live amendments.
+    assert amendment["validated_value"] == EXPECTED_EMA_DECAY
     assert amendment["amended_value"] == EXPECTED_EMA_DECAY
-    assert amendment["validated_value"] == 0.995
-    assert amendment in ideogram_release_policy._POLICY_BODY["amendments"]
+    assert amendment["covered_by_source_validation_cell"] is True
+    assert ideogram_release_policy._POLICY_BODY["amendments"] == []
+    assert amendment in ideogram_release_policy._POLICY_BODY["vacated_amendments"]
     assert (
         ideogram_release_policy.PRODUCTION_ACTIVATION["amendment_sha256"]
         == ideogram_release_policy.AMENDMENT_SHA256
@@ -256,7 +315,7 @@ def test_ideogram4_depth_is_invariant_to_margin_and_sec_per_it(row):
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
-def test_ideogram4_export_is_not_dominated_by_ema_attenuation(row):
+def test_ideogram4_export_stays_inside_the_measured_strength_band(row):
     """(a) EMA attenuation — the reason this law is deep and not shallow.
 
     ``setup_ema`` builds ``ExponentialMovingAverage`` from the LoRA parameters
@@ -280,27 +339,87 @@ def test_ideogram4_export_is_not_dominated_by_ema_attenuation(row):
     ``(1-d)*sum_t d^(T-t)*theta_t / theta_T`` on the cumulative-lr path; a
     constant-lr path gives 34% / 58% / 69%).
 
-    THE ASSERTION NOW USES THE CORRECT QUANTITY (integrator, week-6 merge).  The
-    old proxy ``EMA_DECAY ** steps <= 0.15`` was retained through the
-    correctness-sweep unit because that unit could only edit docstrings.  At the
-    amended decay it is TOOTHLESS: ``0.99**T <= 0.15`` binds only at T >= 189,
-    while this law's shallowest shape ships 421, so the proxy could no longer
-    fail for any depth anyone would plausibly ship.  It is replaced by
-    ``exported_fraction``, where the floor genuinely binds — 0.85 corresponds to
-    T >= 338 at decay 0.99, and the retired two-point law's 177 steps at N=14
-    scores 0.664 and fails.
+    THE ASSERTION IS NOW A STRENGTH BAND, NOT A FRACTION FLOOR (integrator,
+    week-6 merge, 2026-08-07).  Two earlier framings were both wrong:
+
+      * ``EMA_DECAY ** steps <= 0.15`` — a memory-horizon proxy that measures
+        nothing the evaluator sees, and toothless past T ~= 189 at 0.99.
+      * ``exported_fraction >= 0.85`` — the right direction of concern, wrong
+        sign of policy.  Attenuation is not waste; it is the mechanism by which
+        a deeper run lands on a competitive exported magnitude.  At decay 0.995
+        that floor needs T >= 678, and it FAILS THE ANCHOR: 5FNLSgh8 won rank 1
+        of 16 at 378 steps with ``f = 0.685``.
+
+    WHAT IS ASSERTED INSTEAD, and where each end of the band comes from:
+
+      LOWER 0.85x the anchor.  Rejects the retired two-point law
+      ``240*(n/24)^0.57``, which is what the original guard existed to reject:
+      at n_train 12/36/41 it ships 162/302/326 steps for strength ratios
+      0.256/0.712/0.801 — all three fail.  This is a real floor, not decoration.
+
+      UPPER 2.0x the anchor, EXCLUSIVE.  Not a chosen constant: 2.0 is exactly
+      where the one measured over-strength artifact sits.  5EACrayt ran the
+      anchor's config at 2x lr and the SAME 378 steps, so its exported strength
+      is 2.000x by construction, and it scored 0.0965093 against the anchor's
+      0.0502341 (rank 13 of 16, +92.1%).  We refuse to ship a modelled strength
+      that reaches a magnitude the field has measured to be badly wrong.
+
+    KNIFE-EDGE, STATED RATHER THAN HIDDEN: 84be9fcd ships 1.959x — 98.0% of the
+    measured-bad magnitude.  So this test is 2% from red on our DEEPEST shape,
+    and that is deliberate: ideogram4 depth cannot be raised again without
+    re-arguing this band.
+
+    WHY THE BAND IS NOT EVIDENCE THAT 589/614 ARE TOO DEEP.  The strength model
+    is linear in the cumulative lr path and was measured on the LR axis at fixed
+    depth.  The field falsifies that extrapolation along the DEPTH axis: on
+    b72da8c6 the rank-1 entrant shipped 1100 steps at lr 4e-4 and the rank-2
+    shipped 1523 at the same lr — modelled strengths far past 2x, and they took
+    the top two places.  More steps at fixed lr is a better-converged adapter,
+    not merely a bigger one; the model's own docstring flags it as "exact early,
+    degrades late".  The band is therefore a TRIPWIRE forcing re-argument, not a
+    claim that the optimum is 1.0x.  See the week-6 release note's "known unfixed
+    exposure" for the full statement.
     """
     _task, _family, pairs, hours, _winner, expected = row
     steps = recipe.size_scaled_steps("ideogram4", pairs, hours, 2000)
     assert steps == expected
-    exported = exported_fraction(steps, EMA_DECAY)
-    assert exported >= 0.85, (
-        f"{_task}: only {100 * exported:.0f}% of the trained delta is exported "
-        f"at {steps} steps / decay {EMA_DECAY}"
+
+    anchor = exported_strength(JUL20_IN_FAMILY_WINNER_STEPS, 0.995)
+    ratio = exported_strength(steps, EMA_DECAY) / anchor
+
+    assert ratio >= 0.85, (
+        f"{_task}: exported strength is only {ratio:.3f}x the in-family rank-1 "
+        f"anchor at {steps} steps / decay {EMA_DECAY} — too shallow"
     )
-    # And strictly better than what the c424362 two-point law would have shipped.
+    assert ratio < MATCHED_PAIR_OVERSTRENGTH_RATIO, (
+        f"{_task}: exported strength {ratio:.3f}x reaches the magnitude measured "
+        f"at rank 13 of 16 (5EACrayt, 2x lr, same depth, +92.1% loss)"
+    )
+    # The retired c424362 two-point law is strictly rejected by the lower bound.
     old_law = int(round(240 * (pairs / 24) ** 0.57))
-    assert exported > exported_fraction(old_law, EMA_DECAY)
+    assert exported_strength(old_law, EMA_DECAY) / anchor < 0.85
+
+
+@pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
+def test_readopting_099_would_breach_the_band_on_a_real_shape(row):
+    """Why the Week-6 EMA amendment was vacated, in the band's own units.
+
+    0.99 halves the averaging horizon (99 steps against 199), so the export
+    carries a larger share of a path whose magnitude is already set by depth.
+    On the two 1.0 h shapes that pushes the modelled strength PAST the measured
+    over-strength point; on the 0.75 h shape it does not, which is precisely why
+    the amendment looked harmless when it was only checked at R1.
+    """
+    _task, _family, pairs, hours, _winner, expected = row
+    anchor = exported_strength(JUL20_IN_FAMILY_WINNER_STEPS, 0.995)
+    at_099 = exported_strength(expected, 0.99) / anchor
+    at_0995 = exported_strength(expected, 0.995) / anchor
+    assert at_099 > at_0995
+    breached = {"b72da8c6": True, "84be9fcd": True, "1365fa1c": False}
+    assert (at_099 >= MATCHED_PAIR_OVERSTRENGTH_RATIO) is breached[_task], (
+        _task,
+        at_099,
+    )
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
