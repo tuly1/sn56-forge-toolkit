@@ -50,10 +50,17 @@ from forge.tasks import checkpoints
 # ships for each.  Mirrors tests/test_week6_ideogram_depth.py::REAL_IDEOGRAM_TASKS
 # but is re-derived from `recipe` below so the two cannot silently diverge.
 REAL_SHAPES = [
-    # task, n_pairs, hours, steps we ship
-    ("1365fa1c", 14, 0.75, 421),  # R1 draw shape; tightest budget
-    ("84be9fcd", 46, 1.0, 616),
-    ("b72da8c6", 40, 1.0, 589),
+    # task, n_train, hours, steps we ship
+    #
+    # THE SIZE COLUMN IS n_train, NOT `image_text_pairs` (2026-08-07).  The
+    # validator withholds ceil(0.10*N) before building train_data.zip, so the
+    # container is handed 12 / 41 / 36 where the auditing record says 14 / 46 /
+    # 40 — OBSERVED from each zip's central directory.  Feeding the audit N here
+    # made this file certify depths (421/616/589) that were never emitted; what
+    # `recipe` actually produced at the real abscissa was 401/593/569.
+    ("1365fa1c", 12, 0.75, 414),  # R1 draw shape; tightest budget  (N=14)
+    ("84be9fcd", 41, 1.0, 614),   # (N=46)
+    ("b72da8c6", 36, 1.0, 589),   # (N=40) — unchanged; the one coincidence
 ]
 IDS = [row[0] for row in REAL_SHAPES]
 

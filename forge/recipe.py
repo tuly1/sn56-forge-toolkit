@@ -51,42 +51,158 @@ FIELD-DEPTH-LAW-AUDIT "Known limitations and unfixed exposure".
 The single biggest defect the audit found is NOT the depth law: in 11 of the 14
 Aug-3 tasks the `SEC_PER_IT` wall-time cap truncated the size law before the
 size law was ever consulted.  See the SEC_PER_IT block below.
+
+WEEK-6 ABSCISSA CORRECTION (2026-08-07) — THE LAW WAS FED THE WRONG NUMBER.
+==========================================================================
+Everything above, and every `base` in the table below, was calibrated against
+`N` = the auditing record's `image_text_pairs`.  THE CONTAINER NEVER SEES `N`.
+
+OBSERVED, 14/14 real Aug-3 tasks.  The validator keeps a 10% holdout for its own
+scoring and ships the miner only the remainder.  Reading the zip END-OF-CENTRAL-
+DIRECTORY of every `training_data` URL in
+`SN56-project/evidence/week6-tournament-dataset-harvest-20260806/tasks/*/task-audit.json`
+(central directory only; no image payload fetched) gives the entry count inside
+each `train_data.zip`:
+
+    task      type        N   images in train_data.zip   N - ceil(0.10*N)
+    41025fb5  krea2       21  18                         18
+    3e0fdcde  krea2       42  37                         37
+    db9f7244  krea2       43  38                         38
+    f6725c2b  krea2       50  45                         45
+    1365fa1c  ideogram4   14  12                         12
+    b72da8c6  ideogram4   40  36                         36
+    84be9fcd  ideogram4   46  41                         41
+    b290d171  z-image     39  35                         35
+    b2582457  z-image     48  43                         43
+    7421f056  qwen-image  28  25                         25
+    4782f46f  qwen-image  31  27                         27
+    ff643470  qwen-image  41  36                         36
+    db5fefc5  flux        15  13                         13
+    241cda6c  flux        15  13                         13
+
+    n_train == N - ceil(0.10*N), exactly, 14 out of 14.  Zero exceptions.
+
+Independent corroboration for the Jul-20 abscissa (that tournament's presigns
+are dead, so its zip cannot be probed): SN56-WEEK3-POSTMORTEM.md §6a describes
+the Jul-20 R1 ideogram4 field (task 3cfa1578) as running "~111 epochs on 9
+images", against an auditing record whose `image_text_pairs` is 11.  9 is
+exactly 11 - ceil(1.1).  The note in this file that "the N=9 in earlier week-6
+notes is wrong" was itself the error: 11 and 9 are both right, for two DIFFERENT
+quantities, and 9 is the one the law is handed.
+
+THE RUNTIME PATH, confirmed end to end:
+  forge/tasks/aitoolkit.py:56-58  `dataset.prepare_aitoolkit_dataset(zip)` ->
+      total_pairs = post-dedup count of what is INSIDE train_data.zip == n_train
+  forge/tasks/aitoolkit.py:78     `pairs = total_pairs - holdout_pairs`
+  forge/tasks/aitoolkit.py:97     `build_config(spec, num_images=pairs, ...)`
+                                  -> `size_scaled_steps(..., num_images, ...)`
+`holdout_pairs` is 0 in production (`holdout.budget_allows` returns False unless
+`FORGE_HOLDOUT_SELECTION_TYPES` names the type, and nothing outside tests and
+ops/calibration/run_krea_ladder.py sets it), so today `num_images == n_train`.
+
+CONSEQUENCE, before this commit: every documented depth in this file, every
+replay table, and every guard test evaluated the law at `N` while the container
+evaluated it at `n_train`.  The law is sublinear, so emission was silently
+SHORT of documentation by (n_train/N)**p everywhere:
+    krea2 -3.6..-5.3%   ideogram4 -3.4..-4.8%   z-image -5.3%
+    qwen-image -6.8% (on the one qwen shape the clock does not already bind)
+    flux -6.9%
+
+THE FIX IS RECALIBRATION, NOT PLUMBING — `N` IS NOT KNOWABLE IN THE CONTAINER.
+The alternative repair, "pass the full N to the law", was evaluated and REJECTED
+on three independent grounds:
+  1. NOT AVAILABLE.  `forge/cli.py:32-42` is the whole input surface:
+     --task-id --model --dataset-zip --model-type --expected-repo-name
+     --hours-to-complete --trigger-word.  None carries `image_text_pairs`, and
+     `--dataset-zip` is a decoy (no network at runtime, see data/schema.py).
+  2. NOT RECOVERABLE.  n_train = N - ceil(0.10*N) is not injective: it maps
+     {20, 21} -> 18, {30, 31} -> 27, {40, 41} -> 36, {50, 51} -> 45.  The
+     collision at 18 is OUR OWN R1 SHAPE.
+  3. NOT COHERENT.  If `FORGE_HOLDOUT_SELECTION_TYPES` is ever switched on, the
+     optimizer really does see fewer images, and a law pinned to `N` would keep
+     prescribing depth for images that were removed from training.
+So `base` is refitted against the abscissa the runtime supplies.  The law's
+domain is now stated once and for all: `num_images` is THE NUMBER OF IMAGES THE
+OPTIMIZER WILL ACTUALLY STEP OVER, and every anchor below is quoted at that
+number, with the auditing-record `N` shown alongside only for traceability.
 """
 
 from __future__ import annotations
 
 # --- step-scaling table ----------------------------------------------------
-# steps = clamp(base * (N / n_ref)**p, min, max), then capped by wall clock.
+# steps = clamp(base * (n / n_ref)**p, min, max), then capped by wall clock.
+#
+# `n` IS `n_train`: the images the optimizer steps over, i.e. what is inside
+# train_data.zip, NOT the auditing record's `image_text_pairs`.  See the
+# "WEEK-6 ABSCISSA CORRECTION" block in the module docstring — that distinction
+# is worth 3-7% of depth on every type and it invalidated every number in this
+# table until 2026-08-07.  Anchors below are written `n=<n_train> (N=<audit>)`.
 #
 # Provenance tags used below:
 #   OBSERVED  = read out of a published artifact's metadata / config
 #   INFERRED  = derived (e.g. kohya writes epochs, not steps)
 #
 # WHAT `max` IS FOR, stated once so no row has to claim more than it delivers.
-# Observed tournament dataset sizes are N = 9..50 (Jul-20 and Aug-3 harvests).
-# The N at which each `max` first binds is:
-#   ideogram4  48   ACTIVE inside the observed range
-#   krea2      72   backstop only
-#   flux       80   backstop only
-#   qwen-image 85   backstop only
-#   z-image    90   backstop only
+# Observed tournament dataset sizes are N = 9..50 (Jul-20 and Aug-3 harvests),
+# i.e. n_train = 8..45.  The n_train at which each `max` first binds, with the
+# real dataset N that corresponds to:
+#   ideogram4  43  (N=48)  ACTIVE just above the observed range
+#   krea2      62  (N=69)  backstop only
+#   qwen-image 76  (N=85)  backstop only
+#   z-image    81  (N=90)  backstop only
+#   flux       92  (N=103) backstop only
+# NOTE the abscissa refit moved these thresholds in `n` but NOT in real dataset
+# size for ideogram4 / qwen-image / z-image — their old N-space crossovers were
+# 48 / 85 / 90 and n_train(48)=43, n_train(85)=76, n_train(90)=81.  Those three
+# `max` values bind at exactly the same real task they always did, which is the
+# check that the refit is a change of units and not a change of policy.  krea2
+# (72 -> 69) and flux (80 -> 103) moved, because their refits were not pure
+# unit changes (krea2 is anchored on one point, flux's anchor VALUE was also
+# wrong — see the rows).  Both remain far outside anything ever observed.
 # So four of the five are ceilings on EXTRAPOLATION, not policy, and changing
 # them cannot move any real tournament shape.  A `max` set where it can never
 # bind within 4x the observed range is not a decision, it is decoration — the
 # reason ideogram4's short-lived `max=1600` was withdrawn (its law topped out at
 # 365 at N=50).  `test_step_table_max_binding_sizes` pins this table, so a row
 # that quietly becomes inert fails a test.
-_N_REF = 24  # ~mid of the 10-50 pair range
+_N_REF = 24  # ~mid of the 10-50 pair range (a reparametrisation only: n_ref and
+# base trade off exactly, so it is deliberately NOT restated in n_train units —
+# moving it would rescale every `base` for no gain)
 
 STEP_TABLE = {
     #            base  n_ref   p    min    max
-    # flux — UNCHANGED. The law is already right: uncapped it returns 870 steps
-    # at N=15, which is EXACTLY what the rank-1 miner shipped on both Aug-3 flux
-    # tasks (5FW2Eaae, 58 epochs x 15 imgs; 5D7iEJm5, 50 x 15 = 750).  Only the
-    # clock was wrong (see SEC_PER_IT).  The audit rates flux depth evidence TOO
-    # THIN to move (n=4 artifacts, 2 head-to-heads) and the step counts are
-    # INFERRED, not observed, because kohya records epochs.  Deliberately left
-    # alone.  NOTE, AND THIS IS BIGGER THAN "a small clock fix": on a
+    # flux — base 1100 -> 1024.  THIS IS THE ONE ROW WHERE THE ABSCISSA ERROR
+    # ALSO CORRUPTED THE ANCHOR ITSELF, and correcting both moves depth DOWN,
+    # not up.  kohya records EPOCHS, not steps, so this row's anchor was built
+    # as `epochs x images` — and the image count used was the auditing record's
+    # N=15 instead of the 13 that were actually in train_data.zip (OBSERVED:
+    # zip central directory of 241cda6c and db5fefc5, both 13 images + 13 .txt).
+    #   what the artifact says   5FW2Eaae 241cda6c rank 1: 58 kohya epochs
+    #                            (`kohya_top_epoch` in the week-6 field audit's
+    #                            analysis.json; `shipped_step` is null because
+    #                            kohya writes no step count)
+    #   old reading  58 x N=15       = 870 steps   <- WRONG, no such run
+    #   true         58 x n_train=13 = 754 steps   <- 58 passes over 13 images
+    # Meanwhile the law, handed 13, was returning 1100*sqrt(13/24) = 810.  So
+    # the shipped depth was not 6.9% SHORT of its anchor as the raw abscissa
+    # arithmetic suggests — it was 7.4% LONG of it (810 vs 754), because the two
+    # errors point opposite ways for a type whose anchor is denominated in
+    # epochs.  base 1024 restores the anchor exactly: 1024*sqrt(13/24) = 753.6
+    # -> 754 = 58.0 epochs over 13 images.  Expressed in epochs — the natural
+    # invariant for kohya — this row now ships what the rank-1 miner ran, and
+    # the old 1100 ran 62.3 epochs.
+    # ASSUMPTION, STATED: `steps = epochs * n_train` presumes repeats=1 and
+    # train_batch_size x grad_accum = 1.  Those flux artifacts carry no `ss_*`
+    # kohya metadata (analysis.json: ss_network_dim etc. all null) so neither
+    # can be read.  It is the SAME assumption the 870 was built on; only the
+    # image count changed.  Under repeats=2 the anchor would be 1508, under
+    # batch 2 it would be 377 — the row is INFERRED and the audit rates flux
+    # depth evidence TOO THIN to move on anything but arithmetic (n=4 artifacts,
+    # 2 head-to-heads).  The second flux anchor is 5D7iEJm5 db5fefc5 rank 1 at
+    # 50 epochs x 13 = 650 (this file previously wrote "50 x 15 = 750" and then
+    # claimed 870 matched "both", which it never did); 754 is used because
+    # 241cda6c is the task STEP_TABLE actually governs.
+    # NOTE, AND THIS IS BIGGER THAN "a small clock fix": on a
     # standalone-checkpoint FLUX base the validator runs
     # `ops/docker/standalone-image-trainer.dockerfile`, which sets
     # `FORGE_FLUX_BACKEND=kohya`; `dispatch.for_model_type` then routes to
@@ -98,7 +214,7 @@ STEP_TABLE = {
     # takes that path; 241cda6c (rayonlabs/FLUX.1-dev) does not.  So HALF the
     # observed flux draw never consults STEP_TABLE at all — an open decision
     # (FIELD-DEPTH-LAW-AUDIT §6.5 + "Known limitations").
-    "flux": dict(base=1100, n_ref=_N_REF, p=0.50, min=500, max=2000),
+    "flux": dict(base=1024, n_ref=_N_REF, p=0.50, min=500, max=2000),
     # krea2 — was base=1200 p=0.50 min=100 max=2000 (0.64x the field winners).
     # The 8-win operator 5FBmn1ax's krea2 policy is a PURE CLOCK-FILL with NO
     # size term, recovered exactly from his own published step counts:
@@ -109,12 +225,27 @@ STEP_TABLE = {
     # p is flattened 0.50 -> 0.35 to mirror that near-size-independence while
     # keeping a floor for pathologically small sets.  `min` 100->600 because no
     # 100-step krea2 is competitive in anything we observed — the one 200-step
-    # krea2 in the R1 field ranked 13/14.  At N=21 the law returns 1431.5 -> 1432,
-    # which is EXACTLY the depth 5FBmn1ax configured and completed on the real R1
-    # shape (and 5FjDsFGA independently completed the same 1432 there).
-    # Replay on the four real Aug-3 krea2 shapes with SEC_PER_IT["krea2"]=1.35:
-    # 1432/1825/1840/1939 vs winners 1000/2012/2012/2012 = 1.05x (was 0.64x); the
-    # size law now binds on all four, which is the intent (see SEC_PER_IT).
+    # krea2 in the R1 field ranked 13/14.
+    # base 1500 -> 1584, ABSCISSA REFIT (2026-08-07).  The calibration target is
+    # unchanged and is stated as a single sentence: the law must return 1432 at
+    # the real R1 shape, because that is the depth 5FBmn1ax CONFIGURED AND
+    # COMPLETED there and 5FjDsFGA independently completed the same 1432.  The
+    # R1 shape hands the container 18 images (N=21; OBSERVED, zip central
+    # directory of 41025fb5), not 21, so:
+    #     wanted   law(18)  = 1432
+    #     old      1500*(18/24)^0.35 = 1356.3 -> 1356   (-5.3%, the silent loss)
+    #     base_new = 1432 / (18/24)^0.35 = 1432/0.9042145 = 1583.70
+    #     new      1584*(18/24)^0.35 = 1432.3 -> 1432    EXACT
+    # 1584 is the unique integer that lands 1432: 1583 gives 1431.4 and 1585
+    # gives 1433.2.  (The row previously claimed to emit 1432 here.  It never
+    # did — this commit is what makes that sentence true.)
+    # Replay on the four real Aug-3 krea2 shapes at their OBSERVED n_train, with
+    # SEC_PER_IT["krea2"]=1.35:
+    #     n=18 (N=21) 1432   n=37 (N=42) 1843
+    #     n=38 (N=43) 1860   n=45 (N=50) 1974
+    # vs winners 1000/2012/2012/2012 = 1.06x mean (was 0.64x before week 6, and
+    # 0.99x as actually emitted immediately before this commit); the size law
+    # binds on all four, which is the intent (see SEC_PER_IT).
     # RESIDUAL UNCERTAINTY, largest of any row.  Two things are true at once:
     #  * Depth is NOT sufficient.  The R1 winner shipped only 1000 steps and beat
     #    the 1432/1750/2000 pack with an entirely different recipe
@@ -134,7 +265,7 @@ STEP_TABLE = {
     # honest claim is: this removes a self-inflicted depth deficit and puts us at
     # a depth two operators demonstrably completed on this exact shape.  It does
     # NOT on its own predict a top-5 finish; the selection/recipe work does.
-    "krea2": dict(base=1500, n_ref=_N_REF, p=0.35, min=600, max=2200),
+    "krea2": dict(base=1584, n_ref=_N_REF, p=0.35, min=600, max=2200),
     # ideogram4 — was base=140 p=0.50 min=48 max=400 (the discredited Jul-16
     # experiment), then base=240 p=0.57 min=120 max=1600, a two-point fit to the
     # champion's own published step counts (N=14 -> 174, N=46 -> 341).  BOTH are
@@ -199,8 +330,18 @@ STEP_TABLE = {
     #       `ema_config` block at all — the same operator ran EMA 0.99 on the
     #       two tasks he WON (at 174 and 341) and no EMA on the one he lost, so
     #       depth and EMA are confounded inside his own three runs.
-    #   Jul-20 R1 3cfa1578 ideogram4, N=11 (not 9 — `image_text_pairs` in the
-    #       auditing record), h=0.75, SIXTEEN miners.  This is the largest
+    #   Jul-20 R1 3cfa1578 ideogram4, N=11 BUT n_train=9, h=0.75, SIXTEEN
+    #       miners.  THE "N=11 (not 9)" CORRECTION THIS LINE USED TO CARRY WAS
+    #       ITSELF THE ERROR — both numbers are right, for different quantities:
+    #       `image_text_pairs` in the auditing record is 11, and the container
+    #       was handed 11 - ceil(1.1) = 9.  PROVED BY OUR OWN TOURNAMENT RUN:
+    #       on Jul-20 this row was `base=140 p=0.50` (commit 22ccd02) with the
+    #       clock inert (cap 605 at 0.75 h), and our entry 5HLA2QWY shipped 86
+    #       steps.  140*(9/24)^0.5 = 85.7 -> 86.  140*(11/24)^0.5 = 94.8 -> 95.
+    #       We shipped 86, so `num_images` was 9.  That is a live production
+    #       measurement of the abscissa, not an inference.  Independently,
+    #       SN56-WEEK3-POSTMORTEM.md §6a describes the same task's field as
+    #       "~111 epochs on 9 images".  This is the largest
     #       ideogram4 sample in existence AND it is at the R1 shape, so it is
     #       weighted hardest here.  Full ladder re-derived; the two results that
     #       matter:
@@ -225,21 +366,26 @@ STEP_TABLE = {
     #       serves, so it is not evidence that 86 is safe for us today.
     #       The 378-step rank 1 IS in our recipe family (lr 2.5e-5 + cosine +
     #       EMA), and it is the ONLY field artifact anywhere that is.
-    #       (Supersedes the week-6 sweep's reading, which had the right artifact
-    #       but the wrong N and called 378 "BELOW the 421/589/616 this row
-    #       ships" — at 378's OWN shape, N=11, this row ships 390, i.e. +3.2%.)
+    #       IT IS ALSO THIS ROW'S CALIBRATION ANCHOR, and after the abscissa
+    #       refit the row reproduces it EXACTLY: at 378's own shape the
+    #       container holds 9 images and 517*(9/24)^0.32 = 377.7 -> 378.
+    #       (The row previously claimed "+3.2%" by evaluating itself at N=11;
+    #       what it actually emitted at 9 was 365, i.e. -3.4%.  Neither number
+    #       was 378.  base 500 -> 517 = 378/(9/24)^0.32 fixes it.)
     # Net across two tournaments: ideogram4 depth is FLAT and WIDE — 86 to 1523
     # all placed 1st or 2nd or mid-pack somewhere — with NO consistent
-    # direction.  There is NO size law to fit: N=11 -> 378, N=14 -> 174,
-    # N=40 -> 1100, N=46 -> 341 is uncorrelated with size, and the arithmetic is
-    # not close.  Fit a power law `steps = A*N**p` to any two of the Aug-3
-    # three and it misses the third by 3.5x, 4.1x, or 41829x; OLS on all three
-    # in log space gives R^2 = 0.50 with a 2.54x multiplicative residual sd.
-    # The killer is that the two CLOSEST points in N are the FURTHEST apart in
-    # depth: N=40 -> 1100 and N=46 -> 341 means 15% more data and 3.23x fewer
-    # steps, a local exponent of -8.4.  No monotone function of N can do that,
-    # so N is the wrong instrument and `p` should be near-flat for that reason
-    # rather than fitted.
+    # direction.  There is NO size law to fit — restated at the abscissa the law
+    # is handed, which changes the numbers a little and the verdict not at all:
+    # n=9 -> 378, n=12 -> 174, n=36 -> 1100, n=41 -> 341 is uncorrelated with
+    # size, and the arithmetic is not close.  Fit a power law `steps = A*n**p`
+    # to any two of the Aug-3 three and it misses the third by 4.0x, 3.5x, or
+    # 125000x; OLS on all three in log space gives R^2 = 0.52 with a 2.50x
+    # multiplicative residual sd (was 0.50 / 2.54x at the audit N).
+    # The killer is that the two CLOSEST points in size are the FURTHEST apart
+    # in depth: n=36 -> 1100 and n=41 -> 341 means 14% more data and 3.23x fewer
+    # steps, a local exponent of -9.0.  No monotone function of dataset size can
+    # do that, so size is the wrong instrument and `p` should be near-flat for
+    # that reason rather than fitted.
     #
     # NO FAMILY SPLIT, and NOT because it is infeasible.  `spec.trigger_word is
     # None` separates `style` from every other family 12/12 across the Aug-3
@@ -270,9 +416,13 @@ STEP_TABLE = {
     #      EMA's memory horizon.
     #      WHAT IT ACTUALLY COSTS: the export is an attenuated copy of the
     #      trained delta.  Under our cosine 2.5e-5 -> 2.5e-6 schedule the
-    #      exported adapter is ~43% of the final iterate at 177 steps, ~72% at
-    #      421, ~82% at 589, ~83% at 616 (INFERRED — see the model note above;
+    #      exported adapter is ~43% of the final iterate at 177 steps, ~71% at
+    #      414, ~82% at 589, ~83% at 614 (INFERRED — see the model note above;
     #      under a constant lr the same formula gives 34% / 58% / 68% / 69%).
+    #      [depths restated at the corrected abscissa: 421/589/616 were what
+    #      this row believed it shipped at N=14/40/46; it ships 414/589/614 at
+    #      the n_train=12/36/41 those tasks actually deliver.  The attenuation
+    #      curve is flat here — the largest move, 421->414, costs 0.7pp.]
     #      So the penalty is real and depth still fixes it, but the old numbers
     #      ("41% untrained at 177, 4.6% at 616") described a quantity that does
     #      not exist.  Depth is the ONLY lever on this that does not require
@@ -282,15 +432,18 @@ STEP_TABLE = {
     #      2.05 -> the 1.0 h cap is 674 steps and the 0.75 h cap is 477.  The
     #      b72da8c6 winning regime (~1250) is UNREACHABLE while do_cfg is on.
     #      That is a do_cfg decision, not a depth decision.
-    # base/p are chosen so the SIZE LAW binds ~10-15% below that ceiling on all
-    # three real shapes — 421 / 589 / 616 against caps 477 / 674 / 674 — taking
-    # grant utilisation from 45-54% to 82-85%.  KNOWN CORNER, stated rather than
-    # hidden: on a 0.75 h grant the law crosses the 477 cap at N~21, so a SHORT
-    # R1 ideogram task with a mid-size dataset is clock-bound at 477 (432 if the
-    # margin reverts to 0.85).  That is the do_cfg tax being visible, not a
-    # miscalibration; it is 1.3x the withdrawn law at N=50 and 2.1x at N=21, and
-    # it keeps four periodic candidates.  Every 1.0 h shape up to N=50 stays
-    # law-bound.
+    # base/p are chosen so the SIZE LAW binds ~9-13% below that ceiling on all
+    # three real shapes — 414 / 589 / 614 at n_train 12 / 36 / 41 against caps
+    # 477 / 674 / 674 — taking grant utilisation from 45-54% to 87-91%.
+    # KNOWN CORNER, stated rather than hidden: on a 0.75 h grant the law crosses
+    # the 477 cap at n_train 19 (N=22), so a SHORT R1 ideogram task with a
+    # mid-size dataset is clock-bound at 477 (432, reached at n_train 14 / N=16,
+    # if the margin reverts to 0.85).  That is the do_cfg tax being visible, not
+    # a miscalibration; it is 2.3x the withdrawn two-point law at n_train 18 and
+    # 1.8x at n_train 45, and it keeps four periodic candidates.  EVERY 1.0 h
+    # shape at ANY N stays law-bound, and now for a structural reason rather
+    # than a numerical one: `max` 620 is below the 1.0 h cap of 674, so the law
+    # cannot reach that cap at any dataset size.
     # Because the law binds on the real shapes and the clock does not, this row
     # is invariant to MARGIN and to any SEC_PER_IT revision over the range the
     # tests grid.  HOW MUCH ERROR IT ABSORBS — corrected, because the previous
@@ -299,30 +452,32 @@ STEP_TABLE = {
     #   PLANNING truncation (the constant is wrong -> we plan fewer steps).
     #   `size_scaled_steps` caps at (budget*0.92 - 480)/SEC, so the law survives
     #   only while SEC stays below
-    #       84be9fcd 616 steps @1.0h : 4.597  (+9.5% over 4.2, 2.28x the 2.019
+    #       84be9fcd 614 steps @1.0h : 4.612  (+9.8% over 4.2, 2.28x the 2.019
     #                                          field no-do_cfg bound)  <-- tightest
-    #       1365fa1c 421 steps @0.75h: 4.760  (+13.3%)
+    #       1365fa1c 414 steps @0.75h: 4.841  (+15.3%)
     #       b72da8c6 589 steps @1.0h : 4.808  (+14.5%)
     #   RUNTIME kill (the box is actually slower -> the deadline stops us).  The
     #   terminate gate is budget - 180 - 45, less STARTUP_S, so the real rate at
-    #   which the tightest shape stops short is 3075/616 = 4.992 (+18.9%).
+    #   which the tightest shape stops short is 3075/614 = 5.008 (+19.2%).
     # The old 5.06 was neither of these (it dropped STOP_MARGIN_S as well).
     # A truncation DEGRADES rather than forfeits (`forge/tasks/aitoolkit.py`
     # _run_toolkit -> _terminate -> _finalize promotes the newest periodic save,
     # and there are four of them).
     # p 0.57 -> 0.32 because the field shows no size signal at all; this mirrors
     # krea2's deliberately flat 0.35 rather than a 2-point fit.  min 120 -> 350
-    # binds only below N~10, under the smallest ideogram4 dataset ever observed
-    # (N=11, Jul-20).  max 1600 -> 620: 1600 was INERT (the old law topped out at
-    # 365 at N=50, so it could never bind within 4x), whereas 620 first CHANGES
-    # the output at N = 48 — not 47, as this comment used to say: at N=47 the
-    # law returns 619.975, which rounds to 620 with or without the cap, so the
-    # cap is a no-op there.  BE HONEST ABOUT HOW LITTLE THIS DOES: 620 binds
-    # only at N = 48, 49, 50 (the top of the observed range) and changes depth
-    # by 4 / 8 / 12 steps respectively.  It is barely more than decoration; it
-    # is kept because it caps extrapolation of a recipe we have never run past
-    # ~200 steps in a tournament, not because it moves any real shape.
-    # (`test_step_table_max_binding_sizes` pins the crossover at 48.)
+    # binds only at n_train <= 7, below the smallest ideogram4 abscissa ever
+    # observed (n_train 9, from N=11, Jul-20).  max 1600 -> 620: 1600 was INERT
+    # (the old law topped out at 365 at N=50, so it could never bind within 4x),
+    # whereas 620 first CHANGES the output at n_train = 43, which is exactly the
+    # N = 48 this comment used to name — the refit moved the threshold's UNITS,
+    # not the real dataset at which it bites.  BE HONEST ABOUT HOW LITTLE THIS
+    # DOES: 620 binds only at n_train 43, 44, 45 (N = 48, 49, 50 — the top of
+    # the observed range, and above the largest ideogram4 task ever seen, which
+    # is n_train 41) and changes depth by 3 / 8 / 12 steps respectively.  It is
+    # barely more than decoration; it is kept because it caps extrapolation of a
+    # recipe we have never run past ~200 steps in a tournament, not because it
+    # moves any real shape.
+    # (`test_step_table_max_binding_sizes` pins the crossover at n_train 43.)
     #
     # DEPTH RE-ADJUDICATED 2026-08-06, PRE-TOURNAMENT, AND HELD.  The open
     # question was whether to revert this row to the production pin
@@ -333,22 +488,27 @@ STEP_TABLE = {
     #  1. THE ONLY IN-FAMILY ANCHOR AGREES WITH THIS ROW AND NOT WITH THE
     #     REVERT.  One field artifact in two tournaments shares our lr/EMA/
     #     scheduler (5FNLSgh8, Jul-20 3cfa1578, lr 2.5e-5 + cosine + EMA + TE).
-    #     It won, at 378 steps, at N=11 h=0.75 — the R1 shape.  This row returns
-    #     390 there (+3.2%); the revert returns 95 (-74.9%, 4.0x too shallow).
+    #     It won, at 378 steps, at n_train 9 (N=11) h=0.75 — the R1 shape.  This
+    #     row returns 378 there, EXACTLY (that is what base=517 is for); the
+    #     revert returns 86 (-77.2%, 4.4x too shallow) — and 86 is not a
+    #     hypothetical, it is precisely what the revert's constants DID ship for
+    #     us on that task in July.
     #     `test_ideogram4_matches_the_only_in_family_field_winner` pins it.
     #  2. THE REVERT IS BELOW EVERY WINNING DEPTH EVER OBSERVED FOR THIS TYPE.
-    #     Winners 378/174/1100/341 at N=11/14/40/46; the revert ships
-    #     95/107/181/194, i.e. 0.25x/0.61x/0.16x/0.57x.  All four residuals have
-    #     the same sign, so it is not scatter, it is bias.  RMS log-distance to
-    #     the four winners: this row 0.617, the revert 1.195.  Our two tournament
+    #     Winners 378/174/1100/341 at n_train 9/12/36/41 (N=11/14/40/46); the
+    #     revert ships 86/99/171/183, i.e. 0.23x/0.57x/0.16x/0.54x.  All four
+    #     residuals have the same sign, so it is not scatter, it is bias.  RMS
+    #     log-distance to the four winners: this row 0.610, the revert 1.261
+    #     (recomputed at the corrected abscissa; was quoted as 0.617 / 1.195,
+    #     and the gap widens rather than narrows).  Our two tournament
     #     losses to date (Jul-20 ideogram 86 steps, Aug-3 krea2 823 steps) were
     #     both on the shallow side of the field, and the single catastrophic
     #     artifact in the whole ideogram4 record (5FjDsFGA, +421% loss) is a
     #     SHALLOW one at 200 steps.  There is no observed deep-side catastrophe.
     #  3. AT LARGE N THIS ROW IS ALREADY THE MINIMAX POSITION between the two
-    #     irreconcilable style anchors: sqrt(341*1100) = 612, and the row ships
-    #     616 at N=46 and 589 at N=40 (log residuals +0.59 / -0.62, almost
-    #     exactly symmetric).  When two anchors disagree by 3.2x, sitting at
+    #     irreconcilable style anchors: sqrt(341*1100) = 612.5, and the row ships
+    #     614 at n_train 41 (N=46) and 589 at n_train 36 (N=40) — log residuals
+    #     +0.588 / -0.625, symmetric to within 4%.  When two anchors disagree by 3.2x, sitting at
     #     their geometric mean IS the best-worst-case, and no single number can
     #     do better without knowing which one generalises.
     #  4. DEPTH IS NOT THE OPERATIVE VARIABLE ANYWAY, so a depth revert buys
@@ -357,9 +517,9 @@ STEP_TABLE = {
     #     R1-shaped field is +0.18 (p = 0.49).  Spending a pre-tournament change
     #     on the coefficient the data says is inert, four days out, on a reviewed
     #     tree, is the wrong trade.
-    # WHAT IS BEING SACRIFICED, SAID PLAINLY.  On 1365fa1c (N=14 h=0.75) this
-    # row ships 421 against a 174 that won and an 800 that lost by 46%, i.e. it
-    # sits nearer the losing arm in log-distance (+0.88 vs -0.64).  If the true
+    # WHAT IS BEING SACRIFICED, SAID PLAINLY.  On 1365fa1c (n_train 12, N=14,
+    # h=0.75) this row ships 414 against a 174 that won and an 800 that lost by
+    # 46%, i.e. it sits nearer the losing arm in log-distance (+0.87 vs -0.66).  If the true
     # story is "ideogram4 punishes depth at tiny N regardless of lr", this row
     # is wrong and the revert was right.  That story is not supported — it is
     # contradicted by the in-family anchor and by the +0.18 rank correlation —
@@ -368,32 +528,56 @@ STEP_TABLE = {
     # STILL TRUE PRE-COMMIT: if ideogram4 is the R1 draw and we lose, the
     # correct next experiment is do_cfg on/off at matched depth (which buys back
     # 2x the reachable depth), NOT another depth change.
-    "ideogram4": dict(base=500, n_ref=_N_REF, p=0.32, min=350, max=620),
-    # z-image — was base=1100 p=0.50 min=400 max=2000.  Cleanest result in the
-    # audit: TWO DIFFERENT rank-1 operators with different recipes imply the
-    # same law to 0.1% —
-    #     5FBmn1ax N=48 -> 1317  => base = 1317*(24/48)^0.5 = 931
-    #     5EACrayt N=39 -> 1188  => base = 1188*(24/39)^0.5 = 932
-    # base=930 reproduces both winners to within 2 steps (1315 vs 1317, 1186 vs
-    # 1188).  `base` DROPS but shipped depth RISES 860 -> 1315, because the real
-    # defect was SEC_PER_IT=3.0 while a field miner completed 2000 steps in the
-    # same 1.0 h.  `max` pulled to 1800 to stay out of the flat-2000-template
-    # regime, whose entrant lost by 7.9%.
-    "z-image": dict(base=930, n_ref=_N_REF, p=0.50, min=350, max=1800),
-    # qwen-image — DEPTH WAS ALREADY RIGHT (now/win = 1.00x).  This row changes
-    # only so it is right for the right REASON: today we land on the field by
-    # accident, because the size law wants 1137/1307 and SEC_PER_IT=4.0 happens
-    # to cut it to 1027.  Fix the clock without fixing the law and qwen instantly
-    # over-trains by 25%.  The champion's exact recovered law is
-    #     steps = 834 * (N/24)^0.51   -> 950 and 1096 vs his published 949 and
-    #                                    1095 (this line previously read "949 and
-    #                                    1104"; 1104 is what OUR base=840 returns
-    #                                    at N=41, not what his 834 returns)
-    # so base=840/p=0.51 makes the SIZE LAW the intended binding constraint.
+    # base 500 -> 517, ABSCISSA REFIT ONLY (2026-08-07): 378/(9/24)^0.32 =
+    # 517.4.  p/min/max deliberately untouched — the row's HELD adjudication
+    # above is unchanged, this restores the depth it always claimed to ship.
+    "ideogram4": dict(base=517, n_ref=_N_REF, p=0.32, min=350, max=620),
+    # z-image — was base=1100 p=0.50 min=400 max=2000, then 930.  Cleanest
+    # result in the audit: TWO DIFFERENT rank-1 operators with different recipes
+    # imply the same law, and the agreement gets TIGHTER at the corrected
+    # abscissa, which is the strongest single check that the abscissa fix is
+    # right.  Both operators' step counts are OBSERVED absolute `steps:` values,
+    # so only the x-axis moves:
+    #     fitted at N (wrong x)          fitted at n_train (what they trained on)
+    #     5FBmn1ax N=48 -> 1317 => 931   n=43 -> 1317 => 1317*(24/43)^0.5 = 983.9
+    #     5EACrayt N=39 -> 1188 => 932   n=35 -> 1188 => 1188*(24/35)^0.5 = 983.8
+    #     spread 0.11%                   spread 0.01%
+    # base=984 reproduces BOTH winners EXACTLY, not to within 2 steps:
+    #     984*(43/24)^0.5 = 1317.1 -> 1317      984*(35/24)^0.5 = 1188.3 -> 1188
+    # (base=930 emitted 1245 and 1123 at those same shapes, 5.5% under both.)
+    # `base` still DROPS relative to the pre-week-6 1100 while shipped depth
+    # RISES 860 -> 1317, because the original defect was SEC_PER_IT=3.0 while a
+    # field miner completed 2000 steps in the same 1.0 h.  `max` 1800 stays out
+    # of the flat-2000-template regime, whose entrant lost by 7.9%; it first
+    # binds at n_train 81 (N=90), the same real dataset as before.
+    "z-image": dict(base=984, n_ref=_N_REF, p=0.50, min=350, max=1800),
+    # qwen-image — base 840 -> 892, ABSCISSA REFIT.  The champion's law was
+    # recovered from his two COMPLETED rank-1 runs, whose `steps:` are OBSERVED
+    # absolute values; only the x-axis was wrong:
+    #     recovered at N        834*(N/24)^0.51  -> 950 @N=31, 1096 @N=41
+    #                           vs his published    949        1095
+    #     recovered at n_train  892*(n/24)^0.51  -> 947 @n=27, 1097 @n=36
+    #                           vs his published    949        1095   (+-0.2%)
+    #   base per anchor: 949/(27/24)^0.51 = 893.7   1095/(36/24)^0.51 = 890.5
+    #   geometric mean 892.1 -> 892.
+    # `p` HELD AT 0.51 AND NOT REFITTED, said explicitly because a 2-point fit
+    # strictly has two free parameters: the exponent re-recovered at the
+    # corrected abscissa is ln(1095/949)/ln(36/27) = 0.497.  0.497 vs 0.510
+    # changes output by <=0.4% anywhere in n_train 8..45, and `p` also does
+    # anti-extrapolation duty, so moving it would be churn.  Stated so the
+    # residual is a decision and not an oversight.
+    # This row still exists to make the SIZE LAW the intended binding
+    # constraint: before week 6 we landed on the field by ACCIDENT, because the
+    # size law wanted 1137/1307 and SEC_PER_IT=4.0 happened to cut it to 1027.
     # `max` 3000 -> 1600: nothing in the field went past 1300 configured / 1095
     # shipped, and FOUR of the six qwen artifacts were deadline-killed by
-    # over-scheduling (1150->850, 1300->700, 1300->600).
-    "qwen-image": dict(base=840, n_ref=_N_REF, p=0.51, min=300, max=1600),
+    # over-scheduling (1150->850, 1300->700, 1300->600).  It first binds at
+    # n_train 76 (N=85), the same real dataset as before the refit.
+    # NOTE qwen is the one type where this refit is partly INERT: on two of the
+    # three real shapes (7421f056, ff643470) the clock cap binds first, so
+    # emission there is unchanged at 836 and 1023.  Only 4782f46f moves
+    # (892 -> 947, +6.2%).
+    "qwen-image": dict(base=892, n_ref=_N_REF, p=0.51, min=300, max=1600),
 }
 
 # --- wall-time budget model ------------------------------------------------
@@ -436,8 +620,13 @@ STEP_TABLE = {
 #               UNMEASURED on our host.                                 -> 1.80
 #   ideogram4   BOUND 2.019 (5FBmn1ax completed 1523 in 1.0 h), DOUBLED
 #               because our config sets do_cfg (see below).             -> 4.20
-#   flux        BOUND 2.500 (rank-1 5FW2Eaae, 58 kohya epochs x N=15 =
-#               870 steps in 0.75 h).  INFERRED — kohya logs epochs.    -> 2.00
+#   flux        BOUND 2.885 (rank-1 5FW2Eaae, 58 kohya epochs x
+#               n_train=13 = 754 steps in W(0.75 h) = 2175 s).  INFERRED
+#               — kohya logs epochs.  This bound LOOSENED from the 2.500
+#               previously written here, because that used N=15 for a
+#               zip that holds 13 images: fewer steps in the same
+#               window means we know LESS about the rate, not that flux
+#               is faster.  2.00 is therefore a 31% pad, not 17%.     -> 2.00
 #
 # TWO qwen artifacts imply far slower rates (5FW2Eaae 6.96 s/step on ff643470,
 # 5GU4Xkd3 8.13 on 4782f46f) and are NOT used to SET the constant.  THE HONEST
@@ -460,7 +649,8 @@ STEP_TABLE = {
 #     ff643470 h=1.5  plan 1023 save_every 205: @6.96 -> 700 steps, SHIPS 615
 #                                               @8.13 -> 600 steps, SHIPS 410
 #     7421f056 h=1.25 plan  836 save_every 168: @6.96 -> 570 steps, SHIPS 504
-#     4782f46f h=1.5  plan  957 save_every 192: @6.96 -> 700 steps, SHIPS 576
+#     4782f46f h=1.5  plan  947 save_every 190: @6.96 -> 700 steps, SHIPS 570
+#                                               @8.13 -> 599 steps, SHIPS 570
 # i.e. 40-60% of planned depth, DEGRADED not forfeited.  A constant built to
 # survive 8.13 would instead plan ~400 qwen steps against a field that shipped
 # 949-1095 — the failure this recalibration exists to undo.  The trade is stated,
@@ -475,8 +665,8 @@ STEP_TABLE = {
 # It yields NO rate datum at all.
 SEC_PER_IT = {
     # flux 2.5 -> 2.0.  Field cadence implies ~1.7 s/step at batch 1; 2.0 is an
-    # ~18% pad and restores the size law (870) as the binding constraint.
-    # INFERRED, not measured — kohya logs epochs.
+    # ~18% pad and restores the size law (754 at the real n_train=13) as the
+    # binding constraint.  INFERRED, not measured — kohya logs epochs.
     "flux": 2.0,
     # krea2 2.2 -> 1.35 (was 1.5 at c424362).  The old 2.2 was justified by
     # `do_differential_guidance`, an unreachable branch that has never executed
@@ -487,14 +677,19 @@ SEC_PER_IT = {
     # both make the SIZE LAW the binding constraint everywhere, which is the
     # stated intent of the krea2 row — while 1.5 is the only one of the three
     # that still lets the clock truncate it:
-    #     shape                     law   SEC1.5   SEC1.35   SEC1.30
-    #     41025fb5 N=21 h=0.75     1432     1336      1432      1432
-    #     3e0fdcde N=42 h=1.00     1825     1825      1825      1825
-    #     db9f7244 N=43 h=1.00     1840     1840      1840      1840
-    #     f6725c2b N=50 h=1.00     1939     1888      1939      1939
-    # The law stops being truncated for any SEC <= 1.399 (0.75 h) and <= 1.460
+    #     shape                          law   SEC1.5   SEC1.35   SEC1.30
+    #     41025fb5 n=18 (N=21) h=0.75   1432     1336      1432      1432
+    #     3e0fdcde n=37 (N=42) h=1.00   1843     1843      1843      1843
+    #     db9f7244 n=38 (N=43) h=1.00   1860     1860      1860      1860
+    #     f6725c2b n=45 (N=50) h=1.00   1974     1888      1974      1974
+    # The law stops being truncated for any SEC <= 1.399 (0.75 h) and <= 1.434
     # (1.0 h); 1.35 sits 3.6% inside that threshold, and 1.30 buys nothing beyond
     # it while making `projected_wall_s` 4% more optimistic.  So 1.35.
+    # (Table re-replayed at the corrected abscissa 2026-08-07.  The 0.75 h
+    # threshold is unchanged at 1.399 because the R1 law is pinned to 1432 by
+    # construction either way; the 1.0 h threshold tightens 1.460 -> 1.434
+    # because the deepest 1.0 h shape moved 1939 -> 1974.  1.35 still clears
+    # both, and the SEC 1.5/1.35/1.30 verdicts are qualitatively identical.)
     #
     # SAFETY.  1.35 is a 7.2% pad over our own measured 1.259 s/step, and that
     # 1.259 is GROSS OF STARTUP (it is toolkit_start -> toolkit_end for 823
@@ -508,8 +703,10 @@ SEC_PER_IT = {
     # the R1 plan truncates at ANY rate above 1.51885 s/step.  That is 20.6% over
     # our own measured 1.259 — a real cushion, but it is a single knife-edge, and
     # the guard test only passes because `field_demonstrated_steps` is exact
-    # integer arithmetic.  The 1.0 h shapes are not tight: 1825/1840/1939 sit
-    # 4-10% inside the 2024-step window.  See `FIELD_DEMONSTRATED_DEPTH`.
+    # integer arithmetic.  The 1.0 h shapes are not tight: 1843/1860/1974 sit
+    # 2.5-9% inside the 2024-step window — but note the deepest one (n_train 45,
+    # N=50) tightened from 4% to 2.5% of margin in the abscissa refit, so that
+    # shape is now the second knife-edge after R1.  See `FIELD_DEMONSTRATED_DEPTH`.
     #
     # DOWNSIDE IF WE ARE SLOWER THAN THAT.  A deadline stop DEGRADES depth, it
     # does not forfeit: `_run_toolkit -> _terminate -> _finalize` promotes the
@@ -527,7 +724,7 @@ SEC_PER_IT = {
     # (PIPELINE-MATERIALIZATION-AUDIT D6).  ~2x the field's per-step cost, so
     # 2.05 * 2 ~= 4.2 is the honest constant FOR OUR PIPELINE.  This costs us
     # nothing on the real shapes: on all three Aug-3 ideogram4 tasks the size law
-    # (421/616/589) still binds below the 4.2-based cap (477/674/674), so the
+    # (414/614/589) still binds below the 4.2-based cap (477/674/674), so the
     # materialised steps are identical to what a 2.1 constant would give — while
     # preserving the kill-safety margin that a 2x-optimistic constant would burn.
     "ideogram4": 4.2,
@@ -579,9 +776,13 @@ EXPORT_RESERVE_S = 180.0  # mirrors cli._EXPORT_RESERVE_SECONDS
 # reproduce from any shipped constant — the slope implied by the series is
 # 3600/SEC = 2892, i.e. SEC ~= 1.245, against a ~944 s fixed reserve.  Corrected
 # 2026-08-06 by the week-6 correctness sweep.)  The krea2 law returns at most
-# 1939 in the observed size range, so at every margin >= 0.85 the LAW binds and
-# this cap is inert for krea2 — which is the intent, and is why the wrong
-# numbers changed no decision.
+# 1974 in the observed size range (n_train 45, from the N=50 task), so at every
+# margin >= 0.90 the LAW binds and this cap is inert for krea2 — which is the
+# intent.  HONEST CORNER INTRODUCED BY THE ABSCISSA REFIT: at margin 0.85 the
+# cap is 1911 and would now clip that one shape 1974 -> 1911 (-3.2%).  The old
+# claim "at every margin >= 0.85" held while the deepest emission was 1869; it
+# does not hold at 1974.  Production runs 0.92, so this is a statement about the
+# sensitivity grid, not about any shipped plan.
 # 0.92 keeps ~290 s of jitter headroom BEYOND the 480 s reserve.
 # The asymmetry favours scheduling slightly deep: over-scheduling is recoverable
 # because `forge/tasks/checkpoints.py` promotes the highest valid periodic save
@@ -594,6 +795,9 @@ EXPORT_RESERVE_S = 180.0  # mirrors cli._EXPORT_RESERVE_SECONDS
 # three real qwen shapes: 7421f056 planned 909, stopped at 850, shipped its
 # 728-step save; ff643470 planned 1104, stopped at 1042, shipped 884.  A margin
 # is a per-type dial because the headroom it is spending is per-type.
+# (Replayed at the corrected abscissa: 7421f056 would plan 911, stop at 850 and
+# ship its 732-step save; ff643470 would plan 1097, stop at 1042 and ship 880.
+# The pre-abscissa figures were 909/728 and 1104/884 — same conclusion.)
 MARGIN = 0.92
 # Per-type override of MARGIN.  READ THIS WITH SEC_PER_IT — the pair is what is
 # calibrated, and the invariant they exist to satisfy is the one the guard test
@@ -637,7 +841,13 @@ MARGIN_BY_TYPE = {
 # 1.5 h).  It is the reproduced KILL at 850 in 1.25 h, which is slower and is a
 # measurement rather than a bound — see the SEC_PER_IT header.
 FIELD_DEMONSTRATED_DEPTH = {
-    "flux": (0.75, 870, "5FW2Eaae 241cda6c rank 1, 58 kohya epochs x N=15"),
+    # 870 -> 754, SAME ARITHMETIC ERROR AS THE `flux` STEP_TABLE ROW: this is
+    # `epochs x images`, and the image count is what train_data.zip holds (13,
+    # OBSERVED from its central directory), not the auditing record's N=15.
+    # This entry is a SAFETY CEILING — "never plan deeper than the field is
+    # known to have completed" — so an inflated value silently weakened the
+    # guard.  754 makes the flux plan land exactly on its own ceiling.
+    "flux": (0.75, 754, "5FW2Eaae 241cda6c rank 1, 58 kohya epochs x n_train=13"),
     "krea2": (0.75, 1432, "5FBmn1ax + 5FjDsFGA 41025fb5, cfg 1432 shipped 1432"),
     "ideogram4": (1.0, 761, "5FBmn1ax b72da8c6 cfg 1523 shipped 1523, HALVED "
                             "for our do_cfg batch-2 step (2.019 -> 4.038 s/step)"),

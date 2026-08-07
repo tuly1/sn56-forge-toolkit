@@ -62,7 +62,8 @@ REAL_IDEOGRAM_TASKS = [
     # CORRECTED: the deep arm is 800, not ">900".  5GU4Xkd3 trained to 900
     # (metadata on last_000000900) and its `last.safetensors` has the same LFS
     # oid as its `last_000000800.safetensors`.
-    ("1365fa1c", "product", 14, 0.75, 174, 421),
+    # n_train 12 (N=14): OBSERVED in the zip central directory.  421 -> 414.
+    ("1365fa1c", "product", 12, 0.75, 174, 414),
     # b72da8c6: BOTH arms deep (1100 rank 1 vs 1523 rank 2, +4.4%).  No shallow
     # arm exists on this task, so it cannot show that a shallow run would lose —
     # only that 1100 ~= 1523.
@@ -72,10 +73,13 @@ REAL_IDEOGRAM_TASKS = [
     # and is the ONLY ideogram4 config in the field with no `ema_config` block —
     # the same operator ran EMA 0.99 on the two tasks he WON, so depth and EMA
     # are confounded within his own three runs.
-    ("b72da8c6", "style", 40, 1.0, 1100, 589),
+    # n_train 36 (N=40).  589 is unchanged: base 500 at N=40 and base 517 at
+    # n_train 36 both land on 589, the one coincidence in the table.
+    ("b72da8c6", "style", 36, 1.0, 1100, 589),
     # 84be9fcd: 341 (rank 1) vs an opponent who published ONE FILE, no
     # __metadata__ and no checkpoint ladder.  ZERO depth information.
-    ("84be9fcd", "style", 46, 1.0, 341, 616),
+    # n_train 41 (N=46).  616 -> 614.
+    ("84be9fcd", "style", 41, 1.0, 341, 614),
 ]
 IDS = [row[0] for row in REAL_IDEOGRAM_TASKS]
 
@@ -84,6 +88,12 @@ IDS = [row[0] for row in REAL_IDEOGRAM_TASKS]
 # `image_text_pairs` in api.gradients.io/auditing/tasks/3cfa1578-... is 11; the
 # "N=9" that appeared in earlier week-6 notes is wrong.
 JUL20_R1_N_PAIRS = 11
+# ...but the law is handed 11 - ceil(1.1) = 9.  BOTH numbers are right, for
+# different quantities, and the "the N=9 in earlier week-6 notes is wrong"
+# correction above was itself the error.  PROVED BY OUR OWN RUN: on Jul-20 the
+# row was base=140 p=0.50 with the clock inert, and 5HLA2QWY shipped 86 steps.
+# 140*(9/24)**0.5 = 85.7 -> 86; 140*(11/24)**0.5 = 94.8 -> 95.
+JUL20_R1_N_TRAIN = 9
 JUL20_R1_HOURS = 0.75
 # 5FNLSgh8, rank 1 of 16, test_loss 0.0502341.  Shipped 378 steps at lr 2.5e-5
 # with `cosine_by_group` + `use_ema: true` / `ema_decay: 0.995` + TE-LoRA on a
@@ -442,7 +452,7 @@ def test_ideogram4_matches_the_only_in_family_field_winner():
     our peak, so its step count is not transferable (that is the whole premise
     of this file).  Exactly ONE is not like that: 5FNLSgh8 on the Jul-20 R1 task
     3cfa1578 ran lr 2.5e-5 with a cosine schedule, EMA on, and a rank-32 LoRA —
-    our family — and WON, 1 of 16, at 378 steps on N=11 h=0.75.
+    our family — and WON, 1 of 16, at 378 steps on N=11 / n_train 9, h=0.75.
 
     That is the R1 shape, ideogram4 is half the R1 draw, and it is the only
     depth in either tournament produced by a recipe like ours.  So it is the one
@@ -451,15 +461,25 @@ def test_ideogram4_matches_the_only_in_family_field_winner():
 
     HOW STRONG THE ANCHOR IS, honestly: n=1.  The band is deliberately wide
     (0.75x..1.35x) — it is a tripwire against a rewrite that lands 4x away, not
-    a claim that 390 is optimal.  For calibration, the production pin 084ea914
-    (base=140 p=0.50) returns 95 here, which is 0.25x and would fail.
+    a claim that 378 is optimal.  For calibration, the production pin 084ea914
+    (base=140 p=0.50) returns 86 here, which is 0.23x and would fail — and 86
+    is not hypothetical, it is what those constants DID ship for us on this
+    exact task.
+
+    EVALUATED AT n_train, NOT AT N.  The winner's container held 9 images, and
+    so will ours; `base` is set to 378/(9/24)**0.32 = 517.4 so the equality is
+    exact rather than "+3.2% at a shape the runtime never sees".
     """
     shipped = recipe.size_scaled_steps(
-        "ideogram4", JUL20_R1_N_PAIRS, JUL20_R1_HOURS, 1000
+        "ideogram4", JUL20_R1_N_TRAIN, JUL20_R1_HOURS, 1000
     )
     ratio = shipped / JUL20_IN_FAMILY_WINNER_STEPS
+    assert shipped == JUL20_IN_FAMILY_WINNER_STEPS, (
+        f"the row no longer reproduces its own calibration anchor: {shipped} "
+        f"!= {JUL20_IN_FAMILY_WINNER_STEPS}"
+    )
     assert 0.75 <= ratio <= 1.35, (
-        f"N={JUL20_R1_N_PAIRS} h={JUL20_R1_HOURS} ships {shipped} steps against "
+        f"n_train={JUL20_R1_N_TRAIN} h={JUL20_R1_HOURS} ships {shipped} steps against "
         f"the only in-family field winner's {JUL20_IN_FAMILY_WINNER_STEPS} "
         f"({ratio:.2f}x)"
     )
@@ -467,7 +487,7 @@ def test_ideogram4_matches_the_only_in_family_field_winner():
     # the agreement would be an accident of SEC_PER_IT (which is UNMEASURED for
     # ideogram4) rather than a property of the depth policy.
     law = recipe.STEP_TABLE["ideogram4"]
-    pure = law["base"] * (JUL20_R1_N_PAIRS / law["n_ref"]) ** law["p"]
+    pure = law["base"] * (JUL20_R1_N_TRAIN / law["n_ref"]) ** law["p"]
     assert shipped == int(round(max(law["min"], min(law["max"], pure))))
 
 
@@ -475,7 +495,8 @@ def test_ideogram4_is_not_below_every_depth_that_ever_won():
     """Directional guard: do not re-ship a law that is under the whole field.
 
     The production pin 084ea914 (base=140 p=0.50 min=48 max=400) returned
-    95/107/181/194 against winning depths of 378/174/1100/341 at N=11/14/40/46 —
+    86/99/171/183 against winning depths of 378/174/1100/341 at the n_train
+    9/12/36/41 those four tasks deliver (N=11/14/40/46) —
     every residual the same sign, i.e. a BIAS, not scatter.  Our two tournament
     results to date were both on the shallow side of their fields, and the one
     catastrophic ideogram4 artifact on record (5FjDsFGA, Jul-20, +421% loss vs
@@ -488,8 +509,9 @@ def test_ideogram4_is_not_below_every_depth_that_ever_won():
     rank 13 on lr alone.  It asserts only that we are not uniformly beneath a
     field whose depth we cannot explain.
     """
-    winners = {11: 378, 14: 174, 40: 1100, 46: 341}
-    hours = {11: 0.75, 14: 0.75, 40: 1.0, 46: 1.0}
+    # keyed by n_train — the abscissa the law is handed, not the audit N
+    winners = {9: 378, 12: 174, 36: 1100, 41: 341}
+    hours = {9: 0.75, 12: 0.75, 36: 1.0, 41: 1.0}
     below = [
         n
         for n, w in winners.items()
@@ -505,30 +527,33 @@ def test_ideogram4_bounds_can_actually_bind():
     """``max`` must not be decoration.
 
     The c424362 row carried ``max: 1600`` while the law topped out at 365 at
-    N=50 — it could never bind within 4x, so it encoded nothing.  620 first
-    CHANGES the shipped depth at **N = 48** — not N=47, as this docstring used
-    to say: at N=47 the law returns 619.975, which rounds to 620 with or without
-    the cap.  ``test_step_table_max_binding_sizes`` pins the crossover at 48.
+    N=50 — it could never bind within 4x, so it encoded nothing.
 
-    And be honest about the size of the effect: 620 binds only at N = 48, 49, 50
-    and changes depth by 4 / 8 / 12 steps.  It is inside the observed range
-    (f6725c2b ran N=50) but it is very nearly decoration; it is kept as a cap on
-    extrapolating a recipe we have never run past ~200 steps in a tournament.
-    ``min`` is the opposite kind of bound: it guards the unobserved small tail,
-    below the N=9 minimum ever seen.
+    ALL BOUNDS BELOW ARE NOW IN n_train, THE LAW'S ACTUAL ARGUMENT.  620 first
+    CHANGES the shipped depth at **n_train = 43**, which is the same real task
+    it always bit at: the old N-space crossover was 48 and 48 - ceil(4.8) = 43.
+    The refit moved the units, not the policy.
 
-    NOTE the assertion is ``pure(46) < max <= pure(50)``, which is satisfied by
-    the N=47 no-op as well — it does not by itself pin 48.
+    And be honest about the size of the effect: 620 binds only at n_train 43,
+    44, 45 (N = 48, 49, 50) and changes depth by 3 / 8 / 12 steps.  That is at
+    the very top of the observed range and ABOVE the largest ideogram4 task ever
+    seen (84be9fcd, n_train 41), so it is very nearly decoration; it is kept as
+    a cap on extrapolating a recipe we have never run past ~200 steps in a
+    tournament.  ``min`` is the opposite kind of bound: it guards the unobserved
+    small tail, below the n_train 9 minimum ever seen — which is exactly the
+    Jul-20 R1 shape this row is anchored on, so ``min`` must NOT bind there.
     """
     law = recipe.STEP_TABLE["ideogram4"]
 
     def pure(n):
         return law["base"] * (n / law["n_ref"]) ** law["p"]
 
-    assert pure(46) < law["max"] <= pure(50), "max must bind inside 9..50"
-    assert recipe.size_scaled_steps("ideogram4", 50, 1.0, 2000) == law["max"]
-    # min binds strictly below the smallest ideogram4 dataset ever observed
-    # (N=9, Jul-20 R1 task 3cfa1578).
+    # the largest ideogram4 abscissa ever observed is 41; the largest of ANY
+    # type is 45 (f6725c2b, N=50).  `max` must sit between them.
+    assert pure(41) < law["max"] <= pure(45), "max must bind inside n_train 8..45"
+    assert recipe.size_scaled_steps("ideogram4", 45, 1.0, 2000) == law["max"]
+    # min binds strictly below the smallest ideogram4 abscissa ever observed
+    # (n_train 9, from the N=11 Jul-20 R1 task 3cfa1578).
     assert pure(9) > law["min"] >= pure(7)
 
 
