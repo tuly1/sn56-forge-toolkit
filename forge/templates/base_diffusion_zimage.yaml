@@ -44,6 +44,66 @@ config:
       noise_scheduler: flowmatch
       timestep_type: weighted
       dtype: bf16
+      # ADDED (was absent -> toolkit default 'mse', toolkit/config_modules.py:502
+      # at ai-toolkit pin 99be3d96).  Consumed at extensions_built_in/sd_trainer/
+      # SDTrainer.py:818; any other string silently falls through to the mse
+      # `else` at :827, so tests/test_loss_and_ema_policy.py asserts the literal.
+      #
+      # The direct z-image observation is ONE task and is confounded — Aug-3
+      # b2582457, where the only mae entrant won:
+      #   .../tournament-...-b2582457-...-5FBmn1ax  mae, ema 0.995, 1317 steps,
+      #       min_denoising_steps 100, rank 1, 0.061716
+      #   .../tournament-...-b2582457-...-5GU4Xkd3  mse, ema off,   1000 steps,
+      #       caption_dropout 0.05,          rank 2, 0.063187   (+2.38%)
+      # That alone would NOT justify the change.  What justifies it is that the
+      # lever is carried by evidence from OUTSIDE this type: the clean,
+      # depth-matched, terminal-export pair on Aug-3 krea2 41025fb5 (+8.39% for
+      # mse) replicated with the operator identity crossed over on Jul-27 krea2
+      # 73013636 (+2.99%) — see base_diffusion_krea2.yaml for the full citation
+      # and the mechanism argument.  loss_type is an architecture-independent
+      # property of the flow-matching objective, and 5FBmn1ax runs mae on all
+      # three of krea2/z-image/qwen while keeping mse on ideogram4, so it is
+      # treating this as a per-family choice, not a per-arch accident.
+      #
+      # NOTE the shape of what is being copied: 5FBmn1ax's b2582457 config is
+      # this template almost verbatim (network 32/32 + conv 16/16, quantize +
+      # quantize_te, assistant_lora_path, timestep_type weighted, lr 1e-4,
+      # optimizer adamw8bit, resolution [512,768,1024]) plus exactly three keys —
+      # loss_type: mae, ema_config, and min_denoising_steps: 100.  Only the first
+      # is taken here; see the EMA note below for why the second is refused, and
+      # min_denoising_steps is not this unit's lever.
+      loss_type: mae
+      # NO ema_config — z-image EMA is REFUSED, unlike qwen-image.  The z-image
+      # field is 8 published configs and the EMA contrast is a coin flip:
+      #   * 6 of 8 ran EMA off (5 of those never wrote the key at all, so the
+      #     "majority" is mostly an omission rather than a decision), and 3 of
+      #     the 4 rank-1 slots are EMA-off (42112d9b 5FpdSckw, c8733e67 5GpcTKW7,
+      #     b290d171 5EACrayt).
+      #   * Both EMA-ON entrants are confounded and neither is usable: Aug-3
+      #     b2582457 5FBmn1ax also carries mae + 317 more steps +
+      #     min_denoising_steps; Jul-27 c8733e67 5HKEAZxF (rank 2) ships a
+      #     `last_premerge.safetensors`, and the EMA-OFF entrant that beat it by
+      #     3.61% at near-matched depth (1222 vs 1200) ships
+      #     `checkpoint-soup.safetensors` + `last.unselected.safetensors` and
+      #     promoted step 1100 — that pair measures merge/selection machinery,
+      #     not EMA.
+      # Against a coin flip there is a MEASURED cost.  At the pinned runtime the
+      # exported adapter IS the shadow (BaseSDTrainProcess.py:495-497 ema.eval()
+      # -> store()+copy_to() before the write, :697-698 ema.train() after), the
+      # shadow is seeded at init (toolkit/ema.py:61-64) while lora_up is
+      # zero-init (toolkit/lora_special.py:122), and setup_ema
+      # (BaseSDTrainProcess.py:769-781) never passes use_num_updates, so the
+      # decay is fixed from step 1 (ema.py:57 + :118-123).  At z-image's planned
+      # 1186 (b290d171) and 1315 (b2582457) steps under this template's constant
+      # LR (no lr_scheduler key -> 'constant', config_modules.py:367) decay 0.995
+      # exports lora_up at 0.833 / 0.849 of its live magnitude on a
+      # linear-growth trajectory and 0.906 / 0.916 on a sqrt one — an 8-17%
+      # depth haircut bought with no measured gain.
+      # THE EXPERIMENT, when there is GPU time: z-image has >20% clock slack, so
+      # run 5FBmn1ax's b2582457 config with and without `ema_config` at fixed
+      # steps and score both with the validator stack.  It is a one-variable
+      # A/B and it is the only way to settle this.
+      # Guarded by tests/test_loss_and_ema_policy.py.
     model:
       name_or_path: /cache/models
       arch: zimage:turbo
