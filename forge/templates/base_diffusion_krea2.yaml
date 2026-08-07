@@ -56,6 +56,46 @@ config:
       unload_text_encoder: false
       cache_text_embeddings: false
       lr: 0.0001
+      # EMA STAYS OFF ON KREA2 — DELIBERATE, and it is the one type where we
+      # REFUSE the field's EMA.  Rebuilt from the public artifacts of BOTH image
+      # tournaments (28 tasks, 75 published repos, 42 config-bearing entrants on
+      # krea2/z-image/qwen):
+      #   * 5FBmn1ax — 8 of its 10 Aug-3 entries won — ran `ema_config` ON with
+      #     decay 0.995 for its qwen and z-image entries IN THE SAME TOURNAMENT
+      #     and left the block ABSENT (= use_ema false, toolkit/config_modules.py
+      #     :521-529 + :795 at ai-toolkit pin 99be3d96) on ALL FOUR krea2 entries:
+      #       .../tournament-...-41025fb5-...-5FBmn1ax/checkpoints/config.yaml
+      #       .../tournament-...-3e0fdcde-...-5FBmn1ax/checkpoints/config.yaml
+      #       .../tournament-...-db9f7244-...-5FBmn1ax/checkpoints/config.yaml
+      #       .../tournament-...-f6725c2b-...-5FBmn1ax/checkpoints/config.yaml
+      #     A within-operator, within-tournament, cross-type split is worth far
+      #     more than the field-wide rank correlation, which is confounded.
+      #   * In the ONLY open krea2 field with real width (Jul-27 73013636, 18
+      #     ranked, 10 published configs), the two EMA-ON entrants finished 11th
+      #     (5HWPK9f6, decay 0.995) and 13th (5CV7cKML, decay 0.99) — last among
+      #     the config-bearing entrants.  The two Aug-3 EMA-ON krea2 winners
+      #     (5EACrayt, 5FNLSgh8 on 41025fb5) are NOT usable as counter-evidence:
+      #     both also ran lr_scheduler cosine_by_group, timestep_type
+      #     krea2_eval_sigmas, train_text_encoder, differential_guidance_scale
+      #     12.0, and shipped last.safetensors byte-identical to their own
+      #     .krea2-best.safetensors chosen by .krea2_checkpoint_evaluations.json.
+      #     EMA cannot be isolated from that bundle.
+      #   * COST, quantified at the pinned runtime: the shadow is seeded at init
+      #     (toolkit/ema.py:61-64 `p.clone().detach()`) and lora_up is zero-init
+      #     (toolkit/lora_special.py:122), so with fixed decay (setup_ema at
+      #     jobs/process/BaseSDTrainProcess.py:769-781 never passes
+      #     use_num_updates, so ema.py:57 + :118-123 keeps decay constant) the exported
+      #     shadow is the trained delta attenuated by the EMA lag.  At krea2's
+      #     planned 1432 / 1825 / 1840 / 1939 steps on the four real Aug-3 krea2
+      #     shapes, under this template's constant LR (no lr_scheduler key ->
+      #     'constant', config_modules.py:367), decay 0.995 would export lora_up
+      #     at 0.861-0.897 of its live magnitude on a linear-growth trajectory
+      #     and 0.924-0.945 on a sqrt one — a 6-14% haircut on our DEEPEST type
+      #     for no measured gain.
+      # `ema_decay` is inert while use_ema is false (config_modules.py:527
+      # replaces the whole block with {'use_ema': False}); it is kept so the
+      # emitted key set does not change shape.  Guarded by
+      # tests/test_loss_and_ema_policy.py.
       ema_config:
         use_ema: false
         ema_decay: 0.99
@@ -67,7 +107,69 @@ config:
       diff_output_preservation_multiplier: 1
       diff_output_preservation_class: person
       switch_boundary_every: 1
-      loss_type: mse
+      # mse -> mae.  Consumed at extensions_built_in/sd_trainer/SDTrainer.py:818
+      # (`l1_loss(pred, target, reduction="none")`) at ai-toolkit pin 99be3d96;
+      # any other string silently falls through to the mse `else` at :827, which
+      # is why tests/test_loss_and_ema_policy.py asserts the exact literal.
+      #
+      # THE ONE CLEAN MATCHED PAIR IN THE WHOLE PUBLIC RECORD, Aug-3 R1 krea2
+      # task 41025fb5 (15 ranked, 7 published configs).  These two configs are
+      # byte-equal except for four keys, both ran steps 1432 / lr 1e-4 /
+      # lr_scheduler constant / timestep_type linear / EMA off / network 32:32,
+      # and BOTH completed and shipped the TRUE terminal export (their
+      # checkpoints/last.safetensors LFS oid matches no rung of their own
+      # numbered ladder, so neither promoted an earlier checkpoint):
+      #   .../tournament-...-41025fb5-...-5FBmn1ax  loss_type mae  rank  4  0.048934
+      #   .../tournament-...-41025fb5-...-5FjDsFGA  loss_type mse  rank 14  0.053039
+      # -> the mse arm's test_loss is 8.39% higher.  Residual diffs: this key,
+      # differential_guidance_scale 3 vs 2, caption_dropout_rate absent vs 0.05,
+      # save_every 200 vs 100 (inert: both completed).
+      #
+      # REPLICATED IN THE PRIOR TOURNAMENT WITH THE OPERATOR IDENTITY CROSSED
+      # OVER, which is what kills the "the champion is just better" reading.
+      # Jul-27 R1 krea2 task 73013636 (18 ranked) carries the SAME two configs
+      # with the SAME three residual diffs, but 5FBmn1ax is on the mse side:
+      #   .../tournament-tourn_0f7a1d3f6b5b66f9_20260727-73013636-...-5EeLcV3L
+      #       loss_type mae  rank  3  0.044143
+      #   .../tournament-tourn_0f7a1d3f6b5b66f9_20260727-73013636-...-5FBmn1ax
+      #       loss_type mse  rank  9  0.045464   (+2.99%)
+      # WEAKER than the Aug-3 pair and reported as such: neither repo contains a
+      # checkpoints/last.safetensors, so both were deadline-killed (ladder tops
+      # 1200 and 1100 of a planned 1432) and the shipped depths are NOT matched.
+      # Same sign, smaller and dirtier.  5FBmn1ax then switched mse -> mae for
+      # Aug-3 on this type and on qwen/z-image, and kept mse on ideogram4.
+      #
+      # HONEST LIMIT: within this field loss_type is COLLINEAR with
+      # differential_guidance_scale (3 travels with mae, 2 with mse) and with
+      # caption_dropout_rate (absent vs 0.05).  The public record cannot separate
+      # the three.  Only loss_type moves here — differential_guidance_scale and
+      # caption_dropout_rate are other units' levers and are left untouched.
+      #
+      # MECHANISM (why this is not just "train the metric you are scored on"):
+      # the score is per-pixel RGB MSE of a 25-step img2img RECONSTRUCTION at
+      # denoise 0.80, 75% of it with the prompt forced to "" (validator pin
+      # b026da04, evaluators/diffusion.py:203-209,311-314; scoring/tasks.py
+      # :280-298), NOT the training objective.  Training loss lives in velocity
+      # space at ONE random timestep per step; the map from it to reconstruction
+      # pixel-MSE runs through the whole ODE and is not monotone, so "MSE
+      # training matches an MSE metric" does not follow.  What does follow: at
+      # batch_size 1 / gradient_accumulation 1 the per-step velocity residual is
+      # heavy-tailed, and mse's gradient scales with the residual while mae's is
+      # sign() — constant magnitude.  mse therefore spends this rank-32 adapter's
+      # capacity on the largest-residual elements, which are the high-noise
+      # timesteps where the target is nearly pure noise and carries almost no
+      # dataset-specific signal; mae spreads it evenly and lands more of it at
+      # the mid/low-noise timesteps that actually write image content.  That is
+      # the right allocation for a metric whose 75%-weighted term is an
+      # UNCONDITIONAL reconstruction, where the only useful thing a LoRA can do
+      # is a broad low-magnitude shift of the base field.  No LR compensation is
+      # needed for the changed gradient scale because adamw8bit normalises by
+      # sqrt(v) — and the field confirms it: every mae artifact ran lr 1e-4 on
+      # krea2 and z-image, identical to its mse neighbours.
+      # Effect sizes (8.4% and 3.0%, same sign, two tournaments) are the size of
+      # a regularisation win, not of a bug fix — which is what this mechanism
+      # predicts.  Guarded by tests/test_loss_and_ema_policy.py.
+      loss_type: mae
       do_differential_guidance: true
       differential_guidance_scale: 2
     logging:

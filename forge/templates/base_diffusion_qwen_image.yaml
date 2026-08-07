@@ -47,6 +47,79 @@ config:
       cache_text_embeddings: true
       train_unet: true
       train_text_encoder: false
+      # ADDED (was absent -> toolkit default 'mse', toolkit/config_modules.py:502
+      # at ai-toolkit pin 99be3d96).  Consumed at extensions_built_in/sd_trainer/
+      # SDTrainer.py:818; any other string silently falls through to the mse
+      # `else` at :827, so tests/test_loss_and_ema_policy.py asserts the literal.
+      #
+      # The two Aug-3 qwen mae artifacts BOTH won, but read them honestly — both
+      # beat opponents that were DEADLINE-KILLED, so the head-to-head gaps are
+      # contaminated by depth, not clean loss_type reads:
+      #   4782f46f 5FBmn1ax mae 949 steps, terminal export      rank 1 0.058812
+      #   4782f46f 5GU4Xkd3 mse, planned 1300, NO last.safetensors,
+      #                     ladder top last_000000600            rank 2 0.075908
+      #   ff643470 5FBmn1ax mae 1095 steps, terminal export      rank 1 0.115937
+      #   ff643470 5FW2Eaae mse, planned 1300, NO last.safetensors,
+      #                     ladder top last_000000700            rank 2 0.116884
+      # (5FBmn1ax also auto-tunes rank 141/149 and lr ~9e-5 against the field's
+      # 128 and 1e-4, so its qwen entries are not one-variable comparisons in any
+      # case.)  This key is therefore taken on the krea2 evidence, which IS
+      # clean: the depth-matched, terminal-export pair on Aug-3 41025fb5 (+8.39%
+      # for mse) replicated with the operator identity crossed over on Jul-27
+      # 73013636 (+2.99%).  See base_diffusion_krea2.yaml for the full citation
+      # and the mechanism argument; loss_type is a property of the flow-matching
+      # objective, and 5FBmn1ax runs mae on krea2, z-image AND qwen while keeping
+      # mse on ideogram4.
+      loss_type: mae
+      # EMA ON — and qwen-image is the ONE type of the three where it ships.
+      # OBSERVED: every single config-bearing qwen entrant across BOTH image
+      # tournaments — 13 of 13, six distinct hotkeys (5FpdSckw, 5GU4Xkd3,
+      # 5GKoYQm7, 5FW2Eaae, 5C7yZ5wg, 5FBmn1ax), Jul-27 and Aug-3, every rank-1
+      # and every rank-2 — ran use_ema true with ema_decay EXACTLY 0.995, e.g.
+      #   .../tournament-...-4782f46f-...-5FBmn1ax/checkpoints/config.yaml
+      #   .../tournament-...-7421f056-...-5FW2Eaae/checkpoints/config.yaml
+      #   .../tournament-...-ff643470-...-5FW2Eaae/checkpoints/config.yaml
+      # Our template was the only qwen recipe in the record with EMA off.
+      # INFERRED and stated as such: unanimity is not a controlled comparison —
+      # nobody ran the off arm, and the near-identical 128/128 + lr 1e-4 +
+      # weighted configs look like one ancestor copied forward.  What it does
+      # establish is that EMA 0.995 is not harmful enough for six operators to
+      # drop it, which is the bar for adopting the field default on the one type
+      # where we are the outlier.
+      #
+      # 0.995 IS THE DECAY THE EVIDENCE SUPPORTS AT OUR DEPTH — checked, not
+      # assumed.  The exported adapter IS the shadow (BaseSDTrainProcess.py
+      # :495-497 ema.eval() -> ema.py:336-341 store()+copy_to() before the write;
+      # :697-698 ema.train() restores after), the shadow is seeded at init
+      # (ema.py:61-64) while lora_up is zero-init (lora_special.py:122), and
+      # setup_ema (BaseSDTrainProcess.py:769-781) never passes use_num_updates,
+      # so ema.py:57 + :118-123 holds the decay fixed from step 1 with no warmup ramp.
+      # Under this template's constant LR (no lr_scheduler key -> 'constant',
+      # config_modules.py:367) the exported lora_up carries this fraction of its
+      # live magnitude — OUR planned depths against the depths the field
+      # actually shipped WITH decay 0.995, on the same three Aug-3 qwen shapes:
+      #   task      ours (recipe.size_scaled_steps)   field (shipped)
+      #   7421f056   836  0.766 lin / 0.858 sqrt       850  0.769 / 0.861  rk1+rk2
+      #   4782f46f   957  0.794 / 0.879                949  0.792 / 0.878  rk1
+      #   ff643470  1023  0.807 / 0.888               1095  0.819 / 0.897  rk1
+      # We land within 15 steps / 1.3 percentage points of the winners on every
+      # shape, so 0.995 here is not an extrapolation and there is NO case for
+      # inventing a depth-matched decay (~0.991, tau≈107) that no artifact ever
+      # ran.  The haircut only leaves the demonstrated envelope if qwen depth
+      # drops below ~600 (0.685 lin / 0.791 sqrt); at that point 0.99 — the only
+      # other decay observed anywhere in the field — becomes the value to
+      # revisit.  tests/test_loss_and_ema_policy.py pins BOTH the decay and the
+      # depths this reasoning rests on, so neither can move silently.
+      # Cost is bounded by the field too: 5FBmn1ax ran EMA on this arch at
+      # network linear 141 — 1.30 G trainable LoRA params against our ~295 M at
+      # linear 32 (measured from the safetensors headers of its 4782f46f export
+      # and ours) — under the same low_vram + quantize + quantize_te settings,
+      # and completed 949 steps in the budget.  The extra shadow copy and the
+      # per-step ema.update() (SDTrainer.py:2151-2153, after optimizer.step())
+      # are therefore demonstrated at 4.4x our parameter count.
+      ema_config:
+        use_ema: true
+        ema_decay: 0.995
     model:
       name_or_path: /cache/models
       arch: qwen_image
