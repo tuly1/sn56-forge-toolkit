@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -158,6 +159,73 @@ def test_non_image_tournament_aborts():
         capture.sanitize_tournament(tournament, TOURNAMENT)
 
 
+def test_valid_plus_malformed_round_task_aborts_instead_of_erasing_membership():
+    tournament, _ = fixtures()
+    tournament["rounds"][0]["tasks"].append({"task_type": "ImageTask"})
+    with pytest.raises(sync.IntegrityError, match="canonical task ID"):
+        capture.sanitize_tournament(tournament, TOURNAMENT)
+
+
+def test_duplicate_round_participants_abort():
+    tournament, _ = fixtures()
+    tournament["rounds"][0]["participants"] = ["ours", "ours"]
+    with pytest.raises(sync.IntegrityError, match="duplicate participants"):
+        capture.sanitize_tournament(tournament, TOURNAMENT)
+
+
+def test_round_and_task_detail_type_conflict_aborts(tmp_path):
+    tournament, task = fixtures()
+    task["task_type"] = "TextTask"
+
+    def opener(request, timeout):
+        return FakeResponse(tournament if request.full_url.endswith("/details") else task)
+
+    with pytest.raises(sync.IntegrityError, match="not an image task"):
+        capture.capture(
+            tmp_path / "evidence", TOURNAMENT, observed_at=NOW, opener=opener
+        )
+
+
+def test_nonfinite_score_aborts_before_publication(tmp_path):
+    tournament, task = fixtures()
+    task["hotkey_details"][0]["test_loss"] = math.nan
+
+    def opener(request, timeout):
+        return FakeResponse(tournament if request.full_url.endswith("/details") else task)
+
+    with pytest.raises(sync.IntegrityError, match="not JSON"):
+        capture.capture(
+            tmp_path / "evidence", TOURNAMENT, observed_at=NOW, opener=opener
+        )
+    assert not (tmp_path / "evidence").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [("test_loss", "0.05"), ("synth_loss", []), ("rank", True), ("repo", {})],
+)
+def test_malformed_score_field_types_abort(field, bad):
+    _, task = fixtures()
+    task["hotkey_details"][0][field] = bad
+    with pytest.raises(sync.IntegrityError, match=f"invalid {field}"):
+        capture.sanitize_task(task, TASK)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "test_data=https://secret.invalid/rows.json",
+        "evaluation_assets.zip",
+        "holdouts/hidden-row.json",
+    ],
+)
+def test_free_text_score_fields_cannot_smuggle_prohibited_material(payload):
+    _, task = fixtures()
+    task["hotkey_details"][0]["score_reason"] = payload
+    with pytest.raises(sync.IntegrityError, match="prohibited material"):
+        capture.sanitize_task(task, TASK)
+
+
 def test_task_identity_mismatch_aborts():
     _, task = fixtures()
     task["task_id"] = "22222222-2222-4222-8222-222222222222"
@@ -209,3 +277,11 @@ def test_existing_snapshot_with_different_bytes_is_not_overwritten(tmp_path):
     with pytest.raises(sync.IntegrityError, match="different bytes"):
         capture.capture(output, TOURNAMENT, observed_at=NOW, opener=opener)
     assert snapshot.read_bytes() == before
+
+
+def test_default_api_transport_rejects_redirects_before_followup():
+    handler = capture._RejectRedirects()
+    with pytest.raises(sync.IntegrityError, match="attempted a redirect"):
+        handler.redirect_request(
+            None, None, 302, "Found", {}, "https://attacker.example/redirected"
+        )

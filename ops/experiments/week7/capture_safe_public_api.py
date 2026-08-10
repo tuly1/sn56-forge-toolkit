@@ -15,11 +15,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 from pathlib import Path
 import re
 import sys
 from typing import Any, Callable, Mapping, Protocol
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
     from safe_harvest_sync import (
@@ -27,6 +28,7 @@ try:
         Publisher,
         SyncError,
         canonical_json,
+        contains_forbidden_body_text,
         sha256_bytes,
         utc_iso,
         utc_now,
@@ -38,6 +40,7 @@ except ImportError:  # pragma: no cover
         Publisher,
         SyncError,
         canonical_json,
+        contains_forbidden_body_text,
         sha256_bytes,
         utc_iso,
         utc_now,
@@ -64,8 +67,17 @@ class Response(Protocol):
 OpenRequest = Callable[[Request, float], Response]
 
 
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        del req, fp, code, msg, headers, newurl
+        raise IntegrityError("public API request attempted a redirect")
+
+
+_NO_REDIRECT_OPENER = build_opener(_RejectRedirects())
+
+
 def _default_open(request: Request, timeout: float) -> Response:
-    return urlopen(request, timeout=timeout)  # type: ignore[return-value]
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)  # type: ignore[return-value]
 
 
 def fetch_json(url: str, *, timeout: float, opener: OpenRequest = _default_open) -> tuple[Any, str, int]:
@@ -84,15 +96,34 @@ def fetch_json(url: str, *, timeout: float, opener: OpenRequest = _default_open)
     finally:
         response.close()
     try:
-        value = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = json.loads(
+            body,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-standard JSON number {token}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise IntegrityError("public API response is not JSON") from exc
     return value, sha256_bytes(body), len(body)
 
 
 def _scalar(value: Any, key: str) -> Any:
     item = value.get(key) if isinstance(value, dict) else None
+    if isinstance(item, float) and not math.isfinite(item):
+        raise IntegrityError(f"public API field {key!r} contains a non-finite number")
+    if isinstance(item, str) and contains_forbidden_body_text(item):
+        raise IntegrityError(f"public API field {key!r} contains prohibited material")
     return item if item is None or isinstance(item, (str, int, float, bool)) else None
+
+
+def _score_rows(value: Any, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise IntegrityError(f"{label} is not a list")
+    rows = [_score_row(row) for row in value]
+    hotkeys = [row["hotkey"] for row in rows]
+    if len(hotkeys) != len(set(hotkeys)):
+        raise IntegrityError(f"{label} contains duplicate hotkeys")
+    return rows
 
 
 def _score_row(value: Any) -> dict[str, Any]:
@@ -114,6 +145,22 @@ def _score_row(value: Any) -> dict[str, Any]:
     hotkey = result["hotkey"]
     if not isinstance(hotkey, str) or not hotkey:
         raise IntegrityError("participant score row has no hotkey")
+    for field in ("repo", "submission_id", "score_reason"):
+        raw_field = value.get(field)
+        if raw_field is not None and not isinstance(raw_field, str):
+            raise IntegrityError(f"participant score row has invalid {field}")
+    for field in ("test_loss", "synth_loss", "quality_score"):
+        metric = value.get(field)
+        if metric is not None and (
+            not isinstance(metric, (int, float))
+            or isinstance(metric, bool)
+            or not math.isfinite(metric)
+        ):
+            raise IntegrityError(f"participant score row has invalid {field}")
+    if value.get("rank") is not None and (
+        type(value.get("rank")) is not int or value["rank"] < 0
+    ):
+        raise IntegrityError("participant score row has invalid rank")
     submitted = result["repo"] is not None or result["submission_id"] is not None
     scored = any(
         isinstance(result[key], (int, float)) and not isinstance(result[key], bool) and result[key] != 0
@@ -130,14 +177,19 @@ def _task_ids(tournament: Mapping[str, Any]) -> list[str]:
         raise IntegrityError("tournament has no rounds list")
     for round_value in rounds:
         if not isinstance(round_value, dict):
-            continue
+            raise IntegrityError("tournament round is not an object")
         tasks = round_value.get("tasks")
         if not isinstance(tasks, list):
-            continue
+            raise IntegrityError("tournament round has no tasks list")
         for task in tasks:
-            task_id = task.get("task_id") if isinstance(task, dict) else None
-            if isinstance(task_id, str) and TASK_RE.fullmatch(task_id):
-                found.add(task_id)
+            if not isinstance(task, dict):
+                raise IntegrityError("tournament task row is not an object")
+            task_id = task.get("task_id")
+            if not isinstance(task_id, str) or TASK_RE.fullmatch(task_id) is None:
+                raise IntegrityError("tournament task row has no canonical task ID")
+            if task_id in found:
+                raise IntegrityError("tournament contains a duplicate task ID")
+            found.add(task_id)
     if not found:
         raise IntegrityError("tournament contains no canonical task IDs")
     return sorted(found)
@@ -151,23 +203,39 @@ def sanitize_tournament(value: Any, tournament_id: str) -> tuple[dict[str, Any],
     task_ids = _task_ids(value)
     safe_rounds: list[dict[str, Any]] = []
     for round_value in value.get("rounds", []):
-        if not isinstance(round_value, dict):
-            continue
+        # `_task_ids` has already established the complete shape.  Never
+        # silently filter malformed rows here: the raw response is not kept,
+        # so filtering would make missing tournament membership unauditable.
+        if not isinstance(round_value, dict):  # defense in depth if validation changes
+            raise IntegrityError("tournament round is not an object")
         tasks: list[dict[str, Any]] = []
         for task in round_value.get("tasks", []):
-            if not isinstance(task, dict) or task.get("task_id") not in task_ids:
-                continue
+            if not isinstance(task, dict):  # defense in depth if validation changes
+                raise IntegrityError("tournament task row is not an object")
+            task_type = _scalar(task, "task_type")
+            if task_type != "ImageTask":
+                raise IntegrityError("image tournament contains a non-image task type")
             scores = task.get("participant_scores")
             tasks.append(
                 {
                     "task_id": task["task_id"],
-                    "task_type": _scalar(task, "task_type"),
+                    "task_type": task_type,
                     "winner": _scalar(task, "winner"),
-                    "participant_scores": (
-                        [_score_row(row) for row in scores] if isinstance(scores, list) else []
+                    "participant_scores": _score_rows(
+                        scores, "tournament task participant_scores"
                     ),
                 }
             )
+        round_participants = round_value.get("participants")
+        if not isinstance(round_participants, list) or not all(
+            isinstance(row, str)
+            and row
+            and not contains_forbidden_body_text(row)
+            for row in round_participants
+        ):
+            raise IntegrityError("tournament round participants are malformed")
+        if len(round_participants) != len(set(round_participants)):
+            raise IntegrityError("tournament round contains duplicate participants")
         safe_rounds.append(
             {
                 "round_id": _scalar(round_value, "round_id"),
@@ -175,22 +243,32 @@ def sanitize_tournament(value: Any, tournament_id: str) -> tuple[dict[str, Any],
                 "round_type": _scalar(round_value, "round_type"),
                 "status": _scalar(round_value, "status"),
                 "is_final_round": _scalar(round_value, "is_final_round"),
-                "participants": [
-                    row for row in round_value.get("participants", []) if isinstance(row, str)
-                ],
+                "participants": list(round_participants),
                 "tasks": tasks,
             }
         )
     participants: list[dict[str, Any]] = []
-    for row in value.get("participants", []):
-        if isinstance(row, dict) and isinstance(row.get("hotkey"), str):
-            participants.append(
-                {
-                    "hotkey": row["hotkey"],
-                    "eliminated_in_round_id": _scalar(row, "eliminated_in_round_id"),
-                    "final_position": _scalar(row, "final_position"),
-                }
-            )
+    raw_participants = value.get("participants")
+    if not isinstance(raw_participants, list):
+        raise IntegrityError("tournament participants are not a list")
+    for row in raw_participants:
+        if (
+            not isinstance(row, dict)
+            or not isinstance(row.get("hotkey"), str)
+            or not row["hotkey"]
+            or contains_forbidden_body_text(row["hotkey"])
+        ):
+            raise IntegrityError("tournament participant row is malformed")
+        participants.append(
+            {
+                "hotkey": row["hotkey"],
+                "eliminated_in_round_id": _scalar(row, "eliminated_in_round_id"),
+                "final_position": _scalar(row, "final_position"),
+            }
+        )
+    participant_hotkeys = [row["hotkey"] for row in participants]
+    if len(participant_hotkeys) != len(set(participant_hotkeys)):
+        raise IntegrityError("tournament contains duplicate participants")
     return (
         {
             "tournament_id": tournament_id,
@@ -211,6 +289,8 @@ def sanitize_task(value: Any, expected_task_id: str) -> dict[str, Any]:
     rows = value.get("hotkey_details")
     if not isinstance(rows, list):
         raise IntegrityError("task response has no hotkey_details list")
+    if value.get("task_type") != "ImageTask":
+        raise IntegrityError("task detail is not an image task")
     return {
         key: _scalar(value, key)
         for key in (
@@ -226,7 +306,7 @@ def sanitize_task(value: Any, expected_task_id: str) -> dict[str, Any]:
         )
     } | {
         "public_training_archive_present": value.get("training_data") is not None,
-        "participants": [_score_row(row) for row in rows],
+        "participants": _score_rows(rows, "task detail hotkey_details"),
     }
 
 
@@ -245,6 +325,11 @@ def capture(
         tournament_url, timeout=timeout, opener=opener
     )
     tournament, task_ids = sanitize_tournament(tournament_raw, tournament_id)
+    round_task_types = {
+        task["task_id"]: task["task_type"]
+        for round_value in tournament["rounds"]
+        for task in round_value["tasks"]
+    }
     tasks: list[dict[str, Any]] = []
     sources = [
         {
@@ -256,7 +341,10 @@ def capture(
     for task_id in task_ids:
         url = f"{API_ROOT}/auditing/tasks/{task_id}"
         raw, digest, size = fetch_json(url, timeout=timeout, opener=opener)
-        tasks.append(sanitize_task(raw, task_id))
+        safe_task = sanitize_task(raw, task_id)
+        if safe_task["task_type"] != round_task_types[task_id]:
+            raise IntegrityError("round/task-detail task type mismatch")
+        tasks.append(safe_task)
         sources.append({"url": url, "response_sha256": digest, "response_bytes": size})
 
     result = {

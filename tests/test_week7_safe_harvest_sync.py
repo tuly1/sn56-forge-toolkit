@@ -49,6 +49,34 @@ def add_object(root: Path, body: bytes, *, claimed: str | None = None) -> str:
     return digest
 
 
+def public_request_url(source: str, key: str) -> str:
+    if source == "gradients-tournament":
+        return f"https://api.gradients.io/tournament/{key}/details"
+    if source == "gradients-task":
+        return f"https://api.gradients.io/auditing/tasks/{key}"
+    if source == "acceptance":
+        return f"local://acceptance/{key}"
+    if source == "hf-model":
+        return f"https://huggingface.co/api/models/{key}"
+    if source == "hf-revision-manifest":
+        repo, revision = key.rsplit("/", 1)
+        return f"https://huggingface.co/{repo}/tree/{revision}"
+    if source == "hf-tree":
+        repo, revision, _page = key.rsplit("/", 2)
+        return f"https://huggingface.co/api/models/{repo}/tree/{revision}"
+    if source == "hf-file":
+        parts = key.split("/")
+        return (
+            "https://huggingface.co/api/resolve-cache/models/"
+            + "/".join(parts[:2])
+            + "/"
+            + parts[2]
+            + "/"
+            + "/".join(parts[3:])
+        )
+    return f"https://example.invalid/{key}"
+
+
 def add_observation(
     root: Path,
     *,
@@ -63,7 +91,7 @@ def add_observation(
         "observed_at": "2026-08-10T13:00:00Z",
         "source": source,
         "key": key,
-        "request_url": f"https://example.invalid/{key}",
+        "request_url": public_request_url(source, key),
         "status": 200,
         "content_sha256": digest,
         "content_bytes": len(body),
@@ -125,6 +153,135 @@ def add_tournament(root: Path, tournament_id: str, task_id: str, **task_fields) 
     return relative
 
 
+def test_tournament_scope_ignores_task_ids_outside_round_task_membership(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    body = sync.canonical_json(
+        {
+            "tournament_id": TOURNAMENT_A,
+            "tournament_type": "image",
+            "rounds": [
+                {
+                    "round_number": 1,
+                    "status": "completed",
+                    "tasks": [{"task_id": TASK_A}],
+                    "untrusted_metadata": {"task_id": TASK_B},
+                }
+            ],
+        }
+    )
+    add_observation(
+        source,
+        source="gradients-tournament",
+        key=TOURNAMENT_A,
+        body=body,
+    )
+
+    scope = sync.derive_tournament_scope(
+        sync.LocalSource(source),
+        sync.LocalSource(source).inventory(),
+        TOURNAMENT_A,
+    )
+
+    assert scope.task_ids == frozenset({TASK_A})
+
+
+def test_tournament_scope_is_completed_round_one_only(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    body = sync.canonical_json(
+        {
+            "tournament_id": TOURNAMENT_A,
+            "tournament_type": "image",
+            "rounds": [
+                {
+                    "round_number": 1,
+                    "status": "completed",
+                    "tasks": [{"task_id": TASK_A}],
+                },
+                {
+                    "round_number": 2,
+                    "status": "active",
+                    "tasks": [{"task_id": TASK_B}],
+                },
+            ],
+        }
+    )
+    add_observation(
+        source, source="gradients-tournament", key=TOURNAMENT_A, body=body
+    )
+
+    scope = sync.derive_tournament_scope(
+        sync.LocalSource(source),
+        sync.LocalSource(source).inventory(),
+        TOURNAMENT_A,
+    )
+
+    assert scope.task_ids == frozenset({TASK_A})
+
+
+def test_tournament_scope_refuses_active_round_one(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    body = sync.canonical_json(
+        {
+            "tournament_id": TOURNAMENT_A,
+            "tournament_type": "image",
+            "rounds": [
+                {
+                    "round_number": 1,
+                    "status": "active",
+                    "tasks": [{"task_id": TASK_A}],
+                }
+            ],
+        }
+    )
+    add_observation(
+        source, source="gradients-tournament", key=TOURNAMENT_A, body=body
+    )
+
+    with pytest.raises(sync.IntegrityError, match="completed Round-1"):
+        sync.derive_tournament_scope(
+            sync.LocalSource(source),
+            sync.LocalSource(source).inventory(),
+            TOURNAMENT_A,
+        )
+
+
+def test_tournament_scope_requires_exact_image_tournament_type(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    add_tournament(source, TOURNAMENT_A, TASK_A)
+    wrapper_path = next((source / "observations/gradients-tournament").rglob("*.json"))
+    wrapper = json.loads(wrapper_path.read_bytes())
+    cas_path = source / wrapper["object"]
+    body = json.loads(cas_path.read_bytes())
+    body["tournament_type"] = "text"
+    replacement = sync.canonical_json(body)
+    replacement_digest = sha(replacement)
+    replacement_path = source / f"objects/sha256/{replacement_digest[:2]}/{replacement_digest}"
+    write_regular(source, replacement_path.relative_to(source).as_posix(), replacement)
+    wrapper["content_sha256"] = replacement_digest
+    wrapper["content_bytes"] = len(replacement)
+    wrapper["object"] = replacement_path.relative_to(source).as_posix()
+    replacement_wrapper = sync.canonical_json(wrapper)
+    wrapper_path.unlink()
+    write_regular(
+        source,
+        wrapper_path.with_name(
+            f"20260810T130000.000000Z-{replacement_digest[:12]}.json"
+        ).relative_to(source).as_posix(),
+        replacement_wrapper,
+    )
+
+    with pytest.raises(sync.IntegrityError, match="selected image tournament"):
+        sync.derive_tournament_scope(
+            sync.LocalSource(source),
+            sync.LocalSource(source).inventory(),
+            TOURNAMENT_A,
+        )
+
+
 def test_create_only_sync_copies_reachable_cas_and_timestamped_mutable_files(tmp_path):
     source = basic_source(tmp_path)
     orphan = add_object(source, b"unreferenced")
@@ -148,7 +305,22 @@ def test_create_only_sync_copies_reachable_cas_and_timestamped_mutable_files(tmp
 
 @pytest.mark.parametrize(
     "forbidden",
-    ["hidden", "HOLDOUT", "test_data", "quarantine", "eval-derived", "eval%5Fderived"],
+    [
+        "hidden",
+        "HOLDOUT",
+        "hold_out",
+        "hold-out",
+        "test_data",
+        "testing",
+        "quarantine",
+        "eval-derived",
+        "eval_data",
+        "evaluation_data",
+        "eval%5Fderived",
+        "h%252569dden",
+        "te%252573t_data",
+        "hold%25256fut",
+    ],
 )
 def test_hf_path_filter_is_case_and_encoding_aware(tmp_path, forbidden):
     source = tmp_path / "source"
@@ -197,6 +369,251 @@ def test_hf_body_and_nested_raw_body_are_screened_before_publication(tmp_path):
     assert not (destination / f"objects/sha256/{raw_digest[:2]}/{raw_digest}").exists()
 
 
+def test_full_json_screen_catches_escaped_forbidden_key_beyond_first_chunk(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    body = b'{"pad":"' + (b"a" * (2 * 1024 * 1024)) + b'","test\\u005fdata":"x"}\n'
+    relative, digest = add_observation(
+        source,
+        source="hf-file",
+        key="org/repo/rev/config.json",
+        body=body,
+    )
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(sync.LocalSource(source), destination, observed_at=NOW)
+
+    assert result["complete"] is True
+    assert result["excluded"]["forbidden_body"] == 1
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+
+
+def test_wrapper_source_key_path_smuggling_aborts_before_cas_publication(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    add_tournament(source, TOURNAMENT_A, TASK_A)
+    body = b'{"full_pool_row":"must not cross"}\n'
+    digest = add_object(source, body)
+    record = sync.canonical_json(
+        {
+            "schema": 1,
+            "source": "fixtures",
+            "key": f"{TASK_A}/0000",
+            "content_sha256": digest,
+            "content_bytes": len(body),
+            "object": f"objects/sha256/{digest[:2]}/{digest}",
+        }
+    )
+    forged = (
+        f"observations/gradients-task/{TASK_A}/"
+        f"20260810T000000.000000Z-{digest[:12]}.json"
+    )
+    write_regular(source, forged, record)
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(
+        sync.LocalSource(source),
+        destination,
+        observed_at=NOW,
+        tournament_id=TOURNAMENT_A,
+    )
+
+    assert result["complete"] is False
+    assert result["status"] == "PARTIAL"
+    assert any("source does not match" in row["message"] for row in result["errors"])
+    assert not (destination / forged).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+
+
+def test_unknown_hf_source_is_out_of_scope_even_with_exact_tournament_and_task(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    add_tournament(source, TOURNAMENT_A, TASK_A)
+    body = b'{"public":"metadata"}\n'
+    key = (
+        "gradients-io-tournaments/"
+        f"tournament-{TOURNAMENT_A}-{TASK_A}-5A1iceAB/rev/page-0001"
+    )
+    relative, digest = add_observation(
+        source, source="hf-secret", key=key, body=body
+    )
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(
+        sync.LocalSource(source),
+        destination,
+        observed_at=NOW,
+        tournament_id=TOURNAMENT_A,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["excluded"]["out_of_scope"] >= 1
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+
+
+def test_hf_scope_cannot_smuggle_ids_in_revision_or_file_components(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    add_tournament(source, TOURNAMENT_A, TASK_A)
+    body = sync.canonical_json(
+        {
+            "repo_id": "evil/unrelated",
+            "revision": "1" * 40,
+            "path": f"notes/tournament-{TOURNAMENT_A}-{TASK_A}-bait/config.yaml",
+        }
+    )
+    key = (
+        "evil/unrelated/"
+        + "1" * 40
+        + f"/notes/tournament-{TOURNAMENT_A}-{TASK_A}-bait/config.yaml"
+    )
+    relative, digest = add_observation(
+        source, source="hf-file", key=key, body=body
+    )
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(
+        sync.LocalSource(source),
+        destination,
+        observed_at=NOW,
+        tournament_id=TOURNAMENT_A,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["excluded"]["out_of_scope"] >= 1
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+
+
+@pytest.mark.parametrize("source_name,key", [
+    ("gradients-task", f"{TASK_A}/extra"),
+    ("gradients-tournament", f"{TOURNAMENT_A}/extra"),
+    ("acceptance", f"{TOURNAMENT_A}/extra"),
+])
+def test_single_component_public_keys_cannot_gain_nested_suffixes(
+    tmp_path, source_name, key
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    add_tournament(source, TOURNAMENT_A, TASK_A)
+    relative, digest = add_observation(
+        source, source=source_name, key=key, body=b'{"public":"metadata"}\n'
+    )
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(
+        sync.LocalSource(source),
+        destination,
+        observed_at=NOW,
+        tournament_id=TOURNAMENT_A,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+
+
+def test_acceptance_body_must_match_exact_tournament_key(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    add_tournament(source, TOURNAMENT_A, TASK_A)
+    relative, digest = add_observation(
+        source,
+        source="acceptance",
+        key=TOURNAMENT_A,
+        body=sync.canonical_json({"tournament_id": TOURNAMENT_B}),
+    )
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(
+        sync.LocalSource(source),
+        destination,
+        observed_at=NOW,
+        tournament_id=TOURNAMENT_A,
+    )
+
+    assert result["status"] == "PARTIAL"
+    assert any("acceptance body contradicts" in row["message"] for row in result["errors"])
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+
+
+@pytest.mark.parametrize("claimed", [None, True, -1, 999999])
+def test_wrapper_content_length_must_exactly_bind_staged_cas(tmp_path, claimed):
+    source = tmp_path / "source"
+    source.mkdir()
+    relative, digest = add_observation(
+        source,
+        source="gradients-task",
+        key=TASK_A,
+        body=b'{"status":"completed"}\n',
+    )
+    wrapper_path = source / relative
+    wrapper = json.loads(wrapper_path.read_bytes())
+    wrapper["content_bytes"] = claimed
+    wrapper_path.write_bytes(sync.canonical_json(wrapper))
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(sync.LocalSource(source), destination, observed_at=NOW)
+
+    assert result["status"] == "PARTIAL"
+    assert any("content_bytes" in row["message"] for row in result["errors"])
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+
+
+def test_wrapper_observed_at_cannot_reorder_append_only_filename(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    relative, digest = add_observation(
+        source,
+        source="gradients-task",
+        key=TASK_A,
+        body=b'{"task_id":"11111111-1111-4111-8111-111111111111"}\n',
+    )
+    wrapper_path = source / relative
+    wrapper = json.loads(wrapper_path.read_bytes())
+    wrapper["observed_at"] = "2999-01-01T00:00:00Z"
+    wrapper_path.write_bytes(sync.canonical_json(wrapper))
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(sync.LocalSource(source), destination, observed_at=NOW)
+
+    assert result["status"] == "PARTIAL"
+    assert any("wrapper time" in row["message"] for row in result["errors"])
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+
+
+@pytest.mark.parametrize("schema", [None, True, 0, 2, "1"])
+def test_observation_wrapper_requires_exact_schema_one(tmp_path, schema):
+    source = tmp_path / "source"
+    source.mkdir()
+    relative, digest = add_observation(
+        source,
+        source="gradients-task",
+        key=TASK_A,
+        body=b'{"task_id":"11111111-1111-4111-8111-111111111111"}\n',
+    )
+    wrapper_path = source / relative
+    wrapper = json.loads(wrapper_path.read_bytes())
+    wrapper["schema"] = schema
+    wrapper_path.write_bytes(sync.canonical_json(wrapper))
+
+    result = sync.sync_archive(
+        sync.LocalSource(source), tmp_path / "evidence", observed_at=NOW
+    )
+
+    assert result["status"] == "PARTIAL"
+    assert any("wrapper schema" in row["message"] for row in result["errors"])
+    assert not (tmp_path / "evidence" / relative).exists()
+    assert not (
+        tmp_path / "evidence" / f"objects/sha256/{digest[:2]}/{digest}"
+    ).exists()
+
+
 def test_allowed_hf_manifest_copies_manifest_and_raw_object(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -239,6 +656,24 @@ def test_source_symlink_is_never_followed(tmp_path):
     assert b"secret" not in b"".join(
         path.read_bytes() for path in destination.rglob("*") if path.is_file()
     )
+
+
+def test_ssh_reader_reuses_a_scoped_local_control_socket():
+    source = sync.SSHSource("example.invalid", "/archive")
+
+    command = source._command("list")
+
+    assert "-oControlMaster=auto" in command
+    assert "-oControlPersist=30" in command
+    control = next(item for item in command if item.startswith("-oControlPath="))
+    assert control.startswith("-oControlPath=/tmp/")
+    assert control.endswith("-%C")
+    assert "sn56-w7-" in control
+    # OpenSSH's Unix-domain socket path limit is 104 bytes on macOS.  The
+    # longest expansion is the fixed path plus the 40-hex-character %C hash.
+    assert len(control.removeprefix("-oControlPath=").replace("%C", "0" * 40)) < 104
+    assert command[-2] == "example.invalid"
+    assert command[-1].endswith(" list /archive")
 
 
 def test_destination_symlink_component_aborts(tmp_path):
@@ -334,10 +769,16 @@ def test_exact_tournament_scope_derives_tasks_and_excludes_cross_tournament(tmp_
     )
     tournament_b_path = add_tournament(source, TOURNAMENT_B, TASK_B)
     task_a_path, _ = add_observation(
-        source, source="gradients-task", key=TASK_A, body=b'{"status":"success"}\n'
+        source,
+        source="gradients-task",
+        key=TASK_A,
+        body=sync.canonical_json({"task_id": TASK_A, "status": "success"}),
     )
     task_b_path, _ = add_observation(
-        source, source="gradients-task", key=TASK_B, body=b'{"status":"success"}\n'
+        source,
+        source="gradients-task",
+        key=TASK_B,
+        body=sync.canonical_json({"task_id": TASK_B, "status": "success"}),
     )
     fixture_a_path, _ = add_observation(
         source,
@@ -351,19 +792,27 @@ def test_exact_tournament_scope_derives_tasks_and_excludes_cross_tournament(tmp_
         key="date-wide-board",
         body=sync.canonical_json({"tournaments": [TOURNAMENT_A, TOURNAMENT_B]}),
     )
+    repo_a = f"gradients-io-tournaments/tournament-{TOURNAMENT_A}-{TASK_A}-5A1iceAB"
+    revision_a = "1" * 40
     hf_key_a = (
-        "gradients-io-tournaments/"
-        f"tournament-{TOURNAMENT_A}-{TASK_A}-5Alice/rev/config.yaml"
+        f"{repo_a}/{revision_a}/config.yaml"
     )
     hf_a_path, _ = add_observation(
         source,
         source="hf-file",
         key=hf_key_a,
-        body=sync.canonical_json({"path": "config.yaml", "test_loss": 0.0123}),
+        body=sync.canonical_json(
+            {
+                "repo_id": repo_a,
+                "revision": revision_a,
+                "path": "config.yaml",
+                "test_loss": 0.0123,
+            }
+        ),
     )
     hf_key_b = (
         "gradients-io-tournaments/"
-        f"tournament-{TOURNAMENT_B}-{TASK_B}-5Bob/rev/config.yaml"
+        f"tournament-{TOURNAMENT_B}-{TASK_B}-5Bob/{'2' * 40}/config.yaml"
     )
     hf_b_path, _ = add_observation(
         source,
@@ -375,7 +824,14 @@ def test_exact_tournament_scope_derives_tasks_and_excludes_cross_tournament(tmp_
         source,
         "events.jsonl",
         (json.dumps({"event": "task_seen", "task_id": TASK_A}, separators=(",", ":")) + "\n").encode()
-        + (json.dumps({"event": "task_seen", "task_id": TASK_B}, separators=(",", ":")) + "\n").encode(),
+        + (json.dumps({"event": "task_seen", "task_id": TASK_B}, separators=(",", ":")) + "\n").encode()
+        + (
+            json.dumps(
+                {"event": "mixed", "selected_task": TASK_A, "foreign_task": TASK_B},
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode(),
     )
     write_regular(source, ".state/state.sqlite3", b"date-wide mutable state")
 
@@ -389,9 +845,9 @@ def test_exact_tournament_scope_derives_tasks_and_excludes_cross_tournament(tmp_
 
     assert result["complete"] is True
     assert result["scope"]["task_ids"] == [TASK_A]
-    for allowed in (tournament_a_path, task_a_path, fixture_a_path, hf_a_path):
+    for allowed in (tournament_a_path, task_a_path, hf_a_path):
         assert (destination / allowed).is_file()
-    for excluded in (tournament_b_path, task_b_path, hf_b_path):
+    for excluded in (tournament_b_path, task_b_path, fixture_a_path, hf_b_path):
         assert not (destination / excluded).exists()
     assert result["excluded"]["out_of_scope"] >= 4
     stamp = sync.utc_token(NOW)
@@ -404,6 +860,39 @@ def test_exact_tournament_scope_derives_tasks_and_excludes_cross_tournament(tmp_
     assert not (destination / f"snapshots/{stamp}/.state/state.sqlite3").exists()
 
 
+def test_watcher_full_pool_fixture_namespace_is_never_in_exact_scope():
+    scope = sync.TournamentScope(
+        tournament_id=TOURNAMENT_A,
+        task_ids=frozenset({TASK_A}),
+        source_observation="observations/gradients-tournament/source.json",
+        source_content_sha256="a" * 64,
+    )
+
+    assert sync.observation_in_scope(
+        f"observations/fixtures/{TASK_A}/0000/image/observation.json", scope
+    ) is False
+
+
+def test_unscoped_sync_excludes_full_pool_fixture_before_reading_its_cas(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    fixture_body = b"FULL_IMAGE_TEXT_PAIR_BYTES"
+    relative, digest = add_observation(
+        source,
+        source="fixtures",
+        key=f"{TASK_A}/0000",
+        body=fixture_body,
+    )
+    destination = tmp_path / "evidence"
+
+    result = sync.sync_archive(sync.LocalSource(source), destination, observed_at=NOW)
+
+    assert result["status"] == "COMPLETE"
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+    assert result["excluded"]["out_of_scope"] == 1
+
+
 def test_public_test_loss_is_allowed_in_body_filter():
     assert sync.contains_forbidden_body(b'{"test_loss":0.05098}') is False
     assert sync.contains_forbidden_body(b'Ranked first by test_loss') is False
@@ -413,20 +902,109 @@ def test_public_test_loss_is_allowed_in_body_filter():
 
 @pytest.mark.parametrize(
     "field",
+    ["test_loss_data", "test_loss_rows", "test_loss/set", "test.loss.data"],
+)
+def test_test_loss_exception_cannot_prefix_a_dataset_surface(field):
+    assert sync.contains_forbidden_body(json.dumps({field: "rows"}).encode()) is True
+    assert sync.contains_forbidden_path(f"repo/{field}/artifact.json") is True
+
+
+@pytest.mark.parametrize(
+    "field",
     [
         "test_data",
+        "test_dataset",
+        "test_datasets",
+        "test_archive",
+        "test_archives",
+        "test_images",
+        "test_assets",
+        "test_prompts",
         "test-rows",
         "test set",
         "eval_data",
+        "evaluation_dataset",
+        "evaluation_datasets",
+        "evaluation_archive",
+        "evaluation_archives",
+        "evaluation_images",
+        "evaluation_assets",
+        "eval_prompts",
         "evaluation-data",
         "eval-derived",
         "hidden",
         "holdout",
+        "holdouts",
         "quarantine",
     ],
 )
 def test_dataset_bearing_body_names_are_excluded(field):
     assert sync.contains_forbidden_body(f'{{"{field}":"rows"}}'.encode()) is True
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["test/data", "test.data", "te\u200bst_data", "hold.out", "eval/rows"],
+)
+def test_dataset_bearing_names_cannot_hide_behind_punctuation_or_format_chars(field):
+    body = json.dumps({field: "rows"}, ensure_ascii=False).encode()
+    assert sync.contains_forbidden_body(body) is True
+    assert sync.contains_forbidden_path(f"repo/{field}/artifact.json") is True
+
+
+def test_canonical_json_rejects_nonfinite_numbers():
+    with pytest.raises(ValueError, match="JSON compliant"):
+        sync.canonical_json({"score": float("nan")})
+
+
+def test_plural_holdout_and_quarantine_paths_are_excluded():
+    assert sync.contains_forbidden_path("repo/holdouts/rows.json") is True
+    assert sync.contains_forbidden_path("repo/quarantines/rows.json") is True
+
+
+def test_public_request_provenance_is_source_and_key_bound():
+    record = {
+        "status": 200,
+        "request_url": f"https://api.gradients.io/auditing/tasks/{TASK_A}",
+    }
+    sync.validate_public_request_provenance("gradients-task", TASK_A, record)
+    with pytest.raises(sync.IntegrityError, match="contradicts"):
+        sync.validate_public_request_provenance(
+            "gradients-task",
+            TASK_A,
+            {"status": 200, "request_url": "https://attacker.example/task"},
+        )
+    with pytest.raises(sync.IntegrityError, match="successful HTTP status"):
+        sync.validate_public_request_provenance(
+            "gradients-task",
+            TASK_A,
+            {"status": True, "request_url": record["request_url"]},
+        )
+
+
+def test_hf_file_public_xet_redirect_authority_is_allowed_but_not_arbitrary_cdn():
+    repo = (
+        "gradients-io-tournaments/"
+        f"tournament-{TOURNAMENT_A}-{TASK_A}-5A1iceAB"
+    )
+    key = f"{repo}/{'1' * 40}/checkpoints/loss_log.db"
+    sync.validate_public_request_provenance(
+        "hf-file",
+        key,
+        {
+            "status": 200,
+            "request_url": "https://us.aws.cdn.hf.co/xet-bridge-us/id/object",
+        },
+    )
+    with pytest.raises(sync.IntegrityError, match="contradicts"):
+        sync.validate_public_request_provenance(
+            "hf-file",
+            key,
+            {
+                "status": 200,
+                "request_url": "https://attacker.cdn.hf.co/not-xet/object",
+            },
+        )
 
 
 def test_root_identity_mismatch_aborts_before_writing(tmp_path):

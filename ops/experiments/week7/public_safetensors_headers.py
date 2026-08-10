@@ -21,13 +21,13 @@ import datetime as dt
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import struct
 import sys
 from typing import Any, Callable, Iterable, Mapping, Protocol
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import quote, unquote, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
     from safe_harvest_sync import (
@@ -35,9 +35,11 @@ try:
         Publisher,
         SyncError,
         canonical_json,
+        checked_relative,
         contains_forbidden_body,
         contains_forbidden_path,
         sha256_bytes,
+        observation_timestamp,
         utc_iso,
         utc_now,
         utc_token,
@@ -49,9 +51,11 @@ except ImportError:  # pragma: no cover - supports package-style test imports
         Publisher,
         SyncError,
         canonical_json,
+        checked_relative,
         contains_forbidden_body,
         contains_forbidden_path,
         sha256_bytes,
+        observation_timestamp,
         utc_iso,
         utc_now,
         utc_token,
@@ -67,6 +71,11 @@ TASK_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 TOURNAMENT_RE = re.compile(r"tourn_[a-z0-9]+_[0-9]{8}")
 MAX_HEADER_BYTES = 16 * 1024 * 1024
 MAX_TREE_BYTES = 64 * 1024 * 1024
+HF_ORGANIZATION = "gradients-io-tournaments"
+TREE_PAGE_RE = re.compile(r"page-[0-9]+")
+OBSERVATION_FILE_RE = re.compile(
+    r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z-([0-9a-f]{12}|unchanged)\.json"
+)
 
 
 class Response(Protocol):
@@ -80,8 +89,38 @@ class Response(Protocol):
 OpenRequest = Callable[[Request, float], Response]
 
 
+def _validate_hf_transport_url(url: str) -> None:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise IntegrityError("public safetensors transport URL is malformed") from exc
+    host = (parsed.hostname or "").casefold()
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or not (host == "huggingface.co" or host.endswith(".hf.co"))
+    ):
+        raise IntegrityError("public safetensors transport left the Hugging Face HTTPS boundary")
+
+
+class _ValidatedHFRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        _validate_hf_transport_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HF_OPENER = build_opener(_ValidatedHFRedirects())
+
+
 def _default_open(request: Request, timeout: float) -> Response:
-    return urlopen(request, timeout=timeout)  # type: ignore[return-value]
+    _validate_hf_transport_url(request.full_url)
+    response = _HF_OPENER.open(request, timeout=timeout)
+    final_url = response.geturl()
+    _validate_hf_transport_url(final_url)
+    return response  # type: ignore[return-value]
 
 
 def _read_regular(root: Path, relative: str, limit: int) -> bytes:
@@ -110,6 +149,34 @@ def _cas_bytes(root: Path, digest: str, limit: int = MAX_TREE_BYTES) -> bytes:
     if sha256_bytes(body) != digest:
         raise IntegrityError("CAS bytes do not match their SHA-256 identity")
     return body
+
+
+def _canonical_relative(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise IntegrityError(f"{label} is not a string")
+    try:
+        normalized = checked_relative(value).as_posix()
+    except SyncError as exc:
+        raise IntegrityError(f"{label} is not a safe relative path") from exc
+    if normalized != value:
+        raise IntegrityError(f"{label} is not a canonical relative path")
+    return normalized
+
+
+def _checked_checkpoint_path(value: Any) -> str:
+    """Return one unambiguous relative tree path, rejecting encoded traversal."""
+    path = _canonical_relative(value, "safetensors tree path")
+    decoded = path
+    # A quoted tree path is quoted once more when placed into the resolve URL.
+    # Check every possible unquoting layer so nested %25 encodings cannot turn
+    # into a dot segment, absolute path, backslash, or NUL downstream.
+    for _ in range(len(path) + 1):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            return path
+        _canonical_relative(next_decoded, "decoded safetensors tree path")
+        decoded = next_decoded
+    raise IntegrityError("safetensors tree path has excessive nested encoding")
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:
@@ -203,97 +270,299 @@ def _load_root_identity(root: Path, tournament_id: str) -> dict[str, Any]:
     return value
 
 
+def _tree_identity(
+    wrapper: Mapping[str, Any], tournament_id: str, observation_path: str
+) -> tuple[str, str, str]:
+    key = _canonical_relative(wrapper.get("key"), "hf-tree key")
+    parts = key.split("/")
+    if (
+        len(parts) != 4
+        or parts[0] != HF_ORGANIZATION
+        or TREE_PAGE_RE.fullmatch(parts[3]) is None
+    ):
+        raise IntegrityError("hf-tree key is malformed or outside the public tournament organization")
+    if int(parts[3].removeprefix("page-")) < 1:
+        raise IntegrityError("hf-tree page numbering must start at one")
+    revision = parts[2]
+    if REVISION_RE.fullmatch(revision) is None:
+        raise IntegrityError("hf-tree key does not bind an immutable revision")
+
+    repo_name = parts[1]
+    marker = f"tournament-{tournament_id}-"
+    if not repo_name.startswith(marker):
+        raise IntegrityError("hf-tree repository is outside the selected tournament")
+    repository_tail = repo_name[len(marker) :]
+    if len(repository_tail) <= 37 or repository_tail[36] != "-":
+        raise IntegrityError("hf-tree repository does not identify an exact task and owner")
+    task_id = repository_tail[:36]
+    owner = repository_tail[37:]
+    if TASK_RE.fullmatch(task_id) is None or re.fullmatch(
+        r"[1-9A-HJ-NP-Za-km-z]{8}", owner
+    ) is None:
+        raise IntegrityError("hf-tree repository does not identify an exact task and owner")
+
+    expected_parent = f"observations/hf-tree/{key}"
+    observed = PurePosixPath(observation_path)
+    if observed.parent.as_posix() != expected_parent:
+        raise IntegrityError("hf-tree key does not match its observation path")
+    if OBSERVATION_FILE_RE.fullmatch(observed.name) is None:
+        raise IntegrityError("hf-tree observation filename is not append-only watcher form")
+    return f"{HF_ORGANIZATION}/{repo_name}", revision, task_id
+
+
+def _load_tree_observation(
+    root: Path, observation_path: str, tournament_id: str
+) -> tuple[dict[str, Any], bytes, tuple[str, str, str]]:
+    relative = _canonical_relative(observation_path, "hf-tree observation path")
+    wrapper_body = _read_regular(root, relative, 4 * 1024 * 1024)
+    wrapper_sha = sha256_bytes(wrapper_body)
+    try:
+        wrapper = json.loads(wrapper_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError("hf-tree observation wrapper is not JSON") from exc
+    if not isinstance(wrapper, dict) or wrapper.get("source") != "hf-tree":
+        raise IntegrityError("hf-tree observation has an invalid source")
+    identity = _tree_identity(wrapper, tournament_id, relative)
+    normalized_observed_at = observation_timestamp(relative, wrapper)
+    digest = wrapper.get("content_sha256")
+    if not isinstance(digest, str) or wrapper.get("object") != _cas_relative(digest):
+        raise IntegrityError("hf-tree observation has an invalid CAS binding")
+    filename_match = OBSERVATION_FILE_RE.fullmatch(PurePosixPath(relative).name)
+    if filename_match is None or filename_match.group(1) not in {
+        digest[:12],
+        "unchanged",
+    }:
+        raise IntegrityError("hf-tree observation filename does not bind its content digest")
+    body = _cas_bytes(root, digest)
+    content_bytes = wrapper.get("content_bytes")
+    if (
+        not isinstance(content_bytes, int)
+        or isinstance(content_bytes, bool)
+        or content_bytes != len(body)
+    ):
+        raise IntegrityError("hf-tree observation has an invalid content length")
+    return {
+        **wrapper,
+        "observed_at": normalized_observed_at,
+        "observation_sha256": wrapper_sha,
+    }, body, identity
+
+
 def _tree_observations(root: Path, tournament_id: str) -> Iterable[tuple[str, dict[str, Any], bytes]]:
-    prefix = root / "observations" / "hf-tree" / "gradients-io-tournaments"
+    prefix = root / "observations" / "hf-tree" / HF_ORGANIZATION
     if not prefix.is_dir():
         return
     marker = f"tournament-{tournament_id}-"
     for path in sorted(prefix.rglob("*.json")):
-        relative = path.relative_to(root).as_posix()
-        if marker not in relative:
+        relative = _canonical_relative(path.relative_to(root).as_posix(), "hf-tree observation path")
+        parts = relative.split("/")
+        if len(parts) < 4 or not parts[3].startswith(marker):
             continue
-        wrapper_body = _read_regular(root, relative, 4 * 1024 * 1024)
-        wrapper_sha = sha256_bytes(wrapper_body)
-        try:
-            wrapper = json.loads(wrapper_body)
-        except json.JSONDecodeError as exc:
-            raise IntegrityError("hf-tree observation wrapper is not JSON") from exc
-        if not isinstance(wrapper, dict) or wrapper.get("source") != "hf-tree":
-            raise IntegrityError("hf-tree observation has an invalid source")
-        digest = wrapper.get("content_sha256")
-        if not isinstance(digest, str) or wrapper.get("object") != _cas_relative(digest):
-            raise IntegrityError("hf-tree observation has an invalid CAS binding")
-        body = _cas_bytes(root, digest)
-        yield relative, {**wrapper, "observation_sha256": wrapper_sha}, body
+        wrapper, body, _ = _load_tree_observation(root, relative, tournament_id)
+        yield relative, wrapper, body
 
 
-def _tree_identity(wrapper: Mapping[str, Any], tournament_id: str) -> tuple[str, str, str]:
-    key = wrapper.get("key")
-    if not isinstance(key, str):
-        raise IntegrityError("hf-tree observation has no key")
-    parts = key.split("/")
-    if len(parts) < 4:
-        raise IntegrityError("hf-tree key is malformed")
-    repo = "/".join(parts[:2])
-    revision = parts[2]
-    if REVISION_RE.fullmatch(revision) is None:
-        raise IntegrityError("hf-tree key does not bind an immutable revision")
-    marker = f"tournament-{tournament_id}-"
-    if marker not in repo:
-        raise IntegrityError("hf-tree repository is outside the selected tournament")
-    task_match = TASK_RE.search(repo)
-    if task_match is None:
-        raise IntegrityError("hf-tree repository does not identify a task")
-    return repo, revision, task_match.group(0)
+def _tree_rows(tree_body: bytes) -> list[Any]:
+    try:
+        rows = json.loads(tree_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError("hf-tree CAS object is not JSON") from exc
+    if not isinstance(rows, list):
+        raise IntegrityError("hf-tree response is not a list")
+    return rows
 
 
-def collect_candidates(root: Path, tournament_id: str) -> list[dict[str, Any]]:
+def _safetensors_tree_entry(row: Any) -> tuple[str, str, int] | None:
+    if not isinstance(row, dict):
+        raise IntegrityError("hf-tree response contains a malformed entry")
+    if row.get("type") != "file":
+        return None
+    raw_path = row.get("path")
+    if not isinstance(raw_path, str):
+        raise IntegrityError("hf-tree file entry has no path")
+    if not raw_path.lower().endswith(".safetensors"):
+        return None
+    path = _checked_checkpoint_path(raw_path)
+    lfs = row.get("lfs")
+    if not isinstance(lfs, dict):
+        raise IntegrityError("safetensors tree row lacks LFS identity")
+    oid = lfs.get("oid")
+    size = lfs.get("size")
+    row_size = row.get("size")
+    if not isinstance(oid, str) or SHA256_RE.fullmatch(oid) is None:
+        raise IntegrityError("safetensors LFS SHA-256 is invalid")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 8
+        or not isinstance(row_size, int)
+        or isinstance(row_size, bool)
+        or row_size != size
+    ):
+        raise IntegrityError("safetensors tree/LFS size is invalid or conflicting")
+    return path, oid, size
+
+
+def _provenance_sort_key(value: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(value.get("observed_at", "")),
+        str(value.get("tree_observation", "")),
+        str(value.get("tree_observation_sha256", "")),
+        str(value.get("tree_content_sha256", "")),
+    )
+
+
+def collect_candidates(
+    root: Path, tournament_id: str, allowed_task_ids: set[str]
+) -> list[dict[str, Any]]:
     """Derive unique public safetensors objects from verified tree snapshots."""
-    candidates: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    candidates: dict[tuple[str, str, str], dict[str, Any]] = {}
+    pages: dict[tuple[str, str], dict[int, str]] = {}
     for observation_path, wrapper, tree_body in _tree_observations(root, tournament_id):
-        repo, revision, task_id = _tree_identity(wrapper, tournament_id)
-        try:
-            rows = json.loads(tree_body)
-        except json.JSONDecodeError as exc:
-            raise IntegrityError("hf-tree CAS object is not JSON") from exc
-        if not isinstance(rows, list):
-            raise IntegrityError("hf-tree response is not a list")
-        for row in rows:
-            if not isinstance(row, dict) or row.get("type") != "file":
+        repo, revision, task_id = _tree_identity(wrapper, tournament_id, observation_path)
+        if task_id not in allowed_task_ids:
+            # The source root can continue growing after the selected round.
+            # Never turn a same-tournament but out-of-scope task into a Range
+            # request merely because its public tree was appended locally.
+            continue
+        page = int(str(wrapper["key"]).rsplit("/", 1)[1].removeprefix("page-"))
+        page_digest = wrapper["content_sha256"]
+        prior_page = pages.setdefault((repo, revision), {}).get(page)
+        if prior_page is not None and prior_page != page_digest:
+            raise IntegrityError("hf-tree page has conflicting repeated content")
+        pages[(repo, revision)][page] = page_digest
+        for row in _tree_rows(tree_body):
+            entry = _safetensors_tree_entry(row)
+            if entry is None:
                 continue
-            path = row.get("path")
-            lfs = row.get("lfs")
-            if not isinstance(path, str) or not path.lower().endswith(".safetensors"):
-                continue
+            path, oid, size = entry
             if contains_forbidden_path(path):
                 # Never request a prohibited path, even when a compromised or
                 # unexpectedly broad upstream tree snapshot contains one.
                 continue
-            if not isinstance(lfs, dict):
-                raise IntegrityError("safetensors tree row lacks LFS identity")
-            oid = lfs.get("oid")
-            size = lfs.get("size")
-            if not isinstance(oid, str) or SHA256_RE.fullmatch(oid) is None:
-                raise IntegrityError("safetensors LFS SHA-256 is invalid")
-            if not isinstance(size, int) or size <= 8:
-                raise IntegrityError("safetensors LFS size is invalid")
-            key = (repo, revision, path, oid)
-            candidate = {
-                "repository": repo,
-                "revision": revision,
-                "task_id": task_id,
-                "path": path,
-                "lfs_sha256": oid,
-                "lfs_bytes": size,
+            key = (repo, revision, path)
+            provenance = {
                 "tree_observation": observation_path,
                 "tree_observation_sha256": wrapper["observation_sha256"],
                 "tree_content_sha256": wrapper["content_sha256"],
+                "observed_at": wrapper.get("observed_at")
+                if isinstance(wrapper.get("observed_at"), str)
+                else "",
             }
             previous = candidates.get(key)
-            if previous is not None and previous != candidate:
-                raise IntegrityError("duplicate checkpoint identity has conflicting provenance")
-            candidates[key] = candidate
-    return [candidates[key] for key in sorted(candidates)]
+            if previous is None:
+                previous = {
+                    "repository": repo,
+                    "revision": revision,
+                    "task_id": task_id,
+                    "path": path,
+                    "lfs_sha256": oid,
+                    "lfs_bytes": size,
+                    "tree_observations": [],
+                }
+                candidates[key] = previous
+            elif previous["lfs_sha256"] != oid or previous["lfs_bytes"] != size:
+                raise IntegrityError("duplicate checkpoint path has conflicting LFS size or OID")
+            if provenance not in previous["tree_observations"]:
+                previous["tree_observations"].append(provenance)
+
+    for observed_pages in pages.values():
+        if sorted(observed_pages) != list(range(1, max(observed_pages) + 1)):
+            raise IntegrityError("hf-tree page set is not contiguous from page one")
+
+    result: list[dict[str, Any]] = []
+    for key in sorted(candidates):
+        candidate = candidates[key]
+        provenance = sorted(candidate["tree_observations"], key=_provenance_sort_key)
+        latest = provenance[-1]
+        candidate["tree_observations"] = provenance
+        candidate.update(
+            {
+                "tree_observation": latest["tree_observation"],
+                "tree_observation_sha256": latest["tree_observation_sha256"],
+                "tree_content_sha256": latest["tree_content_sha256"],
+            }
+        )
+        result.append(candidate)
+    return result
+
+
+def _validate_candidate_association(
+    root: Path, tournament_id: str, candidate: Mapping[str, Any]
+) -> str:
+    """Re-bind an association to each referenced wrapper, CAS, and tree row."""
+    path = _checked_checkpoint_path(candidate.get("path"))
+    repo = candidate.get("repository")
+    revision = candidate.get("revision")
+    task_id = candidate.get("task_id")
+    oid = candidate.get("lfs_sha256")
+    size = candidate.get("lfs_bytes")
+    provenance = candidate.get("tree_observations")
+    if contains_forbidden_path(path):
+        raise IntegrityError("checkpoint association path is prohibited")
+    if (
+        not isinstance(repo, str)
+        or not isinstance(revision, str)
+        or not isinstance(task_id, str)
+        or not isinstance(oid, str)
+        or SHA256_RE.fullmatch(oid) is None
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 8
+    ):
+        raise IntegrityError("checkpoint association identity is malformed")
+    if (
+        not isinstance(provenance, list)
+        or not provenance
+        or not all(isinstance(item, dict) for item in provenance)
+    ):
+        raise IntegrityError("checkpoint association has no tree provenance")
+    ordered = sorted(provenance, key=_provenance_sort_key)
+    if provenance != ordered:
+        raise IntegrityError("checkpoint association tree provenance is not canonical")
+    latest = ordered[-1]
+    if any(
+        candidate.get(field) != latest.get(field)
+        for field in (
+            "tree_observation",
+            "tree_observation_sha256",
+            "tree_content_sha256",
+        )
+    ):
+        raise IntegrityError("checkpoint association latest tree provenance is inconsistent")
+
+    for item in provenance:
+        observation_path = _canonical_relative(
+            item.get("tree_observation"), "checkpoint tree observation path"
+        )
+        wrapper, tree_body, identity = _load_tree_observation(
+            root, observation_path, tournament_id
+        )
+        if identity != (repo, revision, task_id):
+            raise IntegrityError("checkpoint association contradicts its tree repository identity")
+        if (
+            wrapper["observation_sha256"] != item.get("tree_observation_sha256")
+            or wrapper["content_sha256"] != item.get("tree_content_sha256")
+            or (
+                wrapper.get("observed_at")
+                if isinstance(wrapper.get("observed_at"), str)
+                else ""
+            )
+            != item.get("observed_at")
+        ):
+            raise IntegrityError("checkpoint association contradicts its tree provenance fields")
+
+        matched = False
+        for row in _tree_rows(tree_body):
+            entry = _safetensors_tree_entry(row)
+            if entry is None or entry[0] != path:
+                continue
+            matched = True
+            if entry[1] != oid or entry[2] != size:
+                raise IntegrityError("checkpoint association contradicts its referenced tree entry")
+        if not matched:
+            raise IntegrityError("checkpoint association path is absent from its referenced tree")
+    return path
 
 
 def _tensor_summary(parsed: Mapping[str, Any]) -> tuple[Any, list[dict[str, Any]]]:
@@ -324,14 +593,21 @@ def harvest(
     output_root: Path,
     tournament_id: str,
     *,
+    task_ids: Iterable[str],
     observed_at: dt.datetime,
     timeout: float = 30.0,
     opener: OpenRequest = _default_open,
 ) -> dict[str, Any]:
     if TOURNAMENT_RE.fullmatch(tournament_id) is None:
         raise SyncError("invalid tournament ID")
+    allowed_task_ids = set(task_ids)
+    if not allowed_task_ids or any(
+        not isinstance(task_id, str) or TASK_RE.fullmatch(task_id) is None
+        for task_id in allowed_task_ids
+    ):
+        raise SyncError("an exact non-empty task-ID allowlist is required")
     _load_root_identity(input_root, tournament_id)
-    candidates = collect_candidates(input_root, tournament_id)
+    candidates = collect_candidates(input_root, tournament_id, allowed_task_ids)
     publisher = Publisher(output_root)
 
     identity = canonical_json(
@@ -340,6 +616,7 @@ def harvest(
             "schema_version": 1,
             "input_root": str(input_root.absolute()),
             "tournament_id": tournament_id,
+            "task_ids": sorted(allowed_task_ids),
         }
     )
     staged_identity = publisher.stage_bytes(identity)
@@ -351,7 +628,10 @@ def harvest(
     for candidate in candidates:
         repo = candidate["repository"]
         revision = candidate["revision"]
-        path = candidate["path"]
+        # Re-read the source evidence immediately before URL construction so
+        # no association can reach a Range GET unless its exact wrapper, CAS,
+        # and tree entry still bind repo/revision/path/OID/size.
+        path = _validate_candidate_association(input_root, tournament_id, candidate)
         url = (
             "https://huggingface.co/"
             + quote(repo, safe="/")
@@ -406,6 +686,7 @@ def harvest(
         "schema_version": SCHEMA_VERSION,
         "observed_at": utc_iso(observed_at),
         "tournament_id": tournament_id,
+        "task_ids": sorted(allowed_task_ids),
         "candidate_count": len(candidates),
         "unique_lfs_objects": len(objects_seen),
         "associations": associations,
@@ -430,6 +711,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-root", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--tournament-id", required=True)
+    parser.add_argument(
+        "--task-id",
+        action="append",
+        required=True,
+        dest="task_ids",
+        help="exact in-scope task UUID; repeat once per selected task",
+    )
     parser.add_argument("--timeout", type=float, default=30.0)
     return parser.parse_args(argv)
 
@@ -441,6 +729,7 @@ def main(argv: list[str] | None = None) -> int:
             args.input_root,
             args.output_root,
             args.tournament_id,
+            task_ids=args.task_ids,
             observed_at=utc_now(),
             timeout=args.timeout,
         )

@@ -45,10 +45,9 @@ import shlex
 import stat
 import subprocess
 import sys
-import tempfile
 import unicodedata
 from typing import Any, Iterable, Iterator, Mapping, Protocol
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 import uuid
 
 
@@ -57,29 +56,44 @@ SCHEMA_VERSION = 2
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 TOURNAMENT_RE = re.compile(r"tourn_[a-z0-9]+_[0-9]{8}")
 TASK_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+REVISION_RE = re.compile(r"[0-9a-f]{40}")
+HF_REPOSITORY_OWNER_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{8}")
+HF_ORGANIZATION = "gradients-io-tournaments"
 # Paths are a strict namespace boundary. A standalone ``test`` component is
 # excluded there. Bodies are more precise: public scorer telemetry legitimately
 # uses ``test_loss`` and must remain harvestable, while any name suggesting
 # actual evaluation rows/data remains prohibited.
 FORBIDDEN_PATH_RE = re.compile(
-    r"(?<![a-z0-9])(?:hidden|holdout|test(?![-_\s]*loss(?:$|[^a-z0-9]))|"
-    r"quarantine|eval(?:[-_\s]*derived))(?![a-z0-9])",
+    r"(?<![a-z0-9])(?:"
+    r"hidden|hold[-_\s]*outs?|quarantines?|"
+    r"test[-_\s]*loss[-_\s]*(?:data|rows?|set|dataset|archive)|"
+    r"test(?![-_\s]*loss(?:$|[^a-z0-9]))(?:s|ing)?"
+    r"(?:[-_\s]*(?:data|rows?|set))?|"
+    r"eval(?:uation)?(?:[-_\s]*(?:data|derived|rows?|set))?"
+    r")(?![a-z0-9])",
     re.IGNORECASE,
 )
 FORBIDDEN_BODY_RE = re.compile(
     r"(?<![a-z0-9])(?:"
-    r"hidden|holdout|quarantine|"
-    r"test[-_\s]*(?:data|rows?|set)|"
-    r"eval[-_\s]*(?:data|derived)|evaluation[-_\s]*data"
+    r"hidden|hold[-_\s]*outs?|quarantines?|"
+    r"test[-_\s]*loss[-_\s]*(?:data|rows?|set|datasets?|archives?)|"
+    r"test[-_\s]*(?:data|rows?|set|datasets?|archives?|images?|assets?|prompts?)|"
+    r"eval(?:uation)?[-_\s]*(?:data|derived|rows?|set|datasets?|archives?|images?|assets?|prompts?)"
     r")(?![a-z0-9])",
     re.IGNORECASE,
 )
 OBSERVATION_RE = re.compile(r"^observations/.+\.json$")
+OBSERVATION_FILE_RE = re.compile(
+    r"([0-9]{8}T[0-9]{6}\.[0-9]{6}Z)-([0-9a-f]{12}|unchanged)\.json"
+)
 MUTABLE_FILES = (
     "events.jsonl",
     ".state/state.sqlite3",
     ".state/state.sqlite3-wal",
     ".state/state.sqlite3-shm",
+)
+ALLOWED_HF_OBSERVATION_SOURCES = frozenset(
+    {"hf-model", "hf-revision-manifest", "hf-tree", "hf-file"}
 )
 CHUNK = 1024 * 1024
 MAX_METADATA_BYTES = 64 * 1024 * 1024
@@ -134,7 +148,14 @@ def utc_iso(value: dt.datetime) -> str:
 
 def canonical_json(value: Any) -> bytes:
     return (
-        json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True, separators=(",", ": "))
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+            separators=(",", ": "),
+        )
         + "\n"
     ).encode("utf-8")
 
@@ -340,6 +361,17 @@ class SSHSource:
         self.root = root
         self.ssh_bin = ssh_bin
         self.label = f"ssh://{host}{root}"
+        # A scoped multiplexing socket makes one exact harvest scale with the
+        # number of immutable observations rather than paying a fresh SSH
+        # handshake for every hash-verified CAS read.  The random, short /tmp
+        # name is local-only, never changes the remote source, and expires
+        # shortly after the collector stops.
+        # macOS exposes a long per-user ``tempfile.gettempdir()`` path which,
+        # once OpenSSH expands ``%C``, can exceed its 104-byte Unix-socket
+        # ceiling.  ``/tmp`` is the stable short local namespace on both the
+        # operator Mac and Linux; the random name plus OpenSSH's mode-0600
+        # socket creation keeps this collector scoped to the current user.
+        self.control_path = f"/tmp/sn56-w7-{uuid.uuid4().hex[:12]}-%C"
         encoded = base64.b64encode(_REMOTE_READER.encode("utf-8")).decode("ascii")
         self._prefix = (
             "/usr/bin/python3 -I -c "
@@ -362,6 +394,9 @@ class SSHSource:
             "-oBatchMode=yes",
             "-oClearAllForwardings=yes",
             "-oRequestTTY=no",
+            "-oControlMaster=auto",
+            "-oControlPersist=30",
+            f"-oControlPath={self.control_path}",
             self.host,
             remote,
         ]
@@ -403,9 +438,35 @@ class SSHSource:
 
 
 def normalized_sensitive_text(value: str) -> str:
-    # Decode URL escaping twice: HF paths are sometimes embedded inside a URL
-    # which is itself embedded in JSON.
-    return unicodedata.normalize("NFKC", unquote(unquote(value))).lower()
+    # Decode to a fixed point.  HF paths can be embedded in a URL which is
+    # embedded in JSON, and an attacker can add arbitrarily many ``%25``
+    # layers.  Two decoding passes therefore are not a security boundary.
+    normalized = unicodedata.normalize("NFKC", value).lower()
+    for _ in range(len(normalized) + 1):
+        decoded = unicodedata.normalize("NFKC", unquote(normalized)).lower()
+        if decoded == normalized:
+            # Dataset-bearing names are identifiers, not prose.  Remove
+            # default-ignorable/control characters that can split a token and
+            # canonicalize punctuation, path separators, symbols and spacing
+            # to one delimiter.  This makes ``test/data``, ``test.data``,
+            # ``hold.out`` and ``te\u200bst_data`` equivalent to their ordinary
+            # underscore forms while retaining the explicit ``test_loss``
+            # telemetry exception in the matchers below.
+            result: list[str] = []
+            previous_separator = False
+            for character in normalized:
+                category = unicodedata.category(character)
+                if category.startswith("C") or category in {"Mn", "Me"}:
+                    continue
+                if character.isalnum():
+                    result.append(character)
+                    previous_separator = False
+                elif not previous_separator:
+                    result.append("_")
+                    previous_separator = True
+            return "".join(result)
+        normalized = decoded
+    raise IntegrityError("sensitive text did not reach a decoding fixed point")
 
 
 def contains_forbidden_path(value: str) -> bool:
@@ -448,6 +509,142 @@ def is_hf_observation(relative: str, record: Mapping[str, Any]) -> bool:
         or "huggingface.co/" in url
         or "hf.co/" in url
     )
+
+
+def validate_observation_identity(
+    relative: str, record: Mapping[str, Any]
+) -> tuple[str, str]:
+    """Bind a watcher wrapper's asserted source/key to its filesystem path."""
+    observed = checked_relative(relative)
+    if type(record.get("schema")) is not int or record.get("schema") != 1:
+        raise IntegrityError("observation wrapper schema is not supported")
+    parts = observed.parts
+    if len(parts) < 4 or parts[0] != "observations":
+        raise IntegrityError("observation path is outside the watcher namespace")
+    source = record.get("source")
+    key = record.get("key")
+    if not isinstance(source, str) or source != parts[1]:
+        raise IntegrityError("observation source does not match its path")
+    if not isinstance(key, str):
+        raise IntegrityError("observation key is absent")
+    canonical_key = checked_relative(key).as_posix()
+    if canonical_key != key:
+        raise IntegrityError("observation key is not canonical")
+    expected_parent = PurePosixPath("observations") / source / canonical_key
+    if observed.parent != expected_parent:
+        raise IntegrityError("observation key does not match its path")
+    filename_match = OBSERVATION_FILE_RE.fullmatch(observed.name)
+    if filename_match is None:
+        raise IntegrityError("observation filename is not append-only watcher form")
+    digest = record.get("content_sha256")
+    if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+        raise IntegrityError("observation has no valid content SHA-256")
+    suffix = filename_match.group(2)
+    if suffix != "unchanged" and suffix != digest[:12]:
+        raise IntegrityError("observation filename does not bind its content digest")
+    observation_timestamp(relative, record)
+    return source, canonical_key
+
+
+def validate_public_request_provenance(
+    source: str, key: str, record: Mapping[str, Any]
+) -> None:
+    """Bind an exact-scope watcher wrapper to its public read endpoint."""
+    if type(record.get("status")) is not int or record.get("status") != 200:
+        raise IntegrityError("observation does not bind a successful HTTP status")
+    request_url = record.get("request_url")
+    if not isinstance(request_url, str):
+        raise IntegrityError("observation has no request URL provenance")
+    if source == "acceptance":
+        if request_url != f"local://acceptance/{key}":
+            raise IntegrityError("acceptance observation URL provenance is invalid")
+        return
+    try:
+        parsed = urlsplit(request_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise IntegrityError("observation request URL is malformed") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.fragment
+    ):
+        raise IntegrityError("observation request URL authority is invalid")
+    path = unquote(parsed.path)
+    expected_host: str
+    expected_path: str
+    if source == "gradients-tournament":
+        expected_host = "api.gradients.io"
+        expected_path = f"/tournament/{key}/details"
+    elif source == "gradients-task":
+        expected_host = "api.gradients.io"
+        expected_path = f"/auditing/tasks/{key}"
+    elif source == "hf-model":
+        expected_host = "huggingface.co"
+        expected_path = f"/api/models/{key}"
+    elif source == "hf-revision-manifest":
+        expected_host = "huggingface.co"
+        parts = key.rsplit("/", 1)
+        if len(parts) != 2:
+            raise IntegrityError("HF revision request key is malformed")
+        repo, revision = parts
+        expected_path = f"/{repo}/tree/{revision}"
+    elif source == "hf-tree":
+        expected_host = "huggingface.co"
+        parts = key.rsplit("/", 2)
+        if len(parts) != 3:
+            raise IntegrityError("HF tree request key is malformed")
+        repo, revision, _page = parts
+        expected_path = f"/api/models/{repo}/tree/{revision}"
+    elif source == "hf-file":
+        expected_host = "huggingface.co"
+        parts = key.split("/")
+        if len(parts) < 4:
+            raise IntegrityError("HF file request key is malformed")
+        repo = "/".join(parts[:2])
+        revision = parts[2]
+        file_path = "/".join(parts[3:])
+        expected_path = f"/api/resolve-cache/models/{repo}/{revision}/{file_path}"
+    else:
+        raise IntegrityError("observation source has no public endpoint contract")
+    if (
+        source == "hf-file"
+        and isinstance(parsed.hostname, str)
+        and parsed.hostname.endswith(".cdn.hf.co")
+        and path.startswith("/xet-bridge-")
+    ):
+        # Hugging Face's public resolver records the final Xet CDN URL for
+        # some small files.  The redirect URL cannot restate repo/revision/path;
+        # the terminal manifest/tree/hf-file/CAS chain supplies that binding.
+        return
+    if parsed.hostname != expected_host or path != expected_path:
+        raise IntegrityError("observation request URL contradicts its source/key")
+
+
+def observation_timestamp(relative: str, record: Mapping[str, Any]) -> str:
+    """Return filename-derived UTC time after binding the wrapper timestamp."""
+    name = checked_relative(relative).name
+    match = OBSERVATION_FILE_RE.fullmatch(name)
+    if match is None:
+        raise IntegrityError("observation filename is not append-only watcher form")
+    try:
+        filename_time = dt.datetime.strptime(
+            match.group(1), "%Y%m%dT%H%M%S.%fZ"
+        ).replace(tzinfo=dt.timezone.utc)
+        raw_observed = record.get("observed_at")
+        if not isinstance(raw_observed, str):
+            raise ValueError("missing observed_at")
+        wrapper_time = dt.datetime.fromisoformat(raw_observed.replace("Z", "+00:00"))
+        if wrapper_time.tzinfo is None:
+            raise ValueError("naive observed_at")
+        wrapper_time = wrapper_time.astimezone(dt.timezone.utc)
+    except (TypeError, ValueError) as exc:
+        raise IntegrityError("observation timestamp identity is invalid") from exc
+    if abs((filename_time - wrapper_time).total_seconds()) > 2.0:
+        raise IntegrityError("observation wrapper time does not match its filename")
+    return utc_iso(filename_time)
 
 
 def _ensure_destination_directory(path: Path) -> None:
@@ -493,13 +690,13 @@ class Publisher:
         screen_body: bool = False,
     ) -> Staged:
         name = self.partial / f"{uuid.uuid4().hex}.part"
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         digest = hashlib.sha256()
         size = 0
         tail = b""
         excluded = False
         try:
-            with os.fdopen(fd, "wb", buffering=0) as handle:
+            with os.fdopen(fd, "w+b", buffering=0) as handle:
                 for block in source.iter_bytes(entry.path):
                     size += len(block)
                     if size > entry.size:
@@ -514,8 +711,14 @@ class Publisher:
                     handle.write(block)
                 handle.flush()
                 os.fsync(handle.fileno())
-            if size != entry.size:
-                raise IntegrityError("source size changed after inventory")
+                if size != entry.size:
+                    raise IntegrityError("source size changed after inventory")
+                if screen_body:
+                    if size > MAX_METADATA_BYTES:
+                        raise PolicyExcluded("screened body exceeds the metadata safety ceiling")
+                    handle.seek(0)
+                    if contains_forbidden_body(handle.read()):
+                        raise PolicyExcluded("body matched the exclusion vocabulary")
             actual = digest.hexdigest()
             if expected_sha256 is not None and actual != expected_sha256:
                 raise IntegrityError("CAS content does not match its SHA-256 identity")
@@ -653,21 +856,31 @@ def _source_cas_bytes(
     return body
 
 
-def _task_ids(value: Any) -> frozenset[str]:
-    found: set[str] = set()
-
-    def visit(item: Any) -> None:
-        if isinstance(item, Mapping):
-            task_id = item.get("task_id")
-            if isinstance(task_id, str) and TASK_RE.fullmatch(task_id):
-                found.add(task_id)
-            for child in item.values():
-                visit(child)
-        elif isinstance(item, list):
-            for child in item:
-                visit(child)
-
-    visit(value)
+def _completed_r1_task_ids(value: Any) -> frozenset[str]:
+    """Return the unique canonical task set from exactly one completed Round 1."""
+    rounds = value.get("rounds") if isinstance(value, Mapping) else None
+    if not isinstance(rounds, list):
+        return frozenset()
+    round_one = [
+        row
+        for row in rounds
+        if isinstance(row, Mapping)
+        and type(row.get("round_number")) is int
+        and row.get("round_number") == 1
+    ]
+    if len(round_one) != 1 or str(round_one[0].get("status", "")).casefold() != "completed":
+        return frozenset()
+    tasks = round_one[0].get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return frozenset()
+    found: list[str] = []
+    for task in tasks:
+        task_id = task.get("task_id") if isinstance(task, Mapping) else None
+        if not isinstance(task_id, str) or TASK_RE.fullmatch(task_id) is None:
+            return frozenset()
+        found.append(task_id)
+    if len(found) != len(set(found)):
+        return frozenset()
     return frozenset(found)
 
 
@@ -684,7 +897,10 @@ def derive_tournament_scope(
     candidates = sorted(
         entry.path
         for entry in entries
-        if entry.kind == "file" and entry.path.startswith(prefix) and entry.path.endswith(".json")
+        if entry.kind == "file"
+        and entry.path.startswith(prefix)
+        and entry.path.endswith(".json")
+        and len(checked_relative(entry.path).parts) == 4
     )
     if not candidates:
         raise SyncError("exact gradients-tournament observation is absent")
@@ -700,6 +916,7 @@ def derive_tournament_scope(
         or record.get("key") != tournament_id
     ):
         raise IntegrityError("tournament observation identity does not match its path")
+    validate_observation_identity(latest, record)
     digest = record.get("content_sha256")
     if not isinstance(digest, str) or record.get("object") != _object_relative(digest):
         raise IntegrityError("tournament observation has an invalid CAS binding")
@@ -710,35 +927,132 @@ def derive_tournament_scope(
         value = json.loads(body)
     except json.JSONDecodeError as exc:
         raise IntegrityError("tournament observation body is not JSON") from exc
-    if not isinstance(value, dict) or value.get("tournament_id") != tournament_id:
-        raise IntegrityError("tournament body does not assert the selected tournament ID")
-    tasks = _task_ids(value)
+    if (
+        not isinstance(value, dict)
+        or value.get("tournament_id") != tournament_id
+        or value.get("tournament_type") != "image"
+    ):
+        raise IntegrityError(
+            "tournament body does not assert the selected image tournament identity"
+        )
+    tasks = _completed_r1_task_ids(value)
     if not tasks:
-        raise IntegrityError("selected tournament observation contains no task IDs")
+        raise IntegrityError(
+            "selected tournament observation has no unique completed Round-1 task set"
+        )
     return TournamentScope(tournament_id, tasks, latest, digest)
 
 
 def observation_in_scope(relative: str, scope: TournamentScope) -> bool:
-    """Select only exact tournament/task/fixture/HF observation namespaces."""
+    """Select only exact tournament/task/public-submission namespaces.
+
+    The watcher's ``fixtures`` namespace is sourced from ``image_text_pairs``.
+    That is the full public pool and can include rows withheld from the miner's
+    optimizer-visible ``training_data.zip`` partition.  The Week-7 owner
+    boundary permits inventorying the public training archive only, so fixture
+    observations are intentionally excluded without opening their bodies.
+    """
     parts = checked_relative(relative).parts
     if len(parts) < 4 or parts[0] != "observations":
         return False
     source = parts[1]
     key_head = parts[2]
     if source in {"gradients-tournament", "acceptance"}:
-        return key_head == scope.tournament_id
+        return len(parts) == 4 and key_head == scope.tournament_id
     if source == "gradients-task":
-        return key_head in scope.task_ids
+        return len(parts) == 4 and key_head in scope.task_ids
     if source == "fixtures":
-        return key_head in scope.task_ids
-    if source.startswith("hf-") and source != "hf-listing":
+        return False
+    if source in ALLOWED_HF_OBSERVATION_SOURCES:
         # HF repo IDs are path components ``author/repo`` and the repo name is
         # tournament-<exact tournament>-<exact task>-<hotkey>. Requiring both
         # IDs prevents a date-wide listing from smuggling text/environment
         # artifacts into an image-tournament root.
+        if len(parts) < 5 or parts[2] != HF_ORGANIZATION:
+            return False
+        repo_name = parts[3]
         marker = f"tournament-{scope.tournament_id}-"
-        return marker in relative and any(f"-{task_id}-" in relative for task_id in scope.task_ids)
+        if not repo_name.startswith(marker):
+            return False
+        tail = repo_name[len(marker) :]
+        if len(tail) <= 37 or tail[36] != "-":
+            return False
+        task_id, owner = tail[:36], tail[37:]
+        if task_id not in scope.task_ids or HF_REPOSITORY_OWNER_RE.fullmatch(owner) is None:
+            return False
+        if source == "hf-model":
+            return len(parts) == 5
+        if len(parts) < 6 or REVISION_RE.fullmatch(parts[4]) is None:
+            return False
+        if source == "hf-revision-manifest":
+            return len(parts) == 6
+        if source == "hf-tree":
+            return len(parts) == 7 and re.fullmatch(r"page-[0-9]+", parts[5]) is not None
+        return source == "hf-file" and len(parts) >= 7
     return False
+
+
+def validate_scoped_observation_body(
+    source: str, key: str, value: Any, scope: TournamentScope
+) -> None:
+    """Cross-bind source-specific public response identity before publication."""
+    if source == "gradients-tournament":
+        if (
+            not isinstance(value, Mapping)
+            or value.get("tournament_id") != key
+            or value.get("tournament_type") != "image"
+        ):
+            raise IntegrityError("tournament body contradicts its scoped key")
+        return
+    if source == "gradients-task":
+        if not isinstance(value, Mapping) or value.get("task_id") != key:
+            raise IntegrityError("task body contradicts its scoped key")
+        return
+    if source == "acceptance":
+        if not isinstance(value, Mapping) or value.get("tournament_id") != key:
+            raise IntegrityError("acceptance body contradicts its scoped key")
+        return
+    parts = key.split("/")
+    repo = "/".join(parts[:2])
+    if source == "hf-model":
+        if (
+            not isinstance(value, Mapping)
+            or (value.get("id") or value.get("modelId")) != repo
+            or (value.get("id") is not None and value.get("id") != repo)
+            or (value.get("modelId") is not None and value.get("modelId") != repo)
+        ):
+            raise IntegrityError("HF model body contradicts its scoped key")
+        return
+    revision = parts[2]
+    if source == "hf-revision-manifest":
+        if (
+            not isinstance(value, Mapping)
+            or value.get("repo_id") != repo
+            or value.get("revision") != revision
+        ):
+            raise IntegrityError("HF revision body contradicts its scoped key")
+        return
+    if source == "hf-tree":
+        if not isinstance(value, list):
+            raise IntegrityError("HF tree body is not a public tree list")
+        return
+    if source == "hf-file":
+        path = "/".join(parts[3:])
+        if (
+            not isinstance(value, Mapping)
+            or value.get("repo_id") != repo
+            or value.get("revision") != revision
+            or value.get("path") != path
+        ):
+            raise IntegrityError("HF file body contradicts its scoped key")
+        return
+    raise IntegrityError("unknown scoped observation source")
+
+
+def is_full_pool_fixture_observation(relative: str) -> bool:
+    """Identify watcher observations sourced from full image_text_pairs pools."""
+    parts = checked_relative(relative).parts
+    return len(parts) >= 2 and parts[0] == "observations" and parts[1] == "fixtures"
 
 
 def _read_destination_file(root: Path, relative: str) -> bytes:
@@ -793,7 +1107,6 @@ def _filtered_events(body: bytes, scope: TournamentScope) -> tuple[bytes, int, i
     selected: list[bytes] = []
     out_of_scope = 0
     forbidden = 0
-    needles = (scope.tournament_id, *sorted(scope.task_ids))
     for raw in body.splitlines():
         if not raw.strip():
             continue
@@ -805,8 +1118,15 @@ def _filtered_events(body: bytes, scope: TournamentScope) -> tuple[bytes, int, i
         except json.JSONDecodeError:
             out_of_scope += 1
             continue
-        canonical = json.dumps(value, ensure_ascii=True, sort_keys=True)
-        if any(needle in canonical for needle in needles):
+        canonical = json.dumps(value, allow_nan=False, ensure_ascii=True, sort_keys=True)
+        tournaments = set(TOURNAMENT_RE.findall(canonical))
+        tasks = set(TASK_RE.findall(canonical))
+        if any(item != scope.tournament_id for item in tournaments) or any(
+            item not in scope.task_ids for item in tasks
+        ):
+            out_of_scope += 1
+            continue
+        if scope.tournament_id in tournaments or bool(tasks & scope.task_ids):
             selected.append(raw + b"\n")
         else:
             out_of_scope += 1
@@ -860,6 +1180,8 @@ def sync_archive(
                 "eval_data/evaluation_data/eval-derived",
             ],
             "public_test_loss_telemetry": "allowed",
+            "watcher_image_text_pair_fixtures": "excluded-unopened",
+            "public_training_archives": "separate exact-task inventory only",
         },
         "inventory": {
             "files": sum(row.kind == "file" for row in entries),
@@ -902,6 +1224,13 @@ def sync_archive(
     for entry in entries:
         if entry.kind != "file" or OBSERVATION_RE.fullmatch(entry.path) is None:
             continue
+        # This exclusion is unconditional.  Unscoped/diagnostic invocations
+        # must have the same privacy boundary as exact-tournament P0 runs.
+        # Apply it before reading the wrapper, so neither fixture metadata nor
+        # its referenced full-pool CAS bytes cross the boundary.
+        if is_full_pool_fixture_observation(entry.path):
+            result["excluded"]["out_of_scope"] += 1
+            continue
         if scope is not None and not observation_in_scope(entry.path, scope):
             result["excluded"]["out_of_scope"] += 1
             continue
@@ -917,6 +1246,11 @@ def sync_archive(
                 raise IntegrityError("observation snapshot is not JSON") from exc
             if not isinstance(record, dict):
                 raise IntegrityError("observation snapshot is not an object")
+            wrapper_source, wrapper_key = validate_observation_identity(entry.path, record)
+            if scope is not None:
+                validate_public_request_provenance(wrapper_source, wrapper_key, record)
+            if wrapper_source == "fixtures":
+                raise PolicyExcluded("full-pool fixture observation is prohibited")
             hf = is_hf_observation(entry.path, record)
             if contains_forbidden_body(snapshot_body):
                 raise PolicyExcluded("HF observation metadata matched exclusion vocabulary")
@@ -934,13 +1268,24 @@ def sync_archive(
                 source, object_entry, expected_sha256=digest, screen_body=True
             )
             group.append(content_staged)
+            content_bytes = record.get("content_bytes")
+            if (
+                type(content_bytes) is not int
+                or content_bytes < 0
+                or content_bytes != content_staged.size
+            ):
+                raise IntegrityError("observation content_bytes does not match its CAS object")
             content_value: Any = None
             if content_staged.size <= MAX_METADATA_BYTES:
-                content_bytes = content_staged.path.read_bytes()
+                content_body = content_staged.path.read_bytes()
                 try:
-                    content_value = json.loads(content_bytes)
+                    content_value = json.loads(content_body)
                 except json.JSONDecodeError:
                     content_value = None
+            if scope is not None:
+                validate_scoped_observation_body(
+                    wrapper_source, wrapper_key, content_value, scope
+                )
             for nested_digest, declared_path in _nested_hf_objects(content_value) if hf else []:
                 if declared_path is None or contains_forbidden_path(declared_path):
                     raise PolicyExcluded("HF file path matched exclusion vocabulary or was absent")
