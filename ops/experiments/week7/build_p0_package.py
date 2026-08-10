@@ -619,7 +619,13 @@ def verify_watcher_root(
         if not isinstance(wrapper, dict):
             raise IntegrityError("raw-watcher observation wrapper is not an object")
         wrapper_source, wrapper_key = validate_observation_identity(relative, wrapper)
-        validate_public_request_provenance(wrapper_source, wrapper_key, wrapper)
+        normalized_wrapper = validate_public_request_provenance(
+            wrapper_source, wrapper_key, wrapper
+        )
+        if normalized_wrapper != wrapper:
+            raise IntegrityError(
+                "raw-watcher observation wrapper retains an unredacted request query"
+            )
         wrapper_observed_at = _parse_utc_timestamp(
             observation_timestamp(relative, wrapper), "raw-watcher observation observed_at"
         )

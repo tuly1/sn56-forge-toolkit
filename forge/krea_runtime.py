@@ -22,10 +22,10 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
-import subprocess
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -52,7 +52,9 @@ KNOWN_BUNDLES = frozenset(
 
 RUNTIME_CONTRACT_ID = "sn56-krea-runtime-v1"
 PINNED_BASE_COMMIT = "99be3d96a2468d3a5228a4eb05ba67e63c586b4e"
+PINNED_BASE_TREE = "9f7434621f06949655c5ebe13f45247ccf605c05"
 OWNED_RUNTIME_COMMIT = "71e133b4e73a716d1094f22355a46be07953b828"
+OWNED_RUNTIME_TREE = "61456aab4c4f18712414a54c2ef7333fadedf59e"
 OWNED_RUNTIME_REPOSITORY = "https://github.com/tuly1/sn56-ai-toolkit-mirror.git"
 INCUMBENT_RUNTIME_REPOSITORY = "https://github.com/ostris/ai-toolkit.git"
 DEFAULT_INCUMBENT_RUNTIME_DIR = "/app/ai-toolkit"
@@ -189,15 +191,43 @@ def runtime_directory(
         (model_type or "").strip().lower() == "krea2"
         and resolved != INCUMBENT_BUNDLE
     )
-    if is_experimental_krea:
-        raw = env.get(OWNED_KREA_RUNTIME_DIR_ENV, DEFAULT_OWNED_KREA_RUNTIME_DIR)
-    else:
-        raw = env.get(INCUMBENT_RUNTIME_DIR_ENV, DEFAULT_INCUMBENT_RUNTIME_DIR)
-    if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
-        raise KreaRuntimeContractError("selected runtime directory is invalid")
-    if not os.path.isabs(raw):
-        raise KreaRuntimeContractError("selected runtime directory must be absolute")
-    return os.path.realpath(raw)
+    incumbent_dir, owned_dir = _isolated_runtime_directories(env)
+    return owned_dir if is_experimental_krea else incumbent_dir
+
+
+def _isolated_runtime_directories(
+    environ: Mapping[str, str],
+) -> tuple[str, str]:
+    """Resolve both runtime roots and reject aliasing or containment.
+
+    A separately configurable executable and attestation path recreates the
+    exact failure this contract is meant to prevent.  Both roots therefore
+    enter through one resolver, and even a symlink alias or nested checkout is
+    rejected before either runtime can launch.
+    """
+
+    resolved: list[str] = []
+    for variable, default in (
+        (INCUMBENT_RUNTIME_DIR_ENV, DEFAULT_INCUMBENT_RUNTIME_DIR),
+        (OWNED_KREA_RUNTIME_DIR_ENV, DEFAULT_OWNED_KREA_RUNTIME_DIR),
+    ):
+        raw = environ.get(variable, default)
+        if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
+            raise KreaRuntimeContractError("runtime directory is invalid")
+        if not os.path.isabs(raw):
+            raise KreaRuntimeContractError("runtime directory must be absolute")
+        resolved.append(os.path.realpath(raw))
+
+    incumbent_dir, owned_dir = resolved
+    try:
+        common = os.path.commonpath((incumbent_dir, owned_dir))
+    except ValueError as exc:  # pragma: no cover - unlike roots on Windows
+        raise KreaRuntimeContractError("runtime directories are incomparable") from exc
+    if common in {incumbent_dir, owned_dir}:
+        raise KreaRuntimeContractError(
+            "incumbent and owned runtime directories overlap"
+        )
+    return incumbent_dir, owned_dir
 
 
 def runtime_attestation_paths(
@@ -408,104 +438,273 @@ def verify_selected_runtime(
     bundle: str,
     *,
     environ: dict[str, str] | None = None,
-    runner: Any = subprocess.run,
 ) -> str:
-    """Fail before launch unless attestation and executable checkout coincide."""
+    """Fail before every launch unless the executable tree is the pinned tree."""
 
     runtime_dir = runtime_directory(model_type, bundle, environ=environ)
     is_experimental_krea = (
         (model_type or "").strip().lower() == "krea2"
         and bundle != INCUMBENT_BUNDLE
     )
-    if not is_experimental_krea:
-        return runtime_dir
+    if is_experimental_krea:
+        manifest = load_capability_manifest(
+            model_type=model_type,
+            bundle=bundle,
+            environ=environ,
+        )
+        require_capabilities(manifest, _BUNDLE_CAPABILITIES[bundle])
 
-    manifest = load_capability_manifest(
-        model_type=model_type,
-        bundle=bundle,
-        environ=environ,
+    expected_commit = (
+        OWNED_RUNTIME_COMMIT if is_experimental_krea else PINNED_BASE_COMMIT
     )
-    require_capabilities(manifest, _BUNDLE_CAPABILITIES[bundle])
-    _verify_git_checkout(
+    expected_tree = (
+        OWNED_RUNTIME_TREE if is_experimental_krea else PINNED_BASE_TREE
+    )
+    _verify_runtime_tree(
         runtime_dir,
-        expected_commit=OWNED_RUNTIME_COMMIT,
-        expected_repository=OWNED_RUNTIME_REPOSITORY,
-        runner=runner,
+        expected_commit=expected_commit,
+        expected_tree_sha1=expected_tree,
     )
     return runtime_dir
 
 
-def _verify_git_checkout(
+def _git_sha1(data: bytes = b"") -> Any:
+    """Return SHA-1 for Git object compatibility, including on FIPS hosts."""
+
+    try:
+        return hashlib.sha1(data, usedforsecurity=False)
+    except TypeError:  # pragma: no cover - Python/OpenSSL compatibility
+        return hashlib.sha1(data)
+
+
+def _stable_stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _git_blob_digest(directory_fd: int, name: str, expected: os.stat_result) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        file_fd = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise KreaRuntimeContractError(
+            "selected runtime file cannot be opened safely"
+        ) from exc
+    try:
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode) or (
+            _stable_stat_identity(before) != _stable_stat_identity(expected)
+        ):
+            raise KreaRuntimeContractError(
+                "selected runtime file identity changed during verification"
+            )
+        digest = _git_sha1(f"blob {before.st_size}\0".encode("ascii"))
+        observed = 0
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            observed += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(file_fd)
+        if observed != before.st_size or (
+            _stable_stat_identity(after) != _stable_stat_identity(before)
+        ):
+            raise KreaRuntimeContractError(
+                "selected runtime file changed during verification"
+            )
+        return digest.digest()
+    finally:
+        os.close(file_fd)
+
+
+def _git_tree_digest(
+    directory_fd: int,
+    *,
+    root: bool,
+    allowed_root_extras: frozenset[str] = frozenset(),
+) -> bytes:
+    before = os.fstat(directory_fd)
+    if not stat.S_ISDIR(before.st_mode):
+        raise KreaRuntimeContractError("selected runtime tree contains a non-directory")
+    try:
+        names = os.listdir(directory_fd)
+    except OSError as exc:
+        raise KreaRuntimeContractError(
+            "selected runtime directory cannot be enumerated"
+        ) from exc
+
+    entries: list[tuple[bytes, bytes]] = []
+    for name in names:
+        if root and (name == ".git" or name in allowed_root_extras):
+            continue
+        encoded_name = os.fsencode(name)
+        if not encoded_name or b"\x00" in encoded_name or b"/" in encoded_name:
+            raise KreaRuntimeContractError("selected runtime contains an invalid path")
+        try:
+            entry_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise KreaRuntimeContractError(
+                "selected runtime entry changed during verification"
+            ) from exc
+        if stat.S_ISLNK(entry_stat.st_mode):
+            raise KreaRuntimeContractError("selected runtime contains a symlink")
+        if stat.S_ISREG(entry_stat.st_mode):
+            mode = b"100755" if entry_stat.st_mode & 0o111 else b"100644"
+            object_digest = _git_blob_digest(directory_fd, name, entry_stat)
+            sort_key = encoded_name + b"\x00"
+        elif stat.S_ISDIR(entry_stat.st_mode):
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                child_fd = os.open(name, flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise KreaRuntimeContractError(
+                    "selected runtime directory cannot be opened safely"
+                ) from exc
+            try:
+                if _stable_stat_identity(os.fstat(child_fd)) != _stable_stat_identity(
+                    entry_stat
+                ):
+                    raise KreaRuntimeContractError(
+                        "selected runtime directory identity changed"
+                    )
+                object_digest = _git_tree_digest(child_fd, root=False)
+            finally:
+                os.close(child_fd)
+            mode = b"40000"
+            sort_key = encoded_name + b"/"
+        else:
+            raise KreaRuntimeContractError(
+                "selected runtime contains a non-regular entry"
+            )
+        entries.append(
+            (sort_key, mode + b" " + encoded_name + b"\0" + object_digest)
+        )
+
+    after = os.fstat(directory_fd)
+    if _stable_stat_identity(after) != _stable_stat_identity(before):
+        raise KreaRuntimeContractError(
+            "selected runtime directory changed during verification"
+        )
+    body = b"".join(value for _key, value in sorted(entries))
+    return _git_sha1(f"tree {len(body)}\0".encode("ascii") + body).digest()
+
+
+def _verify_runtime_tree(
     runtime_dir: str,
     *,
     expected_commit: str,
-    expected_repository: str,
-    runner: Any,
+    expected_tree_sha1: str,
 ) -> None:
-    """Verify commit, tracked tree, origin, entrypoint, and untracked surface."""
+    """Verify detached HEAD and executed bytes without invoking repository Git.
 
+    Runtime containers need no ``git`` binary for this check.  Hashing the
+    files that will execute also prevents repository-local Git configuration,
+    attributes, filters, index flags, or aliases from shaping the verdict.
+    """
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
     try:
-        directory_stat = os.lstat(runtime_dir)
-        run_path = os.path.join(runtime_dir, "run.py")
-        run_stat = os.lstat(run_path)
+        root_fd = os.open(runtime_dir, flags)
     except OSError as exc:
         raise KreaRuntimeContractError(
             "selected runtime checkout is unavailable"
         ) from exc
-    if not stat.S_ISDIR(directory_stat.st_mode):
-        raise KreaRuntimeContractError("selected runtime checkout is not a directory")
-    if stat.S_ISLNK(run_stat.st_mode) or not stat.S_ISREG(run_stat.st_mode):
-        raise KreaRuntimeContractError("selected runtime run.py is not a regular file")
-
-    def git(*arguments: str) -> str:
+    try:
         try:
-            completed = runner(
-                ["git", "-C", runtime_dir, *arguments],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-        except Exception as exc:
+            git_fd = os.open(".git", flags, dir_fd=root_fd)
+        except OSError as exc:
             raise KreaRuntimeContractError(
-                "selected runtime git verification failed"
+                "selected runtime has no detached Git identity"
             ) from exc
-        if completed.returncode != 0:
-            raise KreaRuntimeContractError(
-                "selected runtime git verification failed"
+        try:
+            head_stat = os.stat("HEAD", dir_fd=git_fd, follow_symlinks=False)
+            head_bytes = _read_fd_regular_bytes(
+                git_fd, "HEAD", head_stat, maximum_size=128
             )
-        return completed.stdout.strip()
+        finally:
+            os.close(git_fd)
+        try:
+            head = head_bytes.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise KreaRuntimeContractError(
+                "selected runtime HEAD is not an exact commit"
+            ) from exc
+        if head != expected_commit or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise KreaRuntimeContractError("selected runtime commit mismatch")
+        allowed_root_extras = (
+            frozenset({RUNTIME_IDENTITY_FILENAME})
+            if expected_commit == OWNED_RUNTIME_COMMIT
+            else frozenset()
+        )
+        tree_sha1 = _git_tree_digest(
+            root_fd,
+            root=True,
+            allowed_root_extras=allowed_root_extras,
+        ).hex()
+        if tree_sha1 != expected_tree_sha1:
+            raise KreaRuntimeContractError("selected runtime executed tree mismatch")
+    finally:
+        os.close(root_fd)
 
-    head = git("rev-parse", "--verify", "HEAD^{commit}")
-    expected = git("rev-parse", "--verify", f"{expected_commit}^{{commit}}")
-    if head != expected_commit or expected != expected_commit:
-        raise KreaRuntimeContractError("selected runtime commit mismatch")
-    if os.path.realpath(git("rev-parse", "--show-toplevel")) != runtime_dir:
-        raise KreaRuntimeContractError("selected runtime is not the repository root")
-    if git("rev-parse", "HEAD^{tree}") != git(
-        "rev-parse", f"{expected_commit}^{{tree}}"
-    ):
-        raise KreaRuntimeContractError("selected runtime tree mismatch")
-    origin = git("remote", "get-url", "origin").removesuffix("/")
-    if origin.removesuffix(".git") != expected_repository.removesuffix(".git"):
-        raise KreaRuntimeContractError("selected runtime repository mismatch")
 
-    status_rows = [
-        row
-        for row in git(
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            "--ignored=matching",
-        ).splitlines()
-        if row
-    ]
-    allowed_identity_rows = {
-        f"?? {RUNTIME_IDENTITY_FILENAME}",
-        f"!! {RUNTIME_IDENTITY_FILENAME}",
-    }
-    if any(row not in allowed_identity_rows for row in status_rows):
-        raise KreaRuntimeContractError("selected runtime working tree is not exact")
+def _read_fd_regular_bytes(
+    directory_fd: int,
+    name: str,
+    expected: os.stat_result,
+    *,
+    maximum_size: int,
+) -> bytes:
+    if expected.st_size > maximum_size:
+        raise KreaRuntimeContractError("selected runtime identity is oversized")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        value_fd = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise KreaRuntimeContractError(
+            "selected runtime identity cannot be opened safely"
+        ) from exc
+    try:
+        before = os.fstat(value_fd)
+        if not stat.S_ISREG(before.st_mode) or (
+            _stable_stat_identity(before) != _stable_stat_identity(expected)
+        ):
+            raise KreaRuntimeContractError("selected runtime identity changed")
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(value_fd, min(64 * 1024, maximum_size + 1 - observed))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > maximum_size:
+                raise KreaRuntimeContractError(
+                    "selected runtime identity is oversized"
+                )
+        if _stable_stat_identity(os.fstat(value_fd)) != _stable_stat_identity(before):
+            raise KreaRuntimeContractError("selected runtime identity changed")
+        return b"".join(chunks)
+    finally:
+        os.close(value_fd)
 
 
 def _read_regular_attestation(path: str, label: str) -> bytes:

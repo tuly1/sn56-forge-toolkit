@@ -217,6 +217,11 @@ def test_malformed_score_field_types_abort(field, bad):
         "test_data=https://secret.invalid/rows.json",
         "evaluation_assets.zip",
         "holdouts/hidden-row.json",
+        "test1=https://secret.invalid/rows.json",
+        "holdout_v2/rows.json",
+        "hidden1/rows.json",
+        "evaluation2/rows.json",
+        "quarantine-version-3/rows.json",
     ],
 )
 def test_free_text_score_fields_cannot_smuggle_prohibited_material(payload):

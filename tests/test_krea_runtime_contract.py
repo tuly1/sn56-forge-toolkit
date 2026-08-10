@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -89,6 +90,48 @@ def _activate(monkeypatch, tmp_path: Path, bundle: str) -> Path:
         krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV, str(tmp_path)
     )
     return path
+
+
+def _committed_runtime_tree(tmp_path: Path) -> tuple[Path, str, str]:
+    """Create one detached exact checkout for Git-free verifier tests."""
+
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    subprocess.run(["git", "init", "-q", str(runtime_dir)], check=True)
+    subprocess.run(
+        ["git", "-C", str(runtime_dir), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(runtime_dir), "config", "user.name", "Test"],
+        check=True,
+    )
+    (runtime_dir / "run.py").write_text("print('exact')\n", encoding="utf-8")
+    package = runtime_dir / "pkg"
+    package.mkdir()
+    (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(runtime_dir), "add", "run.py", "pkg"], check=True)
+    subprocess.run(
+        ["git", "-C", str(runtime_dir), "commit", "-qm", "runtime"],
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(runtime_dir), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "-C", str(runtime_dir), "rev-parse", "HEAD^{tree}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(runtime_dir), "checkout", "-q", "--detach", commit],
+        check=True,
+    )
+    return runtime_dir, commit, tree
 
 
 def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
@@ -225,52 +268,92 @@ def test_attestation_paths_are_derived_from_selected_runtime_and_ignore_legacy_e
     )["runtime_contract_id"] == krea_runtime.RUNTIME_CONTRACT_ID
 
 
-def test_git_verifier_rejects_a_dirty_selected_runtime_tree(tmp_path):
-    runtime_dir = tmp_path / "runtime"
-    runtime_dir.mkdir()
-    subprocess.run(["git", "init", "-q", str(runtime_dir)], check=True)
-    subprocess.run(
-        ["git", "-C", str(runtime_dir), "config", "user.email", "test@example.com"],
-        check=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(runtime_dir), "config", "user.name", "Test"],
-        check=True,
-    )
-    (runtime_dir / "run.py").write_text("print('clean')\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(runtime_dir), "add", "run.py"], check=True)
-    subprocess.run(
-        ["git", "-C", str(runtime_dir), "commit", "-qm", "runtime"],
-        check=True,
-    )
-    repository = "https://github.com/example/runtime.git"
-    subprocess.run(
-        ["git", "-C", str(runtime_dir), "remote", "add", "origin", repository],
-        check=True,
-    )
-    commit = subprocess.run(
-        ["git", "-C", str(runtime_dir), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+def test_git_free_runtime_tree_verifier_accepts_exact_tree_with_empty_path(
+    tmp_path, monkeypatch
+):
+    runtime_dir, commit, tree = _committed_runtime_tree(tmp_path)
+    monkeypatch.setenv("PATH", "")
 
-    krea_runtime._verify_git_checkout(
+    krea_runtime._verify_runtime_tree(
         str(runtime_dir),
         expected_commit=commit,
-        expected_repository=repository,
-        runner=subprocess.run,
+        expected_tree_sha1=tree,
     )
-    (runtime_dir / "run.py").write_text("print('mutated')\n", encoding="utf-8")
 
-    with pytest.raises(
-        krea_runtime.KreaRuntimeContractError, match="working tree"
-    ):
-        krea_runtime._verify_git_checkout(
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["wrong-head", "tracked-bytes", "mode", "untracked", "symlink"],
+)
+def test_git_free_runtime_tree_verifier_rejects_every_executed_tree_drift(
+    tmp_path, monkeypatch, tamper
+):
+    runtime_dir, commit, tree = _committed_runtime_tree(tmp_path)
+
+    if tamper == "wrong-head":
+        (runtime_dir / ".git" / "HEAD").write_text("f" * 40 + "\n", encoding="ascii")
+    elif tamper == "tracked-bytes":
+        (runtime_dir / "run.py").write_text("print('tampered')\n", encoding="utf-8")
+    elif tamper == "mode":
+        os.chmod(runtime_dir / "run.py", 0o755)
+    elif tamper == "untracked":
+        (runtime_dir / "untracked.py").write_text("pass\n", encoding="utf-8")
+    elif tamper == "symlink":
+        target = tmp_path / "outside.py"
+        target.write_text("print('outside')\n", encoding="utf-8")
+        (runtime_dir / "run.py").unlink()
+        (runtime_dir / "run.py").symlink_to(target)
+    else:  # pragma: no cover - guarded by parametrization.
+        raise AssertionError(tamper)
+
+    monkeypatch.setenv("PATH", "")
+    with pytest.raises(krea_runtime.KreaRuntimeContractError):
+        krea_runtime._verify_runtime_tree(
             str(runtime_dir),
             expected_commit=commit,
-            expected_repository=repository,
-            runner=subprocess.run,
+            expected_tree_sha1=tree,
+        )
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["equal", "symlink-alias", "owned-inside-incumbent", "incumbent-inside-owned"],
+)
+def test_incumbent_and_owned_runtime_paths_must_be_disjoint(
+    tmp_path, layout
+):
+    incumbent = tmp_path / "incumbent"
+    incumbent.mkdir()
+    owned = tmp_path / "owned"
+
+    if layout == "equal":
+        owned = incumbent
+    elif layout == "symlink-alias":
+        owned.symlink_to(incumbent, target_is_directory=True)
+    elif layout == "owned-inside-incumbent":
+        owned = incumbent / "owned"
+        owned.mkdir()
+    elif layout == "incumbent-inside-owned":
+        owned.mkdir()
+        incumbent.rmdir()
+        incumbent = owned / "incumbent"
+        incumbent.mkdir()
+    else:  # pragma: no cover - guarded by parametrization.
+        raise AssertionError(layout)
+
+    env = {
+        krea_runtime.BUNDLE_ENV: krea_runtime.LEADER_BUNDLE,
+        krea_runtime.INCUMBENT_RUNTIME_DIR_ENV: str(incumbent),
+        krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV: str(owned),
+    }
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError,
+        match="distinct|overlap|collision",
+    ):
+        krea_runtime.verify_selected_runtime(
+            "krea2",
+            krea_runtime.LEADER_BUNDLE,
+            environ=env,
         )
 
 
@@ -939,6 +1022,112 @@ def _localize_spec(monkeypatch, tmp_path: Path, spec: ImageSpec) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "model_type",
+    ["krea2", "ideogram4", "qwen-image", "z-image", "flux"],
+)
+def test_every_aitoolkit_launch_verifies_the_incumbent_runtime(
+    tmp_path, monkeypatch, model_type
+):
+    spec = _spec(model_type)
+    _localize_spec(monkeypatch, tmp_path, spec)
+    toolkit_dir = tmp_path / "incumbent-toolkit"
+    toolkit_dir.mkdir()
+    (toolkit_dir / "run.py").write_text("pass\n", encoding="utf-8")
+    monkeypatch.delenv(krea_runtime.BUNDLE_ENV, raising=False)
+    verified = []
+
+    def verify(selected_model_type, bundle, **_kwargs):
+        verified.append((selected_model_type, bundle))
+        return str(toolkit_dir.resolve())
+
+    class CompletedProcess:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+    popen_calls = []
+    monkeypatch.setattr(krea_runtime, "verify_selected_runtime", verify)
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (
+            popen_calls.append((args, kwargs)) or CompletedProcess()
+        ),
+    )
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="", stderr=""
+        ),
+    )
+    Path(spec.save_root).mkdir(parents=True)
+    scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+
+    class Deadline:
+        def remaining(self):
+            return 10_000.0
+
+    assert (
+        aitoolkit._run_toolkit(
+            str(tmp_path / "task.yaml"),
+            Deadline(),
+            spec,
+            scope,
+            timing_bundle=krea_runtime.INCUMBENT_BUNDLE,
+            toolkit_dir=str(toolkit_dir),
+        )
+        is False
+    )
+    assert verified == [(model_type, krea_runtime.INCUMBENT_BUNDLE)]
+    assert len(popen_calls) == 1
+    assert popen_calls[0][1]["cwd"] == str(toolkit_dir.resolve())
+
+
+def test_incumbent_caller_toolkit_mismatch_aborts_before_popen(
+    tmp_path, monkeypatch
+):
+    spec = _spec("ideogram4")
+    _localize_spec(monkeypatch, tmp_path, spec)
+    verified = tmp_path / "verified-incumbent"
+    caller = tmp_path / "caller-selected"
+    verified.mkdir()
+    caller.mkdir()
+    monkeypatch.setattr(
+        krea_runtime,
+        "verify_selected_runtime",
+        lambda *_args, **_kwargs: str(verified.resolve()),
+    )
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "subprocess launched after incumbent runtime mismatch"
+        ),
+    )
+    Path(spec.save_root).mkdir(parents=True)
+    scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+
+    class Deadline:
+        def remaining(self):
+            return 10_000.0
+
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError,
+        match="differs.*executable|executable.*differs|runtime mismatch",
+    ):
+        aitoolkit._run_toolkit(
+            str(tmp_path / "task.yaml"),
+            Deadline(),
+            spec,
+            scope,
+            timing_bundle=krea_runtime.INCUMBENT_BUNDLE,
+            toolkit_dir=str(caller),
+        )
+
+
 def test_default_incumbent_runner_does_not_emit_record(
     tmp_path, monkeypatch
 ):
@@ -990,7 +1179,7 @@ def test_attested_tree_different_from_executed_tree_aborts_before_launch(
     (executed / "run.py").write_text("pass\n", encoding="utf-8")
     monkeypatch.setattr(
         krea_runtime,
-        "_verify_git_checkout",
+        "_verify_runtime_tree",
         lambda runtime_dir, **_kwargs: (
             None
             if runtime_dir == str(attested)
@@ -1112,7 +1301,6 @@ def test_integrated_fake_process_persists_first_and_terminal_observations(
     env_marker = tmp_path / "python-bytecode-env.txt"
     fake_script = f'''import json, os, struct, time\nfrom pathlib import Path\ndef write(path, step):\n    metadata = {{"training_info": json.dumps({{"step": step, "epoch": 1}})}}\n    header = json.dumps({{"__metadata__": metadata, "weight": {{"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}}}).encode()\n    Path(path).write_bytes(struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0))\nPath({str(env_marker)!r}).write_text(os.environ.get("PYTHONDONTWRITEBYTECODE", ""))\ntime.sleep(0.08)\nwrite({str(checkpoint_path)!r}, 200)\ntime.sleep(0.15)\nwrite({str(terminal_path)!r}, {planned})\nprint("{planned}/{planned} loss=0.1", flush=True)\nprint("Saved checkpoint to {str(terminal_path)}", flush=True)\n'''
     (toolkit_dir / "run.py").write_text(fake_script, encoding="utf-8")
-    monkeypatch.setattr(aitoolkit, "_AI_TOOLKIT_DIR", str(toolkit_dir))
     monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
     monkeypatch.setattr(
         krea_runtime,

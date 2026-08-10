@@ -21,6 +21,9 @@ Security / evidence invariants
 * HF-derived paths and bodies are screened before publication.  Anything
   matching hidden/holdout/test/quarantine/eval-derived terminology is omitted
   as a policy exclusion.  Its path and bytes are not repeated in the ledger.
+* Request-query names are source-allowlisted. Accepted pagination/Xet values
+  are discarded and only fixed, value-free redaction metadata is published;
+  unexpected or unscoped queries fail closed.
 * Mutable events and SQLite state are captured under a UTC timestamp, never at
   a stable name.  They receive the same content screen and may be excluded.
 * Every CAS filename is its SHA-256.  Both new and pre-existing destination
@@ -47,7 +50,7 @@ import subprocess
 import sys
 import unicodedata
 from typing import Any, Iterable, Iterator, Mapping, Protocol
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 import uuid
 
 
@@ -82,6 +85,17 @@ FORBIDDEN_BODY_RE = re.compile(
     r")(?![a-z0-9])",
     re.IGNORECASE,
 )
+# Treat numeric and version suffixes as part of a prohibited dataset namespace.
+# The main expressions above deliberately permit public ``test_loss`` telemetry;
+# this independent expression closes identifiers such as ``test1``,
+# ``holdout_v2`` and ``evaluation-version-3`` without broadening that exception
+# to ordinary prose.
+FORBIDDEN_VERSIONED_NAME_RE = re.compile(
+    r"(?<![a-z0-9])(?:hidden|hold[-_\s]*outs?|quarantines?|"
+    r"test|eval(?:uation)?)"
+    r"(?:[-_\s]*(?:v(?:er(?:sion)?)?[-_\s]*)?)?[0-9]+(?![a-z0-9])",
+    re.IGNORECASE,
+)
 OBSERVATION_RE = re.compile(r"^observations/.+\.json$")
 OBSERVATION_FILE_RE = re.compile(
     r"([0-9]{8}T[0-9]{6}\.[0-9]{6}Z)-([0-9a-f]{12}|unchanged)\.json"
@@ -95,8 +109,45 @@ MUTABLE_FILES = (
 ALLOWED_HF_OBSERVATION_SOURCES = frozenset(
     {"hf-model", "hf-revision-manifest", "hf-tree", "hf-file"}
 )
+PUBLIC_PROVENANCE_SOURCES = frozenset(
+    {
+        "acceptance",
+        "gradients-task",
+        "gradients-tournament",
+        *ALLOWED_HF_OBSERVATION_SOURCES,
+    }
+)
 CHUNK = 1024 * 1024
 MAX_METADATA_BYTES = 64 * 1024 * 1024
+
+# Watcher wrappers normally arrive query-free because the watcher already
+# redacts them.  These allowlists are defense in depth for externally produced
+# wrappers: only query names needed for HF pagination or signed Xet transport
+# may cross the validator, and their values are never published.
+HF_TREE_QUERY_KEYS = frozenset({"cursor", "expand", "recursive"})
+HF_XET_QUERY_KEYS = frozenset(
+    {
+        "expires",
+        "key-pair-id",
+        "policy",
+        "response-content-disposition",
+        "response-content-type",
+        "signature",
+        "x-amz-algorithm",
+        "x-amz-content-sha256",
+        "x-amz-credential",
+        "x-amz-date",
+        "x-amz-expires",
+        "x-amz-security-token",
+        "x-amz-signature",
+        "x-amz-signedheaders",
+        "x-id",
+        "x-xet-cas-uid",
+    }
+)
+HF_XET_SIGNATURE_KEYS = frozenset({"signature", "x-amz-signature"})
+MAX_QUERY_BYTES = 16 * 1024
+MAX_QUERY_FIELDS = 32
 
 
 class SyncError(RuntimeError):
@@ -470,11 +521,19 @@ def normalized_sensitive_text(value: str) -> str:
 
 
 def contains_forbidden_path(value: str) -> bool:
-    return FORBIDDEN_PATH_RE.search(normalized_sensitive_text(value)) is not None
+    normalized = normalized_sensitive_text(value)
+    return (
+        FORBIDDEN_PATH_RE.search(normalized) is not None
+        or FORBIDDEN_VERSIONED_NAME_RE.search(normalized) is not None
+    )
 
 
 def contains_forbidden_body_text(value: str) -> bool:
-    return FORBIDDEN_BODY_RE.search(normalized_sensitive_text(value)) is not None
+    normalized = normalized_sensitive_text(value)
+    return (
+        FORBIDDEN_BODY_RE.search(normalized) is not None
+        or FORBIDDEN_VERSIONED_NAME_RE.search(normalized) is not None
+    )
 
 
 def contains_forbidden_body(value: bytes) -> bool:
@@ -546,10 +605,101 @@ def validate_observation_identity(
     return source, canonical_key
 
 
+def _redacted_request_query(
+    record: Mapping[str, Any],
+    parsed: Any,
+    *,
+    query_kind: str,
+) -> dict[str, Any] | None:
+    """Validate one source-specific query and return value-free metadata.
+
+    Query values can contain temporary credentials.  They are accepted only
+    for the two public transports that require them and are never copied into
+    the destination wrapper, not even as hashes.
+    """
+
+    if query_kind == "hf-tree":
+        allowed = HF_TREE_QUERY_KEYS
+        required_signature = False
+    elif query_kind == "hf-xet":
+        allowed = HF_XET_QUERY_KEYS
+        required_signature = True
+    elif query_kind == "none":
+        allowed = frozenset()
+        required_signature = False
+    else:  # pragma: no cover - internal closed enum
+        raise IntegrityError("observation query contract is unknown")
+
+    existing = record.get("request_query")
+    if parsed.query:
+        if existing is not None:
+            raise IntegrityError("observation carries raw and redacted query metadata")
+        if len(parsed.query.encode("utf-8")) > MAX_QUERY_BYTES:
+            raise IntegrityError("observation request query exceeds its safety ceiling")
+        try:
+            pairs = parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+                max_num_fields=MAX_QUERY_FIELDS,
+            )
+        except ValueError as exc:
+            raise IntegrityError("observation request query is malformed") from exc
+        keys = [name.casefold() for name, _value in pairs]
+        if (
+            not pairs
+            or any(not name or name not in allowed for name in keys)
+            or len(keys) != len(set(keys))
+            or any(not value or len(value.encode("utf-8")) > MAX_QUERY_BYTES for _, value in pairs)
+        ):
+            raise IntegrityError("observation request query violates its source allowlist")
+        values = {name.casefold(): value for name, value in pairs}
+        if query_kind == "hf-tree" and any(
+            values[name].casefold() != "true"
+            for name in ("expand", "recursive")
+            if name in values
+        ):
+            raise IntegrityError("HF tree query flags are not canonical")
+        if required_signature and not HF_XET_SIGNATURE_KEYS.intersection(keys):
+            raise IntegrityError("signed Xet query has no signature field")
+        return {
+            "redacted": True,
+            "keys": sorted(keys),
+            "pair_count": len(keys),
+        }
+
+    if existing is None:
+        return None
+    if not isinstance(existing, Mapping) or set(existing) != {
+        "redacted",
+        "keys",
+        "pair_count",
+    }:
+        raise IntegrityError("redacted request query metadata is malformed")
+    keys_value = existing.get("keys")
+    if (
+        existing.get("redacted") is not True
+        or not isinstance(keys_value, list)
+        or not keys_value
+        or not all(isinstance(name, str) and name == name.casefold() for name in keys_value)
+        or keys_value != sorted(set(keys_value))
+        or any(name not in allowed for name in keys_value)
+        or type(existing.get("pair_count")) is not int
+        or existing["pair_count"] != len(keys_value)
+        or (required_signature and not HF_XET_SIGNATURE_KEYS.intersection(keys_value))
+    ):
+        raise IntegrityError("redacted request query metadata violates its source allowlist")
+    return {
+        "redacted": True,
+        "keys": list(keys_value),
+        "pair_count": existing["pair_count"],
+    }
+
+
 def validate_public_request_provenance(
     source: str, key: str, record: Mapping[str, Any]
-) -> None:
-    """Bind an exact-scope watcher wrapper to its public read endpoint."""
+) -> dict[str, Any]:
+    """Bind a watcher wrapper to its public endpoint and redact URL queries."""
     if type(record.get("status")) is not int or record.get("status") != 200:
         raise IntegrityError("observation does not bind a successful HTTP status")
     request_url = record.get("request_url")
@@ -558,7 +708,9 @@ def validate_public_request_provenance(
     if source == "acceptance":
         if request_url != f"local://acceptance/{key}":
             raise IntegrityError("acceptance observation URL provenance is invalid")
-        return
+        if "request_query" in record:
+            raise IntegrityError("acceptance observation has request query metadata")
+        return dict(record)
     try:
         parsed = urlsplit(request_url)
         port = parsed.port
@@ -572,6 +724,8 @@ def validate_public_request_provenance(
         or parsed.fragment
     ):
         raise IntegrityError("observation request URL authority is invalid")
+    if "?" in request_url and not parsed.query:
+        raise IntegrityError("observation request query is malformed")
     path = unquote(parsed.path)
     expected_host: str
     expected_path: str
@@ -609,18 +763,51 @@ def validate_public_request_provenance(
         expected_path = f"/api/resolve-cache/models/{repo}/{revision}/{file_path}"
     else:
         raise IntegrityError("observation source has no public endpoint contract")
-    if (
+    xet_transport = bool(
         source == "hf-file"
         and isinstance(parsed.hostname, str)
         and parsed.hostname.endswith(".cdn.hf.co")
         and path.startswith("/xet-bridge-")
-    ):
+    )
+    if xet_transport:
         # Hugging Face's public resolver records the final Xet CDN URL for
         # some small files.  The redirect URL cannot restate repo/revision/path;
         # the terminal manifest/tree/hf-file/CAS chain supplies that binding.
-        return
-    if parsed.hostname != expected_host or path != expected_path:
+        query_kind = "hf-xet"
+    elif parsed.hostname != expected_host or path != expected_path:
         raise IntegrityError("observation request URL contradicts its source/key")
+    else:
+        query_kind = "hf-tree" if source == "hf-tree" else "none"
+
+    query_metadata = _redacted_request_query(
+        record,
+        parsed,
+        query_kind=query_kind,
+    )
+    sanitized = dict(record)
+    sanitized["request_url"] = urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, "", "")
+    )
+    if query_metadata is None:
+        sanitized.pop("request_query", None)
+    else:
+        sanitized["request_query"] = query_metadata
+    return sanitized
+
+
+def reject_uncontracted_request_query(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep diagnostic/unscoped wrappers from archiving opaque URL queries."""
+
+    request_url = record.get("request_url")
+    if not isinstance(request_url, str):
+        raise IntegrityError("observation has no request URL provenance")
+    try:
+        parsed = urlsplit(request_url)
+    except ValueError as exc:
+        raise IntegrityError("observation request URL is malformed") from exc
+    if "?" in request_url or parsed.query or "request_query" in record:
+        raise IntegrityError("uncontracted observation request query is prohibited")
+    return dict(record)
 
 
 def observation_timestamp(relative: str, record: Mapping[str, Any]) -> str:
@@ -1180,6 +1367,9 @@ def sync_archive(
                 "eval_data/evaluation_data/eval-derived",
             ],
             "public_test_loss_telemetry": "allowed",
+            "request_queries": (
+                "source-allowlisted; values discarded; value-free metadata only"
+            ),
             "watcher_image_text_pair_fixtures": "excluded-unopened",
             "public_training_archives": "separate exact-task inventory only",
         },
@@ -1247,8 +1437,16 @@ def sync_archive(
             if not isinstance(record, dict):
                 raise IntegrityError("observation snapshot is not an object")
             wrapper_source, wrapper_key = validate_observation_identity(entry.path, record)
-            if scope is not None:
-                validate_public_request_provenance(wrapper_source, wrapper_key, record)
+            if wrapper_source in PUBLIC_PROVENANCE_SOURCES:
+                record = validate_public_request_provenance(
+                    wrapper_source, wrapper_key, record
+                )
+            else:
+                record = reject_uncontracted_request_query(record)
+            # Never publish the source wrapper verbatim after URL validation:
+            # legitimate pagination/Xet query values are transport credentials
+            # and survive only as fixed, value-free metadata.
+            snapshot_body = canonical_json(record)
             if wrapper_source == "fixtures":
                 raise PolicyExcluded("full-pool fixture observation is prohibited")
             hf = is_hf_observation(entry.path, record)

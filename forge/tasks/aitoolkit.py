@@ -36,9 +36,6 @@ from forge.tasks import checkpoints, holdout
 from forge.data import dataset
 from forge.data.schema import ImageSpec
 
-# ai-toolkit checkout inside diagonalge/ai-toolkit:latest. Overridable for local
-# tests (like SDXL used SD_SCRIPTS_DIR); run.py lives here and is the cwd.
-_AI_TOOLKIT_DIR = os.environ.get("AI_TOOLKIT_DIR", "/app/ai-toolkit")
 _POLL_SECONDS = 5
 # Extra cushion ON TOP OF the export reserve. We gate termination on
 # deadline.remaining() (the SOFT stop = hard_stop - export_reserve), so training
@@ -313,20 +310,18 @@ def _run_toolkit(
         raise adaptive_timing.TimingProfileError(
             "bootstrap timing observation inputs are incomplete"
         )
-    selected_toolkit_dir = toolkit_dir or _AI_TOOLKIT_DIR
-    if (
-        spec.model_type == "krea2"
-        and selected_bundle != krea_runtime.INCUMBENT_BUNDLE
-    ):
-        verified_toolkit_dir = krea_runtime.verify_selected_runtime(
-            spec.model_type,
-            selected_bundle,
+    selected_toolkit_dir = toolkit_dir or krea_runtime.runtime_directory(
+        spec.model_type, selected_bundle
+    )
+    verified_toolkit_dir = krea_runtime.verify_selected_runtime(
+        spec.model_type,
+        selected_bundle,
+    )
+    if os.path.realpath(selected_toolkit_dir) != verified_toolkit_dir:
+        raise krea_runtime.KreaRuntimeContractError(
+            "attested runtime differs from the selected executable tree"
         )
-        if os.path.realpath(selected_toolkit_dir) != verified_toolkit_dir:
-            raise krea_runtime.KreaRuntimeContractError(
-                "attested Krea runtime differs from the selected executable tree"
-            )
-        selected_toolkit_dir = verified_toolkit_dir
+    selected_toolkit_dir = verified_toolkit_dir
     telemetry.event("toolkit_start")
     started = time.monotonic()
 

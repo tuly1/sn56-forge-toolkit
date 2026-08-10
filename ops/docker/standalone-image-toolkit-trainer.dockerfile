@@ -3,6 +3,7 @@ FROM diagonalge/ai-toolkit:latest@sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783a
 ENV AI_TOOLKIT_DIR=/app/ai-toolkit
 ENV FORGE_KREA_AI_TOOLKIT_DIR=/opt/sn56/krea-ai-toolkit
 ENV FORGE_TEMPLATES_DIR=/app/forge/templates
+ENV PYTHONDONTWRITEBYTECODE=1
 
 # This is the exact 185-entry version/VCS metadata inventory observed in both
 # independently built H100 subjects. It does not attest downloaded wheel bytes.
@@ -100,7 +101,9 @@ RUN retry_network() { \
         --lock /opt/sn56/image-runtime-lock.txt \
         --constraints /opt/sn56/image-runtime-phase1-constraints.txt && \
     test "$(git -C /app/ai-toolkit rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
-    test "$(git -C /opt/sn56/krea-ai-toolkit rev-parse HEAD)" = 71e133b4e73a716d1094f22355a46be07953b828
+    test "$(git -C /opt/sn56/krea-ai-toolkit rev-parse HEAD)" = 71e133b4e73a716d1094f22355a46be07953b828 && \
+    find /app/ai-toolkit /opt/sn56/krea-ai-toolkit -xdev \
+        -type d -name __pycache__ -prune -exec rm -rf -- {} +
 
 WORKDIR /app
 # Templates ship inside the package (forge/templates/*.yaml), so this one COPY

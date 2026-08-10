@@ -556,6 +556,31 @@ def rewrite_safe_api(path: Path, mutator) -> None:
     )
 
 
+def rewrite_watcher_file_and_ledger(root: Path, relative: str, body: bytes) -> None:
+    """Keep a test watcher's synthetic COMPLETE ledger bound to one mutation."""
+    write(root, relative, body)
+    ledger_path = next((root / "ledgers").glob("*.json"))
+    ledger = json.loads(ledger_path.read_bytes())
+    rows = ledger["files"]
+    replacement = {
+        "path": relative,
+        "sha256": sha(body),
+        "bytes": len(body),
+        "created": True,
+    }
+    for index, row in enumerate(rows):
+        if row["path"] == relative:
+            rows[index] = replacement
+            break
+    else:
+        rows.append(replacement)
+    ledger_body = sync.canonical_json(ledger)
+    ledger_path.write_bytes(ledger_body)
+    ledger_path.with_suffix(".sha256").write_text(
+        f"{sha(ledger_body)}  {ledger_path.name}\n", encoding="ascii"
+    )
+
+
 def training_archive_inputs(
     tmp_path: Path,
     api: Path,
@@ -827,6 +852,43 @@ def test_safe_api_source_endpoint_provenance_is_mandatory(tmp_path):
     with pytest.raises(sync.IntegrityError, match="exact endpoint set"):
         p0.build_package(
             api, watcher, headers, inventory, tmp_path / "output", TOURNAMENT, observed_at=NOW
+        )
+
+
+def test_p0_rejects_raw_watcher_query_even_when_complete_ledger_rebinds_it(tmp_path):
+    api, watcher, headers, inventory = inputs(tmp_path)
+    wrapper_path = next((watcher / "observations" / "gradients-task").rglob("*.json"))
+    relative = wrapper_path.relative_to(watcher).as_posix()
+    wrapper = json.loads(wrapper_path.read_bytes())
+    wrapper["request_url"] += "?token=must-not-persist"
+    rewrite_watcher_file_and_ledger(watcher, relative, sync.canonical_json(wrapper))
+
+    with pytest.raises(sync.IntegrityError, match="query"):
+        p0.build_package(
+            api,
+            watcher,
+            headers,
+            inventory,
+            tmp_path / "output-query",
+            TOURNAMENT,
+            observed_at=NOW,
+        )
+
+
+def test_p0_rejects_numeric_suffix_path_named_by_complete_ledger(tmp_path):
+    api, watcher, headers, inventory = inputs(tmp_path)
+    relative = "snapshots/20260810T195900.000000Z/test1.json"
+    rewrite_watcher_file_and_ledger(watcher, relative, b'{"public":"metadata"}\n')
+
+    with pytest.raises(sync.IntegrityError, match="prohibited path"):
+        p0.build_package(
+            api,
+            watcher,
+            headers,
+            inventory,
+            tmp_path / "output-suffix",
+            TOURNAMENT,
+            observed_at=NOW,
         )
 
 

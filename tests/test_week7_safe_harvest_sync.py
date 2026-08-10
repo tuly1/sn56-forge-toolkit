@@ -102,6 +102,14 @@ def add_observation(
     return relative, digest
 
 
+def rewrite_observation(root: Path, relative: str, mutator) -> dict:
+    path = root / relative
+    record = json.loads(path.read_bytes())
+    mutator(record)
+    path.write_bytes(sync.canonical_json(record))
+    return record
+
+
 def tree_fingerprint(root: Path) -> dict[str, tuple[int, int, int, str]]:
     result = {}
     for path in sorted(root.rglob("*")):
@@ -962,6 +970,75 @@ def test_plural_holdout_and_quarantine_paths_are_excluded():
     assert sync.contains_forbidden_path("repo/quarantines/rows.json") is True
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "test1",
+        "test01",
+        "testv1",
+        "test_version_2",
+        "holdout1",
+        "holdout_v2",
+        "hidden1",
+        "hidden-version-3",
+        "eval1",
+        "evaluationv2",
+        "quarantine1",
+        "quarantine_version_4",
+        "test%31",
+        "test%2531",
+        "test１",
+    ],
+)
+def test_numeric_and_version_suffixes_remain_prohibited_after_normalization(field):
+    assert sync.contains_forbidden_path(f"repo/{field}/artifact.json") is True
+    assert sync.contains_forbidden_body(
+        json.dumps({field: "rows"}, ensure_ascii=False).encode()
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "test_loss",
+        "checkpoints/1000",
+        "contest1",
+        "latest1",
+        "attestation1",
+        "hiddenlayer1",
+        "evaluationmetrics1",
+    ],
+)
+def test_numeric_suffix_filter_does_not_capture_unrelated_public_names(field):
+    assert sync.contains_forbidden_path(f"repo/{field}/artifact.json") is False
+    assert sync.contains_forbidden_body(
+        json.dumps({field: "public"}).encode()
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["test1", "holdout1", "hidden1", "evaluationv2", "quarantine1"],
+)
+def test_watcher_sync_excludes_numeric_suffix_names_before_publication(tmp_path, field):
+    source = tmp_path / "source"
+    source.mkdir()
+    relative, digest = add_observation(
+        source,
+        source="hf-file",
+        key=f"org/repo/{'1' * 40}/{field}/config.yaml",
+        body=b"learning_rate: 0.0002\n",
+    )
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(sync.LocalSource(source), destination, observed_at=NOW)
+
+    assert result["status"] == "COMPLETE"
+    assert result["excluded"]["forbidden_path"] == 1
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
+
+
 def test_public_request_provenance_is_source_and_key_bound():
     record = {
         "status": 200,
@@ -980,6 +1057,170 @@ def test_public_request_provenance_is_source_and_key_bound():
             TASK_A,
             {"status": True, "request_url": record["request_url"]},
         )
+
+
+def test_hf_tree_query_is_source_allowlisted_and_value_free_after_sync(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    key = f"org/repo/{'1' * 40}/page-0002"
+    relative, _ = add_observation(
+        source,
+        source="hf-tree",
+        key=key,
+        body=b"[]\n",
+    )
+    secret = "opaque-pagination-secret"
+    rewrite_observation(
+        source,
+        relative,
+        lambda value: value.__setitem__(
+            "request_url",
+            f"https://huggingface.co/api/models/org/repo/tree/{'1' * 40}"
+            f"?cursor={secret}&expand=true&recursive=true",
+        ),
+    )
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(sync.LocalSource(source), destination, observed_at=NOW)
+
+    assert result["status"] == "COMPLETE"
+    published = (destination / relative).read_bytes()
+    wrapper = json.loads(published)
+    assert wrapper["request_url"] == (
+        f"https://huggingface.co/api/models/org/repo/tree/{'1' * 40}"
+    )
+    assert wrapper["request_query"] == {
+        "redacted": True,
+        "keys": ["cursor", "expand", "recursive"],
+        "pair_count": 3,
+    }
+    assert secret.encode() not in published
+
+
+def test_signed_xet_query_is_source_allowlisted_and_value_free_after_sync(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    key = f"org/repo/{'1' * 40}/checkpoints/last.safetensors"
+    relative, _ = add_observation(
+        source,
+        source="hf-file",
+        key=key,
+        body=b'{"public":"metadata"}\n',
+    )
+    secret = "signed-secret-value"
+    rewrite_observation(
+        source,
+        relative,
+        lambda value: value.__setitem__(
+            "request_url",
+            "https://us-east-1.aws.cdn.hf.co/xet-bridge-us/object"
+            f"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature={secret}",
+        ),
+    )
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(sync.LocalSource(source), destination, observed_at=NOW)
+
+    assert result["status"] == "COMPLETE"
+    published = (destination / relative).read_bytes()
+    wrapper = json.loads(published)
+    assert wrapper["request_url"] == (
+        "https://us-east-1.aws.cdn.hf.co/xet-bridge-us/object"
+    )
+    assert wrapper["request_query"] == {
+        "redacted": True,
+        "keys": ["x-amz-algorithm", "x-amz-signature"],
+        "pair_count": 2,
+    }
+    assert secret.encode() not in published
+
+
+@pytest.mark.parametrize(
+    ("source", "key", "url"),
+    [
+        (
+            "gradients-task",
+            TASK_A,
+            f"https://api.gradients.io/auditing/tasks/{TASK_A}?token=secret",
+        ),
+        (
+            "hf-tree",
+            f"org/repo/{'1' * 40}/page-0001",
+            f"https://huggingface.co/api/models/org/repo/tree/{'1' * 40}?token=secret",
+        ),
+        (
+            "hf-tree",
+            f"org/repo/{'1' * 40}/page-0001",
+            f"https://huggingface.co/api/models/org/repo/tree/{'1' * 40}?cursor=a&cursor=b",
+        ),
+        (
+            "hf-tree",
+            f"org/repo/{'1' * 40}/page-0001",
+            f"https://huggingface.co/api/models/org/repo/tree/{'1' * 40}?cursor=",
+        ),
+        (
+            "hf-file",
+            f"org/repo/{'1' * 40}/checkpoints/last.safetensors",
+            "https://us.aws.cdn.hf.co/xet-bridge-us/object?X-Amz-Expires=300",
+        ),
+    ],
+)
+def test_public_query_contract_rejects_unexpected_duplicate_empty_and_unsigned_xet(
+    source, key, url
+):
+    with pytest.raises(sync.IntegrityError, match="query"):
+        sync.validate_public_request_provenance(
+            source,
+            key,
+            {"status": 200, "request_url": url},
+        )
+
+
+def test_raw_and_redacted_query_metadata_cannot_coexist():
+    key = f"org/repo/{'1' * 40}/page-0001"
+    with pytest.raises(sync.IntegrityError, match="raw and redacted"):
+        sync.validate_public_request_provenance(
+            "hf-tree",
+            key,
+            {
+                "status": 200,
+                "request_url": (
+                    f"https://huggingface.co/api/models/org/repo/tree/{'1' * 40}"
+                    "?cursor=secret"
+                ),
+                "request_query": {
+                    "redacted": True,
+                    "keys": ["cursor"],
+                    "pair_count": 1,
+                },
+            },
+        )
+
+
+def test_unscoped_observation_query_fails_closed_in_sync(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    relative, digest = add_observation(
+        source,
+        source="diagnostic",
+        key="public/row",
+        body=b'{"public":"metadata"}\n',
+    )
+    rewrite_observation(
+        source,
+        relative,
+        lambda value: value.__setitem__(
+            "request_url", "https://example.invalid/public/row?token=secret"
+        ),
+    )
+
+    destination = tmp_path / "evidence"
+    result = sync.sync_archive(sync.LocalSource(source), destination, observed_at=NOW)
+
+    assert result["status"] == "PARTIAL"
+    assert any("uncontracted" in row["message"] for row in result["errors"])
+    assert not (destination / relative).exists()
+    assert not (destination / f"objects/sha256/{digest[:2]}/{digest}").exists()
 
 
 def test_hf_file_public_xet_redirect_authority_is_allowed_but_not_arbitrary_cdn():

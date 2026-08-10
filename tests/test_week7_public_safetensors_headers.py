@@ -304,8 +304,19 @@ def test_preexisting_different_record_aborts_without_overwrite(tmp_path):
     assert record_path.read_bytes() == before
 
 
-def test_prohibited_checkpoint_path_is_never_requested(tmp_path):
-    source = source_root(tmp_path, path="hidden/test_rows.safetensors")
+@pytest.mark.parametrize(
+    "path",
+    [
+        "hidden/test_rows.safetensors",
+        "checkpoints/test1.safetensors",
+        "checkpoints/holdout1.safetensors",
+        "checkpoints/hiddenv2.safetensors",
+        "checkpoints/evaluation2.safetensors",
+        "checkpoints/quarantine-version-3.safetensors",
+    ],
+)
+def test_prohibited_checkpoint_path_is_never_requested(tmp_path, path):
+    source = source_root(tmp_path, path=path)
     output = tmp_path / "headers"
     calls = 0
 

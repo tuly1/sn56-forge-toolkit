@@ -52,7 +52,11 @@ excluded. Public `test_loss` score telemetry remains allowed. Exact-tournament
 syncs also bind every admitted wrapper to its source-specific public URL and a
 successful status; public Hugging Face Xet redirects are admitted only under the
 HF-owned CDN path and remain independently bound by tree/manifest/file/CAS
-identity.
+identity. Request queries are source-allowlisted: only bounded tree-pagination
+parameters and the required signed Xet transport parameters are accepted.
+Unexpected, duplicate, malformed, or unscoped query parameters abort the sync;
+accepted URLs are published without query values and retain only value-free
+redaction metadata (normalized key names and count).
 
 The source watcher, miner endpoint, registration, and production repositories
 are never mutated. A `PARTIAL` ledger means at least one allowed observation or
@@ -103,10 +107,9 @@ tournament/round state, task model and timing metadata, public participant
 hotkeys, repository/submission IDs, scores, ranks, and score reasons. Dataset
 URLs, training-row bodies, test-row bodies, and all other fields are discarded;
 no dataset URL is followed. Task/participant membership, ImageTask identity,
-metric types, finite values, repository prefixes, and exact source endpoint
-hash/size provenance are fail-closed. Free-text fields are screened before
-publication. Zero-valued score placeholders remain `pending` rather than being
-mislabeled as completed scores.
+metric types, finite values, and exact source endpoint hash/size provenance are
+fail-closed. Free-text fields are screened before publication. Zero-valued score
+placeholders remain `pending` rather than being mislabeled as completed scores.
 
 ```bash
 python ops/experiments/week7/capture_safe_public_api.py \
@@ -127,9 +130,11 @@ and the selected safetensors-header inventory. A newer PARTIAL watcher attempt
 cannot be hidden behind an older COMPLETE ledger. Ledger/API/wrapper timestamps
 are filename-bound. Repository captures are reconciled against immutable tree
 counts, file observations, CAS byte counts, and exact checkpoint/config
-identity. The resulting package joins public scores and submission status to
-immutable Hugging Face revisions, configs, checkpoint identities, and bounded
-metadata.
+identity. Repository prefixes and their embedded task/owner identities are
+validated here, at terminal P0 packaging, against the exact tournament, task,
+and participant records. The resulting package joins public scores and
+submission status to immutable Hugging Face revisions, configs, checkpoint
+identities, and bounded metadata.
 
 The training-archive inventory is deliberately not an admission mechanism. It
 uses only the exact task's public `training_data.zip`, never the watcher's full
