@@ -141,7 +141,7 @@ def test_incumbent_path_is_the_same_object_and_never_reads_manifest(monkeypatch)
     assert manifest is None
 
 
-def test_incumbent_config_is_golden_equal_to_deployed_084ea914(monkeypatch):
+def test_incumbent_config_is_golden_equal_to_served_4152f4cd(monkeypatch):
     monkeypatch.delenv(krea_runtime.BUNDLE_ENV, raising=False)
 
     cfg = config.build_config(_spec(), num_images=18, hours_to_complete=0.75)
@@ -150,7 +150,7 @@ def test_incumbent_config_is_golden_equal_to_deployed_084ea914(monkeypatch):
     # Generated independently from the immutable deployed fallback for this
     # exact task shape. This catches a "dormant" feature changing the incumbent.
     assert hashlib.sha256(canonical).hexdigest() == (
-        "9ab3612f0bc52e93b24987dac89444bf062e77516c5aa8ca4e07c45779140396"
+        "19191fafc831036baf9f3479233427f6df8a1b871ee3988281394729acd06d3a"
     )
 
 

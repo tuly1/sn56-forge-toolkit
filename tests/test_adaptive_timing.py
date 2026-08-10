@@ -186,8 +186,9 @@ def test_no_profile_preserves_incumbent_recipe_outputs(monkeypatch):
     )
 
     assert profile is None
-    assert recipe.size_scaled_steps("krea2", 24, 0.75, 2000) == 824
-    assert recipe.size_scaled_steps("krea2", 24, 1.0, 2000) == 1172
+    # Exact incumbent outputs at the served Week-6 base, 4152f4cd.
+    assert recipe.size_scaled_steps("krea2", 24, 0.75, 2000) == 1484
+    assert recipe.size_scaled_steps("krea2", 24, 1.0, 2000) == 1584
 
 
 def test_experimental_bundle_requires_profile(monkeypatch):
@@ -541,8 +542,8 @@ def test_valid_profile_is_bound_and_changes_only_explicit_recipe_call(tmp_path):
         throughput_profile=profile,
     )
 
-    assert incumbent == 824
-    assert measured == 1200
+    assert incumbent == 1484
+    assert measured == 1584
     assert profile.source_record_sha256 == hashlib.sha256(
         _source_path(tmp_path).read_bytes()
     ).hexdigest()
