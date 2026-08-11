@@ -176,3 +176,113 @@ python ops/experiments/week7/build_p0_package.py \
 Outputs are UTC-named, checksum-bound, and create-only. `PARTIAL` is an honest
 terminal result when a public surface is missing or lagging; it must not be
 silently promoted to COMPLETE by inference.
+
+## Rights-clean HKE fixture candidates
+
+`hke_procedural_renderer.py` is the CPU-only fixture source for the next Krea
+screen. It renders 98 first-party rows from integer geometry and a code-owned
+bitmap alphabet: social 10 discovery + 8 confirmation, product 28 + 10, and
+logo/UI 32 + 10. It has no network, font, reference-image, model-output, or
+tournament-content input. Discovery and confirmation use distinct key domains
+and must be written to disjoint create-only roots. The public candidate exposes
+only confirmation counts and commitments; exact confirmation membership stays
+in the custodian tree. Confirmation row IDs, file names, caption variation
+tokens, visible variation tokens, and group identities are all derived from the
+private confirmation key, so public source plus ordinal counts cannot recreate
+them.
+
+```bash
+python ops/experiments/week7/hke_procedural_renderer.py build \
+  --public-output /absolute/create-only/public-candidate \
+  --custodian-output /absolute/create-only/private-confirmation \
+  --discovery-key-file /absolute/private/discovery-key.bin \
+  --confirmation-key-file /absolute/private/confirmation-key.bin \
+  --generator-commit EXACT_PUSHED_40_HEX_COMMIT \
+  --generator-tree EXACT_40_HEX_TREE \
+  --author-record 'SN56 first-party procedural renderer' \
+  --rights-owner 'NAMED RIGHTS OWNER' \
+  --license-or-use-grant 'EXACT OWNER-APPROVED USE OR LICENSE RECORD'
+
+python ops/experiments/week7/hke_procedural_renderer.py verify \
+  --public-output /absolute/create-only/public-candidate \
+  --custodian-output /absolute/create-only/private-confirmation \
+  --discovery-key-file /absolute/private/discovery-key.bin \
+  --confirmation-key-file /absolute/private/confirmation-key.bin
+```
+
+The result is deliberately `candidate_unreviewed`. Machine replay, rights
+declarations, and a zero-match exact/pixel/caption/perceptual screen are not
+human review.
+
+`hke_fixture_admission.py` enforces that missing authority. A custodian first
+creates the private 98-row review template. A named human fills every bound
+row check and chooses PASS; `seal-review` validates and seals that exact draft;
+then `admit` reruns candidate and keyed replay verification before emitting one
+receipt per family. Public receipts omit reviewer identity and confirmation row
+identities. The receipt honestly labels the named-human assertion as
+operator-attested; it does not cryptographically authenticate a person. Even a
+PASS authorizes fixture use only: owner ratification is still required and GPU
+and deployment remain false. Review drafts and seals must live outside the
+public candidate, candidate-custodian, and repository trees.
+
+```bash
+python ops/experiments/week7/hke_fixture_admission.py review-template \
+  --public-root /absolute/public-candidate \
+  --custodian-root /absolute/private-confirmation \
+  --output /absolute/private/review-draft.json
+
+# A named human reviews and edits review-draft.json outside the repository.
+
+python ops/experiments/week7/hke_fixture_admission.py seal-review \
+  --public-root /absolute/public-candidate \
+  --custodian-root /absolute/private-confirmation \
+  --draft /absolute/private/review-draft.json \
+  --output /absolute/private/review-sealed.json
+
+python ops/experiments/week7/hke_fixture_admission.py admit \
+  --public-root /absolute/public-candidate \
+  --custodian-root /absolute/private-confirmation \
+  --sealed-review /absolute/private/review-sealed.json \
+  --discovery-key-file /absolute/private/discovery-key.bin \
+  --confirmation-key-file /absolute/private/confirmation-key.bin \
+  --output-root /absolute/create-only/admission-receipts
+```
+
+## Calibration-only HKE factor screen
+
+`run_hke_factorial.py` freezes the first controlled screen without adding a
+router or checkpoint promoter:
+
+- A: MAE + current dataset-size law;
+- B: MSE + current dataset-size law;
+- C: MAE + measured clock-fill; and
+- D: MSE + measured clock-fill.
+
+The CPU contract is frozen before rental. Clock-fill is materialized only after
+the mechanical H100 gate produces internally validated, bundle-bound,
+operator-attested profiles for the incumbent runtime and matching dataset
+regime. These records establish internal consistency, not independent proof of
+measurement, and every profile must name the same H100 80 GB identity. There
+is no hard-coded HKE seconds/step fallback. Product and logo/UI use A–D; the
+10-row social envelope uses A/D for operational reliability only. Decisions
+use terminal checkpoints and paired exact-score rows. A factor reaches
+discovery GO only with the same improving direction on both primary families,
+a 95% paired interval clearing zero on at least one, and no 1% regression. GO
+is not ship authority.
+
+The serialized plan embeds the complete admission-set and complete timing
+profile/binding documents. Analysis reruns their semantic validators and
+recomputes every A–D config, including the unlaunched social MSE timing source;
+a plan digest alone is never treated as evidence. Training, attachment, and
+exact-score inputs are complete self-hashed receipt bodies bound to the plan,
+config, artifact, fixture, and evaluator. They are still explicitly
+operator-attested and do not independently prove that a human or GPU performed
+the declared work. The decision record preserves that limitation and carries
+no ship authority.
+
+```bash
+python ops/experiments/week7/run_hke_factorial.py contract
+python ops/experiments/week7/run_hke_factorial.py analyze \
+  --plan timing-bound-plan.json \
+  --evidence discovery-score-evidence.json
+```
