@@ -1787,14 +1787,28 @@ def projection_matches_bundle_contract(projection: Any, *, bundle: str) -> bool:
     MSE to their real source records; only this one declared factor is varied
     for bundle-level compatibility.  Seed and save cadence are normalized by
     :func:`timing_contract_projection`, while the exact config-file hash binds
-    their concrete values.
+    their concrete values.  The incumbent bridge may add one of the same two
+    controlled seeds to an otherwise byte-derived incumbent config; that field
+    remains exact in evidence and is removed only for bundle compatibility.
     """
 
     if bundle not in KNOWN_BUNDLES or not isinstance(projection, dict):
         return False
     expected = _reference_bundle_projection(bundle)
     candidate = copy.deepcopy(projection)
-    if bundle in {
+    if bundle == INCUMBENT_BUNDLE:
+        try:
+            process = candidate["config"]["process"][0]
+        except Exception:
+            return False
+        if "training_seed" in process:
+            concrete_seed = process.pop("training_seed")
+            if (
+                isinstance(concrete_seed, bool)
+                or concrete_seed not in WEEK7_FACTORIAL_ALLOWED_TRAINING_SEEDS
+            ):
+                return False
+    elif bundle in {
         WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
         WEEK7_FACTORIAL_MULTIRES_BUNDLE,
     }:

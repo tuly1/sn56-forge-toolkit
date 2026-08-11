@@ -517,9 +517,11 @@ def test_generator_identity_rejects_ambient_contract_drift(
     target.mkdir(parents=True)
     renderer_copy = target / "hke_procedural_renderer.py"
     admission_copy = target / "hke_fixture_admission.py"
+    factor_copy = target / "run_hke_factorial.py"
     contract_copy = target / "hke_fixture_contract.json"
     shutil.copy2(Path(renderer.__file__), renderer_copy)
     shutil.copy2(admission.__file__, admission_copy)
+    shutil.copy2(admission.FACTOR_AUTHORITY_PATH, factor_copy)
     shutil.copy2(renderer.DECLARATIVE_CONTRACT_PATH, contract_copy)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
@@ -840,9 +842,11 @@ def _committed_generator_copy(tmp_path: Path):
     target.mkdir(parents=True)
     renderer_copy = target / "hke_procedural_renderer.py"
     admission_copy = target / "hke_fixture_admission.py"
+    factor_copy = target / "run_hke_factorial.py"
     contract_copy = target / "hke_fixture_contract.json"
     shutil.copy2(Path(renderer.__file__), renderer_copy)
     shutil.copy2(admission.__file__, admission_copy)
+    shutil.copy2(admission.FACTOR_AUTHORITY_PATH, factor_copy)
     shutil.copy2(renderer.DECLARATIVE_CONTRACT_PATH, contract_copy)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
