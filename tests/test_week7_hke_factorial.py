@@ -1655,7 +1655,7 @@ def test_profile_rejects_rehashed_source_rate_mutation(base_config):
     profile = replace(
         profile, profile_sha256=adaptive_timing.canonical_sha256(document)
     )
-    with pytest.raises(H.HKEContractError, match="timing source loss"):
+    with pytest.raises(H.HKEContractError, match="timing source differs"):
         H.bind_timing_profile(
             profile,
             loss="mae",
