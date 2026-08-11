@@ -989,7 +989,12 @@ def test_plural_holdout_and_quarantine_paths_are_excluded():
         "test%2531",
         "test１",
         "test١",
+        "tests1",
+        "tests１",
+        "testing١",
         "holdout_v۲",
+        "evaluations_v۲",
+        "evals-version-３",
     ],
 )
 def test_numeric_and_version_suffixes_remain_prohibited_after_normalization(field):
@@ -1020,7 +1025,16 @@ def test_numeric_suffix_filter_does_not_capture_unrelated_public_names(field):
 
 @pytest.mark.parametrize(
     "field",
-    ["test1", "holdout1", "hidden1", "evaluationv2", "quarantine1"],
+    [
+        "test1",
+        "tests1",
+        "testing١",
+        "holdout1",
+        "hidden1",
+        "evaluationv2",
+        "evaluations_v۲",
+        "quarantine1",
+    ],
 )
 def test_watcher_sync_excludes_numeric_suffix_names_before_publication(tmp_path, field):
     source = tmp_path / "source"
@@ -1195,6 +1209,62 @@ def test_raw_and_redacted_query_metadata_cannot_coexist():
                     "keys": ["cursor"],
                     "pair_count": 1,
                 },
+            },
+        )
+
+
+@pytest.mark.parametrize("request_query", [None, {}, [], "null"])
+def test_explicit_invalid_request_query_metadata_cannot_masquerade_as_absent(
+    request_query,
+):
+    key = f"org/repo/{'1' * 40}/page-0001"
+    with pytest.raises(sync.IntegrityError, match="query metadata"):
+        sync.validate_public_request_provenance(
+            "hf-tree",
+            key,
+            {
+                "status": 200,
+                "request_url": (
+                    f"https://huggingface.co/api/models/org/repo/tree/{'1' * 40}"
+                ),
+                "request_query": request_query,
+            },
+        )
+
+
+def test_raw_query_plus_explicit_null_metadata_fails_closed():
+    key = f"org/repo/{'1' * 40}/page-0001"
+    with pytest.raises(sync.IntegrityError, match="raw and redacted"):
+        sync.validate_public_request_provenance(
+            "hf-tree",
+            key,
+            {
+                "status": 200,
+                "request_url": (
+                    f"https://huggingface.co/api/models/org/repo/tree/{'1' * 40}"
+                    "?cursor=public-page"
+                ),
+                "request_query": None,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "encoded_value",
+    ["%FF", "%C0%AF", "%ED%A0%80", "%F4%90%80%80"],
+)
+def test_query_values_with_invalid_percent_encoded_utf8_fail_closed(encoded_value):
+    key = f"org/repo/{'1' * 40}/page-0001"
+    with pytest.raises(sync.IntegrityError, match="invalid UTF-8"):
+        sync.validate_public_request_provenance(
+            "hf-tree",
+            key,
+            {
+                "status": 200,
+                "request_url": (
+                    f"https://huggingface.co/api/models/org/repo/tree/{'1' * 40}"
+                    f"?cursor={encoded_value}"
+                ),
             },
         )
 

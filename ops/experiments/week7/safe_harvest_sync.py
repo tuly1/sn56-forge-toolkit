@@ -50,7 +50,7 @@ import subprocess
 import sys
 import unicodedata
 from typing import Any, Iterable, Iterator, Mapping, Protocol
-from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_to_bytes, urlsplit, urlunsplit
 import uuid
 
 
@@ -72,7 +72,7 @@ FORBIDDEN_PATH_RE = re.compile(
     r"test[-_\s]*loss[-_\s]*(?:data|rows?|set|dataset|archive)|"
     r"test(?![-_\s]*loss(?:$|[^a-z0-9]))(?:s|ing)?"
     r"(?:[-_\s]*(?:data|rows?|set))?|"
-    r"eval(?:uation)?(?:[-_\s]*(?:data|derived|rows?|set))?"
+    r"eval(?:s|uation(?:s)?)?(?:[-_\s]*(?:data|derived|rows?|set))?"
     r")(?![a-z0-9])",
     re.IGNORECASE,
 )
@@ -81,7 +81,7 @@ FORBIDDEN_BODY_RE = re.compile(
     r"hidden|hold[-_\s]*outs?|quarantines?|"
     r"test[-_\s]*loss[-_\s]*(?:data|rows?|set|datasets?|archives?)|"
     r"test[-_\s]*(?:data|rows?|set|datasets?|archives?|images?|assets?|prompts?)|"
-    r"eval(?:uation)?[-_\s]*(?:data|derived|rows?|set|datasets?|archives?|images?|assets?|prompts?)"
+    r"eval(?:s|uation(?:s)?)?[-_\s]*(?:data|derived|rows?|set|datasets?|archives?|images?|assets?|prompts?)"
     r")(?![a-z0-9])",
     re.IGNORECASE,
 )
@@ -92,7 +92,7 @@ FORBIDDEN_BODY_RE = re.compile(
 # to ordinary prose.
 FORBIDDEN_VERSIONED_NAME_RE = re.compile(
     r"(?<![a-z0-9])(?:hidden|hold[-_\s]*outs?|quarantines?|"
-    r"test|eval(?:uation)?)"
+    r"test(?:s|ing)?|eval(?:s|uation(?:s)?)?)"
     r"(?:[-_\s]*(?:v(?:er(?:sion)?)?[-_\s]*)?)?[0-9]+(?![a-z0-9])",
     re.IGNORECASE,
 )
@@ -555,6 +555,22 @@ def _require_canonical_percent_encoding(value: str, *, label: str) -> None:
         raise IntegrityError("observation request query contains ambiguous raw plus")
 
 
+def _require_percent_decoded_utf8(value: str, *, label: str) -> None:
+    """Require percent-decoded bytes to form one valid UTF-8 string.
+
+    ``parse_qsl`` defaults to replacement decoding.  At an evidence boundary,
+    that would let distinct invalid byte sequences collapse to the same
+    accepted query metadata after their values are redacted.  Validate the
+    complete byte representation strictly before asking ``urllib`` to parse
+    the fields.
+    """
+
+    try:
+        unquote_to_bytes(value).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise IntegrityError(f"{label} contains invalid UTF-8 percent encoding") from exc
+
+
 def _decode_path_to_fixed_point(value: str) -> str:
     """Decode a URL path completely so nested delimiters cannot hide syntax."""
 
@@ -690,13 +706,17 @@ def _redacted_request_query(
     else:  # pragma: no cover - internal closed enum
         raise IntegrityError("observation query contract is unknown")
 
+    has_existing = "request_query" in record
     existing = record.get("request_query")
     if parsed.query:
-        if existing is not None:
+        if has_existing:
             raise IntegrityError("observation carries raw and redacted query metadata")
         if len(parsed.query.encode("utf-8")) > MAX_QUERY_BYTES:
             raise IntegrityError("observation request query exceeds its safety ceiling")
         _require_canonical_percent_encoding(
+            parsed.query, label="observation request query"
+        )
+        _require_percent_decoded_utf8(
             parsed.query, label="observation request query"
         )
         try:
@@ -731,7 +751,7 @@ def _redacted_request_query(
             "pair_count": len(keys),
         }
 
-    if existing is None:
+    if not has_existing:
         return None
     if not isinstance(existing, Mapping) or set(existing) != {
         "redacted",
