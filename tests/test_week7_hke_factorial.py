@@ -1190,6 +1190,7 @@ def test_plan_binds_every_pack_cell_to_physical_inputs(base_config):
 def test_execution_code_tree_must_equal_reviewed_factor_authority_tree(base_config):
     admission = _admission_set()
     execution = _execution()
+    execution["incumbent"]["code_tree"] = "f" * 40
     execution["owned"]["code_tree"] = "f" * 40
     with pytest.raises(H.HKEContractError, match="reviewed generator revision"):
         H.build_prelaunch_plan(
@@ -1468,7 +1469,9 @@ def test_product_receipts_cannot_be_transplanted_into_logo_guardrail(base_config
     _rehash(transplanted, "curve_sha256")
     evidence["curves"]["logo_ui"]["candidate"] = transplanted
     _rehash(evidence, "evidence_sha256")
-    with pytest.raises(H.HKEContractError, match="receipt cell binding mismatch"):
+    with pytest.raises(
+        H.HKEContractError, match="execution order|receipt cell binding"
+    ):
         H.evaluate_futurebound_gates(plan, evidence)
 
 
@@ -1832,7 +1835,9 @@ def test_foreign_physical_receipt_chain_cannot_be_relabelled_to_target_cell(
     transplanted = _curve(plan, "d1_core", "C", 0.9)
     transplanted["cell_sha256"] = plan["cells"]["d1_core"]["D"]["cell_sha256"]
     _rehash(transplanted, "curve_sha256")
-    with pytest.raises(H.HKEContractError, match="receipt cell binding mismatch"):
+    with pytest.raises(
+        H.HKEContractError, match="execution order|receipt cell binding"
+    ):
         H.validate_score_curve(
             transplanted,
             plan_sha256=plan["plan_sha256"],

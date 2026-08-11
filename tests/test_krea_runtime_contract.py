@@ -140,6 +140,12 @@ def _committed_runtime_tree(tmp_path: Path) -> tuple[Path, str, str]:
 
 def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
     bundle_sha = krea_runtime.bundle_contract_sha256(bundle)
+    projection = krea_runtime.bundle_contract_document(bundle)[
+        "normalized_config_projection"
+    ]
+    source_loss_type = projection["config"]["process"][0]["train"].get(
+        "loss_type", "mae"
+    )
     document = adaptive_timing._seal_profile_document(
         {
             "schema": adaptive_timing.PROFILE_SCHEMA,
@@ -160,6 +166,11 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
             "provenance": {
                 "source_run_id": SOURCE_RUN_ID,
                 "source_record_sha256": "b" * 64,
+                "source_generated_config_sha256": "c" * 64,
+                "source_config_projection_sha256": adaptive_timing.canonical_sha256(
+                    projection
+                ),
+                "source_loss_type": source_loss_type,
                 "runtime_commit": krea_runtime.OWNED_RUNTIME_COMMIT,
                 "measured_at_utc": "2026-08-04T12:00:00Z",
                 "accelerator_identity": "NVIDIA H100 PCIe|81559-MiB",
