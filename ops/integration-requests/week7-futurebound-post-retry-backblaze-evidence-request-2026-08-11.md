@@ -1,7 +1,9 @@
 # Week-7 FutureBound post-retry Backblaze evidence request
 
-Status: **REQUEST ONLY / NO ROOT-CAUSE CLAIM**  
-Date: 2026-08-11  
+Status: **REQUEST ONLY / NO ROOT-CAUSE CLAIM**
+
+Date: 2026-08-11
+
 Scope: validator-side metadata for the original attempt and its successful
 retry; no hidden/test rows, credentials, object bodies, or private dataset
 content are requested.
