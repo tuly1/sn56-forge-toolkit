@@ -175,7 +175,7 @@ class BoundTimingProfile:
 
     @property
     def accelerator_identity(self) -> str:
-        """Compatibility label derived from the validated mechanical record."""
+        """Canonical physical-GPU identity from the validated observation."""
 
         row = self.accelerator_observation["device"]
         return adaptive_timing.accelerator_identity(

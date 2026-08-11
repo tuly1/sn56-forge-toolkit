@@ -26,6 +26,13 @@ it does not establish why the original attempt failed or which storage event
 caused the retry. That original-attempt cause remains **INCONCLUSIVE** on the
 public evidence.
 
+The dataset-preparation/Backblaze B2 incident is **Gradients-reported**, not
+independently established by this packet. No validator-side incident notice or
+storage event ledger is archived here; obtaining that source record is the
+purpose of this request. Keep that reported incident, the original attempt,
+the retry assignment, the successful retry upload, and the retry's
+model-quality result as five distinct facts.
+
 ## Requested validator-side records
 
 Please provide a redacted, hash-bound event ledger for both the original
