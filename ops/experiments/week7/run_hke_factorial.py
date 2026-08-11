@@ -1541,7 +1541,7 @@ def _profile_binding_body(
             profile.seconds_per_step, expected_rate, rel_tol=1e-12, abs_tol=1e-12
         )
     ):
-        raise HKEContractError("timing source loss differs from its outer binding")
+        raise HKEContractError("timing source differs from its outer binding")
     return {
         "schema": 2,
         "kind": "sn56-week7-hke-timing-profile-binding",

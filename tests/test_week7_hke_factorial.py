@@ -1588,7 +1588,7 @@ def test_h100_raw_record_and_uuid_are_bound(base_config):
     forged["observation_sha256"] = H.canonical_sha256(body)
     with pytest.raises(H.HKEContractError, match="raw output"):
         H._validate_h100_observation(forged, "forged")
-    with pytest.raises(H.HKEContractError, match="label"):
+    with pytest.raises(H.HKEContractError, match="outer binding"):
         profiles = _bound_profiles(base_config, 10, observation)
         H.bind_timing_profile(
             replace(profiles["mae"].profile, accelerator_identity="forged"),
@@ -1678,7 +1678,7 @@ def test_training_directory_inventory_rejects_extra_symlink_and_directory(tmp_pa
     (tmp_path / "extra.bin").unlink()
 
     (tmp_path / "nested").mkdir()
-    with pytest.raises(H.HKEContractError, match="indirect"):
+    with pytest.raises(H.HKEContractError, match="non-regular"):
         H.inventory_training_directory(tmp_path)
     (tmp_path / "nested").rmdir()
 
