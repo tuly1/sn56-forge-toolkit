@@ -24,6 +24,7 @@ import os
 import platform
 from pathlib import Path, PurePosixPath
 import stat
+import subprocess
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -42,6 +43,9 @@ DECLARATIVE_CONTRACT_SOURCE_PATH = "ops/experiments/week7/hke_fixture_contract.j
 DISCOVERY_DOMAIN = b"SN56-W7-HKE-DISCOVERY-v3"
 CONFIRMATION_DOMAIN = b"SN56-W7-HKE-CONFIRMATION-v3"
 PNG_FORMAT = "PNG"
+SCRIPT_PATH = Path(__file__).resolve()
+EXECUTABLE_REPOSITORY_ROOT = SCRIPT_PATH.parents[3]
+FIXED_GIT = Path("/usr/bin/git")
 
 FIXTURE_CONTRACT: tuple[dict[str, Any], ...] = (
     {
@@ -871,6 +875,152 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def _require_no_symlink_ancestors_allow_missing(path: Path, label: str) -> None:
+    """Reject a symlink in the existing prefix of a possibly absent path."""
+
+    path = _absolute(path)
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(metadata.st_mode):
+            raise FixtureError(f"{label} has a symlink component: {current}")
+
+
+def _parse_worktree_roots(raw: bytes) -> tuple[Path, ...]:
+    """Parse fixed Git ``worktree list --porcelain -z`` output strictly."""
+
+    if not raw or not raw.endswith(b"\0\0"):
+        raise FixtureError("Git worktree inventory is absent or malformed")
+    roots: list[Path] = []
+    for record in raw[:-2].split(b"\0\0"):
+        fields = record.split(b"\0")
+        if not fields or not fields[0].startswith(b"worktree "):
+            raise FixtureError("Git worktree inventory is malformed")
+        if any(field.startswith(b"worktree ") for field in fields[1:]):
+            raise FixtureError("Git worktree inventory has an ambiguous record")
+        try:
+            value = fields[0][len(b"worktree ") :].decode(
+                sys.getfilesystemencoding(), "strict"
+            )
+        except UnicodeDecodeError as exc:
+            raise FixtureError("Git worktree path is not valid filesystem text") from exc
+        root = Path(value)
+        if not value or not root.is_absolute() or "\x00" in value:
+            raise FixtureError("Git worktree path is not absolute")
+        normalized = _absolute(root)
+        if normalized in roots:
+            raise FixtureError("Git worktree inventory contains a duplicate root")
+        roots.append(normalized)
+    if not roots:
+        raise FixtureError("Git worktree inventory is empty")
+    return tuple(roots)
+
+
+def _registered_worktree_roots() -> tuple[Path, ...]:
+    """Return every registered worktree, including missing/prunable entries.
+
+    The executable is fixed and ambient user/system configuration is removed.
+    Repository-local behavior that could affect this command is explicitly
+    neutralized, and the machine-readable output is parsed fail-closed.
+    """
+
+    if not FIXED_GIT.is_file():
+        raise FixtureError("fixed /usr/bin/git is unavailable")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent-sn56-hke-custody",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    completed = subprocess.run(
+        [
+            str(FIXED_GIT),
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=",
+            "-c",
+            "filter.lfs.smudge=",
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+        ],
+        cwd=EXECUTABLE_REPOSITORY_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0 or completed.stderr:
+        raise FixtureError("cannot inventory registered Git worktrees")
+    roots = _parse_worktree_roots(completed.stdout)
+    if EXECUTABLE_REPOSITORY_ROOT not in roots:
+        raise FixtureError("executable repository is absent from worktree inventory")
+    return roots
+
+
+def _validate_custody_boundary(
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+) -> tuple[Path, Path, tuple[Path, ...]]:
+    """Require private custody outside every executable/public boundary."""
+
+    if isinstance(public_boundary_roots, (str, bytes, Path)):
+        raise FixtureError("public_boundary_roots must be a non-empty path sequence")
+    try:
+        boundaries = tuple(
+            sorted(
+                (_absolute(Path(path)) for path in public_boundary_roots),
+                key=os.fspath,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise FixtureError("public_boundary_roots is malformed") from exc
+    if not boundaries:
+        raise FixtureError("public_boundary_roots must not be empty")
+    if len(set(boundaries)) != len(boundaries):
+        raise FixtureError("public_boundary_roots contains duplicates")
+    public_root = _absolute(public_root)
+    custodian_root = _absolute(custodian_root)
+    for index, boundary in enumerate(boundaries):
+        _require_no_symlink_ancestors_allow_missing(
+            boundary, f"public boundary {index}"
+        )
+    if not any(boundary in public_root.parents for boundary in boundaries):
+        raise FixtureError(
+            "public output must be strictly inside a declared public boundary"
+        )
+    forbidden = (
+        EXECUTABLE_REPOSITORY_ROOT,
+        *_registered_worktree_roots(),
+        public_root,
+        *boundaries,
+    )
+    if any(_paths_overlap(custodian_root, root) for root in forbidden):
+        raise FixtureError(
+            "custodian output must be outside the executable repository, every "
+            "registered worktree, the public candidate, and all public boundaries"
+        )
+    _require_no_symlink_ancestors_allow_missing(custodian_root, "custodian output")
+    return public_root, custodian_root, boundaries
+
+
 def _safe_row_path(root: Path, relative: Any, label: str) -> Path:
     if not isinstance(relative, str):
         raise FixtureError(f"{label} must be a relative path")
@@ -1056,6 +1206,7 @@ def build_candidate(
     author_record: str,
     rights_owner: str,
     license_or_use_grant: str,
+    public_boundary_roots: Sequence[Path],
 ) -> dict[str, Any]:
     """Create discovery and separately held confirmation candidate outputs."""
 
@@ -1069,10 +1220,18 @@ def build_candidate(
         license_or_use_grant=license_or_use_grant,
     )
     _require_distinct_phase_keys(discovery_key, confirmation_key)
-    if _paths_overlap(public_output, custodian_output):
-        raise FixtureError("public and custodian outputs must be disjoint trees")
+    public_output, custodian_output, boundaries = _validate_custody_boundary(
+        public_root=public_output,
+        custodian_root=custodian_output,
+        public_boundary_roots=public_boundary_roots,
+    )
     public_root = _ensure_new_root(public_output, "public output")
-    custodian_root = _ensure_new_root(custodian_output, "custodian output")
+    try:
+        custodian_root = _ensure_new_root(custodian_output, "custodian output")
+    except BaseException:
+        # A custody failure must not leave a valid-looking public candidate tree.
+        public_root.rmdir()
+        raise
 
     discovery_rows: dict[str, list[dict[str, Any]]] = {}
     confirmation_rows: dict[str, list[dict[str, Any]]] = {}
@@ -1192,6 +1351,13 @@ def build_candidate(
         "discovery_manifest_file_sha256": discovery_manifest_sha,
         "confirmation": {
             "separately_custodied": True,
+            "custody_policy": {
+                "classification": "caller-boundary-and-live-worktree-verified",
+                "public_boundary_count": len(boundaries),
+                "custodian_outside_executable_repository": True,
+                "custodian_outside_all_registered_worktrees": True,
+                "custodian_outside_all_public_boundaries": True,
+            },
             "public_membership_disclosed": False,
             "total_row_count": sum(
                 item["confirmation_count"] for item in FIXTURE_CONTRACT
@@ -1293,17 +1459,23 @@ def _verify_row_bytes(
     return dict(row), image_bytes
 
 
-def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
+def verify_candidate(
+    public_root: Path,
+    custodian_root: Path,
+    *,
+    public_boundary_roots: Sequence[Path],
+) -> dict[str, Any]:
     """Validate candidate manifests, bytes, isolation, counts, and dedup evidence.
 
     This verification does not claim deterministic replay because it does not
     accept the two secret keys.  :func:`verify_replay` adds that stronger gate.
     """
 
-    if _paths_overlap(public_root, custodian_root):
-        raise FixtureError("public and custodian outputs must be disjoint trees")
-    public_root = _absolute(public_root)
-    custodian_root = _absolute(custodian_root)
+    public_root, custodian_root, boundaries = _validate_custody_boundary(
+        public_root=public_root,
+        custodian_root=custodian_root,
+        public_boundary_roots=public_boundary_roots,
+    )
     _require_no_symlink_components(public_root, "public output")
     _require_no_symlink_components(custodian_root, "custodian output")
     candidate_path = public_root / "CANDIDATE-MANIFEST.json"
@@ -1375,6 +1547,7 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
         "ambient_inputs",
     } or set(candidate.get("confirmation", {})) != {
         "separately_custodied",
+        "custody_policy",
         "public_membership_disclosed",
         "total_row_count",
         "custodian_manifest_sha256",
@@ -1635,6 +1808,14 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
         != expected_confirmation_total
     ):
         raise FixtureError("candidate confirmation total is invalid")
+    if candidate.get("confirmation", {}).get("custody_policy") != {
+        "classification": "caller-boundary-and-live-worktree-verified",
+        "public_boundary_count": len(boundaries),
+        "custodian_outside_executable_repository": True,
+        "custodian_outside_all_registered_worktrees": True,
+        "custodian_outside_all_public_boundaries": True,
+    }:
+        raise FixtureError("candidate custody policy is absent or changed")
     return {
         "candidate_manifest": candidate,
         "discovery_manifest": discovery,
@@ -1650,13 +1831,18 @@ def verify_replay(
     custodian_output: Path,
     discovery_key: bytes | bytearray,
     confirmation_key: bytes | bytearray,
+    public_boundary_roots: Sequence[Path],
 ) -> dict[str, Any]:
     """Rerender every row and require exact manifest and byte identities."""
 
     discovery_key = _validate_key(discovery_key, "discovery key")
     confirmation_key = _validate_key(confirmation_key, "confirmation key")
     _require_distinct_phase_keys(discovery_key, confirmation_key)
-    verified_candidate = verify_candidate(Path(public_output), Path(custodian_output))
+    verified_candidate = verify_candidate(
+        Path(public_output),
+        Path(custodian_output),
+        public_boundary_roots=public_boundary_roots,
+    )
     discovery = verified_candidate["discovery_manifest"]
     confirmation = verified_candidate["confirmation_manifest"]
     expected_manifests = {
@@ -1758,6 +1944,14 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
         item.add_argument("--custodian-output", type=Path, required=True)
         item.add_argument("--discovery-key-file", type=Path, required=True)
         item.add_argument("--confirmation-key-file", type=Path, required=True)
+        item.add_argument(
+            "--public-boundary-root",
+            dest="public_boundary_roots",
+            action="append",
+            type=Path,
+            required=True,
+            help="public upload/evidence boundary; repeat for every boundary",
+        )
     commands["build"].add_argument("--generator-commit", required=True)
     commands["build"].add_argument("--generator-tree", required=True)
     commands["build"].add_argument("--author-record", required=True)
@@ -1775,6 +1969,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "confirmation_key": _read_key_file(
             args.confirmation_key_file, "confirmation key"
         ),
+        "public_boundary_roots": args.public_boundary_roots,
     }
     result = (
         build_candidate(

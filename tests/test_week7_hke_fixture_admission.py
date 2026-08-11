@@ -49,7 +49,8 @@ RIGHTS = {
 @pytest.fixture(scope="module")
 def candidate(tmp_path_factory):
     root = tmp_path_factory.mktemp("hke-admission")
-    public = root / "public"
+    public = root / "public-boundary" / "public"
+    public.parent.mkdir()
     custodian = root / "custodian"
     renderer.build_candidate(
         public_output=public,
@@ -58,6 +59,7 @@ def candidate(tmp_path_factory):
         confirmation_key=CONFIRMATION_KEY,
         generator_commit=GENERATOR_COMMIT,
         generator_tree=GENERATOR_TREE,
+        public_boundary_roots=(public.parent,),
         **RIGHTS,
     )
     return public, custodian
@@ -65,7 +67,9 @@ def candidate(tmp_path_factory):
 
 def completed_review(candidate):
     public, custodian = candidate
-    draft = admission.build_review_template(public, custodian)
+    draft = admission.build_review_template(
+        public, custodian, public_boundary_roots=(public.parent,)
+    )
     draft["reviewer_identity"] = "Atulya Shetty"
     draft["reviewed_at_utc"] = "2026-08-10T23:00:00Z"
     draft["decision"] = "PASS"
@@ -107,6 +111,7 @@ def admitted(candidate):
     sealed = admission.seal_review(
         public_root=public,
         custodian_root=custodian,
+        public_boundary_roots=(public.parent,),
         draft=completed_review(candidate),
     )
     root, receipts = admission.build_admissions(
@@ -114,6 +119,7 @@ def admitted(candidate):
         custodian_root=custodian,
         discovery_key=DISCOVERY_KEY,
         confirmation_key=CONFIRMATION_KEY,
+        public_boundary_roots=(public.parent,),
         sealed_review=sealed,
         generator_identity_probe=generator_probe,
     )
@@ -251,7 +257,9 @@ def c2_authority(receipts: dict, freeze: dict) -> dict:
 
 def test_template_is_private_pending_and_never_fakes_human_review(candidate):
     public, custodian = candidate
-    template = admission.build_review_template(public, custodian)
+    template = admission.build_review_template(
+        public, custodian, public_boundary_roots=(public.parent,)
+    )
     assert template["status"] == "PENDING_NAMED_HUMAN_REVIEW"
     assert template["reviewer_identity"] == ""
     assert template["decision"] == "PENDING"
@@ -275,13 +283,21 @@ def test_role_label_and_one_missing_row_check_abort(candidate):
     role = completed_review(candidate)
     role["reviewer_identity"] = "human reviewer"
     with pytest.raises(admission.AdmissionError, match="role label"):
-        admission.seal_review(public_root=public, custodian_root=custodian, draft=role)
+        admission.seal_review(
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            draft=role,
+        )
 
     missing = completed_review(candidate)
     missing["rows"][17]["checks"]["caption_semantics_accepted"] = False
     with pytest.raises(admission.AdmissionError, match="unapproved check"):
         admission.seal_review(
-            public_root=public, custodian_root=custodian, draft=missing
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            draft=missing,
         )
 
 
@@ -291,7 +307,10 @@ def test_exact_row_tampering_aborts_even_if_every_boolean_says_pass(candidate):
     forged["rows"][73]["image_sha256"] = "0" * 64
     with pytest.raises(admission.AdmissionError, match="identity mismatch"):
         admission.seal_review(
-            public_root=public, custodian_root=custodian, draft=forged
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            draft=forged,
         )
 
 
@@ -300,6 +319,7 @@ def test_pass_emits_three_admissions_but_keeps_gpu_and_deploy_closed(candidate):
     sealed = admission.seal_review(
         public_root=public,
         custodian_root=custodian,
+        public_boundary_roots=(public.parent,),
         draft=completed_review(candidate),
     )
     root, receipts = admission.build_admissions(
@@ -307,6 +327,7 @@ def test_pass_emits_three_admissions_but_keeps_gpu_and_deploy_closed(candidate):
         custodian_root=custodian,
         discovery_key=DISCOVERY_KEY,
         confirmation_key=CONFIRMATION_KEY,
+        public_boundary_roots=(public.parent,),
         sealed_review=sealed,
         generator_identity_probe=generator_probe,
     )
@@ -359,7 +380,9 @@ def test_pass_emits_three_admissions_but_keeps_gpu_and_deploy_closed(candidate):
         admission.canonical_bytes(receipt) for receipt in receipts.values()
     )
     assert b"Atulya Shetty" not in public_bytes
-    confirmation = renderer.verify_candidate(public, custodian)["confirmation_manifest"]
+    confirmation = renderer.verify_candidate(
+        public, custodian, public_boundary_roots=(public.parent,)
+    )["confirmation_manifest"]
     private_row_id = next(iter(next(iter(confirmation["families"].values()))["rows"]))[
         "row_id"
     ].encode("ascii")
@@ -373,6 +396,7 @@ def test_private_review_records_cannot_be_written_in_candidate_or_repo(candidate
             public / "review.json",
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             label="review",
         )
     with pytest.raises(admission.AdmissionError, match="must be outside"):
@@ -380,6 +404,7 @@ def test_private_review_records_cannot_be_written_in_candidate_or_repo(candidate
             custodian / "review.json",
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             label="review",
         )
     with pytest.raises(admission.AdmissionError, match="must be outside"):
@@ -387,7 +412,26 @@ def test_private_review_records_cannot_be_written_in_candidate_or_repo(candidate
             admission.REPO_ROOT / "review.json",
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             label="review",
+        )
+
+
+def test_admission_rejects_relocated_custodian_inside_evidence_boundary(
+    candidate, tmp_path: Path
+) -> None:
+    public, custodian = candidate
+    evidence = tmp_path / "public-evidence"
+    evidence.mkdir()
+    copied_public = evidence / "candidate"
+    relocated_custodian = evidence / "private-confirmation"
+    shutil.copytree(public, copied_public)
+    shutil.copytree(custodian, relocated_custodian)
+    with pytest.raises(admission.AdmissionError, match="custodian output must be outside"):
+        admission.build_review_template(
+            copied_public,
+            relocated_custodian,
+            public_boundary_roots=(evidence,),
         )
 
 
@@ -396,6 +440,7 @@ def test_sealed_review_digest_tampering_aborts(candidate):
     sealed = admission.seal_review(
         public_root=public,
         custodian_root=custodian,
+        public_boundary_roots=(public.parent,),
         draft=completed_review(candidate),
     )
     tampered = copy.deepcopy(sealed)
@@ -406,6 +451,7 @@ def test_sealed_review_digest_tampering_aborts(candidate):
             custodian_root=custodian,
             discovery_key=DISCOVERY_KEY,
             confirmation_key=CONFIRMATION_KEY,
+            public_boundary_roots=(public.parent,),
             sealed_review=tampered,
             generator_identity_probe=generator_probe,
         )
@@ -416,6 +462,7 @@ def test_admission_rejects_attested_tree_that_is_not_the_executed_revision(candi
     sealed = admission.seal_review(
         public_root=public,
         custodian_root=custodian,
+        public_boundary_roots=(public.parent,),
         draft=completed_review(candidate),
     )
 
@@ -430,6 +477,7 @@ def test_admission_rejects_attested_tree_that_is_not_the_executed_revision(candi
             custodian_root=custodian,
             discovery_key=DISCOVERY_KEY,
             confirmation_key=CONFIRMATION_KEY,
+            public_boundary_roots=(public.parent,),
             sealed_review=sealed,
             generator_identity_probe=wrong_tree,
         )
@@ -442,6 +490,7 @@ def test_admission_rejects_equal_keys_before_trusting_stubbed_replay(
     sealed = admission.seal_review(
         public_root=public,
         custodian_root=custodian,
+        public_boundary_roots=(public.parent,),
         draft=completed_review(candidate),
     )
     called = False
@@ -458,6 +507,7 @@ def test_admission_rejects_equal_keys_before_trusting_stubbed_replay(
             custodian_root=custodian,
             discovery_key=DISCOVERY_KEY,
             confirmation_key=DISCOVERY_KEY,
+            public_boundary_roots=(public.parent,),
             sealed_review=sealed,
             generator_identity_probe=generator_probe,
         )
@@ -468,8 +518,9 @@ def test_admission_rejects_mismatched_phase_commitment(
     candidate, tmp_path: Path
 ) -> None:
     public, custodian = candidate
-    copied_public = tmp_path / "public"
+    copied_public = tmp_path / "public-boundary" / "public"
     copied_custodian = tmp_path / "custodian"
+    copied_public.parent.mkdir()
     shutil.copytree(public, copied_public)
     shutil.copytree(custodian, copied_custodian)
     confirmation_path = copied_custodian / "CONFIRMATION-MANIFEST.json"
@@ -485,7 +536,11 @@ def test_admission_rejects_mismatched_phase_commitment(
     for family in candidate_record["families"].values():
         family["confirmation"]["custodian_manifest_sha256"] = confirmation_sha
     _rewrite_semantic(candidate_path, candidate_record)
-    draft = admission.build_review_template(copied_public, copied_custodian)
+    draft = admission.build_review_template(
+        copied_public,
+        copied_custodian,
+        public_boundary_roots=(copied_public.parent,),
+    )
     draft["reviewer_identity"] = "Atulya Shetty"
     draft["reviewed_at_utc"] = "2026-08-11T02:00:00Z"
     draft["decision"] = "PASS"
@@ -495,6 +550,7 @@ def test_admission_rejects_mismatched_phase_commitment(
     sealed = admission.seal_review(
         public_root=copied_public,
         custodian_root=copied_custodian,
+        public_boundary_roots=(copied_public.parent,),
         draft=draft,
     )
     with pytest.raises(admission.AdmissionError, match="phase keys do not match"):
@@ -503,6 +559,7 @@ def test_admission_rejects_mismatched_phase_commitment(
             custodian_root=copied_custodian,
             discovery_key=DISCOVERY_KEY,
             confirmation_key=CONFIRMATION_KEY,
+            public_boundary_roots=(copied_public.parent,),
             sealed_review=sealed,
             generator_identity_probe=generator_probe,
         )
@@ -550,7 +607,9 @@ def test_generator_identity_rejects_ambient_contract_drift(
 
 def test_discovery_receipt_rejects_training_evaluation_transplant(candidate) -> None:
     public, custodian = candidate
-    verified = renderer.verify_candidate(public, custodian)
+    verified = renderer.verify_candidate(
+        public, custodian, public_boundary_roots=(public.parent,)
+    )
     family = copy.deepcopy(
         verified["candidate_manifest"]["families"]["W7-HKE-SOCIAL-A"]
     )
@@ -567,7 +626,9 @@ def test_discovery_receipt_rejects_stable_semantic_duplicate_across_split(
     candidate,
 ) -> None:
     public, custodian = candidate
-    verified = renderer.verify_candidate(public, custodian)
+    verified = renderer.verify_candidate(
+        public, custodian, public_boundary_roots=(public.parent,)
+    )
     family = copy.deepcopy(
         verified["candidate_manifest"]["families"]["W7-HKE-PRODUCT-A"]
     )
@@ -621,9 +682,11 @@ def test_owner_ratification_requires_named_owner_and_stays_gpu_closed(candidate)
 def test_ratification_cli_requires_a_human_completed_draft(tmp_path: Path) -> None:
     common = [
         "--public-root",
-        str(tmp_path / "public"),
+        str(tmp_path / "public-boundary" / "public"),
         "--custodian-root",
         str(tmp_path / "custodian"),
+        "--public-boundary-root",
+        str(tmp_path / "public-boundary"),
         "--admission-set",
         str(tmp_path / "ADMISSION-SET.json"),
         "--sealed-review",
@@ -661,7 +724,9 @@ def test_confirmation_reveal_requires_post_d2_freeze_and_exact_commitment(
     public, custodian, _sealed, root, receipts = admitted(candidate)
     commitment = receipts["social"]["packs"]["C1"]["semantic_commitment_sha256"]
     frozen = confirmation_freeze(receipts)
-    verified = renderer.verify_candidate(public, custodian)
+    verified = renderer.verify_candidate(
+        public, custodian, public_boundary_roots=(public.parent,)
+    )
     private_pack = verified["confirmation_manifest"]["families"]["W7-HKE-SOCIAL-A"][
         "packs"
     ]["C1"]
@@ -670,6 +735,7 @@ def test_confirmation_reveal_requires_post_d2_freeze_and_exact_commitment(
     reveal = admission.build_confirmation_reveal(
         public_root=public,
         custodian_root=custodian,
+        public_boundary_roots=(public.parent,),
         admission_set=root,
         family="social",
         pack="C1",
@@ -686,6 +752,7 @@ def test_confirmation_reveal_requires_post_d2_freeze_and_exact_commitment(
             reveal,
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             admission_set=root,
             confirmation_authority=frozen,
         )
@@ -702,6 +769,7 @@ def test_confirmation_reveal_requires_post_d2_freeze_and_exact_commitment(
             forged_rows,
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             admission_set=root,
             confirmation_authority=frozen,
         )
@@ -717,6 +785,7 @@ def test_confirmation_reveal_requires_post_d2_freeze_and_exact_commitment(
         admission.build_confirmation_reveal(
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             admission_set=root,
             family="social",
             pack="C1",
@@ -732,6 +801,7 @@ def test_confirmation_reveal_requires_post_d2_freeze_and_exact_commitment(
         admission.build_confirmation_reveal(
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             admission_set=root,
             family="social",
             pack="C1",
@@ -744,6 +814,7 @@ def test_confirmation_reveal_requires_post_d2_freeze_and_exact_commitment(
         admission.build_confirmation_reveal(
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             admission_set=root,
             family="social",
             pack="C1",
@@ -760,6 +831,7 @@ def test_product_and_logo_guardrail_reveals_use_same_post_d2_freeze(
         reveal = admission.build_confirmation_reveal(
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             admission_set=root,
             family=family,
             pack="C1",
@@ -786,6 +858,7 @@ def test_self_rehashed_forged_freeze_cannot_authorize_c1(
         admission.build_confirmation_reveal(
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             admission_set=root,
             family="social",
             pack="C1",
@@ -802,6 +875,7 @@ def test_c2_requires_separate_borderline_trigger_authority(
         admission.build_confirmation_reveal(
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             admission_set=root,
             family="social",
             pack="C2",
@@ -811,6 +885,7 @@ def test_c2_requires_separate_borderline_trigger_authority(
     reveal = admission.build_confirmation_reveal(
         public_root=public,
         custodian_root=custodian,
+        public_boundary_roots=(public.parent,),
         admission_set=root,
         family="social",
         pack="C2",
@@ -828,6 +903,7 @@ def test_c2_requires_separate_borderline_trigger_authority(
         admission.build_confirmation_reveal(
             public_root=public,
             custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
             admission_set=root,
             family="social",
             pack="C2",

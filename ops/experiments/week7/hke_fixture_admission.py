@@ -213,6 +213,23 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def _verify_candidate(
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+) -> dict[str, Any]:
+    """Translate renderer custody/integrity failures at the admission boundary."""
+
+    try:
+        return renderer.verify_candidate(
+            Path(public_root),
+            Path(custodian_root),
+            public_boundary_roots=public_boundary_roots,
+        )
+    except renderer.FixtureError as exc:
+        raise AdmissionError(str(exc)) from exc
+
+
 def _write_new(path: Path, value: Any) -> str:
     path = Path(path)
     if path.parent.is_symlink() or not path.parent.is_dir():
@@ -226,17 +243,34 @@ def _write_new(path: Path, value: Any) -> str:
 
 
 def _private_record_path(
-    path: Path, *, public_root: Path, custodian_root: Path, label: str
+    path: Path,
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    label: str,
 ) -> Path:
     """Require human-review records to live outside public/candidate trees."""
 
     path = renderer._absolute(Path(path))
     public_root = renderer._absolute(Path(public_root))
     custodian_root = renderer._absolute(Path(custodian_root))
+    try:
+        renderer._validate_custody_boundary(
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+        )
+    except renderer.FixtureError as exc:
+        raise AdmissionError(str(exc)) from exc
     if (
         renderer._paths_overlap(path, public_root)
         or renderer._paths_overlap(path, custodian_root)
         or renderer._paths_overlap(path, REPO_ROOT)
+        or any(
+            renderer._paths_overlap(path, boundary)
+            for boundary in public_boundary_roots
+        )
     ):
         raise AdmissionError(
             f"{label} must be outside public, candidate-custodian, and repository trees"
@@ -275,10 +309,15 @@ def _rows(verified: Mapping[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def build_review_template(public_root: Path, custodian_root: Path) -> dict[str, Any]:
+def build_review_template(
+    public_root: Path,
+    custodian_root: Path,
+    *,
+    public_boundary_roots: Sequence[Path],
+) -> dict[str, Any]:
     """Build a private, exact-row checklist; this is not a review."""
 
-    verified = renderer.verify_candidate(Path(public_root), Path(custodian_root))
+    verified = _verify_candidate(public_root, custodian_root, public_boundary_roots)
     candidate = verified["candidate_manifest"]
     body = {
         "schema": SCHEMA,
@@ -389,9 +428,13 @@ def validate_review_body(
 
 
 def seal_review(
-    *, public_root: Path, custodian_root: Path, draft: Mapping[str, Any]
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    draft: Mapping[str, Any],
 ) -> dict[str, Any]:
-    verified = renderer.verify_candidate(Path(public_root), Path(custodian_root))
+    verified = _verify_candidate(public_root, custodian_root, public_boundary_roots)
     body = validate_review_body(draft, verified)
     body.pop("review_sha256", None)
     return {**body, "review_sha256": semantic_sha256(body)}
@@ -659,6 +702,7 @@ def build_admissions(
     custodian_root: Path,
     discovery_key: bytes,
     confirmation_key: bytes,
+    public_boundary_roots: Sequence[Path],
     sealed_review: Mapping[str, Any],
     generator_identity_probe: Callable[
         [], Mapping[str, Any]
@@ -678,7 +722,7 @@ def build_admissions(
             confirmation_key, renderer.CONFIRMATION_DOMAIN
         ),
     }
-    verified = renderer.verify_candidate(Path(public_root), Path(custodian_root))
+    verified = _verify_candidate(public_root, custodian_root, public_boundary_roots)
     if (
         verified["discovery_manifest"].get("phase_key_commitment_sha256")
         != phase_commitments["discovery"]
@@ -686,12 +730,16 @@ def build_admissions(
         != phase_commitments["confirmation"]
     ):
         raise AdmissionError("supplied phase keys do not match candidate commitments")
-    replay = renderer.verify_replay(
-        public_output=Path(public_root),
-        custodian_output=Path(custodian_root),
-        discovery_key=discovery_key,
-        confirmation_key=confirmation_key,
-    )
+    try:
+        replay = renderer.verify_replay(
+            public_output=Path(public_root),
+            custodian_output=Path(custodian_root),
+            discovery_key=discovery_key,
+            confirmation_key=confirmation_key,
+            public_boundary_roots=public_boundary_roots,
+        )
+    except renderer.FixtureError as exc:
+        raise AdmissionError(str(exc)) from exc
     review = validate_sealed_review(sealed_review, verified)
     candidate = verified["candidate_manifest"]
     live_generator = dict(generator_identity_probe())
@@ -1467,6 +1515,7 @@ def build_confirmation_reveal(
     *,
     public_root: Path,
     custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
     admission_set: Mapping[str, Any],
     family: str,
     pack: str,
@@ -1490,7 +1539,7 @@ def build_confirmation_reveal(
         status = "PRIVATE_C2_REVEALED_AFTER_BORDERLINE_C1_TRIGGER"
     else:
         raise AdmissionError("confirmation reveal is outside the predeclared protocol")
-    verified = renderer.verify_candidate(Path(public_root), Path(custodian_root))
+    verified = _verify_candidate(public_root, custodian_root, public_boundary_roots)
     candidate = verified["candidate_manifest"]
     if checked_set["candidate_semantic_sha256"] != candidate["semantic_sha256"]:
         raise AdmissionError("confirmation candidate disagrees with admission")
@@ -1571,6 +1620,7 @@ def validate_confirmation_reveal(
     *,
     public_root: Path,
     custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
     admission_set: Mapping[str, Any],
     confirmation_authority: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -1579,6 +1629,7 @@ def validate_confirmation_reveal(
     expected = build_confirmation_reveal(
         public_root=public_root,
         custodian_root=custodian_root,
+        public_boundary_roots=public_boundary_roots,
         admission_set=admission_set,
         family=str(value.get("family", "")),
         pack=str(value.get("pack", "")),
@@ -1612,6 +1663,14 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     ):
         item.add_argument("--public-root", type=Path, required=True)
         item.add_argument("--custodian-root", type=Path, required=True)
+        item.add_argument(
+            "--public-boundary-root",
+            dest="public_boundary_roots",
+            action="append",
+            type=Path,
+            required=True,
+            help="public upload/evidence boundary; repeat for every boundary",
+        )
     template.add_argument("--output", type=Path, required=True)
     seal.add_argument("--draft", type=Path, required=True)
     seal.add_argument("--output", type=Path, required=True)
@@ -1643,9 +1702,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output,
             public_root=args.public_root,
             custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
             label="human review template",
         )
-        value = build_review_template(args.public_root, args.custodian_root)
+        value = build_review_template(
+            args.public_root,
+            args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
+        )
         _write_new(output, value)
         return 0
     if args.command == "seal-review":
@@ -1653,18 +1717,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.draft,
             public_root=args.public_root,
             custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
             label="human review draft",
         )
         output = _private_record_path(
             args.output,
             public_root=args.public_root,
             custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
             label="sealed human review",
         )
         draft = _load_json(draft_path, "human review draft")
         value = seal_review(
             public_root=args.public_root,
             custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
             draft=draft,
         )
         _write_new(output, value)
@@ -1674,12 +1741,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.sealed_review,
             public_root=args.public_root,
             custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
             label="sealed human review",
         )
         output = _private_record_path(
             args.output,
             public_root=args.public_root,
             custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
             label="owner ratification",
         )
         admission_set = _load_json(args.admission_set, "admission set")
@@ -1693,6 +1762,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.draft,
                 public_root=args.public_root,
                 custodian_root=args.custodian_root,
+                public_boundary_roots=args.public_boundary_roots,
                 label="owner ratification draft",
             )
             value = seal_owner_ratification(
@@ -1707,17 +1777,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.confirmation_authority,
             public_root=args.public_root,
             custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
             label="confirmation authority",
         )
         output = _private_record_path(
             args.output,
             public_root=args.public_root,
             custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
             label="confirmation reveal",
         )
         value = build_confirmation_reveal(
             public_root=args.public_root,
             custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
             admission_set=_load_json(args.admission_set, "admission set"),
             family=args.family,
             pack=args.pack,
@@ -1729,6 +1802,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.sealed_review,
         public_root=args.public_root,
         custodian_root=args.custodian_root,
+        public_boundary_roots=args.public_boundary_roots,
         label="sealed human review",
     )
     sealed = _load_json(sealed_path, "sealed human review")
@@ -1737,6 +1811,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         custodian_root=args.custodian_root,
         discovery_key=_read_key(args.discovery_key_file, "discovery key"),
         confirmation_key=_read_key(args.confirmation_key_file, "confirmation key"),
+        public_boundary_roots=args.public_boundary_roots,
         sealed_review=sealed,
     )
     if renderer._paths_overlap(

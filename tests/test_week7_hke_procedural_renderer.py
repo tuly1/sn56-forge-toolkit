@@ -7,6 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
+import subprocess
 
 import pytest
 
@@ -54,7 +55,8 @@ def _rewrite_semantic(path: Path, value: dict) -> None:
 @pytest.fixture(scope="module")
 def built(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path, dict]:
     root = tmp_path_factory.mktemp("week7-hke-renderer")
-    public = root / "public"
+    public = root / "public-boundary" / "public"
+    public.parent.mkdir()
     custodian = root / "custodian"
     result = renderer.build_candidate(
         public_output=public,
@@ -63,6 +65,7 @@ def built(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path, dict]:
         confirmation_key=CONFIRMATION_KEY,
         generator_commit=GENERATOR_COMMIT,
         generator_tree=GENERATOR_TREE,
+        public_boundary_roots=(public.parent,),
         **RIGHTS,
     )
     return public, custodian, result
@@ -190,7 +193,9 @@ def test_exact_shapes_candidate_governance_and_row_evidence(built) -> None:
     assert result["cross_candidate_evidence"]["group_identity_duplicate_count"] == 0
     assert result["cross_candidate_evidence"]["perceptual_near_duplicate_count"] == 0
     assert result["rights_record"]["rights_owner"] == RIGHTS["rights_owner"]
-    assert renderer.verify_candidate(public, custodian)["verified_rows"] == 144
+    assert renderer.verify_candidate(
+        public, custodian, public_boundary_roots=(public.parent,)
+    )["verified_rows"] == 144
 
 
 def test_confirmation_is_custodian_only_and_public_manifest_leaks_no_membership(
@@ -222,8 +227,10 @@ def test_confirmation_is_custodian_only_and_public_manifest_leaks_no_membership(
 
 
 def test_fresh_build_is_byte_deterministic_and_replay_passes(tmp_path: Path) -> None:
-    first_public, first_custodian = tmp_path / "p1", tmp_path / "c1"
-    second_public, second_custodian = tmp_path / "p2", tmp_path / "c2"
+    first_public, first_custodian = tmp_path / "b1" / "p1", tmp_path / "c1"
+    second_public, second_custodian = tmp_path / "b2" / "p2", tmp_path / "c2"
+    first_public.parent.mkdir()
+    second_public.parent.mkdir()
     first = renderer.build_candidate(
         public_output=first_public,
         custodian_output=first_custodian,
@@ -231,6 +238,7 @@ def test_fresh_build_is_byte_deterministic_and_replay_passes(tmp_path: Path) -> 
         confirmation_key=CONFIRMATION_KEY,
         generator_commit=GENERATOR_COMMIT,
         generator_tree=GENERATOR_TREE,
+        public_boundary_roots=(first_public.parent,),
         **RIGHTS,
     )
     second = renderer.build_candidate(
@@ -240,6 +248,7 @@ def test_fresh_build_is_byte_deterministic_and_replay_passes(tmp_path: Path) -> 
         confirmation_key=CONFIRMATION_KEY,
         generator_commit=GENERATOR_COMMIT,
         generator_tree=GENERATOR_TREE,
+        public_boundary_roots=(second_public.parent,),
         **RIGHTS,
     )
     assert first == second
@@ -250,6 +259,7 @@ def test_fresh_build_is_byte_deterministic_and_replay_passes(tmp_path: Path) -> 
         custodian_output=first_custodian,
         discovery_key=DISCOVERY_KEY,
         confirmation_key=CONFIRMATION_KEY,
+        public_boundary_roots=(first_public.parent,),
     )
     assert replay == {
         "status": "PASS",
@@ -292,6 +302,7 @@ def test_keys_and_domains_are_distinct_and_wrong_key_fails_replay(
             custodian_output=custodian,
             discovery_key=b"wrong-discovery-key-material-0000",
             confirmation_key=CONFIRMATION_KEY,
+            public_boundary_roots=(public.parent,),
         )
     with pytest.raises(renderer.FixtureError, match="must be distinct"):
         renderer.verify_replay(
@@ -299,34 +310,43 @@ def test_keys_and_domains_are_distinct_and_wrong_key_fails_replay(
             custodian_output=custodian,
             discovery_key=DISCOVERY_KEY,
             confirmation_key=DISCOVERY_KEY,
+            public_boundary_roots=(public.parent,),
         )
     with pytest.raises(renderer.FixtureError, match="must be distinct"):
         renderer.build_candidate(
-            public_output=public.parent / "same-key-public",
-            custodian_output=public.parent / "same-key-custodian",
+            public_output=public.parent / "same-key-boundary" / "same-key-public",
+            custodian_output=public.parent.parent / "same-key-custodian",
             discovery_key=DISCOVERY_KEY,
             confirmation_key=DISCOVERY_KEY,
             generator_commit=GENERATOR_COMMIT,
             generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(public.parent / "same-key-boundary",),
             **RIGHTS,
         )
     with monkeypatch.context() as context:
         context.setattr(renderer, "_require_distinct_phase_keys", lambda *_: None)
+        (tmp_path / "same-key-boundary").mkdir()
         renderer.build_candidate(
-            public_output=tmp_path / "same-key-internally-consistent-public",
+            public_output=tmp_path / "same-key-boundary" / "public",
             custodian_output=tmp_path / "same-key-internally-consistent-private",
             discovery_key=DISCOVERY_KEY,
             confirmation_key=DISCOVERY_KEY,
             generator_commit=GENERATOR_COMMIT,
             generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(
+                tmp_path / "same-key-boundary",
+            ),
             **RIGHTS,
         )
     with pytest.raises(renderer.FixtureError, match="must be distinct"):
         renderer.verify_replay(
-            public_output=tmp_path / "same-key-internally-consistent-public",
+            public_output=tmp_path / "same-key-boundary" / "public",
             custodian_output=tmp_path / "same-key-internally-consistent-private",
             discovery_key=DISCOVERY_KEY,
             confirmation_key=DISCOVERY_KEY,
+            public_boundary_roots=(
+                tmp_path / "same-key-boundary",
+            ),
         )
 
 
@@ -334,8 +354,9 @@ def test_swapped_or_mismatched_phase_commitment_fails_replay(
     built, tmp_path: Path
 ) -> None:
     public, custodian, _ = built
-    copied_public = tmp_path / "commitment-public"
+    copied_public = tmp_path / "commitment-boundary" / "commitment-public"
     copied_custodian = tmp_path / "commitment-custodian"
+    copied_public.parent.mkdir()
     shutil.copytree(public, copied_public)
     shutil.copytree(custodian, copied_custodian)
     discovery_path = copied_public / "DISCOVERY-MANIFEST.json"
@@ -356,6 +377,7 @@ def test_swapped_or_mismatched_phase_commitment_fails_replay(
             custodian_output=copied_custodian,
             discovery_key=DISCOVERY_KEY,
             confirmation_key=CONFIRMATION_KEY,
+            public_boundary_roots=(copied_public.parent,),
         )
 
 
@@ -415,8 +437,9 @@ def test_train_eval_semantic_identity_transplant_is_detected() -> None:
 
 def test_schema_v2_candidate_is_explicitly_invalidated(built, tmp_path: Path) -> None:
     public, custodian, _ = built
-    copied_public = tmp_path / "schema-public"
+    copied_public = tmp_path / "schema-boundary" / "schema-public"
     copied_custodian = tmp_path / "schema-custodian"
+    copied_public.parent.mkdir()
     shutil.copytree(public, copied_public)
     shutil.copytree(custodian, copied_custodian)
     candidate_path = copied_public / "CANDIDATE-MANIFEST.json"
@@ -424,7 +447,11 @@ def test_schema_v2_candidate_is_explicitly_invalidated(built, tmp_path: Path) ->
     candidate["schema"] = 2
     _rewrite_semantic(candidate_path, candidate)
     with pytest.raises(renderer.FixtureError, match="identity or provenance"):
-        renderer.verify_candidate(copied_public, copied_custodian)
+        renderer.verify_candidate(
+            copied_public,
+            copied_custodian,
+            public_boundary_roots=(copied_public.parent,),
+        )
 
 
 def test_confirmation_membership_caption_and_visible_token_require_private_key() -> (
@@ -466,20 +493,23 @@ def test_create_only_disjoint_outputs_and_tamper_detection(
             confirmation_key=CONFIRMATION_KEY,
             generator_commit=GENERATOR_COMMIT,
             generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(public.parent,),
             **RIGHTS,
         )
-    with pytest.raises(renderer.FixtureError, match="disjoint trees"):
+    with pytest.raises(renderer.FixtureError, match="custodian output must be outside"):
         renderer.build_candidate(
-            public_output=tmp_path / "nested",
+            public_output=tmp_path / "nested" / "public",
             custodian_output=tmp_path / "nested" / "custodian",
             discovery_key=DISCOVERY_KEY,
             confirmation_key=CONFIRMATION_KEY,
             generator_commit=GENERATOR_COMMIT,
             generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(tmp_path / "nested",),
             **RIGHTS,
         )
-    copied_public = tmp_path / "copied-public"
+    copied_public = tmp_path / "copied-boundary" / "copied-public"
     copied_custodian = tmp_path / "copied-custodian"
+    copied_public.parent.mkdir()
     shutil.copytree(public, copied_public)
     shutil.copytree(custodian, copied_custodian)
     manifest = _json(copied_public / "DISCOVERY-MANIFEST.json")
@@ -487,15 +517,184 @@ def test_create_only_disjoint_outputs_and_tamper_detection(
     target = copied_public / "discovery" / row["relative_image_path"]
     target.write_bytes(target.read_bytes() + b"tamper")
     with pytest.raises(renderer.FixtureError, match="root inventory mismatch"):
-        renderer.verify_candidate(copied_public, copied_custodian)
+        renderer.verify_candidate(
+            copied_public,
+            copied_custodian,
+            public_boundary_roots=(copied_public.parent,),
+        )
 
-    clean_public = tmp_path / "extra-public"
+    clean_public = tmp_path / "extra-boundary" / "extra-public"
     clean_custodian = tmp_path / "extra-custodian"
+    clean_public.parent.mkdir()
     shutil.copytree(public, clean_public)
     shutil.copytree(custodian, clean_custodian)
     (clean_public / "unexpected-private-review.json").write_text("{}\n")
     with pytest.raises(renderer.FixtureError, match="root inventory mismatch"):
-        renderer.verify_candidate(clean_public, clean_custodian)
+        renderer.verify_candidate(
+            clean_public,
+            clean_custodian,
+            public_boundary_roots=(clean_public.parent,),
+        )
+
+
+def test_custody_rejects_leaf_only_public_boundary_and_evidence_siblings(
+    tmp_path: Path,
+) -> None:
+    leaf_public = tmp_path / "leaf-public"
+    with pytest.raises(renderer.FixtureError, match="strictly inside"):
+        renderer.build_candidate(
+            public_output=leaf_public,
+            custodian_output=tmp_path / "leaf-private",
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(leaf_public,),
+            **RIGHTS,
+        )
+    assert not leaf_public.exists()
+
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    with pytest.raises(renderer.FixtureError, match="custodian output must be outside"):
+        renderer.build_candidate(
+            public_output=evidence / "candidate",
+            custodian_output=evidence / "private-confirmation",
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(evidence,),
+            **RIGHTS,
+        )
+    assert not (evidence / "candidate").exists()
+    assert not (evidence / "private-confirmation").exists()
+
+
+def test_custody_rejects_executable_repo_and_every_registered_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "upload"
+    boundary.mkdir()
+    with pytest.raises(renderer.FixtureError, match="custodian output must be outside"):
+        renderer.build_candidate(
+            public_output=boundary / "candidate-a",
+            custodian_output=renderer.EXECUTABLE_REPOSITORY_ROOT / "private-a",
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(boundary,),
+            **RIGHTS,
+        )
+
+    second_worktree = tmp_path / "missing-prunable-second-worktree"
+    monkeypatch.setattr(
+        renderer,
+        "_registered_worktree_roots",
+        lambda: (renderer.EXECUTABLE_REPOSITORY_ROOT, second_worktree),
+    )
+    with pytest.raises(renderer.FixtureError, match="custodian output must be outside"):
+        renderer.build_candidate(
+            public_output=boundary / "candidate-b",
+            custodian_output=second_worktree / "private-b",
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(boundary,),
+            **RIGHTS,
+        )
+    assert not (boundary / "candidate-a").exists()
+    assert not (boundary / "candidate-b").exists()
+
+
+def test_custody_rejects_symlink_ancestors_before_creation(tmp_path: Path) -> None:
+    real_boundary = tmp_path / "real-public-boundary"
+    real_boundary.mkdir()
+    linked_boundary = tmp_path / "linked-public-boundary"
+    linked_boundary.symlink_to(real_boundary, target_is_directory=True)
+    with pytest.raises(renderer.FixtureError, match="symlink component"):
+        renderer.build_candidate(
+            public_output=linked_boundary / "candidate",
+            custodian_output=tmp_path / "private-a",
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(linked_boundary,),
+            **RIGHTS,
+        )
+
+    private_parent = tmp_path / "private-parent"
+    private_parent.mkdir()
+    linked_private = tmp_path / "linked-private"
+    linked_private.symlink_to(private_parent, target_is_directory=True)
+    with pytest.raises(renderer.FixtureError, match="symlink component"):
+        renderer.build_candidate(
+            public_output=real_boundary / "candidate",
+            custodian_output=linked_private / "custodian",
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(real_boundary,),
+            **RIGHTS,
+        )
+    assert not (real_boundary / "candidate").exists()
+
+
+def test_relocated_private_tree_inside_public_boundary_fails_verify_and_admission(
+    built, tmp_path: Path
+) -> None:
+    public, custodian, _ = built
+    evidence = tmp_path / "relocated-evidence"
+    evidence.mkdir()
+    copied_public = evidence / "candidate"
+    relocated_custodian = evidence / "private"
+    shutil.copytree(public, copied_public)
+    shutil.copytree(custodian, relocated_custodian)
+    with pytest.raises(renderer.FixtureError, match="custodian output must be outside"):
+        renderer.verify_candidate(
+            copied_public,
+            relocated_custodian,
+            public_boundary_roots=(evidence,),
+        )
+
+
+def test_fixed_git_worktree_inventory_is_config_isolated_and_malformed_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(argv, *, cwd, env, check, capture_output):
+        observed.update(argv=argv, cwd=cwd, env=env, check=check, capture=capture_output)
+        output = (
+            f"worktree {renderer.EXECUTABLE_REPOSITORY_ROOT}\0"
+            f"HEAD {'a' * 40}\0\0"
+        ).encode()
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr(renderer.subprocess, "run", fake_run)
+    assert renderer._registered_worktree_roots() == (
+        renderer.EXECUTABLE_REPOSITORY_ROOT,
+    )
+    assert observed["argv"][0] == "/usr/bin/git"
+    assert observed["argv"][-4:] == ["worktree", "list", "--porcelain", "-z"]
+    assert observed["env"] == {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent-sn56-hke-custody",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+    with pytest.raises(renderer.FixtureError, match="malformed"):
+        renderer._parse_worktree_roots(b"HEAD " + b"b" * 40 + b"\0\0")
 
 
 def test_source_and_records_exclude_forbidden_input_surfaces(built) -> None:
@@ -527,12 +726,13 @@ def test_owner_and_use_record_are_mandatory_before_candidate_creation(
     invalid["rights_owner"] = "TBD"
     with pytest.raises(renderer.FixtureError, match="rights owner"):
         renderer.build_candidate(
-            public_output=tmp_path / "public",
+            public_output=tmp_path / "rights-boundary" / "public",
             custodian_output=tmp_path / "custodian",
             discovery_key=DISCOVERY_KEY,
             confirmation_key=CONFIRMATION_KEY,
             generator_commit=GENERATOR_COMMIT,
             generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(tmp_path / "rights-boundary",),
             **invalid,
         )
 
