@@ -1323,6 +1323,7 @@ def emit_effective_runtime_record(
             ThroughputProfile,
             canonical_sha256 as timing_canonical_sha256,
             dataset_regime,
+            validate_accelerator_identity,
         )
 
         if not isinstance(throughput_profile, ThroughputProfile):
@@ -1357,6 +1358,14 @@ def emit_effective_runtime_record(
             raise KreaRuntimeContractError(
                 "operator-attested timing profile dataset regime drifted"
             )
+        try:
+            accelerator_identity = validate_accelerator_identity(
+                throughput_profile.accelerator_identity
+            )
+        except Exception as exc:
+            raise KreaRuntimeContractError(
+                "operator-attested timing profile accelerator identity is invalid"
+            ) from exc
         timing = {
             "mode": "operator_attested_profile",
             "profile_sha256": throughput_profile.profile_sha256,
@@ -1364,22 +1373,31 @@ def emit_effective_runtime_record(
             "measured_dataset_size": throughput_profile.measured_dataset_size,
             "current_dataset_size": current_dataset_size,
             "dataset_regime": throughput_profile.dataset_regime,
-            "accelerator_identity": throughput_profile.accelerator_identity,
+            "accelerator_identity": accelerator_identity,
         }
     elif timing_probe:
-        from forge.adaptive_timing import dataset_regime
+        from forge.adaptive_timing import (
+            dataset_regime,
+            validate_accelerator_identity,
+        )
 
         if (
             isinstance(current_dataset_size, bool)
             or not isinstance(current_dataset_size, int)
             or current_dataset_size <= 0
             or not isinstance(current_accelerator_identity, str)
-            or not current_accelerator_identity.strip()
-            or len(current_accelerator_identity) > 256
         ):
             raise KreaRuntimeContractError(
                 "bootstrap timing run identity is incomplete"
             )
+        try:
+            accelerator_identity = validate_accelerator_identity(
+                current_accelerator_identity
+            )
+        except Exception as exc:
+            raise KreaRuntimeContractError(
+                "bootstrap timing run accelerator identity is invalid"
+            ) from exc
         timing = {
             "mode": "bootstrap_probe_unmeasured",
             "profile_sha256": None,
@@ -1387,7 +1405,7 @@ def emit_effective_runtime_record(
             "measured_dataset_size": None,
             "current_dataset_size": current_dataset_size,
             "dataset_regime": dataset_regime(current_dataset_size),
-            "accelerator_identity": current_accelerator_identity.strip(),
+            "accelerator_identity": accelerator_identity,
         }
     else:
         timing = {

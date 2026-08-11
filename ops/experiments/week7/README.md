@@ -197,11 +197,13 @@ instrument. The schema-3 inventory is 144 rows:
 D1 is discovery, D2 is independent discovery replication, C1 is sealed
 confirmation, and social C2 is a separately sealed reserve. Every pack's 10
 training rows and 8 evaluation rows are disjoint. Discovery and confirmation
-use distinct private phase-key files, each held at mode `0600`. Training and
-evaluation use distinct derived split keys within those phases. All effective
-keys must be unequal across both separation axes and never reused for a
-different phase or split. Public discovery and private confirmation outputs
-also live in disjoint create-only trees.
+use distinct private phase-key files, each held at mode `0600`. Within a
+phase, training and evaluation rows are derived from that one phase key using
+domain-separated inputs that bind phase, fixture, pack, split role, and row
+ordinal. There are no separate training-key and evaluation-key files. All
+effective row seeds must be unequal across both separation axes and never
+reused for a different phase, pack, split role, or row. Public discovery and
+private confirmation outputs also live in disjoint create-only trees.
 
 The renderer uses integer geometry and a code-owned bitmap alphabet. It has no
 network, external font, reference-image, model-output, opponent, tournament,
@@ -264,6 +266,13 @@ The stage order is fail-closed:
    C1 as guardrails.
 6. Keep social C2 sealed unless the separately predeclared borderline trigger
    fires.
+
+The per-cell sequences recorded in these plans are an operator procedure, not
+machine-verified counterbalancing. The current receipts bind individual cells
+and inputs but do not prove ordinal execution, predecessor completion,
+non-overlap, or chronology across cells. Any analysis that relies on temporal
+counterbalancing must verify chronology from a separate run log; the plans
+alone do not establish it.
 
 Training directories and evaluation directories are independently inventoried
 and bound to their pack/split identities. Timing profiles and all execution,

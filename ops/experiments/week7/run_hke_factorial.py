@@ -178,7 +178,11 @@ class BoundTimingProfile:
         """Compatibility label derived from the validated mechanical record."""
 
         row = self.accelerator_observation["device"]
-        return f"{row['name']}|{row['memory_total_mib']}-MiB|{row['uuid']}"
+        return adaptive_timing.accelerator_identity(
+            name=row["name"],
+            memory_total_mib=row["memory_total_mib"],
+            uuid=row["uuid"],
+        )
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -1030,7 +1034,11 @@ def _validate_effective_runtime_record(
         planned_steps, int(_save_node(expected_config)["save_every"])
     )
     contract = krea_runtime.bundle_contract_document(expected_bundle)
-    expected_capabilities = sorted(contract["required_capabilities"])
+    expected_capabilities = (
+        []
+        if expected_bundle == INCUMBENT_BUNDLE
+        else sorted(krea_runtime.REQUIRED_CAPABILITIES)
+    )
     expected_aliases = contract["runtime_manifest_capability_aliases"]
     if expected_bundle == INCUMBENT_BUNDLE:
         capability_binding_ok = (
@@ -1207,7 +1215,12 @@ def build_cell_execution_order(
     authorized_at_utc: str,
     source_run_id: str,
 ) -> dict[str, Any]:
-    """Create an operator-attested owner order for one exact planned cell."""
+    """Bind owner authorization to one exact planned cell.
+
+    This receipt proves neither the cell's ordinal position, predecessor
+    completion, chronology, nor exclusive/non-overlapping execution.  Those
+    remain an operator procedure unless a separate run log establishes them.
+    """
 
     _require_sha256(plan_sha256, "execution-order plan")
     identity = _validate_cell_identity(plan_cell["cell_identity"], "execution order")
@@ -1417,13 +1430,25 @@ def _validate_training_source_record(
         expected_profile_sha is not None
     ):
         raise HKEContractError(f"{label} source probe timing mode mismatch")
+    timing_accelerator_identity = timing.get("accelerator_identity")
+    if expected_timing_mode != "incumbent_static":
+        try:
+            timing_accelerator_identity = (
+                adaptive_timing.validate_accelerator_identity(
+                    timing_accelerator_identity
+                )
+            )
+        except Exception as exc:
+            raise HKEContractError(
+                f"{label} source timing accelerator identity is invalid"
+            ) from exc
     if expected_timing_mode != "incumbent_static" and (
         timing.get("runtime_commit") != identity["runtime_commit"]
         or timing.get("current_dataset_size") != fixture["training_row_count"]
         or timing.get("dataset_regime")
         != adaptive_timing.dataset_regime(fixture["training_row_count"])
         or identity["accelerator_uuid"]
-        not in str(timing.get("accelerator_identity", ""))
+        not in str(timing_accelerator_identity)
     ):
         raise HKEContractError(f"{label} source timing/accelerator mismatch")
     return {**body, "source_record_sha256": declared}
@@ -1659,8 +1684,10 @@ def _validate_bound_profile_document(
         f"serialized {loss} timing accelerator",
     )
     device = accelerator_observation["device"]
-    accelerator_identity = (
-        f"{device['name']}|{device['memory_total_mib']}-MiB|{device['uuid']}"
+    accelerator_identity = adaptive_timing.accelerator_identity(
+        name=device["name"],
+        memory_total_mib=device["memory_total_mib"],
+        uuid=device["uuid"],
     )
     try:
         profile = adaptive_timing.validate_profile(
@@ -2875,7 +2902,7 @@ def build_prelaunch_plan(
             "evaluation_row_identity_sha256": fixture["evaluation_row_identity_sha256"],
             "evaluator_sha256": evaluator_sha,
         },
-        "counterbalanced_order": [
+        "operator_procedure_order": [
             "bridge-incumbent",
             "bridge-owned",
             "R0",
@@ -2884,6 +2911,7 @@ def build_prelaunch_plan(
             "B",
             "C",
         ],
+        "order_evidence_class": "operator_procedure_not_machine_verified",
         "stage_machine": experiment_contract()["stage_machine"],
         "authorization": {
             "mechanical_plan_ready": True,
@@ -3100,7 +3128,8 @@ def _validate_plan_v3(value: Mapping[str, Any]) -> dict[str, Any]:
         "timing_profiles",
         "cells",
         "zero_lora_control",
-        "counterbalanced_order",
+        "operator_procedure_order",
+        "order_evidence_class",
         "stage_machine",
         "authorization",
     }
@@ -4422,12 +4451,13 @@ def build_d2_replication_plan(
         "evaluator": prelaunch["evaluator"],
         "evaluator_sha256": prelaunch["evaluator_sha256"],
         "cells": cells,
-        "counterbalanced_order": [
+        "operator_procedure_order": [
             "incumbent-Seed-A",
             "candidate-Seed-B",
             "candidate-Seed-A",
             "incumbent-Seed-B",
         ],
+        "order_evidence_class": "operator_procedure_not_machine_verified",
         "confirmation_commitments": copy.deepcopy(frozen["confirmation_commitments"]),
         "accelerator_observation": observation,
         "execution_identities": copy.deepcopy(prelaunch["execution_identities"]),
@@ -4463,7 +4493,8 @@ def _validate_d2_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         "evaluator",
         "evaluator_sha256",
         "cells",
-        "counterbalanced_order",
+        "operator_procedure_order",
+        "order_evidence_class",
         "confirmation_commitments",
         "accelerator_observation",
         "execution_identities",
@@ -5064,7 +5095,7 @@ def build_confirmation_plan(
         "evaluator": copy.deepcopy(d2_plan["evaluator"]),
         "evaluator_sha256": d2_plan["evaluator_sha256"],
         "cells": cells,
-        "counterbalanced_order": [
+        "operator_procedure_order": [
             "social-incumbent",
             "product-candidate",
             "logo_ui-incumbent",
@@ -5072,6 +5103,7 @@ def build_confirmation_plan(
             "product-incumbent",
             "logo_ui-candidate",
         ],
+        "order_evidence_class": "operator_procedure_not_machine_verified",
         "authorization": {
             "mechanical_plan_ready": True,
             "separate_owner_gpu_order_required": True,
@@ -5101,7 +5133,8 @@ def _validate_confirmation_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         "evaluator",
         "evaluator_sha256",
         "cells",
-        "counterbalanced_order",
+        "operator_procedure_order",
+        "order_evidence_class",
         "authorization",
         "plan_sha256",
     }
@@ -5349,7 +5382,8 @@ def build_c2_plan(
         "evaluator": copy.deepcopy(d2_plan["evaluator"]),
         "evaluator_sha256": d2_plan["evaluator_sha256"],
         "cells": cells,
-        "counterbalanced_order": ["candidate", "incumbent"],
+        "operator_procedure_order": ["candidate", "incumbent"],
+        "order_evidence_class": "operator_procedure_not_machine_verified",
         "authorization": {
             "mechanical_plan_ready": True,
             "separate_owner_gpu_order_required": True,
@@ -5382,7 +5416,8 @@ def _validate_c2_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         "evaluator",
         "evaluator_sha256",
         "cells",
-        "counterbalanced_order",
+        "operator_procedure_order",
+        "order_evidence_class",
         "authorization",
         "plan_sha256",
     }

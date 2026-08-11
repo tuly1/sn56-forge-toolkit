@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 
@@ -17,6 +18,7 @@ import pytest
 import yaml
 
 from forge import adaptive_timing, krea_runtime
+from forge.tasks.integrity import inspect_training_artifact
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "ops" / "experiments" / "week7" / "run_hke_factorial.py"
@@ -44,6 +46,24 @@ def committed_sources_match_test_checkout(monkeypatch):
 
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _write_training_artifact(path: Path, *, step: int) -> Path:
+    """Write one minimal loadable safetensors artifact with a real step."""
+
+    metadata = {"training_info": json.dumps({"step": step, "epoch": 1})}
+    header = json.dumps(
+        {
+            "__metadata__": metadata,
+            "weight": {
+                "dtype": "F32",
+                "shape": [1],
+                "data_offsets": [0, 4],
+            },
+        }
+    ).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header)) + header + struct.pack("<f", 0.0))
+    return path
 
 
 def test_head_blob_hash_ignores_hostile_replace_ref(tmp_path, monkeypatch):
@@ -203,7 +223,7 @@ def _runtime_record(
         "capabilities": (
             []
             if bundle == krea_runtime.INCUMBENT_BUNDLE
-            else sorted(contract["required_capabilities"])
+            else sorted(krea_runtime.REQUIRED_CAPABILITIES)
         ),
         "runtime_manifest_capability_aliases": contract[
             "runtime_manifest_capability_aliases"
@@ -1160,6 +1180,19 @@ def test_futurebound_factorial_is_depth_matched_and_isolates_two_factors(base_co
 def test_plan_binds_every_pack_cell_to_physical_inputs(base_config):
     plan = _plan(base_config)
     assert H._validate_plan(plan) == plan
+    assert "counterbalanced_order" not in plan
+    assert plan["operator_procedure_order"] == [
+        "bridge-incumbent",
+        "bridge-owned",
+        "R0",
+        "A",
+        "D",
+        "B",
+        "C",
+    ]
+    assert plan["order_evidence_class"] == (
+        "operator_procedure_not_machine_verified"
+    )
     assert set(plan["cells"]) == {"bridge", "d1_core"}
     assert set(plan["cells"]["d1_core"]) == {"R0", "A", "B", "C", "D"}
     assert plan["cells"]["d1_core"]["R0"]["required_checkpoint_steps"][-1] == 1166
@@ -1185,6 +1218,19 @@ def test_plan_binds_every_pack_cell_to_physical_inputs(base_config):
                 "text_encoder_path": H.KREA2_TEXT_ENCODER_PATH,
                 "vae_path": model["name_or_path"],
             }
+
+
+def test_operator_procedure_order_is_bound_but_not_claimed_as_counterbalancing(
+    base_config,
+):
+    plan = _plan(base_config)
+    forged = copy.deepcopy(plan)
+    forged["operator_procedure_order"] = list(
+        reversed(forged["operator_procedure_order"])
+    )
+    _rehash(forged, "plan_sha256")
+    with pytest.raises(H.HKEContractError, match="does not reproduce"):
+        H._validate_plan(forged)
 
 
 def test_execution_code_tree_must_equal_reviewed_factor_authority_tree(base_config):
@@ -1231,6 +1277,25 @@ def test_complete_bound_evidence_produces_canonical_decision(base_config):
 
 def test_complete_staged_chain_is_the_only_public_go_path(base_config):
     staged = _staged_confirmation(base_config)
+    assert staged["d2_plan"]["operator_procedure_order"] == [
+        "incumbent-Seed-A",
+        "candidate-Seed-B",
+        "candidate-Seed-A",
+        "incumbent-Seed-B",
+    ]
+    assert staged["confirmation_plan"]["operator_procedure_order"] == [
+        "social-incumbent",
+        "product-candidate",
+        "logo_ui-incumbent",
+        "social-candidate",
+        "product-incumbent",
+        "logo_ui-candidate",
+    ]
+    assert all(
+        plan["order_evidence_class"]
+        == "operator_procedure_not_machine_verified"
+        for plan in (staged["d2_plan"], staged["confirmation_plan"])
+    )
     assert staged["d2_plan"]["authorization"]["gpu_execution_authorized"] is False
     assert staged["d2_plan"]["authorization"]["d2_execution_authorized"] is False
     assert (
@@ -1422,6 +1487,10 @@ def test_borderline_c1_requires_and_accepts_predeclared_c2(base_config):
         c2_authority=authority,
         c2_reveal=reveal,
     )
+    assert c2_plan["operator_procedure_order"] == ["candidate", "incumbent"]
+    assert c2_plan["order_evidence_class"] == (
+        "operator_procedure_not_machine_verified"
+    )
     assert c2_plan["authorization"]["gpu_execution_authorized"] is False
     assert c2_plan["authorization"]["c2_execution_authorized"] is False
     c2_evidence = _c2_evidence(c2_plan)
@@ -1598,6 +1667,97 @@ def test_h100_raw_record_and_uuid_are_bound(base_config):
             source_record=profiles["mae"].source_record,
             accelerator_observation=observation,
         )
+
+
+def test_real_profile_producer_loader_and_factorial_binding_share_gpu_identity(
+    tmp_path, base_config
+):
+    """Exercise the real producer/loader path without constructing a profile."""
+
+    observation = _observation()
+    device = observation["device"]
+    expected_identity = adaptive_timing.accelerator_identity(
+        name=device["name"],
+        memory_total_mib=device["memory_total_mib"],
+        uuid=device["uuid"],
+    )
+    measured_config = H.materialize_current_law_configs(
+        base_config, num_images=10, hours_to_complete=0.75
+    )["C"]
+    planned_steps = int(H._train_node(measured_config)["steps"])
+    source_run_id = "week7-mae-real-producer:" + "b" * 32
+    source_record = _runtime_record(
+        measured_config,
+        bundle=krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        source_run_id=source_run_id,
+        dataset_size=10,
+        accelerator_identity=expected_identity,
+        timing_mode="bootstrap_probe_unmeasured",
+        seconds_per_step=0.8,
+    )
+    artifact = _write_training_artifact(
+        tmp_path / "real-producer-terminal.safetensors", step=planned_steps
+    )
+    inspected = inspect_training_artifact(str(artifact))
+    source_record["training_completion_observation"].update(
+        {
+            "artifact_path": str(artifact.resolve()),
+            "artifact_name": artifact.name,
+            "artifact_size_bytes": inspected.size_bytes,
+            "artifact_sha256": inspected.sha256,
+            "artifact_checkpoint_step": inspected.checkpoint_step,
+            "completed_steps": inspected.checkpoint_step,
+            "artifact_file_identity": inspected.file_identity,
+        }
+    )
+    _rehash_runtime_record(source_record)
+    source_path = tmp_path / "real-producer.effective-runtime.json"
+    source_path.write_bytes(H._runtime_record_bytes(source_record))
+
+    profile_document = adaptive_timing.produce_profile_document(
+        str(source_path),
+        source_run_id=source_run_id,
+        bundle_id=krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        model_type="krea2",
+        measured_dataset_size=10,
+        measured_at_utc="2026-08-11T20:00:00Z",
+        expected_accelerator_identity=expected_identity,
+    )
+    profile_path = tmp_path / "real-producer-profile.json"
+    profile_path.write_text(json.dumps(profile_document), encoding="utf-8")
+    loaded = adaptive_timing.load_bundle_profile(
+        bundle_id=krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        bundle_sha256=krea_runtime.bundle_contract_sha256(
+            krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE
+        ),
+        model_type="krea2",
+        current_dataset_size=10,
+        dataset_regime=adaptive_timing.dataset_regime(10),
+        required=True,
+        expected_accelerator_identity=expected_identity,
+        path=str(profile_path),
+        source_record_path=str(source_path),
+    )
+    assert loaded is not None
+    binding = H.bind_timing_profile(
+        loaded,
+        loss="mae",
+        measured_dataset_size=10,
+        measured_config=measured_config,
+        source_record=source_record,
+        accelerator_observation=observation,
+    )
+    validated = H._profile_for_loss(
+        {"mae": binding},
+        "mae",
+        expected_dataset_size=10,
+        expected_dataset_regime=adaptive_timing.dataset_regime(10),
+        expected_config=measured_config,
+        expected_bundle_id=krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        expected_runtime_commit=krea_runtime.OWNED_RUNTIME_COMMIT,
+    )
+    assert validated == loaded
+    assert binding.accelerator_identity == expected_identity
 
 
 def test_timing_binding_uses_the_profile_runtime_not_incumbent_constants(base_config):

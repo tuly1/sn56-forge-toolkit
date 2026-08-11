@@ -27,12 +27,13 @@ final result. The safe post-retry API snapshot records a scored submission at
 - snapshot SHA-256:
   `a77f3c5da54b1b81c891a3a27ff62a7aa1464a03fbcd2ac20898989e29d0d9f5`.
 
-The correction record identifies PR #16 head
-`ed99cee0d6c9cab1b68f43c742e2735fee99a0d0` and tree
-`d9cccfd31f906b9f2b4e282551e6657baa2d8501` as independently reviewed PASS.
-That is review authority only. PR #17 still requires a clean rebase onto that
-base, a pushed exact head/tree equality check, and an independent exact-SHA
-PASS before any fresh candidate is generated.
+The correction record's earlier PASS claim for PR #16 head
+`ed99cee0d6c9cab1b68f43c742e2735fee99a0d0` was superseded by a later
+independent HOLD: prohibited-path aliases, explicit `request_query: null`, and
+invalid UTF-8 query encodings remained accepted. PR #16 must receive a new
+exact-SHA independent PASS after those defects are fixed. PR #17 must then be
+rebased onto that exact cleared base, pushed, read back, and independently
+audited before any fresh candidate is generated.
 
 ## Schema-3 fixture gate
 
@@ -51,10 +52,12 @@ Only the following fresh first-party packs are in scope:
 
 Every training/evaluation split is disjoint, and every pack is independent.
 Discovery and confirmation require distinct private phase-key files, each held
-at mode `0600`. Training and evaluation require distinct derived split keys
-inside each phase. All effective keys must be unequal across both axes and
-never reused across phases or splits. Discovery and confirmation outputs must
-be separate create-only trees.
+at mode `0600`. Within each phase, row seeds are derived from that one phase
+key using domain-separated inputs that bind phase, fixture, pack, split role,
+and ordinal; there are no separate training/evaluation key files. Effective
+row seeds must be unequal across both axes and never reused across phases,
+packs, split roles, or rows. Discovery and confirmation outputs must be
+separate create-only trees.
 
 Admission remains closed until the fresh candidate has exact ownership/use
 records, deterministic byte replay, complete source and dependency bindings,
@@ -105,6 +108,12 @@ The plan must enforce this order:
 6. Keep social C2 sealed unless a separate, predeclared borderline-C1 trigger
    fires. C2 cannot tune a threshold, replace routine C1 confirmation, or
    rescue a failed result.
+
+Within those stages, listed cell sequences are an operator procedure only.
+The schema binds the declared list and individual cell receipts but does not
+machine-prove actual chronology, predecessor completion, non-overlap, or
+counterbalancing. Do not report counterbalancing as established without an
+independent chronological run record.
 
 Training rows may never enter evaluation inventories. Confirmation results may
 not select a recipe, checkpoint, threshold, or router.
