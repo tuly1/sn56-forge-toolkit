@@ -38,6 +38,11 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _BUNDLE_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _SOURCE_RUN_ID_RE = re.compile(r".+:[0-9a-f]{32}")
+_ACCELERATOR_IDENTITY_RE = re.compile(
+    r"[^|\r\n]+\|[1-9][0-9]*-MiB\|"
+    r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 _PROFILE_FIELDS = {
     "schema",
@@ -291,11 +296,12 @@ def current_accelerator_identity(
     environ: Mapping[str, str] | None = None,
     runner: Callable[..., Any] = subprocess.run,
 ) -> str:
-    """Return a portable GPU-class identity or fail before profile reuse.
+    """Return the live physical-GPU identity or fail before profile reuse.
 
-    Model name and total memory are read from the device while deliberately
-    omitting per-device UUID, allowing reuse on an equivalent card. Environment
-    variables are not an identity source and cannot override this observation.
+    Model name, total memory, and UUID come from one ``nvidia-smi`` observation.
+    Profiles are lab evidence for one measured device, so reuse on a merely
+    equivalent card is rejected. Environment variables are not an identity
+    source and cannot override this observation.
     """
 
     del environ
@@ -303,7 +309,7 @@ def current_accelerator_identity(
         completed = runner(
             [
                 "nvidia-smi",
-                "--query-gpu=name,memory.total",
+                "--query-gpu=name,uuid,memory.total",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -314,18 +320,49 @@ def current_accelerator_identity(
         rows = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
         if completed.returncode != 0 or len(rows) != 1:
             raise ValueError
-        name, memory = (part.strip() for part in rows[0].rsplit(",", 1))
+        parts = [part.strip() for part in rows[0].split(",")]
+        if len(parts) != 3:
+            raise ValueError
+        name, uuid, memory = parts
         if not name or not memory.isdigit():
             raise ValueError
-        return _text(
-            f"{name}|{int(memory)}-MiB",
-            "accelerator identity",
-            maximum=256,
+        return accelerator_identity(
+            name=name,
+            memory_total_mib=int(memory),
+            uuid=uuid,
         )
     except Exception as exc:
         raise TimingProfileError(
             "current accelerator identity could not be established"
         ) from exc
+
+
+def validate_accelerator_identity(value: Any) -> str:
+    """Validate the canonical physical-device identity carried end to end."""
+
+    identity = _text(value, "accelerator identity", maximum=256)
+    if _ACCELERATOR_IDENTITY_RE.fullmatch(identity) is None:
+        raise TimingProfileError("accelerator identity is malformed")
+    return identity
+
+
+def accelerator_identity(*, name: Any, memory_total_mib: Any, uuid: Any) -> str:
+    """Build the sole canonical accelerator identity used by timing evidence."""
+
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or name != name.strip()
+        or "|" in name
+        or isinstance(memory_total_mib, bool)
+        or not isinstance(memory_total_mib, int)
+        or memory_total_mib <= 0
+        or not isinstance(uuid, str)
+    ):
+        raise TimingProfileError("accelerator identity is malformed")
+    return validate_accelerator_identity(
+        f"{name}|{memory_total_mib}-MiB|{uuid}"
+    )
 
 
 def produce_profile_document(
@@ -364,9 +401,7 @@ def produce_profile_document(
     accelerator_identity = expected_accelerator_identity
     if accelerator_identity is None:
         accelerator_identity = current_accelerator_identity(runner=runner)
-    accelerator_identity = _text(
-        accelerator_identity, "accelerator identity", maximum=256
-    )
+    accelerator_identity = validate_accelerator_identity(accelerator_identity)
     raw, record = _read_source_record(source_record_path)
     document = _exact_object(record, _SOURCE_RECORD_FIELDS, "source runtime record")
     if document["schema"] != 4:
@@ -804,15 +839,11 @@ def validate_profile(
     )
     runtime_commit = _git_commit(provenance["runtime_commit"])
     measured_at_utc = _utc(provenance["measured_at_utc"])
-    accelerator_identity = _text(
-        provenance["accelerator_identity"],
-        "accelerator identity",
-        maximum=256,
+    accelerator_identity = validate_accelerator_identity(
+        provenance["accelerator_identity"]
     )
-    if accelerator_identity != _text(
-        expected_accelerator_identity,
-        "expected accelerator identity",
-        maximum=256,
+    if accelerator_identity != validate_accelerator_identity(
+        expected_accelerator_identity
     ):
         raise TimingProfileError("timing profile accelerator identity mismatch")
 

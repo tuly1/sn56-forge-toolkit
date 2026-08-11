@@ -18,6 +18,8 @@ from forge.tasks import aitoolkit, checkpoints
 from forge.data.schema import ImageSpec
 
 SOURCE_RUN_ID = "runtime-contract:" + "a" * 32
+ACCELERATOR_UUID = "GPU-12345678-abcd-1234-abcd-123456789abc"
+ACCELERATOR_IDENTITY = f"NVIDIA H100 PCIe|81559-MiB|{ACCELERATOR_UUID}"
 
 
 def _verified_runtime_for_test(path: Path) -> krea_runtime.VerifiedRuntime:
@@ -173,7 +175,7 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
                 "source_loss_type": source_loss_type,
                 "runtime_commit": krea_runtime.OWNED_RUNTIME_COMMIT,
                 "measured_at_utc": "2026-08-04T12:00:00Z",
-                "accelerator_identity": "NVIDIA H100 PCIe|81559-MiB",
+                "accelerator_identity": ACCELERATOR_IDENTITY,
             },
         }
     )
@@ -184,7 +186,7 @@ def _timing_profile(bundle: str, *, startup_seconds: float = 120.0):
         expected_model_type="krea2",
         current_dataset_size=18,
         expected_dataset_regime=adaptive_timing.dataset_regime(18),
-        expected_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+        expected_accelerator_identity=ACCELERATOR_IDENTITY,
     )
 
 
@@ -664,7 +666,7 @@ def test_week7_factorial_timing_source_can_emit_and_produce_profile(
         source_run_id=source_run_id,
         timing_probe=True,
         current_dataset_size=10,
-        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+        current_accelerator_identity=ACCELERATOR_IDENTITY,
     )
     assert record["effective"]["planned_steps"] == 1200
     first_step = int(process["save"]["save_every"])
@@ -695,7 +697,7 @@ def test_week7_factorial_timing_source_can_emit_and_produce_profile(
         model_type="krea2",
         measured_dataset_size=10,
         measured_at_utc="2026-08-11T22:00:00Z",
-        expected_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+        expected_accelerator_identity=ACCELERATOR_IDENTITY,
     )
     assert profile["seconds_per_step"] == pytest.approx(2.0)
     assert profile["measurement"]["completed_steps"] == 1200
@@ -737,7 +739,7 @@ def test_effective_runtime_record_hash_binds_exact_generated_config(
         source_run_id=SOURCE_RUN_ID,
         timing_probe=True,
         current_dataset_size=18,
-        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+        current_accelerator_identity=ACCELERATOR_IDENTITY,
     )
     on_disk = json.loads(
         (tmp_path / "task.yaml.effective-runtime.json").read_text(encoding="utf-8")
@@ -758,7 +760,7 @@ def test_effective_runtime_record_hash_binds_exact_generated_config(
     assert record["timing"]["measured_dataset_size"] is None
     assert record["timing"]["current_dataset_size"] == 18
     assert record["timing"]["dataset_regime"] == "small-11-24"
-    assert record["timing"]["accelerator_identity"] == ("NVIDIA H100 PCIe|81559-MiB")
+    assert record["timing"]["accelerator_identity"] == ACCELERATOR_IDENTITY
     assert record["runtime_commit"] == krea_runtime.OWNED_RUNTIME_COMMIT
     assert record["timing"]["runtime_commit"] == krea_runtime.OWNED_RUNTIME_COMMIT
     assert record["bundle_claim"]["byte_equivalent_to_source_config"] is False
@@ -800,7 +802,7 @@ def test_bootstrap_emitter_persistence_and_profile_producer_are_schema_compatibl
         source_run_id=source_run_id,
         timing_probe=True,
         current_dataset_size=18,
-        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+        current_accelerator_identity=ACCELERATOR_IDENTITY,
     )
     observation = adaptive_timing.emit_bootstrap_first_checkpoint_observation(
         bundle_id=krea_runtime.LEADER_BUNDLE,
@@ -833,7 +835,7 @@ def test_bootstrap_emitter_persistence_and_profile_producer_are_schema_compatibl
         measured_at_utc="2026-08-04T18:00:00Z",
         runner=lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
-            stdout="NVIDIA H100 PCIe, 81559\n",
+            stdout=f"NVIDIA H100 PCIe, {ACCELERATOR_UUID}, 81559\n",
             stderr="",
         ),
     )
@@ -866,7 +868,7 @@ def test_effective_record_lifecycle_is_ordered_and_terminal_immutable(
         source_run_id=f"{spec.task_id}:{scope['attempt_nonce']}",
         timing_probe=True,
         current_dataset_size=18,
-        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+        current_accelerator_identity=ACCELERATOR_IDENTITY,
     )
     artifact = _write_training_safetensor(
         save_root / f"{spec.expected_repo_name}.safetensors",
@@ -941,7 +943,7 @@ def test_terminal_artifact_symlink_and_wrong_scope_abort(tmp_path, monkeypatch):
         source_run_id=f"{spec.task_id}:{scope['attempt_nonce']}",
         timing_probe=True,
         current_dataset_size=18,
-        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+        current_accelerator_identity=ACCELERATOR_IDENTITY,
     )
     observation = adaptive_timing.emit_bootstrap_first_checkpoint_observation(
         bundle_id=krea_runtime.LEADER_BUNDLE,
@@ -1027,7 +1029,7 @@ def test_experimental_record_emission_is_mandatory(tmp_path, monkeypatch):
             source_run_id=SOURCE_RUN_ID,
             timing_probe=True,
             current_dataset_size=18,
-            current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+            current_accelerator_identity=ACCELERATOR_IDENTITY,
         )
 
 

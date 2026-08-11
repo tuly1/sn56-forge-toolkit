@@ -15,18 +15,19 @@ BUNDLE_SHA = krea_runtime.bundle_contract_sha256(krea_runtime.LEADER_BUNDLE)
 RUNTIME_COMMIT = krea_runtime.OWNED_RUNTIME_COMMIT
 DATASET_SIZE = 24
 DATASET_REGIME = "small-11-24"
-ACCELERATOR_IDENTITY = "NVIDIA H100 PCIe|81559-MiB"
+ACCELERATOR_UUID = "GPU-12345678-abcd-1234-abcd-123456789abc"
+ACCELERATOR_IDENTITY = f"NVIDIA H100 PCIe|81559-MiB|{ACCELERATOR_UUID}"
 SOURCE_RUN_ID = "week6-timing-probe:" + "a" * 32
 
 
 def _nvidia_runner(identity: str = ACCELERATOR_IDENTITY):
-    name, memory = identity.split("|", 1)
+    name, memory, uuid = identity.split("|", 2)
     memory = memory.removesuffix("-MiB")
 
     def run(*_args, **_kwargs):
         return SimpleNamespace(
             returncode=0,
-            stdout=f"{name}, {memory}\n",
+            stdout=f"{name}, {uuid}, {memory}\n",
             stderr="",
         )
 
@@ -290,7 +291,10 @@ def test_profile_producer_accepts_mae_bundle_capability_subset(tmp_path):
             "did not complete naturally",
         ),
         (
-            {"timing.accelerator_identity": "NVIDIA H100 SXM|81559-MiB"},
+            {
+                "timing.accelerator_identity":
+                    f"NVIDIA H100 SXM|81559-MiB|{ACCELERATOR_UUID}"
+            },
             {},
             "timing identity mismatch",
         ),
@@ -603,7 +607,15 @@ def test_explicit_recipe_profile_fails_closed_on_wrong_contract(tmp_path):
         ("leader-v1", BUNDLE_SHA, "ideogram4", DATASET_SIZE, DATASET_REGIME, ACCELERATOR_IDENTITY, "model type mismatch"),
         ("leader-v1", BUNDLE_SHA, "krea2", 25, "medium-25-50", ACCELERATOR_IDENTITY, "dataset regime mismatch"),
         ("leader-v1", BUNDLE_SHA, "krea2", DATASET_SIZE, "medium-25-50", ACCELERATOR_IDENTITY, "current dataset regime is inconsistent"),
-        ("leader-v1", BUNDLE_SHA, "krea2", DATASET_SIZE, DATASET_REGIME, "NVIDIA H100 SXM|81559-MiB", "accelerator identity mismatch"),
+        (
+            "leader-v1",
+            BUNDLE_SHA,
+            "krea2",
+            DATASET_SIZE,
+            DATASET_REGIME,
+            f"NVIDIA H100 SXM|81559-MiB|{ACCELERATOR_UUID}",
+            "accelerator identity mismatch",
+        ),
     ],
 )
 def test_profile_rejects_cross_bundle_or_model_reuse(
