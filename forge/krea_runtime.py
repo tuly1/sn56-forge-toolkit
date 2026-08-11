@@ -186,6 +186,11 @@ _BUNDLE_CAPABILITIES = {
     ),
 }
 
+# These are experiment-contract values, duplicated here deliberately so the
+# runtime can reject an undeclared concrete seed before its timing projection
+# abstracts that factorial dimension.
+WEEK7_FACTORIAL_ALLOWED_TRAINING_SEEDS = frozenset({42_565_431, 42_565_432})
+
 
 class KreaRuntimeContractError(RuntimeError):
     """An experimental recipe cannot be represented by the active runtime."""
@@ -1301,10 +1306,9 @@ def emit_effective_runtime_record(
         or any(character not in "0123456789abcdef" for character in attempt_nonce)
     ):
         raise KreaRuntimeContractError("effective runtime source run id is invalid")
-    expected_projection = bundle_contract_document(bundle)[
-        "normalized_config_projection"
-    ]
-    if timing_contract_projection(cfg, bundle=bundle) != expected_projection:
+    if not projection_matches_bundle_contract(
+        timing_contract_projection(cfg, bundle=bundle), bundle=bundle
+    ):
         raise KreaRuntimeContractError(
             "effective config no longer matches the bundle timing contract"
         )
@@ -1315,7 +1319,11 @@ def emit_effective_runtime_record(
         )
     timing: dict[str, Any]
     if throughput_profile is not None:
-        from forge.adaptive_timing import ThroughputProfile, dataset_regime
+        from forge.adaptive_timing import (
+            ThroughputProfile,
+            canonical_sha256 as timing_canonical_sha256,
+            dataset_regime,
+        )
 
         if not isinstance(throughput_profile, ThroughputProfile):
             raise KreaRuntimeContractError("invalid operator-attested timing profile")
@@ -1329,6 +1337,16 @@ def emit_effective_runtime_record(
         ):
             raise KreaRuntimeContractError(
                 "operator-attested timing profile binding drifted"
+            )
+        current_projection = timing_contract_projection(cfg, bundle=bundle)
+        current_loss = _process(cfg)["train"].get("loss_type")
+        if (
+            throughput_profile.source_config_projection_sha256
+            != timing_canonical_sha256(current_projection)
+            or throughput_profile.source_loss_type != current_loss
+        ):
+            raise KreaRuntimeContractError(
+                "operator-attested timing profile source config drifted"
             )
         if (
             isinstance(current_dataset_size, bool)
@@ -1645,9 +1663,9 @@ def timing_contract_projection(cfg: dict[str, Any], *, bundle: str) -> dict[str,
     count are abstracted. Every throughput- or optimizer-relevant value remains
     in the projection, including resolution, cache behavior, batch size,
     optimizer parameters, dtype, checkpointing, noise, guidance, EMA, scheduler,
-    and all untouched template fields. Experimental bundle save cadence remains
-    exact; incumbent cadence is explicitly normalized because it is derived
-    from the independently budgeted step count.
+    and all untouched template fields.  Incumbent and Week-7 save cadence are
+    normalized only after the concrete Week-7 seed and kill-safe cadence have
+    been validated against their declared experiment contract.
     """
 
     if bundle not in KNOWN_BUNDLES:
@@ -1664,8 +1682,47 @@ def timing_contract_projection(cfg: dict[str, Any], *, bundle: str) -> dict[str,
         for key in ("text_encoder_path", "vae_path"):
             if key in model_kwargs:
                 model_kwargs[key] = "<model-path>"
+        concrete_steps = p["train"]["steps"]
+        if (
+            isinstance(concrete_steps, bool)
+            or not isinstance(concrete_steps, int)
+            or concrete_steps <= 0
+        ):
+            raise ValueError
+        if bundle in {
+            WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+            WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        }:
+            concrete_seed = p.get("training_seed")
+            concrete_cadence = p["save"].get("save_every")
+            expected_cadence = (
+                max(1, min(200, max(1, concrete_steps // 2), concrete_steps))
+                if concrete_steps < 25
+                else max(1, min(max(25, concrete_steps // 5 + 1), concrete_steps))
+            )
+            if (
+                isinstance(concrete_seed, bool)
+                or concrete_seed not in WEEK7_FACTORIAL_ALLOWED_TRAINING_SEEDS
+                or isinstance(concrete_cadence, bool)
+                or not isinstance(concrete_cadence, int)
+                or concrete_cadence != expected_cadence
+            ):
+                raise ValueError
         p["train"]["steps"] = "<budgeted-steps>"
         if bundle == INCUMBENT_BUNDLE:
+            p["save"]["save_every"] = "<kill-safe-derived-from-steps>"
+        elif bundle in {
+            WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+            WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        }:
+            # One Week-7 runtime bundle deliberately carries both loss cells,
+            # both predeclared seeds, and derived checkpoint cadences.  Those
+            # exact values remain bound by the generated-config SHA in the raw
+            # runtime record and by the outer experiment profile binding; the
+            # bundle-level projection abstracts only these declared factorial
+            # dimensions so the profile producer can consume the real C/D
+            # timing runs instead of requiring an impossible reference config.
+            p["training_seed"] = "<predeclared-cell-seed>"
             p["save"]["save_every"] = "<kill-safe-derived-from-steps>"
     except Exception as exc:
         raise KreaRuntimeContractError(
@@ -1693,6 +1750,11 @@ def _reference_bundle_projection(bundle: str) -> dict[str, Any]:
                 "vae_path": "/reference/model",
             }
         )
+        if bundle in {
+            WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+            WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        }:
+            p["training_seed"] = 42_565_431
         p["train"]["steps"] = 1234
         p["save"]["save_every"] = 247
         if bundle in {LEADER_BUNDLE, LEADER_COMFY_TE_BUNDLE}:
@@ -1715,6 +1777,36 @@ def _reference_bundle_projection(bundle: str) -> dict[str, Any]:
         raise KreaRuntimeContractError(
             "could not construct Krea reference projection"
         ) from exc
+
+
+def projection_matches_bundle_contract(projection: Any, *, bundle: str) -> bool:
+    """Check one effective projection against its bundle's declared shape.
+
+    Week-7 uses one owned runtime bundle for both predeclared loss cells.  The
+    projection retains the actual loss so downstream evidence can bind MAE and
+    MSE to their real source records; only this one declared factor is varied
+    for bundle-level compatibility.  Seed and save cadence are normalized by
+    :func:`timing_contract_projection`, while the exact config-file hash binds
+    their concrete values.
+    """
+
+    if bundle not in KNOWN_BUNDLES or not isinstance(projection, dict):
+        return False
+    expected = _reference_bundle_projection(bundle)
+    candidate = copy.deepcopy(projection)
+    if bundle in {
+        WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+        WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+    }:
+        try:
+            actual_loss = candidate["config"]["process"][0]["train"]["loss_type"]
+            expected_loss = expected["config"]["process"][0]["train"]["loss_type"]
+        except Exception:
+            return False
+        if actual_loss not in {"mae", "mse"}:
+            return False
+        candidate["config"]["process"][0]["train"]["loss_type"] = expected_loss
+    return candidate == expected
 
 
 def _effective_fields(cfg: dict[str, Any], *, bundle: str) -> dict[str, Any]:

@@ -111,9 +111,155 @@ def _accelerator_label(observation):
     return f"{device['name']}|{device['memory_total_mib']}-MiB|{device['uuid']}"
 
 
-def _profile(loss: str, count: int, observation, rate: float = 0.9):
-    completed = 100
-    first = 20
+def _runtime_record(
+    config,
+    *,
+    bundle: str,
+    source_run_id: str,
+    dataset_size: int,
+    accelerator_identity: str,
+    timing_mode: str,
+    profile_sha256=None,
+    artifact_sha256=None,
+    artifact_bytes: int = 1024,
+    seconds_per_step: float = 2.0,
+    first_checkpoint_step: int | None = None,
+):
+    planned = int(H._train_node(config)["steps"])
+    expected_first_checkpoint = min(
+        planned, int(H._process_node(config)["save"]["save_every"])
+    )
+    first_checkpoint_step = first_checkpoint_step or expected_first_checkpoint
+    nonce = source_run_id.rpartition(":")[2]
+    artifact_sha256 = artifact_sha256 or _sha(f"terminal:{source_run_id}")
+    contract = krea_runtime.bundle_contract_document(bundle)
+    timing = (
+        {
+            "mode": "incumbent_static",
+            "profile_sha256": None,
+            "runtime_commit": None,
+        }
+        if timing_mode == "incumbent_static"
+        else {
+            "mode": timing_mode,
+            "profile_sha256": profile_sha256,
+            "runtime_commit": krea_runtime.runtime_commit_for_bundle(bundle),
+            "measured_dataset_size": (
+                dataset_size if timing_mode == "operator_attested_profile" else None
+            ),
+            "current_dataset_size": dataset_size,
+            "dataset_regime": adaptive_timing.dataset_regime(dataset_size),
+            "accelerator_identity": accelerator_identity,
+        }
+    )
+    first_observation = {
+        "bundle_id": bundle,
+        "timing_profile_sha256": (
+            profile_sha256 if timing_mode == "operator_attested_profile" else None
+        ),
+        "checkpoint_step": first_checkpoint_step,
+        "elapsed_since_launch_s": first_checkpoint_step * seconds_per_step,
+        "active_planned_steps": planned,
+        "active_plan_mutable": False,
+        "active_plan_action": "observe_only_fixed_subprocess",
+    }
+    if timing_mode == "operator_attested_profile":
+        first_observation.update(
+            {
+                "profiled_seconds_per_step": seconds_per_step,
+                "observed_seconds_per_step": seconds_per_step,
+                "observed_to_profile_ratio": 1.0,
+                "correction": "within_profile_band",
+                "active_plan_exceeds_observed_budget": False,
+                "future_budget_cap_steps": planned,
+                "future_target_steps": planned,
+                "future_recommended_steps": planned,
+                "future_step_delta": 0,
+            }
+        )
+    else:
+        first_observation["observation_mode"] = "bootstrap_raw_first_checkpoint"
+    body = {
+        "schema": 4,
+        "runtime_contract_id": krea_runtime.RUNTIME_CONTRACT_ID,
+        "source_run_id": source_run_id,
+        "model_type": "krea2",
+        "runtime_repository": krea_runtime.runtime_repository_for_bundle(bundle),
+        "runtime_commit": krea_runtime.runtime_commit_for_bundle(bundle),
+        "bundle": bundle,
+        "bundle_claim": krea_runtime.bundle_claim_document(bundle),
+        "bundle_contract_sha256": krea_runtime.bundle_contract_sha256(bundle),
+        "generated_config_sha256": hashlib.sha256(
+            H._generated_config_bytes(config)
+        ).hexdigest(),
+        "capability_manifest_file_sha256": (
+            None if bundle == krea_runtime.INCUMBENT_BUNDLE else _sha("manifest-file")
+        ),
+        "capability_manifest_semantic_sha256": (
+            None
+            if bundle == krea_runtime.INCUMBENT_BUNDLE
+            else _sha("manifest-semantic")
+        ),
+        "capabilities": (
+            []
+            if bundle == krea_runtime.INCUMBENT_BUNDLE
+            else sorted(contract["required_capabilities"])
+        ),
+        "runtime_manifest_capability_aliases": contract[
+            "runtime_manifest_capability_aliases"
+        ],
+        "timing": timing,
+        "effective": {
+            "planned_steps": planned,
+            "normalized_config_projection": krea_runtime.timing_contract_projection(
+                config, bundle=bundle
+            ),
+        },
+        "lifecycle": "terminal",
+        "first_checkpoint_observation": first_observation,
+        "training_completion_observation": {
+            "training_elapsed_seconds": float(planned * seconds_per_step),
+            "returncode": 0,
+            "stopped_by_deadline": False,
+            "natural_completion": True,
+            "artifact_path": f"/work/{source_run_id.replace(':', '-')}.safetensors",
+            "artifact_name": f"{source_run_id.replace(':', '-')}.safetensors",
+            "artifact_size_bytes": artifact_bytes,
+            "artifact_sha256": artifact_sha256,
+            "artifact_loadable": True,
+            "artifact_checkpoint_step": planned,
+            "completed_steps": planned,
+            "scope_attempt_nonce": nonce,
+            "artifact_file_identity": {
+                "device": 1,
+                "inode": 2,
+                "size": artifact_bytes,
+                "mtime_ns": 3,
+                "ctime_ns": 4,
+            },
+        },
+    }
+    record = {
+        **body,
+        "record_sha256": hashlib.sha256(H._runtime_record_bytes(body)).hexdigest(),
+    }
+    return record
+
+
+def _profile(loss: str, count: int, observation, config, rate: float = 0.9):
+    completed = int(H._train_node(config)["steps"])
+    first = min(completed, int(H._process_node(config)["save"]["save_every"]))
+    source_run_id = f"week7-{loss}-probe:{'a' * 32}"
+    source_record = _runtime_record(
+        config,
+        bundle=krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        source_run_id=source_run_id,
+        dataset_size=count,
+        accelerator_identity=_accelerator_label(observation),
+        timing_mode="bootstrap_probe_unmeasured",
+        seconds_per_step=rate,
+        first_checkpoint_step=first,
+    )
     value = adaptive_timing.ThroughputProfile(
         bundle_id=krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE,
         bundle_sha256=krea_runtime.bundle_contract_sha256(
@@ -128,8 +274,15 @@ def _profile(loss: str, count: int, observation, rate: float = 0.9):
         training_elapsed_seconds=completed * rate,
         first_checkpoint_step=first,
         first_checkpoint_elapsed_seconds=first * rate,
-        source_run_id=f"week7-{loss}-probe:{'a' * 32}",
-        source_record_sha256=_sha(f"record-{loss}-{count}-{rate}"),
+        source_run_id=source_run_id,
+        source_record_sha256=hashlib.sha256(
+            H._runtime_record_bytes(source_record)
+        ).hexdigest(),
+        source_generated_config_sha256=source_record["generated_config_sha256"],
+        source_config_projection_sha256=adaptive_timing.canonical_sha256(
+            source_record["effective"]["normalized_config_projection"]
+        ),
+        source_loss_type=loss,
         runtime_commit=krea_runtime.OWNED_RUNTIME_COMMIT,
         measured_at_utc="2026-08-11T20:00:00Z",
         accelerator_identity=_accelerator_label(observation),
@@ -137,7 +290,10 @@ def _profile(loss: str, count: int, observation, rate: float = 0.9):
     )
     document = H._profile_document(value)
     document.pop("profile_sha256")
-    return replace(value, profile_sha256=adaptive_timing.canonical_sha256(document))
+    return (
+        replace(value, profile_sha256=adaptive_timing.canonical_sha256(document)),
+        source_record,
+    )
 
 
 def _bound_profiles(base_config, count: int, observation=None):
@@ -145,18 +301,25 @@ def _bound_profiles(base_config, count: int, observation=None):
     current = H.materialize_current_law_configs(
         base_config, num_images=count, hours_to_complete=0.75
     )
-    return {
-        loss: H.bind_timing_profile(
-            _profile(loss, count, observation, 0.8 if loss == "mae" else 0.9),
+    result = {}
+    for loss in ("mae", "mse"):
+        measured_config = current["C" if loss == "mae" else "D"]
+        profile, source_record = _profile(
+            loss,
+            count,
+            observation,
+            measured_config,
+            0.8 if loss == "mae" else 0.9,
+        )
+        result[loss] = H.bind_timing_profile(
+            profile,
             loss=loss,
             measured_dataset_size=count,
-            measured_config_sha256=H.canonical_sha256(
-                current["C" if loss == "mae" else "D"]
-            ),
+            measured_config=measured_config,
+            source_record=source_record,
             accelerator_observation=observation,
         )
-        for loss in ("mae", "mse")
-    }
+    return result
 
 
 def _inventory(family: str, pack: str, count: int):
@@ -273,6 +436,7 @@ def _generator_revision():
 
     renderer_path = "ops/experiments/week7/hke_procedural_renderer.py"
     admission_path = "ops/experiments/week7/hke_fixture_admission.py"
+    factor_path = "ops/experiments/week7/run_hke_factorial.py"
     contract_path = "ops/experiments/week7/hke_fixture_contract.json"
     return {
         "repository": "https://github.com/tuly1/sn56-forge-toolkit.git",
@@ -282,6 +446,8 @@ def _generator_revision():
         "renderer_source_sha256": blob_sha(renderer_path),
         "admission_authority_path": admission_path,
         "admission_authority_source_sha256": blob_sha(admission_path),
+        "factor_authority_path": factor_path,
+        "factor_authority_source_sha256": blob_sha(factor_path),
         "contract_path": contract_path,
         "contract_source_sha256": blob_sha(contract_path),
         "pinned_remote_refs": [branch],
@@ -293,12 +459,16 @@ def test_claimed_generator_revision_resolves_literal_tree_and_blobs():
     paths = (
         revision["renderer_source_path"],
         revision["admission_authority_path"],
+        revision["factor_authority_path"],
         revision["contract_path"],
     )
     literal = H._literal_revision_identity(revision["commit"], paths)
     assert literal["commit"] == revision["commit"]
     assert literal["tree"] == revision["tree"]
     assert literal["blob_sha256"][paths[0]] == revision["renderer_source_sha256"]
+    assert (
+        literal["blob_sha256"][paths[2]] == revision["factor_authority_source_sha256"]
+    )
     with pytest.raises(H.HKEContractError, match="unavailable"):
         H._literal_revision_identity("f" * 40, paths)
 
@@ -433,9 +603,11 @@ def _evaluator():
 
 
 def _execution():
+    reviewed_tree = _generator_revision()["tree"]
     common = {
-        "code_tree": "c" * 40,
+        "code_tree": reviewed_tree,
         "container_digest": "sha256:" + "e" * 64,
+        "python_executable": "/usr/bin/python3",
     }
     return {
         "incumbent": {
@@ -493,6 +665,18 @@ def _rehash(receipt, digest_field):
     receipt[digest_field] = H.canonical_sha256(body)
 
 
+def _rehash_runtime_record(record):
+    body = dict(record)
+    body.pop("record_sha256", None)
+    record["record_sha256"] = hashlib.sha256(H._runtime_record_bytes(body)).hexdigest()
+
+
+def _rehash_source_record(source):
+    body = dict(source)
+    body.pop("source_record_sha256", None)
+    source["source_record_sha256"] = H.canonical_sha256(body)
+
+
 def _comparison(composite=0.04, prompted=None, blank=None):
     prompted = composite if prompted is None else prompted
     blank = composite if blank is None else blank
@@ -519,19 +703,71 @@ def _passing_comparisons():
 def _curve_for_cell(plan, cell, fixture, label: str, value: float):
     identity = cell["cell_identity"]
     common = H._receipt_cell_binding(identity)
+    source_run_id = f"run:{label}:{_sha(label)[:32]}"
+    execution_order = H.build_cell_execution_order(
+        plan_sha256=plan["plan_sha256"],
+        plan_cell=cell,
+        owner_identity="Atulya Shetty",
+        authorized_at_utc="2026-08-11T21:30:00Z",
+        source_run_id=source_run_id,
+    )
+    terminal_artifact = _sha(f"artifact:{label}:{cell['planned_steps']}")
+    config_path = f"/work/{_sha(label)[:12]}.yaml"
+    runtime_directory = "/runtime"
+    argv = ["/usr/bin/python3", "run.py", config_path]
+    support = cell.get("timing_support") or {}
+    timing_mode = support["execution_timing_mode"]
+    profile_sha256 = support.get("profile_sha256")
+    runtime_record = _runtime_record(
+        cell["config"],
+        bundle=identity["bundle_id"],
+        source_run_id=source_run_id,
+        dataset_size=fixture["training_row_count"],
+        accelerator_identity=(
+            "NVIDIA H100 PCIe|81559-MiB|" + identity["accelerator_uuid"]
+        ),
+        timing_mode=timing_mode,
+        profile_sha256=profile_sha256,
+        artifact_sha256=terminal_artifact,
+    )
+    runtime_revision_body = {
+        "repository": krea_runtime.runtime_repository_for_bundle(identity["bundle_id"]),
+        "commit": identity["runtime_commit"],
+        "tree": identity["runtime_tree"],
+        "directory": runtime_directory,
+        "clean": True,
+        "observed_at_utc": "2026-08-11T21:31:00Z",
+    }
     source_body = {
-        "schema": 1,
+        "schema": 2,
         "kind": "sn56-week7-hke-training-source",
-        "run_id": f"run:{label}",
+        "run_id": source_run_id,
         "cell_identity": copy.deepcopy(identity),
         "training_inventory": copy.deepcopy(fixture["training_inventory"]),
-        "argv_sha256": _sha(f"argv:{label}"),
+        "argv": argv,
+        "argv_sha256": H.canonical_sha256(argv),
+        "config_path": config_path,
+        "cwd": runtime_directory,
+        "runtime_directory": runtime_directory,
+        "runtime_revision": {
+            **runtime_revision_body,
+            "revision_sha256": H.canonical_sha256(runtime_revision_body),
+        },
+        "generated_config": copy.deepcopy(cell["config"]),
+        "generated_config_file_sha256": hashlib.sha256(
+            H._generated_config_bytes(cell["config"])
+        ).hexdigest(),
+        "effective_runtime_record": runtime_record,
+        "effective_runtime_record_file_sha256": hashlib.sha256(
+            H._runtime_record_bytes(runtime_record)
+        ).hexdigest(),
+        "bundle_environment": {krea_runtime.BUNDLE_ENV: identity["bundle_id"]},
+        "execution_order_sha256": execution_order["execution_order_sha256"],
     }
     source = {
         **source_body,
         "source_record_sha256": H.canonical_sha256(source_body),
     }
-    terminal_artifact = _sha(f"artifact:{label}:{cell['planned_steps']}")
     training = {
         **common,
         "schema": H.SCHEMA,
@@ -614,12 +850,14 @@ def _curve_for_cell(plan, cell, fixture, label: str, value: float):
             {**entry_body, "entry_sha256": H.canonical_sha256(entry_body)}
         )
     body = {
-        "schema": 3,
+        "schema": H.SCHEMA,
         "kind": "sn56-week7-hke-score-curve",
         "status": "OPERATOR_ATTESTED_PASS",
         "evidence_class": "content_bound_operator_attested_not_independent_proof",
         "plan_sha256": plan["plan_sha256"],
         "cell_sha256": cell["cell_sha256"],
+        "execution_order": execution_order,
+        "execution_order_sha256": execution_order["execution_order_sha256"],
         "training_receipt": training,
         "checkpoints": checkpoints,
     }
@@ -940,6 +1178,40 @@ def test_plan_binds_every_pack_cell_to_physical_inputs(base_config):
     assert plan["authorization"]["bridge_launch_authorized"] is False
     assert plan["authorization"]["separate_owner_gpu_order_required"] is True
     assert "C1" not in json.dumps(plan["fixture"])
+    for stage in plan["cells"].values():
+        for cell in stage.values():
+            model = H._process_node(cell["config"])["model"]
+            assert model["model_kwargs"] == {
+                "text_encoder_path": H.KREA2_TEXT_ENCODER_PATH,
+                "vae_path": model["name_or_path"],
+            }
+
+
+def test_execution_code_tree_must_equal_reviewed_factor_authority_tree(base_config):
+    admission = _admission_set()
+    execution = _execution()
+    execution["owned"]["code_tree"] = "f" * 40
+    with pytest.raises(H.HKEContractError, match="reviewed generator revision"):
+        H.build_prelaunch_plan(
+            base_config,
+            admission_set=admission,
+            owner_ratification=_ratification(admission),
+            profiles_by_family={"social": {"D1": _bound_profiles(base_config, 10)}},
+            evaluator_identity=_evaluator(),
+            execution_identities=execution,
+        )
+
+
+def test_c2_thresholds_are_part_of_the_contract_digest(monkeypatch):
+    original = H.experiment_contract()
+    monkeypatch.setattr(
+        H,
+        "C2_BORDERLINE_CI_LOWER_ABS_MAX",
+        H.C2_BORDERLINE_CI_LOWER_ABS_MAX + 0.0001,
+    )
+    changed = H.experiment_contract()
+    assert changed["contract_sha256"] != original["contract_sha256"]
+    assert changed["decision"]["c2_trigger"] != original["decision"]["c2_trigger"]
 
 
 def test_all_prior_plan_and_admission_schemas_are_invalidated():
@@ -1319,7 +1591,8 @@ def test_h100_raw_record_and_uuid_are_bound(base_config):
             replace(profiles["mae"].profile, accelerator_identity="forged"),
             loss="mae",
             measured_dataset_size=10,
-            measured_config_sha256=profiles["mae"].measured_config_sha256,
+            measured_config=profiles["mae"].measured_config,
+            source_record=profiles["mae"].source_record,
             accelerator_observation=observation,
         )
 
@@ -1340,7 +1613,52 @@ def test_timing_binding_uses_the_profile_runtime_not_incumbent_constants(base_co
             mismatched,
             loss="mae",
             measured_dataset_size=10,
-            measured_config_sha256=binding.measured_config_sha256,
+            measured_config=binding.measured_config,
+            source_record=binding.source_record,
+            accelerator_observation=binding.accelerator_observation,
+        )
+
+
+def test_mae_timing_profile_cannot_bind_an_mse_config(base_config):
+    binding = _bound_profiles(base_config, 10)["mae"]
+    mse_config = H.materialize_current_law_configs(
+        base_config, num_images=10, hours_to_complete=0.75
+    )["D"]
+    with pytest.raises(H.HKEContractError):
+        H.bind_timing_profile(
+            binding.profile,
+            loss="mse",
+            measured_dataset_size=10,
+            measured_config=mse_config,
+            source_record=binding.source_record,
+            accelerator_observation=binding.accelerator_observation,
+        )
+
+
+def test_profile_rejects_rehashed_source_rate_mutation(base_config):
+    binding = _bound_profiles(base_config, 10)["mae"]
+    source = copy.deepcopy(binding.source_record)
+    source["training_completion_observation"]["training_elapsed_seconds"] += 60.0
+    _rehash_runtime_record(source)
+    profile = replace(
+        binding.profile,
+        source_record_sha256=hashlib.sha256(
+            H._runtime_record_bytes(source)
+        ).hexdigest(),
+        profile_sha256="0" * 64,
+    )
+    document = H._profile_document(profile)
+    document.pop("profile_sha256")
+    profile = replace(
+        profile, profile_sha256=adaptive_timing.canonical_sha256(document)
+    )
+    with pytest.raises(H.HKEContractError, match="timing source loss"):
+        H.bind_timing_profile(
+            profile,
+            loss="mae",
+            measured_dataset_size=10,
+            measured_config=binding.measured_config,
+            source_record=source,
             accelerator_observation=binding.accelerator_observation,
         )
 
@@ -1390,6 +1708,105 @@ def test_training_inventory_rejects_same_name_inode_swap_during_hash(
         H.inventory_training_directory(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "config",
+        "runtime_revision",
+        "effective_runtime",
+        "argv",
+        "cwd",
+        "execution_order",
+    ],
+)
+def test_training_source_rejects_rehashed_execution_tampering(base_config, mutation):
+    plan = _plan(base_config)
+    cell = plan["cells"]["d1_core"]["A"]
+    curve = _curve(plan, "d1_core", "A", 0.9)
+    order = curve["execution_order"]
+    source = copy.deepcopy(curve["training_receipt"]["source_record"])
+    if mutation == "config":
+        H._train_node(source["generated_config"])["lr"] = 0.123
+    elif mutation == "runtime_revision":
+        source["runtime_revision"]["tree"] = "f" * 40
+        _rehash(source["runtime_revision"], "revision_sha256")
+    elif mutation == "effective_runtime":
+        source["effective_runtime_record"]["runtime_commit"] = "f" * 40
+        _rehash_runtime_record(source["effective_runtime_record"])
+        source["effective_runtime_record_file_sha256"] = hashlib.sha256(
+            H._runtime_record_bytes(source["effective_runtime_record"])
+        ).hexdigest()
+    elif mutation == "argv":
+        source["argv"][0] = "/usr/bin/false"
+        source["argv_sha256"] = H.canonical_sha256(source["argv"])
+    elif mutation == "cwd":
+        source["cwd"] = "/foreign-runtime"
+    else:
+        source["execution_order_sha256"] = "f" * 64
+    _rehash_source_record(source)
+    with pytest.raises(H.HKEContractError):
+        H._validate_training_source_record(
+            source, cell, plan["fixture"], order, "tampered"
+        )
+
+
+def test_training_receipt_rejects_artifact_not_bound_to_runtime_sidecar(base_config):
+    plan = _plan(base_config)
+    cell = plan["cells"]["d1_core"]["A"]
+    curve = _curve(plan, "d1_core", "A", 0.9)
+    forged = copy.deepcopy(curve["training_receipt"])
+    forged["terminal_artifact_sha256"] = "f" * 64
+    _rehash(forged, "training_receipt_sha256")
+    with pytest.raises(H.HKEContractError, match="authority binding"):
+        H._validate_training_receipt(
+            forged,
+            plan_sha256=plan["plan_sha256"],
+            plan_cell=cell,
+            fixture=plan["fixture"],
+            execution_order=curve["execution_order"],
+        )
+
+
+def test_missing_or_foreign_execution_order_cannot_validate_curve(base_config):
+    plan = _plan(base_config)
+    cell = plan["cells"]["d1_core"]["A"]
+    curve = _curve(plan, "d1_core", "A", 0.9)
+    missing = copy.deepcopy(curve)
+    missing.pop("execution_order")
+    _rehash(missing, "curve_sha256")
+    with pytest.raises(H.HKEContractError, match="malformed"):
+        H.validate_score_curve(
+            missing,
+            plan_sha256=plan["plan_sha256"],
+            plan_cell=cell,
+            fixture=plan["fixture"],
+            evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity="Atulya Shetty",
+        )
+
+    foreign = copy.deepcopy(curve)
+    foreign["execution_order"] = H.build_cell_execution_order(
+        plan_sha256=plan["plan_sha256"],
+        plan_cell=cell,
+        owner_identity="Foreign Operator",
+        authorized_at_utc="2026-08-11T21:30:00Z",
+        source_run_id=foreign["execution_order"]["source_run_id"],
+    )
+    foreign["execution_order_sha256"] = foreign["execution_order"][
+        "execution_order_sha256"
+    ]
+    _rehash(foreign, "curve_sha256")
+    with pytest.raises(H.HKEContractError, match="does not reproduce"):
+        H.validate_score_curve(
+            foreign,
+            plan_sha256=plan["plan_sha256"],
+            plan_cell=cell,
+            fixture=plan["fixture"],
+            evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity="Atulya Shetty",
+        )
+
+
 def test_terminal_checkpoint_must_be_from_same_cell(base_config):
     plan = _plan(base_config)
     curve = _curve(plan, "d1_core", "D", 0.9)
@@ -1404,6 +1821,7 @@ def test_terminal_checkpoint_must_be_from_same_cell(base_config):
             plan_cell=plan["cells"]["d1_core"]["D"],
             fixture=plan["fixture"],
             evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity="Atulya Shetty",
         )
 
 
@@ -1421,6 +1839,7 @@ def test_foreign_physical_receipt_chain_cannot_be_relabelled_to_target_cell(
             plan_cell=plan["cells"]["d1_core"]["D"],
             fixture=plan["fixture"],
             evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity="Atulya Shetty",
         )
 
 
@@ -1438,6 +1857,7 @@ def test_every_predeclared_checkpoint_must_have_an_exact_score(base_config):
             plan_cell=plan["cells"]["d1_core"]["C"],
             fixture=plan["fixture"],
             evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity="Atulya Shetty",
         )
 
 
@@ -1515,22 +1935,29 @@ def test_ten_second_profile_fails_fixed_depth_feasibility(base_config):
     admission = _admission_set()
     observation = _observation()
     profiles = _bound_profiles(base_config, 10, observation)
-    profiles = {
-        loss: H.bind_timing_profile(
-            _profile(loss, 10, observation, rate=10.0),
+    slow_profiles = {}
+    for loss in ("mae", "mse"):
+        profile, source_record = _profile(
+            loss,
+            10,
+            observation,
+            profiles[loss].measured_config,
+            rate=10.0,
+        )
+        slow_profiles[loss] = H.bind_timing_profile(
+            profile,
             loss=loss,
             measured_dataset_size=10,
-            measured_config_sha256=profiles[loss].measured_config_sha256,
+            measured_config=profiles[loss].measured_config,
+            source_record=source_record,
             accelerator_observation=observation,
         )
-        for loss in ("mae", "mse")
-    }
     with pytest.raises(H.HKEContractError, match="cannot fit"):
         H.build_prelaunch_plan(
             base_config,
             admission_set=admission,
             owner_ratification=_ratification(admission),
-            profiles_by_family={"social": {"D1": profiles}},
+            profiles_by_family={"social": {"D1": slow_profiles}},
             evaluator_identity=_evaluator(),
             execution_identities=_execution(),
         )

@@ -57,6 +57,7 @@ OWNED_MULTIRES_BUNDLE_SHA256 = krea_runtime.bundle_contract_sha256(
     OWNED_MULTIRES_BUNDLE
 )
 OWNED_RUNTIME_COMMIT = krea_runtime.OWNED_RUNTIME_COMMIT
+KREA2_TEXT_ENCODER_PATH = "/cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct"
 INCUMBENT_TEMPLATE_PATH = (
     REPO_ROOT / "forge" / "templates" / "base_diffusion_krea2.yaml"
 )
@@ -167,6 +168,8 @@ class BoundTimingProfile:
     loss: str
     measured_dataset_size: int
     measured_config_sha256: str
+    measured_config: Mapping[str, Any]
+    source_record: Mapping[str, Any]
     accelerator_observation: Mapping[str, Any]
     binding_sha256: str
 
@@ -194,6 +197,27 @@ def canonical_bytes(value: Any) -> bytes:
 
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def _runtime_record_bytes(value: Any) -> bytes:
+    """Reproduce the compact newline-terminated runtime-sidecar byte domain."""
+
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _generated_config_bytes(value: Mapping[str, Any]) -> bytes:
+    """Reproduce ``forge.config.write_config`` for an exact config-file bind."""
+
+    return yaml.safe_dump(dict(value), sort_keys=False).encode("utf-8")
 
 
 def fixture_semantic_sha256(value: Any) -> str:
@@ -686,7 +710,7 @@ def inventory_training_directory(path: Path) -> dict[str, Any]:
 
 
 def _validate_execution_identity(value: Any, label: str) -> dict[str, str]:
-    fields = {"code_tree", "runtime_tree", "container_digest"}
+    fields = {"code_tree", "runtime_tree", "container_digest", "python_executable"}
     if not isinstance(value, Mapping) or set(value) != fields:
         raise HKEContractError(f"{label} execution identity is malformed")
     result = dict(value)
@@ -702,6 +726,13 @@ def _validate_execution_identity(value: Any, label: str) -> dict[str, str]:
     if not isinstance(digest, str) or not digest.startswith("sha256:"):
         raise HKEContractError(f"{label} container digest is not immutable")
     _require_sha256(digest.removeprefix("sha256:"), f"{label} container digest")
+    executable = result["python_executable"]
+    if (
+        not isinstance(executable, str)
+        or not os.path.isabs(executable)
+        or os.path.normpath(executable) != executable
+    ):
+        raise HKEContractError(f"{label} Python executable is not absolute")
     return result
 
 
@@ -772,6 +803,7 @@ def _cell_identity_body(
         "code_tree": checked_execution["code_tree"],
         "runtime_tree": checked_execution["runtime_tree"],
         "container_digest": checked_execution["container_digest"],
+        "python_executable": checked_execution["python_executable"],
         "training_inventory_sha256": training_inventory_sha256,
         "evaluation_inventory_sha256": evaluation_inventory_sha256,
         "bundle_id": bundle_id,
@@ -806,6 +838,7 @@ def _validate_cell_identity(value: Any, label: str) -> dict[str, Any]:
             "code_tree": document.get("code_tree"),
             "runtime_tree": document.get("runtime_tree"),
             "container_digest": document.get("container_digest"),
+            "python_executable": document.get("python_executable"),
         },
         training_inventory_sha256=document.get("training_inventory_sha256"),
         evaluation_inventory_sha256=document.get("evaluation_inventory_sha256"),
@@ -834,6 +867,7 @@ CELL_BINDING_FIELDS = frozenset(
         "code_tree",
         "runtime_tree",
         "container_digest",
+        "python_executable",
         "training_inventory_sha256",
         "evaluation_inventory_sha256",
         "bundle_id",
@@ -851,6 +885,389 @@ def _receipt_cell_binding(identity: Mapping[str, Any]) -> dict[str, Any]:
     return {key: checked[key] for key in CELL_BINDING_FIELDS}
 
 
+def _validate_effective_runtime_record(
+    value: Any,
+    *,
+    expected_run_id: str,
+    expected_bundle: str,
+    expected_config: Mapping[str, Any],
+    expected_config_file_sha256: str,
+    expected_source_file_sha256: str | None = None,
+    label: str,
+) -> dict[str, Any]:
+    """Bind a real Forge runtime sidecar to the exact planned config/bundle."""
+
+    fields = {
+        "schema",
+        "runtime_contract_id",
+        "source_run_id",
+        "model_type",
+        "runtime_repository",
+        "runtime_commit",
+        "bundle",
+        "bundle_claim",
+        "bundle_contract_sha256",
+        "generated_config_sha256",
+        "capability_manifest_file_sha256",
+        "capability_manifest_semantic_sha256",
+        "capabilities",
+        "runtime_manifest_capability_aliases",
+        "timing",
+        "effective",
+        "lifecycle",
+        "first_checkpoint_observation",
+        "training_completion_observation",
+        "record_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise HKEContractError(f"{label} effective-runtime record is malformed")
+    record = copy.deepcopy(dict(value))
+    body = dict(record)
+    declared = body.pop("record_sha256")
+    _require_sha256(declared, f"{label} effective-runtime record")
+    if declared != hashlib.sha256(_runtime_record_bytes(body)).hexdigest():
+        raise HKEContractError(f"{label} effective-runtime record digest mismatch")
+    source_file_sha = hashlib.sha256(_runtime_record_bytes(record)).hexdigest()
+    if (
+        expected_source_file_sha256 is not None
+        and source_file_sha != expected_source_file_sha256
+    ):
+        raise HKEContractError(f"{label} effective-runtime file digest mismatch")
+    _require_sha256(expected_config_file_sha256, f"{label} generated config file")
+    if hashlib.sha256(_generated_config_bytes(expected_config)).hexdigest() != (
+        expected_config_file_sha256
+    ):
+        raise HKEContractError(f"{label} generated config file digest is false")
+    expected_projection = krea_runtime.timing_contract_projection(
+        copy.deepcopy(dict(expected_config)), bundle=expected_bundle
+    )
+    effective = record.get("effective")
+    if not isinstance(effective, Mapping) or set(effective) != {
+        "planned_steps",
+        "normalized_config_projection",
+    }:
+        raise HKEContractError(f"{label} effective runtime fields are malformed")
+    first = record.get("first_checkpoint_observation")
+    completion = record.get("training_completion_observation")
+    bootstrap_first_fields = {
+        "bundle_id",
+        "timing_profile_sha256",
+        "observation_mode",
+        "checkpoint_step",
+        "elapsed_since_launch_s",
+        "active_planned_steps",
+        "active_plan_mutable",
+        "active_plan_action",
+    }
+    profiled_first_fields = {
+        "bundle_id",
+        "timing_profile_sha256",
+        "checkpoint_step",
+        "elapsed_since_launch_s",
+        "profiled_seconds_per_step",
+        "observed_seconds_per_step",
+        "observed_to_profile_ratio",
+        "correction",
+        "active_planned_steps",
+        "active_plan_mutable",
+        "active_plan_action",
+        "active_plan_exceeds_observed_budget",
+        "future_budget_cap_steps",
+        "future_target_steps",
+        "future_recommended_steps",
+        "future_step_delta",
+    }
+    completion_fields = {
+        "training_elapsed_seconds",
+        "returncode",
+        "stopped_by_deadline",
+        "natural_completion",
+        "artifact_path",
+        "artifact_name",
+        "artifact_size_bytes",
+        "artifact_sha256",
+        "artifact_loadable",
+        "artifact_checkpoint_step",
+        "completed_steps",
+        "scope_attempt_nonce",
+        "artifact_file_identity",
+    }
+    timing = record.get("timing")
+    if not isinstance(timing, Mapping):
+        raise HKEContractError(f"{label} runtime timing identity is malformed")
+    timing_mode = timing.get("mode")
+    expected_timing_fields = (
+        {"mode", "profile_sha256", "runtime_commit"}
+        if timing_mode == "incumbent_static"
+        else {
+            "mode",
+            "profile_sha256",
+            "runtime_commit",
+            "measured_dataset_size",
+            "current_dataset_size",
+            "dataset_regime",
+            "accelerator_identity",
+        }
+    )
+    expected_first_fields = (
+        profiled_first_fields
+        if timing_mode == "operator_attested_profile"
+        else bootstrap_first_fields
+    )
+    if (
+        set(timing) != expected_timing_fields
+        or not isinstance(first, Mapping)
+        or set(first) != expected_first_fields
+        or not isinstance(completion, Mapping)
+        or set(completion) != completion_fields
+        or not isinstance(completion.get("artifact_file_identity"), Mapping)
+        or set(completion["artifact_file_identity"])
+        != {"device", "inode", "size", "mtime_ns", "ctime_ns"}
+    ):
+        raise HKEContractError(f"{label} runtime observations are malformed")
+    planned_steps = _train_node(expected_config)["steps"]
+    expected_first_checkpoint_step = min(
+        planned_steps, int(_save_node(expected_config)["save_every"])
+    )
+    contract = krea_runtime.bundle_contract_document(expected_bundle)
+    expected_capabilities = sorted(contract["required_capabilities"])
+    expected_aliases = contract["runtime_manifest_capability_aliases"]
+    if expected_bundle == INCUMBENT_BUNDLE:
+        capability_binding_ok = (
+            record["capability_manifest_file_sha256"] is None
+            and record["capability_manifest_semantic_sha256"] is None
+            and record["capabilities"] == []
+            and record["runtime_manifest_capability_aliases"] == {}
+        )
+    else:
+        try:
+            _require_sha256(
+                record["capability_manifest_file_sha256"],
+                f"{label} capability manifest file",
+            )
+            _require_sha256(
+                record["capability_manifest_semantic_sha256"],
+                f"{label} capability manifest semantic",
+            )
+        except HKEContractError:
+            capability_binding_ok = False
+        else:
+            capability_binding_ok = (
+                record["capabilities"] == expected_capabilities
+                and record["runtime_manifest_capability_aliases"] == expected_aliases
+            )
+    profile_sha = timing.get("profile_sha256")
+    first_profile_sha = first.get("timing_profile_sha256")
+    timing_observation_ok = False
+    if timing_mode == "operator_attested_profile":
+        try:
+            _require_sha256(profile_sha, f"{label} timing profile")
+        except HKEContractError:
+            timing_observation_ok = False
+        else:
+            try:
+                profiled_rate = float(first["profiled_seconds_per_step"])
+                observed_rate = float(first["observed_seconds_per_step"])
+                observed_ratio = float(first["observed_to_profile_ratio"])
+                elapsed_rate = float(first["elapsed_since_launch_s"]) / int(
+                    first["checkpoint_step"]
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                profiled_rate = observed_rate = observed_ratio = elapsed_rate = math.nan
+            expected_correction = (
+                "faster"
+                if observed_ratio < 0.95
+                else ("slower" if observed_ratio > 1.05 else "within_profile_band")
+            )
+            timing_observation_ok = (
+                first_profile_sha == profile_sha
+                and timing.get("runtime_commit")
+                == krea_runtime.runtime_commit_for_bundle(expected_bundle)
+                and isinstance(timing.get("measured_dataset_size"), int)
+                and timing.get("measured_dataset_size", 0) > 0
+                and isinstance(timing.get("current_dataset_size"), int)
+                and timing.get("current_dataset_size", 0) > 0
+                and isinstance(timing.get("accelerator_identity"), str)
+                and bool(timing.get("accelerator_identity", "").strip())
+                and all(
+                    math.isfinite(item) and item > 0
+                    for item in (profiled_rate, observed_rate, observed_ratio)
+                )
+                and math.isclose(
+                    observed_rate, elapsed_rate, rel_tol=1e-6, abs_tol=1e-6
+                )
+                and math.isclose(
+                    observed_ratio,
+                    observed_rate / profiled_rate,
+                    rel_tol=1e-6,
+                    abs_tol=1e-6,
+                )
+                and first.get("correction") == expected_correction
+                and isinstance(first.get("active_plan_exceeds_observed_budget"), bool)
+                and all(
+                    isinstance(first.get(key), int)
+                    and not isinstance(first.get(key), bool)
+                    and first.get(key) > 0
+                    for key in (
+                        "future_budget_cap_steps",
+                        "future_target_steps",
+                        "future_recommended_steps",
+                    )
+                )
+                and isinstance(first.get("future_step_delta"), int)
+                and not isinstance(first.get("future_step_delta"), bool)
+            )
+    elif timing_mode == "bootstrap_probe_unmeasured":
+        timing_observation_ok = (
+            profile_sha is None
+            and first_profile_sha is None
+            and first.get("observation_mode") == "bootstrap_raw_first_checkpoint"
+            and timing.get("runtime_commit")
+            == krea_runtime.runtime_commit_for_bundle(expected_bundle)
+            and timing.get("measured_dataset_size") is None
+        )
+    elif timing_mode == "incumbent_static":
+        timing_observation_ok = (
+            expected_bundle == INCUMBENT_BUNDLE
+            and profile_sha is None
+            and timing.get("runtime_commit") is None
+            and first_profile_sha is None
+            and first.get("observation_mode") == "bootstrap_raw_first_checkpoint"
+        )
+    if (
+        first.get("bundle_id") != expected_bundle
+        or first.get("active_planned_steps") != planned_steps
+        or first.get("active_plan_mutable") is not False
+        or first.get("active_plan_action") != "observe_only_fixed_subprocess"
+        or isinstance(first.get("checkpoint_step"), bool)
+        or not isinstance(first.get("checkpoint_step"), int)
+        or not 0 < first["checkpoint_step"] <= planned_steps
+        or first["checkpoint_step"] != expected_first_checkpoint_step
+        or not isinstance(first.get("elapsed_since_launch_s"), (int, float))
+        or not 0
+        < float(first["elapsed_since_launch_s"])
+        <= float(completion.get("training_elapsed_seconds", 0))
+        or completion.get("returncode") != 0
+        or completion.get("stopped_by_deadline") is not False
+        or completion.get("natural_completion") is not True
+        or completion.get("artifact_loadable") is not True
+        or not isinstance(completion.get("artifact_path"), str)
+        or not os.path.isabs(completion.get("artifact_path", ""))
+        or not isinstance(completion.get("artifact_name"), str)
+        or os.path.basename(completion.get("artifact_path", ""))
+        != completion.get("artifact_name")
+        or isinstance(completion.get("artifact_size_bytes"), bool)
+        or not isinstance(completion.get("artifact_size_bytes"), int)
+        or completion.get("artifact_size_bytes", 0) <= 0
+        or completion.get("artifact_checkpoint_step") != planned_steps
+        or completion.get("completed_steps") != planned_steps
+        or completion.get("artifact_size_bytes")
+        != completion["artifact_file_identity"].get("size")
+        or not capability_binding_ok
+        or not timing_observation_ok
+        or re.fullmatch(r"[0-9a-f]{32}", str(completion.get("scope_attempt_nonce", "")))
+        is None
+        or not expected_run_id.endswith(
+            ":" + str(completion.get("scope_attempt_nonce", ""))
+        )
+    ):
+        raise HKEContractError(f"{label} runtime observations are inconsistent")
+    _require_sha256(completion.get("artifact_sha256"), f"{label} artifact")
+    if (
+        record["schema"] != 4
+        or record["runtime_contract_id"] != krea_runtime.RUNTIME_CONTRACT_ID
+        or record["source_run_id"] != expected_run_id
+        or record["model_type"] != MODEL_TYPE
+        or record["runtime_repository"]
+        != krea_runtime.runtime_repository_for_bundle(expected_bundle)
+        or record["runtime_commit"]
+        != krea_runtime.runtime_commit_for_bundle(expected_bundle)
+        or record["bundle"] != expected_bundle
+        or record["bundle_claim"] != krea_runtime.bundle_claim_document(expected_bundle)
+        or record["bundle_contract_sha256"]
+        != krea_runtime.bundle_contract_sha256(expected_bundle)
+        or record["bundle_claim"] != contract["claim"]
+        or record["generated_config_sha256"] != expected_config_file_sha256
+        or record["lifecycle"] != "terminal"
+        or effective["planned_steps"] != planned_steps
+        or effective["normalized_config_projection"] != expected_projection
+        or not krea_runtime.projection_matches_bundle_contract(
+            effective["normalized_config_projection"], bundle=expected_bundle
+        )
+    ):
+        raise HKEContractError(f"{label} effective-runtime binding mismatch")
+    return record
+
+
+def build_cell_execution_order(
+    *,
+    plan_sha256: str,
+    plan_cell: Mapping[str, Any],
+    owner_identity: str,
+    authorized_at_utc: str,
+    source_run_id: str,
+) -> dict[str, Any]:
+    """Create an operator-attested owner order for one exact planned cell."""
+
+    _require_sha256(plan_sha256, "execution-order plan")
+    identity = _validate_cell_identity(plan_cell["cell_identity"], "execution order")
+    if plan_cell.get("cell_sha256") != identity["cell_sha256"]:
+        raise HKEContractError("execution-order plan cell digest mismatch")
+    _validate_utc_timestamp(authorized_at_utc, "execution order")
+    if not isinstance(owner_identity, str) or not owner_identity.strip():
+        raise HKEContractError("execution-order owner identity is absent")
+    task_identity, separator, attempt_nonce = str(source_run_id).rpartition(":")
+    if (
+        not separator
+        or not task_identity
+        or len(str(source_run_id)) > 256
+        or re.fullmatch(r"[0-9a-f]{32}", attempt_nonce) is None
+    ):
+        raise HKEContractError("execution-order source run id is invalid")
+    body = {
+        "schema": SCHEMA,
+        "kind": "sn56-week7-hke-owner-cell-execution-order",
+        "status": "OWNER_AUTHORIZED_EXACT_CELL_EXECUTION",
+        "plan_sha256": plan_sha256,
+        "cell_sha256": identity["cell_sha256"],
+        "source_run_id": str(source_run_id),
+        "owner_identity": owner_identity.strip(),
+        "authorized_at_utc": authorized_at_utc,
+        "decision": "AUTHORIZE_GPU_EXECUTION_OF_EXACT_CELL",
+        "governance": {
+            "operator_attested_not_cryptographically_authenticated": True,
+            "gpu_execution_authorized": True,
+            "checkpoint_promotion_authorized": False,
+            "deployment_authorized": False,
+        },
+    }
+    return {**body, "execution_order_sha256": canonical_sha256(body)}
+
+
+def _validate_cell_execution_order(
+    value: Any,
+    *,
+    plan_sha256: str,
+    plan_cell: Mapping[str, Any],
+    expected_owner_identity: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise HKEContractError("cell execution order is unavailable")
+    expected = build_cell_execution_order(
+        plan_sha256=plan_sha256,
+        plan_cell=plan_cell,
+        owner_identity=str(value.get("owner_identity", "")),
+        authorized_at_utc=str(value.get("authorized_at_utc", "")),
+        source_run_id=str(value.get("source_run_id", "")),
+    )
+    if (
+        dict(value) != expected
+        or expected["owner_identity"] != expected_owner_identity.strip()
+    ):
+        raise HKEContractError("cell execution order does not reproduce")
+    return expected
+
+
 def _require_receipt_cell_binding(
     receipt: Mapping[str, Any], identity: Mapping[str, Any], label: str
 ) -> None:
@@ -861,7 +1278,11 @@ def _require_receipt_cell_binding(
 
 
 def _validate_training_source_record(
-    value: Any, identity: Mapping[str, Any], label: str
+    value: Any,
+    plan_cell: Mapping[str, Any],
+    fixture: Mapping[str, Any],
+    execution_order: Mapping[str, Any],
+    label: str,
 ) -> dict[str, Any]:
     """Validate the embedded source body; a free hash string is not accepted."""
 
@@ -871,7 +1292,18 @@ def _validate_training_source_record(
         "run_id",
         "cell_identity",
         "training_inventory",
+        "argv",
         "argv_sha256",
+        "config_path",
+        "cwd",
+        "runtime_directory",
+        "runtime_revision",
+        "generated_config",
+        "generated_config_file_sha256",
+        "effective_runtime_record",
+        "effective_runtime_record_file_sha256",
+        "bundle_environment",
+        "execution_order_sha256",
         "source_record_sha256",
     }
     if not isinstance(value, Mapping) or set(value) != fields:
@@ -881,24 +1313,126 @@ def _validate_training_source_record(
     _require_sha256(declared, f"{label} source record")
     if declared != canonical_sha256(body):
         raise HKEContractError(f"{label} source record digest mismatch")
-    if value["schema"] != 1 or value["kind"] != "sn56-week7-hke-training-source":
+    if value["schema"] != 2 or value["kind"] != "sn56-week7-hke-training-source":
         raise HKEContractError(f"{label} source record schema is unsupported")
-    if not isinstance(value["run_id"], str) or not value["run_id"].strip():
+    if (
+        not isinstance(value["run_id"], str)
+        or not value["run_id"].strip()
+        or value["run_id"] != execution_order["source_run_id"]
+    ):
         raise HKEContractError(f"{label} source run id is invalid")
+    identity = _validate_cell_identity(plan_cell["cell_identity"], label)
     checked_identity = _validate_cell_identity(value["cell_identity"], label)
-    if checked_identity != _validate_cell_identity(identity, label):
+    if checked_identity != identity:
         raise HKEContractError(f"{label} source record cell mismatch")
     inventory = _validate_inventory_body(value["training_inventory"], label)
     if inventory["semantic_sha256"] != checked_identity["training_inventory_sha256"]:
         raise HKEContractError(f"{label} source inventory is foreign")
     _require_sha256(value["argv_sha256"], f"{label} source argv")
+    argv = value["argv"]
+    config_path = value["config_path"]
+    cwd = value["cwd"]
+    runtime_directory = value["runtime_directory"]
+    runtime_revision = value["runtime_revision"]
+    if not isinstance(runtime_revision, Mapping) or set(runtime_revision) != {
+        "repository",
+        "commit",
+        "tree",
+        "directory",
+        "clean",
+        "observed_at_utc",
+        "revision_sha256",
+    }:
+        raise HKEContractError(f"{label} runtime revision is malformed")
+    runtime_revision_body = dict(runtime_revision)
+    runtime_revision_sha = runtime_revision_body.pop("revision_sha256")
+    _require_sha256(runtime_revision_sha, f"{label} runtime revision")
+    _validate_utc_timestamp(runtime_revision.get("observed_at_utc"), f"{label} runtime")
+    if (
+        runtime_revision_sha != canonical_sha256(runtime_revision_body)
+        or runtime_revision.get("repository")
+        != krea_runtime.runtime_repository_for_bundle(identity["bundle_id"])
+        or runtime_revision.get("commit") != identity["runtime_commit"]
+        or runtime_revision.get("tree") != identity["runtime_tree"]
+        or runtime_revision.get("directory") != runtime_directory
+        or runtime_revision.get("clean") is not True
+    ):
+        raise HKEContractError(f"{label} executed runtime tree mismatch")
+    if (
+        value["generated_config"] != plan_cell["config"]
+        or canonical_sha256(value["generated_config"])
+        != identity["generated_config_sha256"]
+        or value["bundle_environment"]
+        != {krea_runtime.BUNDLE_ENV: identity["bundle_id"]}
+        or value["execution_order_sha256"] != execution_order["execution_order_sha256"]
+        or not isinstance(argv, list)
+        or len(argv) != 3
+        or any(not isinstance(item, str) or not item for item in argv)
+        or argv[0] != identity["python_executable"]
+        or argv[1] != "run.py"
+        or argv[2] != config_path
+        or not isinstance(config_path, str)
+        or not os.path.isabs(config_path)
+        or not isinstance(runtime_directory, str)
+        or not os.path.isabs(runtime_directory)
+        or cwd != runtime_directory
+        or value["argv_sha256"] != canonical_sha256(argv)
+    ):
+        raise HKEContractError(f"{label} source executed-config binding mismatch")
+    runtime_record = _validate_effective_runtime_record(
+        value["effective_runtime_record"],
+        expected_run_id=value["run_id"],
+        expected_bundle=identity["bundle_id"],
+        expected_config=value["generated_config"],
+        expected_config_file_sha256=value["generated_config_file_sha256"],
+        expected_source_file_sha256=value["effective_runtime_record_file_sha256"],
+        label=f"{label} source",
+    )
+    if runtime_record["runtime_commit"] != identity["runtime_commit"]:
+        raise HKEContractError(f"{label} source runtime commit mismatch")
+    timing = runtime_record["timing"]
+    if not isinstance(timing, Mapping):
+        raise HKEContractError(f"{label} source timing identity is malformed")
+    support = plan_cell.get("timing_support") or {}
+    expected_timing_mode = support.get("execution_timing_mode")
+    expected_profile_sha = support.get("profile_sha256")
+    if expected_timing_mode == "operator_attested_profile":
+        if (
+            expected_profile_sha is None
+            or timing.get("mode") != "operator_attested_profile"
+            or timing.get("profile_sha256") != expected_profile_sha
+        ):
+            raise HKEContractError(f"{label} source timing profile mismatch")
+    elif expected_timing_mode == "incumbent_static":
+        if identity["bundle_id"] != INCUMBENT_BUNDLE or timing.get("mode") != (
+            "incumbent_static"
+        ):
+            raise HKEContractError(f"{label} incumbent timing mode mismatch")
+    elif expected_timing_mode == "bootstrap_probe_unmeasured":
+        if timing.get("mode") != "bootstrap_probe_unmeasured":
+            raise HKEContractError(f"{label} source probe timing mode mismatch")
+    else:
+        raise HKEContractError(f"{label} plan timing mode is unsupported")
+    if expected_timing_mode != "operator_attested_profile" and (
+        expected_profile_sha is not None
+    ):
+        raise HKEContractError(f"{label} source probe timing mode mismatch")
+    if expected_timing_mode != "incumbent_static" and (
+        timing.get("runtime_commit") != identity["runtime_commit"]
+        or timing.get("current_dataset_size") != fixture["training_row_count"]
+        or timing.get("dataset_regime")
+        != adaptive_timing.dataset_regime(fixture["training_row_count"])
+        or identity["accelerator_uuid"]
+        not in str(timing.get("accelerator_identity", ""))
+    ):
+        raise HKEContractError(f"{label} source timing/accelerator mismatch")
     return {**body, "source_record_sha256": declared}
 
 
 def _profile_document(
     profile: adaptive_timing.ThroughputProfile,
 ) -> dict[str, Any]:
-    """Reconstruct the schema-3 document whose digest the profile declares."""
+    """Reconstruct the current profile document whose digest it declares."""
 
     return {
         "schema": adaptive_timing.PROFILE_SCHEMA,
@@ -921,6 +1455,11 @@ def _profile_document(
         "provenance": {
             "source_run_id": profile.source_run_id,
             "source_record_sha256": profile.source_record_sha256,
+            "source_generated_config_sha256": (profile.source_generated_config_sha256),
+            "source_config_projection_sha256": (
+                profile.source_config_projection_sha256
+            ),
+            "source_loss_type": profile.source_loss_type,
             "runtime_commit": profile.runtime_commit,
             "measured_at_utc": profile.measured_at_utc,
             "accelerator_identity": profile.accelerator_identity,
@@ -934,7 +1473,8 @@ def _profile_binding_body(
     *,
     loss: str,
     measured_dataset_size: int,
-    measured_config_sha256: str,
+    measured_config: Mapping[str, Any],
+    source_record: Mapping[str, Any],
     accelerator_observation: Mapping[str, Any],
 ) -> dict[str, Any]:
     checked_observation = _validate_h100_observation(
@@ -954,8 +1494,56 @@ def _profile_binding_body(
         or profile.runtime_commit != expected_runtime_commit
     ):
         raise HKEContractError("timing profile bundle/runtime provenance mismatch")
+    measured_config_value = copy.deepcopy(dict(measured_config))
+    measured_config_sha256 = canonical_sha256(measured_config_value)
+    generated_config_file_sha256 = hashlib.sha256(
+        _generated_config_bytes(measured_config_value)
+    ).hexdigest()
+    runtime_record = _validate_effective_runtime_record(
+        source_record,
+        expected_run_id=profile.source_run_id,
+        expected_bundle=profile.bundle_id,
+        expected_config=measured_config_value,
+        expected_config_file_sha256=generated_config_file_sha256,
+        expected_source_file_sha256=profile.source_record_sha256,
+        label=f"{loss} timing profile",
+    )
+    timing = runtime_record["timing"]
+    first = runtime_record["first_checkpoint_observation"]
+    completion = runtime_record["training_completion_observation"]
+    source_projection_sha256 = adaptive_timing.canonical_sha256(
+        runtime_record["effective"]["normalized_config_projection"]
+    )
+    expected_rate = float(completion["training_elapsed_seconds"]) / int(
+        completion["completed_steps"]
+    )
+    if (
+        _train_node(measured_config_value).get("loss_type") != loss
+        or not isinstance(timing, Mapping)
+        or timing.get("mode") != "bootstrap_probe_unmeasured"
+        or timing.get("profile_sha256") is not None
+        or timing.get("runtime_commit") != profile.runtime_commit
+        or timing.get("measured_dataset_size") is not None
+        or timing.get("current_dataset_size") != measured_dataset_size
+        or timing.get("dataset_regime")
+        != adaptive_timing.dataset_regime(measured_dataset_size)
+        or timing.get("accelerator_identity") != profile.accelerator_identity
+        or profile.source_generated_config_sha256
+        != runtime_record["generated_config_sha256"]
+        or profile.source_config_projection_sha256 != source_projection_sha256
+        or profile.source_loss_type != loss
+        or profile.completed_steps != completion["completed_steps"]
+        or profile.training_elapsed_seconds != completion["training_elapsed_seconds"]
+        or profile.first_checkpoint_step != first["checkpoint_step"]
+        or profile.first_checkpoint_elapsed_seconds != first["elapsed_since_launch_s"]
+        or profile.startup_seconds != 0.0
+        or not math.isclose(
+            profile.seconds_per_step, expected_rate, rel_tol=1e-12, abs_tol=1e-12
+        )
+    ):
+        raise HKEContractError("timing source loss differs from its outer binding")
     return {
-        "schema": 1,
+        "schema": 2,
         "kind": "sn56-week7-hke-timing-profile-binding",
         "loss": loss,
         "bundle_id": profile.bundle_id,
@@ -966,6 +1554,9 @@ def _profile_binding_body(
         "measured_dataset_size": measured_dataset_size,
         "dataset_regime": adaptive_timing.dataset_regime(measured_dataset_size),
         "measured_config_sha256": measured_config_sha256,
+        "source_generated_config_file_sha256": runtime_record[
+            "generated_config_sha256"
+        ],
         "accelerator_observation": checked_observation,
         "profile_sha256": profile.profile_sha256,
         "source_record_sha256": profile.source_record_sha256,
@@ -977,7 +1568,8 @@ def bind_timing_profile(
     *,
     loss: str,
     measured_dataset_size: int,
-    measured_config_sha256: str,
+    measured_config: Mapping[str, Any],
+    source_record: Mapping[str, Any],
     accelerator_observation: Mapping[str, Any],
 ) -> BoundTimingProfile:
     """Create the content-addressed outer binding used by prelaunch.
@@ -990,16 +1582,18 @@ def bind_timing_profile(
         profile,
         loss=loss,
         measured_dataset_size=measured_dataset_size,
-        measured_config_sha256=_require_sha256(
-            measured_config_sha256, "measured config sha256"
-        ),
+        measured_config=measured_config,
+        source_record=source_record,
         accelerator_observation=accelerator_observation,
     )
+    measured_config_sha256 = canonical_sha256(measured_config)
     bound = BoundTimingProfile(
         profile=profile,
         loss=loss,
         measured_dataset_size=measured_dataset_size,
         measured_config_sha256=measured_config_sha256,
+        measured_config=copy.deepcopy(dict(measured_config)),
+        source_record=copy.deepcopy(dict(source_record)),
         accelerator_observation=copy.deepcopy(dict(accelerator_observation)),
         binding_sha256=canonical_sha256(body),
     )
@@ -1019,13 +1613,17 @@ def _bound_profile_document(binding: BoundTimingProfile) -> dict[str, Any]:
         binding.profile,
         loss=binding.loss,
         measured_dataset_size=binding.measured_dataset_size,
-        measured_config_sha256=binding.measured_config_sha256,
+        measured_config=binding.measured_config,
+        source_record=binding.source_record,
         accelerator_observation=binding.accelerator_observation,
     )
-    if binding.binding_sha256 != canonical_sha256(binding_body):
+    if binding.measured_config_sha256 != canonical_sha256(
+        binding.measured_config
+    ) or binding.binding_sha256 != canonical_sha256(binding_body):
         raise HKEContractError("bound timing profile digest mismatch")
     return {
         "profile": _profile_document(binding.profile),
+        "source_record": copy.deepcopy(dict(binding.source_record)),
         "binding": {
             **binding_body,
             "binding_sha256": binding.binding_sha256,
@@ -1038,13 +1636,17 @@ def _validate_bound_profile_document(
     *,
     loss: str,
     expected_dataset_size: int,
-    expected_config_sha256: str,
+    expected_config: Mapping[str, Any],
     expected_bundle_id: str = INCUMBENT_BUNDLE,
     expected_runtime_commit: str = INCUMBENT_RUNTIME_COMMIT,
 ) -> BoundTimingProfile:
     """Recreate and validate a serialized timing profile and outer binding."""
 
-    if not isinstance(value, Mapping) or set(value) != {"profile", "binding"}:
+    if not isinstance(value, Mapping) or set(value) != {
+        "profile",
+        "source_record",
+        "binding",
+    }:
         raise HKEContractError(f"serialized {loss} timing profile is malformed")
     binding_value = value["binding"]
     if not isinstance(binding_value, Mapping):
@@ -1082,7 +1684,8 @@ def _validate_bound_profile_document(
         profile,
         loss=loss,
         measured_dataset_size=expected_dataset_size,
-        measured_config_sha256=expected_config_sha256,
+        measured_config=expected_config,
+        source_record=value["source_record"],
         accelerator_observation=accelerator_observation,
     )
     if binding_document != expected_binding or declared_binding != canonical_sha256(
@@ -1093,7 +1696,9 @@ def _validate_bound_profile_document(
         profile=profile,
         loss=loss,
         measured_dataset_size=expected_dataset_size,
-        measured_config_sha256=expected_config_sha256,
+        measured_config_sha256=canonical_sha256(expected_config),
+        measured_config=copy.deepcopy(dict(expected_config)),
+        source_record=copy.deepcopy(dict(value["source_record"])),
         accelerator_observation=accelerator_observation,
         binding_sha256=declared_binding,
     )
@@ -1102,7 +1707,7 @@ def _validate_bound_profile_document(
         loss,
         expected_dataset_size=expected_dataset_size,
         expected_dataset_regime=adaptive_timing.dataset_regime(expected_dataset_size),
-        expected_config_sha256=expected_config_sha256,
+        expected_config=expected_config,
         expected_bundle_id=expected_bundle_id,
         expected_runtime_commit=expected_runtime_commit,
     )
@@ -1189,7 +1794,7 @@ def _profile_for_loss(
     *,
     expected_dataset_size: int,
     expected_dataset_regime: str,
-    expected_config_sha256: str,
+    expected_config: Mapping[str, Any],
     expected_bundle_id: str = INCUMBENT_BUNDLE,
     expected_runtime_commit: str = INCUMBENT_RUNTIME_COMMIT,
 ) -> adaptive_timing.ThroughputProfile:
@@ -1201,7 +1806,11 @@ def _profile_for_loss(
         raise HKEContractError(f"{loss} profile loss binding mismatch")
     if binding.measured_dataset_size != expected_dataset_size:
         raise HKEContractError(f"{loss} profile dataset-size binding mismatch")
-    if binding.measured_config_sha256 != expected_config_sha256:
+    expected_config_sha256 = canonical_sha256(expected_config)
+    if (
+        binding.measured_config_sha256 != expected_config_sha256
+        or binding.measured_config != expected_config
+    ):
         raise HKEContractError(f"{loss} profile config binding mismatch")
     if binding.accelerator_identity != profile.accelerator_identity:
         raise HKEContractError(f"{loss} profile accelerator binding mismatch")
@@ -1239,7 +1848,8 @@ def _profile_for_loss(
         validated,
         loss=loss,
         measured_dataset_size=expected_dataset_size,
-        measured_config_sha256=expected_config_sha256,
+        measured_config=expected_config,
+        source_record=binding.source_record,
         accelerator_observation=binding.accelerator_observation,
     )
     if binding.binding_sha256 != canonical_sha256(expected_binding):
@@ -1307,6 +1917,27 @@ def _clock_fill_steps(
     return max(1, min(int(recipe.STEP_TABLE[MODEL_TYPE]["max"]), steps))
 
 
+def _materialize_airgapped_krea_base(
+    base_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Inject the same load-bearing offline model paths as production Forge."""
+
+    config = copy.deepcopy(dict(base_config))
+    process = _process_node(config)
+    model = process.get("model")
+    if not isinstance(model, dict):
+        raise HKEContractError("Krea model config is unavailable")
+    base_model_path = model.get("name_or_path")
+    if not isinstance(base_model_path, str) or not base_model_path.startswith("/"):
+        raise HKEContractError("Krea base-model path is not absolute")
+    kwargs = model.setdefault("model_kwargs", {})
+    if not isinstance(kwargs, dict):
+        raise HKEContractError("Krea model kwargs are malformed")
+    kwargs["text_encoder_path"] = KREA2_TEXT_ENCODER_PATH
+    kwargs["vae_path"] = base_model_path
+    return config
+
+
 def materialize_current_law_configs(
     base_config: Mapping[str, Any],
     *,
@@ -1321,7 +1952,7 @@ def materialize_current_law_configs(
         raise HKEContractError("num_images must be an integer") from exc
     if count <= 0 or isinstance(num_images, bool):
         raise HKEContractError("num_images must be positive")
-    original = copy.deepcopy(dict(base_config))
+    original = _materialize_airgapped_krea_base(base_config)
     _process_node(original)["training_seed"] = TRAINING_SEED_A
     template_cadence = int(_save_node(original)["save_every"])
     result: dict[str, dict[str, Any]] = {}
@@ -1357,7 +1988,7 @@ def materialize_arms(
     if count <= 0:
         raise HKEContractError("num_images must be positive")
 
-    original = copy.deepcopy(dict(base_config))
+    original = _materialize_airgapped_krea_base(base_config)
     _process_node(original)["training_seed"] = TRAINING_SEED_A
     expected_regime = adaptive_timing.dataset_regime(count)
     template_cadence = int(_save_node(original)["save_every"])
@@ -1386,9 +2017,7 @@ def materialize_arms(
             loss,
             expected_dataset_size=count,
             expected_dataset_regime=expected_regime,
-            expected_config_sha256=canonical_sha256(
-                timing_sources["C" if loss == "mae" else "D"]
-            ),
+            expected_config=timing_sources["C" if loss == "mae" else "D"],
             expected_bundle_id=OWNED_MULTIRES_BUNDLE,
             expected_runtime_commit=OWNED_RUNTIME_COMMIT,
         )
@@ -1449,7 +2078,7 @@ def materialize_r0(
 ) -> dict[str, Any]:
     """Reconstruct the exact incumbent retry horizon as its own terminal run."""
 
-    config = copy.deepcopy(dict(base_config))
+    config = _materialize_airgapped_krea_base(base_config)
     _process_node(config)["training_seed"] = seed
     _train_node(config)["steps"] = R0_STEPS
     _save_node(config)["save_every"] = recipe.kill_safe_save_every(
@@ -1466,7 +2095,7 @@ def materialize_runtime_bridge(
 ) -> dict[str, dict[str, Any]]:
     """Build the no-multires incumbent/owned equivalence bridge."""
 
-    incumbent = copy.deepcopy(dict(base_config))
+    incumbent = _materialize_airgapped_krea_base(base_config)
     _process_node(incumbent)["training_seed"] = seed
     _train_node(incumbent)["steps"] = FACTORIAL_STEPS
     _save_node(incumbent)["save_every"] = recipe.kill_safe_save_every(
@@ -1747,6 +2376,8 @@ def _validate_admission_set_v3(value: Mapping[str, Any]) -> dict[str, Any]:
         "renderer_source_sha256",
         "admission_authority_path",
         "admission_authority_source_sha256",
+        "factor_authority_path",
+        "factor_authority_source_sha256",
         "contract_path",
         "contract_source_sha256",
         "pinned_remote_refs",
@@ -1756,6 +2387,7 @@ def _validate_admission_set_v3(value: Mapping[str, Any]) -> dict[str, Any]:
     for key in (
         "renderer_source_sha256",
         "admission_authority_source_sha256",
+        "factor_authority_source_sha256",
         "contract_source_sha256",
     ):
         _require_sha256(revision[key], f"fixture admission-set generator {key}")
@@ -1774,9 +2406,10 @@ def _validate_admission_set_v3(value: Mapping[str, Any]) -> dict[str, Any]:
     expected_contract_path = "ops/experiments/week7/hke_fixture_contract.json"
     renderer_path = "ops/experiments/week7/hke_procedural_renderer.py"
     admission_path = "ops/experiments/week7/hke_fixture_admission.py"
+    factor_path = "ops/experiments/week7/run_hke_factorial.py"
     literal = _literal_revision_identity(
         revision["commit"],
-        (renderer_path, admission_path, expected_contract_path),
+        (renderer_path, admission_path, factor_path, expected_contract_path),
     )
     refs = revision["pinned_remote_refs"]
     if (
@@ -1803,6 +2436,11 @@ def _validate_admission_set_v3(value: Mapping[str, Any]) -> dict[str, Any]:
         != literal["blob_sha256"][admission_path]
         or revision["admission_authority_source_sha256"]
         != sha256_file(ADMISSION_AUTHORITY_PATH)
+        or revision["factor_authority_path"] != factor_path
+        or revision["factor_authority_source_sha256"]
+        != literal["blob_sha256"][factor_path]
+        or revision["factor_authority_source_sha256"]
+        != sha256_file(REPO_ROOT / factor_path)
         or revision["renderer_source_sha256"] != literal["blob_sha256"][renderer_path]
         or revision["renderer_source_sha256"] != sha256_file(REPO_ROOT / renderer_path)
         or revision["contract_path"] != expected_contract_path
@@ -1857,6 +2495,7 @@ def _validate_admission_set_v3(value: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "admission_set_sha256": declared,
         "candidate_semantic_sha256": value["candidate_semantic_sha256"],
+        "generator_revision": copy.deepcopy(dict(revision)),
         "receipts": validated,
     }
 
@@ -1984,6 +2623,13 @@ def _plan_cell(
 ) -> dict[str, Any]:
     config_value = copy.deepcopy(dict(config))
     config_sha = canonical_sha256(config_value)
+    support = copy.deepcopy(dict(timing_support or {}))
+    if "execution_timing_mode" not in support:
+        support["execution_timing_mode"] = (
+            "operator_attested_profile"
+            if support.get("profile_sha256") is not None
+            else "bootstrap_probe_unmeasured"
+        )
     identity = _build_cell_identity(
         family=family,
         pack=pack,
@@ -2012,7 +2658,7 @@ def _plan_cell(
         "bundle_id": bundle_id,
         "bundle_sha256": krea_runtime.bundle_contract_sha256(bundle_id),
         "runtime_commit": krea_runtime.runtime_commit_for_bundle(bundle_id),
-        "timing_support": copy.deepcopy(dict(timing_support or {})),
+        "timing_support": support,
         "cell_identity": identity,
         "cell_sha256": identity["cell_sha256"],
     }
@@ -2038,6 +2684,13 @@ def build_prelaunch_plan(
     evaluator = _validate_evaluator_identity(evaluator_identity)
     evaluator_sha = canonical_sha256(evaluator)
     executions = _execution_identities(execution_identities)
+    reviewed_tree = checked_set["generator_revision"]["tree"]
+    if any(
+        execution["code_tree"] != reviewed_tree for execution in executions.values()
+    ):
+        raise HKEContractError(
+            "execution code tree differs from the reviewed generator revision"
+        )
     receipt = checked_set["receipts"]["social"]
     admitted_pack = receipt["packs"]["D1"]
     spec = EXPECTED_PACKS["social"]["D1"]
@@ -2086,7 +2739,7 @@ def build_prelaunch_plan(
             loss,
             expected_dataset_size=spec["train"],
             expected_dataset_regime=adaptive_timing.dataset_regime(spec["train"]),
-            expected_config_sha256=canonical_sha256(timing_sources[arm]),
+            expected_config=timing_sources[arm],
             expected_bundle_id=OWNED_MULTIRES_BUNDLE,
             expected_runtime_commit=OWNED_RUNTIME_COMMIT,
         )
@@ -2165,11 +2818,27 @@ def build_prelaunch_plan(
             fixture_admission_sha256=receipt["admission_sha256"],
             execution=executions["owned"],
             observation=observation,
-            timing_support={
-                "profile_sha256": checked_profiles[loss].profile.profile_sha256,
-                "binding_sha256": checked_profiles[loss].binding_sha256,
-                "conservative_source_arm": "C" if loss == "mae" else "D",
-            },
+            timing_support=(
+                {
+                    "execution_timing_mode": "operator_attested_profile",
+                    "profile_sha256": checked_profiles[loss].profile.profile_sha256,
+                    "binding_sha256": checked_profiles[loss].binding_sha256,
+                    "source_arm": arm,
+                }
+                if arm in {"C", "D"}
+                else {
+                    "execution_timing_mode": "bootstrap_probe_unmeasured",
+                    "profile_sha256": None,
+                    "binding_sha256": None,
+                    "conservative_source_profile_sha256": (
+                        checked_profiles[loss].profile.profile_sha256
+                    ),
+                    "conservative_source_binding_sha256": (
+                        checked_profiles[loss].binding_sha256
+                    ),
+                    "conservative_source_arm": "C" if loss == "mae" else "D",
+                }
+            ),
         )
     sealed_commitments = {
         family: {
@@ -2355,7 +3024,22 @@ def experiment_contract() -> dict[str, Any]:
             "c1_minimum_composite_improvement": MIN_COMPOSITE_IMPROVEMENT,
             "c1_ci_must_clear_zero": True,
             "product_logo_maximum_regression_each": MAX_RELATIVE_REGRESSION,
-            "c2_trigger": "borderline-only",
+            "c2_trigger": {
+                "mode": "borderline-only",
+                "composite_relative_improvement_low_inclusive": (
+                    C2_BORDERLINE_COMPOSITE_LOW
+                ),
+                "composite_relative_improvement_high_inclusive": (
+                    C2_BORDERLINE_COMPOSITE_HIGH
+                ),
+                "paired_ci95_lower_absolute_max": C2_BORDERLINE_CI_LOWER_ABS_MAX,
+            },
+            "c2_acceptance": {
+                "same_direction_required": True,
+                "maximum_prompted_or_blank_regression": MAX_RELATIVE_REGRESSION,
+                "minimum_composite_improvement": None,
+                "ci_must_clear_zero": False,
+            },
         },
         "authorization": {
             "fixture_admission_required": True,
@@ -2465,9 +3149,7 @@ def _validate_plan_v3(value: Mapping[str, Any]) -> dict[str, Any]:
             body["timing_profiles"][loss],
             loss=loss,
             expected_dataset_size=EXPECTED_PACKS["social"]["D1"]["train"],
-            expected_config_sha256=canonical_sha256(
-                timing_sources["C" if loss == "mae" else "D"]
-            ),
+            expected_config=timing_sources["C" if loss == "mae" else "D"],
             expected_bundle_id=OWNED_MULTIRES_BUNDLE,
             expected_runtime_commit=OWNED_RUNTIME_COMMIT,
         )
@@ -2551,6 +3233,7 @@ def _validate_training_receipt(
     plan_sha256: str,
     plan_cell: Mapping[str, Any],
     fixture: Mapping[str, Any],
+    execution_order: Mapping[str, Any],
 ) -> dict[str, Any]:
     fields = set(CELL_BINDING_FIELDS) | {
         "schema",
@@ -2576,8 +3259,9 @@ def _validate_training_receipt(
     identity = _validate_cell_identity(plan_cell["cell_identity"], "training")
     _require_receipt_cell_binding(receipt, identity, "training")
     source = _validate_training_source_record(
-        receipt["source_record"], identity, "training"
+        receipt["source_record"], plan_cell, fixture, execution_order, "training"
     )
+    completion = source["effective_runtime_record"]["training_completion_observation"]
     if (
         receipt["schema"] != SCHEMA
         or receipt["kind"] != "sn56-week7-hke-training-receipt"
@@ -2589,6 +3273,18 @@ def _validate_training_receipt(
         or receipt["completed_steps"] != plan_cell["planned_steps"]
         or receipt["terminal_checkpoint_step"] != plan_cell["planned_steps"]
         or receipt["source_record_sha256"] != source["source_record_sha256"]
+        or completion.get("returncode") != 0
+        or completion.get("stopped_by_deadline") is not False
+        or completion.get("natural_completion") is not True
+        or completion.get("artifact_loadable") is not True
+        or completion.get("artifact_sha256") != receipt["terminal_artifact_sha256"]
+        or completion.get("artifact_size_bytes") != receipt["terminal_artifact_bytes"]
+        or completion.get("artifact_checkpoint_step")
+        != receipt["terminal_checkpoint_step"]
+        or completion.get("completed_steps") != receipt["completed_steps"]
+        or not source["run_id"].endswith(
+            ":" + str(completion.get("scope_attempt_nonce", ""))
+        )
     ):
         raise HKEContractError("training receipt authority binding mismatch")
     _require_sha256(receipt["terminal_artifact_sha256"], "terminal artifact")
@@ -2765,6 +3461,30 @@ def _validate_score_receipt(
     return receipt, row_map
 
 
+def _plan_owner_identity(plan: Mapping[str, Any]) -> str:
+    """Resolve the ratified owner through a staged plan's immutable ancestry."""
+
+    ratification = plan.get("owner_ratification")
+    if isinstance(ratification, Mapping):
+        owner = ratification.get("owner_identity")
+    elif isinstance(plan.get("owner_identity"), str):
+        owner = plan.get("owner_identity")
+    else:
+        owner = None
+        for key in (
+            "source_prelaunch_plan",
+            "source_d2_plan",
+            "source_confirmation_plan",
+        ):
+            source = plan.get(key)
+            if isinstance(source, Mapping):
+                owner = _plan_owner_identity(source)
+                break
+    if not isinstance(owner, str) or not owner.strip():
+        raise HKEContractError("plan owner identity is unavailable")
+    return owner.strip()
+
+
 def validate_score_curve(
     value: Mapping[str, Any],
     *,
@@ -2772,6 +3492,7 @@ def validate_score_curve(
     plan_cell: Mapping[str, Any],
     fixture: Mapping[str, Any],
     evaluator_sha256: str,
+    expected_owner_identity: str,
 ) -> dict[int, dict[str, Any]]:
     """Validate one exact-scored, attachment-proven natural checkpoint curve."""
 
@@ -2782,6 +3503,8 @@ def validate_score_curve(
         "evidence_class",
         "plan_sha256",
         "cell_sha256",
+        "execution_order",
+        "execution_order_sha256",
         "training_receipt",
         "checkpoints",
         "curve_sha256",
@@ -2802,11 +3525,20 @@ def validate_score_curve(
         or value["cell_sha256"] != plan_cell["cell_sha256"]
     ):
         raise HKEContractError("score curve authority binding mismatch")
+    execution_order = _validate_cell_execution_order(
+        value["execution_order"],
+        plan_sha256=plan_sha256,
+        plan_cell=plan_cell,
+        expected_owner_identity=expected_owner_identity,
+    )
+    if value["execution_order_sha256"] != execution_order["execution_order_sha256"]:
+        raise HKEContractError("score curve execution-order binding mismatch")
     training_receipt = _validate_training_receipt(
         value["training_receipt"],
         plan_sha256=plan_sha256,
         plan_cell=plan_cell,
         fixture=fixture,
+        execution_order=execution_order,
     )
     checkpoints = value["checkpoints"]
     if not isinstance(checkpoints, list):
@@ -2901,6 +3633,7 @@ def analyze_runtime_bridge(
             plan_cell=plan["cells"]["bridge"][name],
             fixture=plan["fixture"],
             evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity=_plan_owner_identity(plan),
         )
         for name in ("incumbent", "owned")
     }
@@ -3037,6 +3770,7 @@ def _validated_d1_core(
             plan_cell=plan["cells"]["d1_core"][arm],
             fixture=plan["fixture"],
             evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity=_plan_owner_identity(plan),
         )
         for arm in ("R0", "A", "B", "C", "D")
     }
@@ -3204,7 +3938,7 @@ def _clock_fill_eligibility(
         plan["timing_profiles"][loss],
         loss=loss,
         expected_dataset_size=plan["fixture"]["training_row_count"],
-        expected_config_sha256=canonical_sha256(timing_source),
+        expected_config=timing_source,
         expected_bundle_id=OWNED_MULTIRES_BUNDLE,
         expected_runtime_commit=OWNED_RUNTIME_COMMIT,
     )
@@ -3262,12 +3996,20 @@ def build_optional_e_plan(
         fixture_admission_sha256=plan["fixture"]["admission_sha256"],
         execution={
             key: source_cell["cell_identity"][key]
-            for key in ("code_tree", "runtime_tree", "container_digest")
+            for key in (
+                "code_tree",
+                "runtime_tree",
+                "container_digest",
+                "python_executable",
+            )
         },
         observation=observation,
         timing_support={
-            "profile_sha256": profile.profile.profile_sha256,
-            "binding_sha256": profile.binding_sha256,
+            "execution_timing_mode": "bootstrap_probe_unmeasured",
+            "profile_sha256": None,
+            "binding_sha256": None,
+            "conservative_source_profile_sha256": profile.profile.profile_sha256,
+            "conservative_source_binding_sha256": profile.binding_sha256,
             "source_arm": selected_arm,
             "d1_core_evidence_sha256": d1_evidence["evidence_sha256"],
         },
@@ -3277,6 +4019,7 @@ def build_optional_e_plan(
         "kind": "sn56-week7-hke-optional-e-plan",
         "status": "OPTIONAL_E_READY_NO_OTHER_AUTHORITY",
         "source_prelaunch_plan_sha256": plan["plan_sha256"],
+        "owner_identity": _plan_owner_identity(plan),
         "source_d1_evidence": copy.deepcopy(dict(d1_evidence)),
         "d1_core_evidence_sha256": d1_evidence["evidence_sha256"],
         "source_bridge_evidence": copy.deepcopy(dict(bridge_evidence)),
@@ -3310,6 +4053,7 @@ def _validate_optional_e_plan(
         "kind",
         "status",
         "source_prelaunch_plan_sha256",
+        "owner_identity",
         "source_d1_evidence",
         "d1_core_evidence_sha256",
         "source_bridge_evidence",
@@ -3335,6 +4079,7 @@ def _validate_optional_e_plan(
         or value.get("kind") != "sn56-week7-hke-optional-e-plan"
         or value.get("status") != "OPTIONAL_E_READY_NO_OTHER_AUTHORITY"
         or value.get("source_prelaunch_plan_sha256") != prelaunch["plan_sha256"]
+        or value.get("owner_identity") != _plan_owner_identity(prelaunch)
         or value.get("fixture") != prelaunch["fixture"]
         or value.get("evaluator_sha256") != prelaunch["evaluator_sha256"]
         or value.get("cell", {}).get("cell_identity", {}).get("arm") != "E"
@@ -3397,6 +4142,7 @@ def freeze_d1_candidate(
             plan_cell=e_plan["cell"],
             fixture=e_plan["fixture"],
             evaluator_sha256=e_plan["evaluator_sha256"],
+            expected_owner_identity=_plan_owner_identity(e_plan),
         )
         for step, record in e_curves.items():
             if (
@@ -3865,6 +4611,7 @@ def freeze_confirmation_candidate(
             plan_cell=plan["cells"][key],
             fixture=plan["fixture"],
             evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity=_plan_owner_identity(plan),
         )
         for key in plan["cells"]
     }
@@ -4446,6 +5193,7 @@ def _validate_confirmation_evidence(
                 plan_cell=plan["cells"][family][role],
                 fixture=plan["fixtures"][family],
                 evaluator_sha256=plan["evaluator_sha256"],
+                expected_owner_identity=_plan_owner_identity(plan),
             )
             for role in ("incumbent", "candidate")
         }
@@ -4709,6 +5457,7 @@ def _validate_c2_evidence(
             plan_cell=plan["cells"][role],
             fixture=plan["fixture"],
             evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity=_plan_owner_identity(plan),
         )
         for role in ("incumbent", "candidate")
     }

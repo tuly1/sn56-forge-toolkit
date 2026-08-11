@@ -11,6 +11,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from forge import adaptive_timing, config, krea_runtime, recipe
 from forge.tasks import aitoolkit, checkpoints
@@ -603,6 +604,95 @@ def test_week7_factorial_bundles_are_owned_runtime_only_and_do_not_load_leader(
     assert krea_runtime.runtime_directory(
         "krea2", krea_runtime.WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE
     ) == str(tmp_path)
+
+
+@pytest.mark.parametrize("loss_type", ["mae", "mse"])
+def test_week7_factorial_timing_source_can_emit_and_produce_profile(
+    tmp_path, monkeypatch, loss_type
+):
+    _activate(
+        monkeypatch,
+        tmp_path,
+        krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+    )
+    template_path = Path(krea_runtime.__file__).with_name("templates") / (
+        "base_diffusion_krea2.yaml"
+    )
+    cfg = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    process = cfg["config"]["process"][0]
+    process["model"]["model_kwargs"] = {
+        "text_encoder_path": "/cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct",
+        "vae_path": process["model"]["name_or_path"],
+    }
+    process["training_seed"] = 42_565_431
+    process["train"]["loss_type"] = loss_type
+    process["train"]["steps"] = 1200
+    process["save"]["save_every"] = recipe.kill_safe_save_every(
+        1200, int(process["save"]["save_every"])
+    )
+    cfg, bundle = krea_runtime.materialize_week7_factorial_config(
+        cfg, multires_noise=True
+    )
+    assert bundle == krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE
+    assert krea_runtime.projection_matches_bundle_contract(
+        krea_runtime.timing_contract_projection(cfg, bundle=bundle),
+        bundle=bundle,
+    )
+
+    config_path = tmp_path / f"week7-{loss_type}.yaml"
+    config.write_config(cfg, str(config_path))
+    save_root = tmp_path / f"week7-{loss_type}-save"
+    scope = checkpoints.begin_run(str(save_root), "contract-repo")
+    scope = checkpoints.set_planned_steps(str(save_root), scope, 1200)
+    source_run_id = f"week7-{loss_type}:{scope['attempt_nonce']}"
+    record = krea_runtime.emit_effective_runtime_record(
+        cfg,
+        "krea2",
+        str(config_path),
+        krea_runtime.load_capability_manifest(),
+        source_run_id=source_run_id,
+        timing_probe=True,
+        current_dataset_size=10,
+        current_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+    )
+    assert record["effective"]["planned_steps"] == 1200
+    first_step = int(process["save"]["save_every"])
+    observation = adaptive_timing.emit_bootstrap_first_checkpoint_observation(
+        bundle_id=bundle,
+        checkpoint_step=first_step,
+        elapsed_since_launch_s=float(first_step * 2),
+        active_planned_steps=1200,
+        event_sink=lambda *_args, **_kwargs: None,
+    )
+    krea_runtime.persist_first_checkpoint_observation(str(config_path), observation)
+    artifact = _write_training_safetensor(
+        save_root / "contract-repo.safetensors", step=1200
+    )
+    krea_runtime.persist_training_completion_observation(
+        str(config_path),
+        artifact_path=str(artifact),
+        save_root=str(save_root),
+        scope=scope,
+        training_elapsed_seconds=2400.0,
+        returncode=0,
+        stopped_by_deadline=False,
+    )
+    profile = adaptive_timing.produce_profile_document(
+        str(config_path) + ".effective-runtime.json",
+        source_run_id=source_run_id,
+        bundle_id=bundle,
+        model_type="krea2",
+        measured_dataset_size=10,
+        measured_at_utc="2026-08-11T22:00:00Z",
+        expected_accelerator_identity="NVIDIA H100 PCIe|81559-MiB",
+    )
+    assert profile["seconds_per_step"] == pytest.approx(2.0)
+    assert profile["measurement"]["completed_steps"] == 1200
+    assert profile["provenance"]["source_loss_type"] == loss_type
+    assert (
+        profile["provenance"]["source_generated_config_sha256"]
+        == record["generated_config_sha256"]
+    )
 
 
 def test_week7_multires_factor_fails_closed_when_runtime_capability_is_inert(

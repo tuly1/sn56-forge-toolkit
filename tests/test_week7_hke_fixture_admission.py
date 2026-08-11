@@ -94,6 +94,10 @@ def generator_probe():
         "admission_authority_source_sha256": admission.hashlib.sha256(
             admission.SCRIPT_PATH.read_bytes()
         ).hexdigest(),
+        "factor_authority_path": admission.FACTOR_AUTHORITY_SOURCE_PATH,
+        "factor_authority_source_sha256": admission.hashlib.sha256(
+            admission.FACTOR_AUTHORITY_PATH.read_bytes()
+        ).hexdigest(),
         "pinned_remote_refs": ["refs/heads/test-pushed-branch"],
     }
 

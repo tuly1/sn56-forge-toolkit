@@ -586,6 +586,17 @@ def _current_generator_identity() -> dict[str, Any]:
         )
     ):
         raise AdmissionError("executed admission authority differs from committed blob")
+    factor_blob = run(
+        ("cat-file", "blob", f"HEAD:{FACTOR_AUTHORITY_SOURCE_PATH}"),
+        binary=True,
+    )
+    if not isinstance(factor_blob, bytes):  # pragma: no cover
+        raise AdmissionError("committed factor-authority bytes are unavailable")
+    factor_source_sha = hashlib.sha256(factor_blob).hexdigest()
+    if not hmac.compare_digest(
+        factor_blob, _read_regular_source_bytes(FACTOR_AUTHORITY_PATH)
+    ):
+        raise AdmissionError("executed factor authority differs from committed blob")
     contract_path = renderer.DECLARATIVE_CONTRACT_SOURCE_PATH
     contract_blob = run(
         ("cat-file", "blob", f"HEAD:{contract_path}"),
@@ -634,6 +645,8 @@ def _current_generator_identity() -> dict[str, Any]:
         "renderer_source_sha256": source_sha,
         "admission_authority_path": ADMISSION_SOURCE_PATH,
         "admission_authority_source_sha256": authority_source_sha,
+        "factor_authority_path": FACTOR_AUTHORITY_SOURCE_PATH,
+        "factor_authority_source_sha256": factor_source_sha,
         "contract_path": contract_path,
         "contract_source_sha256": contract_source_sha,
         "pinned_remote_refs": remote_refs,
@@ -705,6 +718,13 @@ def build_admissions(
         r"[0-9a-f]{64}", authority_source_sha
     ):
         raise AdmissionError("admission authority source identity is absent")
+    if live_generator.get("factor_authority_path") != FACTOR_AUTHORITY_SOURCE_PATH:
+        raise AdmissionError("factor authority path identity is absent")
+    factor_source_sha = live_generator.get("factor_authority_source_sha256")
+    if not isinstance(factor_source_sha, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", factor_source_sha
+    ):
+        raise AdmissionError("factor authority source identity is absent")
     dedup = verified["dedup_evidence"]
     if any(
         dedup[key] != 0
@@ -751,6 +771,8 @@ def build_admissions(
         "renderer_source_sha256": live_generator["renderer_source_sha256"],
         "admission_authority_path": live_generator["admission_authority_path"],
         "admission_authority_source_sha256": authority_source_sha,
+        "factor_authority_path": live_generator["factor_authority_path"],
+        "factor_authority_source_sha256": factor_source_sha,
         "contract_path": live_generator["contract_path"],
         "contract_source_sha256": live_generator["contract_source_sha256"],
         "pinned_remote_refs": live_generator["pinned_remote_refs"],
@@ -913,6 +935,8 @@ def _validate_admission_set_envelope(value: Mapping[str, Any]) -> dict[str, Any]
         "renderer_source_sha256",
         "admission_authority_path",
         "admission_authority_source_sha256",
+        "factor_authority_path",
+        "factor_authority_source_sha256",
         "contract_path",
         "contract_source_sha256",
         "pinned_remote_refs",
@@ -928,6 +952,7 @@ def _validate_admission_set_envelope(value: Mapping[str, Any]) -> dict[str, Any]
     for key in (
         "renderer_source_sha256",
         "admission_authority_source_sha256",
+        "factor_authority_source_sha256",
         "contract_source_sha256",
     ):
         _require_sha256(revision.get(key), f"admission generator {key}")
