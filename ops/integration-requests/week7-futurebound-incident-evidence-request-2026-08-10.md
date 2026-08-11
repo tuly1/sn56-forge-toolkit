@@ -1,12 +1,36 @@
 # SN56 FutureBound incident evidence request
 
+> **SUPERSEDED PRE-RETRY SNAPSHOT — DO NOT USE AS CURRENT INCIDENT STATE**
+>
+> This request preserves the public observations available on 2026-08-10
+> before retry reconciliation. The retry later produced submission
+> `c9bffbf6-83ff-4b52-b868-97fc7b51d9b2` with test loss
+> `0.0658568063599321` (displayed as `0.0658568064`), rank `10 of 12`.
+> “No public submission” is therefore not a valid post-retry diagnosis.
+>
+> Use the post-retry correction record and its safe API evidence:
+>
+> - correction record:
+>   `/Users/atulyashetty/Test/SN56-project/evidence/week7-post-retry-20260811/PR16-CORRECTION-RECORD-2026-08-11.md`;
+> - safe API snapshot:
+>   `/Users/atulyashetty/Test/SN56-project/evidence/week7-post-retry-20260811/public-api-safe/snapshots/20260811T142602.496953Z.json`;
+> - snapshot SHA-256:
+>   `a77f3c5da54b1b81c891a3a27ff62a7aa1464a03fbcd2ac20898989e29d0d9f5`.
+
 Date: 2026-08-10 UTC
-Incident status: **UNRESOLVED — ROOT CAUSE NOT ESTABLISHED**
+Historical status: **SUPERSEDED PRE-RETRY EVIDENCE REQUEST**
 Purpose: provide Gradients with precise identifiers and request the private execution records needed to distinguish assignment, infrastructure, clone/build, trainer, watchdog, output-discovery, and upload failures.
 
 ## Scope and interpretation guardrail
 
-This packet is an evidence request, not an incident diagnosis. Public records establish that our FutureBound task produced no public submission or repository. They do **not** establish whether the failure was caused by hardware, assignment/retry handling, source acquisition, image build, container execution, watchdog enforcement, artifact discovery, or upload. No one should attribute a root cause until the corresponding validator-side records are reconciled.
+This packet is an evidence request, not an incident diagnosis. At the time of
+this pre-retry snapshot, the public records showed no submission or repository
+for our FutureBound task. That observation was later superseded by the scored
+retry identified above. The pre-retry public evidence does **not** establish
+which stage failed in the original attempt, so no one should attribute that
+historical failure to hardware, assignment/retry handling, source acquisition,
+image build, container execution, watchdog enforcement, artifact discovery, or
+upload without the corresponding validator-side records.
 
 ## Incident identifiers
 
@@ -24,16 +48,24 @@ This packet is an evidence request, not an incident diagnosis. Public records es
 | Task created | `2026-08-10T13:08:04.044944Z` |
 | Task termination timestamp | `2026-08-10T19:09:35.523166Z` |
 | Task updated timestamp | `2026-08-10T19:53:49.537571Z` |
-| Final local public observation | `2026-08-10T21:49:15.931497Z` |
+| Final observation in this pre-retry packet | `2026-08-10T21:49:15.931497Z` |
 
 ## Verified facts
 
 The following are observations, not causal conclusions:
 
-1. The Hetzner endpoint log recorded a successful authenticated validator request at approximately `2026-08-10T13:02Z`, before the task was created.
-2. The miner PID remained stable during the relevant window: no service restart was observed, and the service continued reporting successful 256-node metagraph syncs.
-3. In the final public task record, our row remained `submission_id=null`, `repo=null`, and `score_reason=null`; it carried no test-loss result.
-4. The public Hugging Face harvest found neither a task-linked repository nor an unlinked/retry repository for our hotkey on this task.
+1. The Hetzner endpoint log recorded a successful route request at
+   approximately `2026-08-10T13:02Z`, before the task was created. This
+   establishes observed reachability, not authenticated validator identity.
+2. One process observation found the miner PID unchanged, and the service
+   reported successful 256-node metagraph syncs. A point observation does not
+   establish sustained PID stability across the full incident window.
+3. In the 2026-08-10 pre-retry public task record, our row remained
+   `submission_id=null`, `repo=null`, and `score_reason=null`; it carried no
+   test-loss result. This is not the final retry state.
+4. The 2026-08-10 public Hugging Face harvest found neither a task-linked
+   repository nor an unlinked/retry repository for our hotkey on this task.
+   This was also a pre-retry observation.
 5. The same served commit produced scored submissions on the other two Round-1 Krea tasks:
    - `797f3e7b-d7fb-4746-9e90-440d1cf4715d`: submission `4a73586d-c58b-4def-81be-1a48326aa6cc`, repository suffix `...-797f3e7b-d7fb-4746-9e90-440d1cf4715d-5HLA2QWY`;
    - `3bd1ebed-bc40-40ed-a313-227db37653fe`: submission `6b522b9d-6c0a-4fe9-9329-031b04489be4`, repository suffix `...-3bd1ebed-bc40-40ed-a313-227db37653fe-5HLA2QWY`.
@@ -110,13 +142,19 @@ Please also state which evidence class supports any proposed root cause. If the 
 ## Local public evidence anchors
 
 - Week-7 P0 handoff: `/Users/atulyashetty/Test/SN56-project/evidence/week7-tournament-harvest-20260810/SN56-WEEK7-P0-HARVEST-HANDOFF-2026-08-10.md`
-- Final safe API snapshot: `/Users/atulyashetty/Test/SN56-project/evidence/week7-tournament-harvest-20260810/public-api-safe/snapshots/20260810T214915.931497Z.json`
+- Final pre-retry safe API snapshot: `/Users/atulyashetty/Test/SN56-project/evidence/week7-tournament-harvest-20260810/public-api-safe/snapshots/20260810T214915.931497Z.json`
 - Snapshot SHA-256: `7d48b530fe8f384899275259107ebcaf7570c669457f20980b4085c27e37c2db`
-- Final watcher sync ledger: `/Users/atulyashetty/Test/SN56-project/evidence/week7-tournament-harvest-20260810/raw-watcher/ledgers/20260810T215621.328448Z.json`
+- Final pre-retry watcher sync ledger: `/Users/atulyashetty/Test/SN56-project/evidence/week7-tournament-harvest-20260810/raw-watcher/ledgers/20260810T215621.328448Z.json`
 - Ledger SHA-256: `c491e9642f4eedd420f9701ecf3e9dcf4aad202c36cad1b2f2d81a4dc9c6f312`
 - Reconciled P0 package: `/Users/atulyashetty/Test/SN56-project/evidence/week7-tournament-harvest-20260810/p0-package/packages/20260810T220727.036459Z.json`
 - Package SHA-256: `ae381a950a3dda32490d3102e09d20e371789f0cf6b9003972eba954d98ebfec`
 
 ## Claim discipline after receipt
 
-Do not report a FutureBound root cause merely because one stage lacks a public artifact. A root-cause statement requires a validator-side record that identifies the first failed stage and reconciles later stages that consequently did not run. Until then, the incident remains: **no public submission, cause unresolved**.
+Do not report a root cause for the original attempt merely because one stage
+lacked a public artifact. Such a statement still requires a validator-side
+record that identifies the first failed stage and reconciles later stages that
+consequently did not run. The historical first-attempt cause remains
+**INCONCLUSIVE** on this packet's evidence; the current post-retry state is a
+scored submission at `0.0658568064`, rank `10 of 12`, not a no-submission
+incident.

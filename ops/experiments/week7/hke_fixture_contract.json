@@ -1,24 +1,63 @@
 {
-  "schema": 1,
+  "schema": 3,
   "kind": "sn56-week7-hke-rights-clean-fixture-contract",
   "status": "CANDIDATE_NOT_ADMITTED",
   "model_type": "krea2",
   "families": {
     "logo_ui": {
-      "confirmation_pairs": 10,
-      "discovery_pairs": 32,
+      "confirmation_packs": {
+        "C1": {
+          "evaluation": 8,
+          "training": 10
+        }
+      },
+      "discovery_packs": {
+        "D1": {
+          "evaluation": 8,
+          "training": 10
+        }
+      },
       "strata": {
-        "logo": 21,
-        "ui": 21
+        "logo": 18,
+        "ui": 18
       }
     },
     "product": {
-      "confirmation_pairs": 10,
-      "discovery_pairs": 28
+      "confirmation_packs": {
+        "C1": {
+          "evaluation": 8,
+          "training": 10
+        }
+      },
+      "discovery_packs": {
+        "D1": {
+          "evaluation": 8,
+          "training": 10
+        }
+      }
     },
     "social": {
-      "confirmation_pairs": 8,
-      "discovery_pairs": 10
+      "campaign_role": "FutureBound_first",
+      "confirmation_packs": {
+        "C1": {
+          "evaluation": 8,
+          "training": 10
+        },
+        "C2": {
+          "evaluation": 8,
+          "training": 10
+        }
+      },
+      "discovery_packs": {
+        "D1": {
+          "evaluation": 8,
+          "training": 10
+        },
+        "D2": {
+          "evaluation": 8,
+          "training": 10
+        }
+      }
     }
   },
   "generation": {
@@ -38,8 +77,8 @@
     ],
     "owned_visible_text": "code_owned_stroke_glyphs_only",
     "seed_domains": {
-      "confirmation": "SN56-W7-HKE-CONFIRMATION-v1",
-      "discovery": "SN56-W7-HKE-DISCOVERY-v1"
+      "confirmation": "SN56-W7-HKE-CONFIRMATION-v3",
+      "discovery": "SN56-W7-HKE-DISCOVERY-v3"
     }
   },
   "admission_requirements": [
@@ -53,6 +92,12 @@
     "named_human_semantic_and_rights_review_bound_to_every_row_hash",
     "cross_family_and_cross_phase_exact_pixel_caption_group_and_perceptual_dedup",
     "private_confirmation_row_caption_path_and_visible_tokens_derived_from_confirmation_key",
+    "phase_independent_semantic_group_dedup_across_all_packs",
+    "discovery_confirmation_key_inequality_at_build_replay_and_admission",
+    "declarative_contract_git_blob_binding",
+    "ten_training_rows_and_eight_disjoint_evaluation_rows_per_pack",
+    "post_d2_confirmation_freeze_bound_private_c1_reveal",
+    "separate_borderline_c1_trigger_required_for_private_c2_reveal",
     "sealed_confirmation_commitment",
     "create_only_root_checksum_manifest"
   ],

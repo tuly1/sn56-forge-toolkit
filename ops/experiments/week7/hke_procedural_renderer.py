@@ -30,37 +30,57 @@ from typing import Any, Iterable, Mapping, Sequence
 import PIL
 from PIL import Image, ImageDraw
 
-
 sys.dont_write_bytecode = True
 
-SCHEMA = 1
+SCHEMA = 3
 KIND = "sn56-week7-hke-procedural-candidate"
-RENDERER_VERSION = "1.0.0"
+RENDERER_VERSION = "3.0.0"
 GENERATOR_REPOSITORY = "https://github.com/tuly1/sn56-forge-toolkit.git"
 GENERATOR_SOURCE_PATH = "ops/experiments/week7/hke_procedural_renderer.py"
 DECLARATIVE_CONTRACT_PATH = Path(__file__).with_name("hke_fixture_contract.json")
-DISCOVERY_DOMAIN = b"SN56-W7-HKE-DISCOVERY-v1"
-CONFIRMATION_DOMAIN = b"SN56-W7-HKE-CONFIRMATION-v1"
+DECLARATIVE_CONTRACT_SOURCE_PATH = "ops/experiments/week7/hke_fixture_contract.json"
+DISCOVERY_DOMAIN = b"SN56-W7-HKE-DISCOVERY-v3"
+CONFIRMATION_DOMAIN = b"SN56-W7-HKE-CONFIRMATION-v3"
 PNG_FORMAT = "PNG"
 
 FIXTURE_CONTRACT: tuple[dict[str, Any], ...] = (
     {
         "fixture_id": "W7-HKE-SOCIAL-A",
         "family": "social",
-        "discovery_count": 10,
-        "confirmation_count": 8,
+        "discovery_packs": [
+            {"pack": "D1", "training_count": 10, "evaluation_count": 8},
+            {"pack": "D2", "training_count": 10, "evaluation_count": 8},
+        ],
+        "confirmation_packs": [
+            {"pack": "C1", "training_count": 10, "evaluation_count": 8},
+            {"pack": "C2", "training_count": 10, "evaluation_count": 8},
+        ],
+        "discovery_count": 36,
+        "confirmation_count": 36,
     },
     {
         "fixture_id": "W7-HKE-PRODUCT-A",
         "family": "product",
-        "discovery_count": 28,
-        "confirmation_count": 10,
+        "discovery_packs": [
+            {"pack": "D1", "training_count": 10, "evaluation_count": 8}
+        ],
+        "confirmation_packs": [
+            {"pack": "C1", "training_count": 10, "evaluation_count": 8}
+        ],
+        "discovery_count": 18,
+        "confirmation_count": 18,
     },
     {
         "fixture_id": "W7-HKE-LOGO-UI-A",
         "family": "logo_ui",
-        "discovery_count": 32,
-        "confirmation_count": 10,
+        "discovery_packs": [
+            {"pack": "D1", "training_count": 10, "evaluation_count": 8}
+        ],
+        "confirmation_packs": [
+            {"pack": "C1", "training_count": 10, "evaluation_count": 8}
+        ],
+        "discovery_count": 18,
+        "confirmation_count": 18,
     },
 )
 
@@ -91,6 +111,8 @@ _ROW_KEYS = {
     "fixture_id",
     "family",
     "phase",
+    "pack",
+    "split_role",
     "ordinal",
     "relative_image_path",
     "relative_caption_path",
@@ -173,12 +195,17 @@ def _git_sha(value: Any, label: str) -> str:
 
 def _identity_text(value: Any, label: str) -> str:
     text = " ".join(str(value or "").split())
-    if len(text) < 3 or len(text) > 256 or text.casefold() in {
-        "unknown",
-        "pending",
-        "placeholder",
-        "tbd",
-    }:
+    if (
+        len(text) < 3
+        or len(text) > 256
+        or text.casefold()
+        in {
+            "unknown",
+            "pending",
+            "placeholder",
+            "tbd",
+        }
+    ):
         raise FixtureError(f"{label} must be an explicit 3..256 character record")
     return text
 
@@ -218,14 +245,78 @@ def _source_sha256() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
+def _contract_source_sha256() -> str:
+    return hashlib.sha256(
+        _read_regular(DECLARATIVE_CONTRACT_PATH, "declarative fixture contract")
+    ).hexdigest()
+
+
 def _validate_key(value: bytes | bytearray, label: str) -> bytes:
     if not isinstance(value, (bytes, bytearray)) or not 32 <= len(value) <= 4096:
         raise FixtureError(f"{label} must contain 32..4096 bytes")
     return bytes(value)
 
 
-def _derive(key: bytes, domain: bytes, fixture_id: str, ordinal: int) -> bytes:
-    message = domain + b"\0" + fixture_id.encode("ascii") + b"\0" + ordinal.to_bytes(4, "big")
+def _require_distinct_phase_keys(discovery_key: bytes, confirmation_key: bytes) -> None:
+    if hmac.compare_digest(discovery_key, confirmation_key):
+        raise FixtureError("discovery and confirmation keys must be distinct")
+
+
+def _phase_packs(fixture: Mapping[str, Any], phase: str) -> Sequence[Mapping[str, Any]]:
+    packs = fixture.get(f"{phase}_packs")
+    if not isinstance(packs, (tuple, list)) or not packs:
+        raise FixtureError(f"{fixture.get('fixture_id')} {phase} packs are invalid")
+    return packs
+
+
+def _pack_assignment(
+    fixture: Mapping[str, Any], phase: str, ordinal: int
+) -> tuple[str, str, int]:
+    if ordinal < 0:
+        raise FixtureError("row ordinal cannot be negative")
+    offset = ordinal
+    for record in _phase_packs(fixture, phase):
+        pack = str(record.get("pack", ""))
+        training_count = record.get("training_count")
+        evaluation_count = record.get("evaluation_count")
+        if (
+            not pack
+            or isinstance(training_count, bool)
+            or not isinstance(training_count, int)
+            or training_count <= 0
+            or isinstance(evaluation_count, bool)
+            or not isinstance(evaluation_count, int)
+            or evaluation_count <= 0
+        ):
+            raise FixtureError(f"{fixture.get('fixture_id')} {phase} pack is invalid")
+        if offset < training_count:
+            return pack, "training", offset
+        offset -= training_count
+        if offset < evaluation_count:
+            return pack, "evaluation", offset
+        offset -= evaluation_count
+    raise FixtureError(f"{fixture.get('fixture_id')} {phase} ordinal is out of range")
+
+
+def _derive(
+    key: bytes,
+    domain: bytes,
+    fixture_id: str,
+    pack: str,
+    split_role: str,
+    split_ordinal: int,
+) -> bytes:
+    message = (
+        domain
+        + b"\0"
+        + fixture_id.encode("ascii")
+        + b"\0"
+        + pack.encode("ascii")
+        + b"\0"
+        + split_role.encode("ascii")
+        + b"\0"
+        + split_ordinal.to_bytes(4, "big")
+    )
     return hmac.new(key, message, hashlib.sha256).digest()
 
 
@@ -268,11 +359,19 @@ def _row_parameters(
     fixture: Mapping[str, Any], phase: str, ordinal: int, key: bytes
 ) -> dict[str, Any]:
     domain = DISCOVERY_DOMAIN if phase == "discovery" else CONFIRMATION_DOMAIN
-    seed = _derive(key, domain, str(fixture["fixture_id"]), ordinal)
+    pack, split_role, split_ordinal = _pack_assignment(fixture, phase, ordinal)
+    seed = _derive(
+        key,
+        domain,
+        str(fixture["fixture_id"]),
+        pack,
+        split_role,
+        split_ordinal,
+    )
     family = fixture["family"]
     subtype = None
     if family == "logo_ui":
-        subtype = "logo" if ordinal % 2 == 0 else "ui"
+        subtype = "logo" if split_ordinal % 2 == 0 else "ui"
     dimensions = {
         "social": ((1024, 1024), (1024, 1280), (1280, 720)),
         "product": ((1024, 1024), (1152, 864)),
@@ -297,8 +396,11 @@ def _row_parameters(
             _number(seed, f"field-pattern-{index:02d}", len(_PALETTES[0]))
             for index in range(32)
         ],
-        "dimensions": list(dimensions[ordinal % len(dimensions)]),
+        "dimensions": list(dimensions[split_ordinal % len(dimensions)]),
         "subtype": subtype,
+        "pack": pack,
+        "split_role": split_role,
+        "split_ordinal": split_ordinal,
         "phase_domain": phase,
     }
 
@@ -309,7 +411,10 @@ def _row_palette(params: Mapping[str, Any]) -> tuple[tuple[int, int, int], ...]:
     if len(jitter) != 3:
         raise FixtureError("row color jitter must have three channels")
     return tuple(
-        tuple(max(0, min(255, channel + jitter[index])) for index, channel in enumerate(color))
+        tuple(
+            max(0, min(255, channel + jitter[index]))
+            for index, channel in enumerate(color)
+        )
         for color in base
     )
 
@@ -375,15 +480,32 @@ def _draw_social(
         fill=palette[0],
     )
     band_y = margin + height // 7
-    draw.rectangle((margin, band_y, width - margin, band_y + height // 5), fill=palette[2])
+    draw.rectangle(
+        (margin, band_y, width - margin, band_y + height // 5), fill=palette[2]
+    )
     for index in range(5):
         x = margin + width // 12 + index * width // 7
         y = band_y + height // 3 + ((index + int(params["layout"])) % 3) * height // 28
         radius = width // 28 + (int(params["shape_a"]) + index * 7) % (width // 45)
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=palette[3 + index % 2])
+        draw.ellipse(
+            (x - radius, y - radius, x + radius, y + radius),
+            fill=palette[3 + index % 2],
+        )
     strings = ["SIGNAL", f"CARD {display_token}"]
-    _draw_text(draw, (margin + width // 16, margin + height // 22), strings[0], palette[1], scale=max(5, width // 150))
-    _draw_text(draw, (margin + width // 16, band_y + height // 18), strings[1], palette[0], scale=max(4, width // 180))
+    _draw_text(
+        draw,
+        (margin + width // 16, margin + height // 22),
+        strings[0],
+        palette[1],
+        scale=max(5, width // 150),
+    )
+    _draw_text(
+        draw,
+        (margin + width // 16, band_y + height // 18),
+        strings[1],
+        palette[0],
+        scale=max(4, width // 180),
+    )
     return strings
 
 
@@ -399,10 +521,15 @@ def _draw_product(
     draw.rectangle((0, horizon, width, height), fill=palette[4])
     cx = width // 2 + (int(params["shape_a"]) - 105) * width // 1800
     base_w = width // 4
-    draw.ellipse((cx - base_w, horizon - height // 24, cx + base_w, horizon + height // 20), fill=palette[0])
+    draw.ellipse(
+        (cx - base_w, horizon - height // 24, cx + base_w, horizon + height // 20),
+        fill=palette[0],
+    )
     stem_w = max(12, width // 35)
     stem_top = height // 3 + (int(params["layout"]) - 3) * height // 90
-    draw.rounded_rectangle((cx - stem_w, stem_top, cx + stem_w, horizon), radius=stem_w, fill=palette[2])
+    draw.rounded_rectangle(
+        (cx - stem_w, stem_top, cx + stem_w, horizon), radius=stem_w, fill=palette[2]
+    )
     shade_w = width // 5 + (int(params["shape_b"]) % (width // 15))
     shade_h = height // 7
     draw.polygon(
@@ -414,10 +541,30 @@ def _draw_product(
         ),
         fill=palette[3],
     )
-    draw.ellipse((cx - shade_w // 2, stem_top + shade_h // 2, cx + shade_w // 2, stem_top + shade_h * 2), fill=palette[4])
+    draw.ellipse(
+        (
+            cx - shade_w // 2,
+            stem_top + shade_h // 2,
+            cx + shade_w // 2,
+            stem_top + shade_h * 2,
+        ),
+        fill=palette[4],
+    )
     strings = ["TAVORA", f"FORM {display_token}"]
-    _draw_text(draw, (width // 16, height // 14), strings[0], palette[0], scale=max(5, width // 160))
-    _draw_text(draw, (width // 16, height // 14 + 11 * max(5, width // 160)), strings[1], palette[2], scale=max(4, width // 190))
+    _draw_text(
+        draw,
+        (width // 16, height // 14),
+        strings[0],
+        palette[0],
+        scale=max(5, width // 160),
+    )
+    _draw_text(
+        draw,
+        (width // 16, height // 14 + 11 * max(5, width // 160)),
+        strings[1],
+        palette[2],
+        scale=max(4, width // 190),
+    )
     return strings
 
 
@@ -435,24 +582,68 @@ def _draw_logo_ui(
         radius = width // 5
         shift = int(params["accent_shift"]) * width // 1200
         draw.polygon(
-            ((cx, cy - radius), (cx + radius, cy), (cx, cy + radius), (cx - radius, cy)),
+            (
+                (cx, cy - radius),
+                (cx + radius, cy),
+                (cx, cy + radius),
+                (cx - radius, cy),
+            ),
             fill=palette[2],
         )
-        draw.ellipse((cx - radius // 2 + shift, cy - radius // 2, cx + radius // 2 + shift, cy + radius // 2), fill=palette[3])
+        draw.ellipse(
+            (
+                cx - radius // 2 + shift,
+                cy - radius // 2,
+                cx + radius // 2 + shift,
+                cy + radius // 2,
+            ),
+            fill=palette[3],
+        )
         strings = ["LUMERA", f"MARK {display_token}"]
-        _draw_text(draw, (width // 2 - width // 5, height * 3 // 4), strings[0], palette[0], scale=max(5, width // 150))
-        _draw_text(draw, (width // 2 - width // 6, height * 3 // 4 + height // 12), strings[1], palette[2], scale=max(4, width // 190))
+        _draw_text(
+            draw,
+            (width // 2 - width // 5, height * 3 // 4),
+            strings[0],
+            palette[0],
+            scale=max(5, width // 150),
+        )
+        _draw_text(
+            draw,
+            (width // 2 - width // 6, height * 3 // 4 + height // 12),
+            strings[1],
+            palette[2],
+            scale=max(4, width // 190),
+        )
     else:
         sidebar = width // 5
         draw.rectangle((0, 0, sidebar, height), fill=palette[0])
-        draw.rectangle((sidebar + width // 20, height // 8, width - width // 20, height // 3), fill=palette[2])
+        draw.rectangle(
+            (sidebar + width // 20, height // 8, width - width // 20, height // 3),
+            fill=palette[2],
+        )
         for index in range(3):
             left = sidebar + width // 20 + index * width // 4
             top = height * 2 // 5
-            draw.rounded_rectangle((left, top, left + width // 5, top + height // 3), radius=12, fill=palette[3 + index % 2])
+            draw.rounded_rectangle(
+                (left, top, left + width // 5, top + height // 3),
+                radius=12,
+                fill=palette[3 + index % 2],
+            )
         strings = ["LUMERA", f"PANEL {display_token}"]
-        _draw_text(draw, (width // 35, height // 14), strings[0], palette[1], scale=max(3, width // 230))
-        _draw_text(draw, (sidebar + width // 16, height // 40), strings[1], palette[0], scale=max(5, width // 170))
+        _draw_text(
+            draw,
+            (width // 35, height // 14),
+            strings[0],
+            palette[1],
+            scale=max(3, width // 230),
+        )
+        _draw_text(
+            draw,
+            (sidebar + width // 16, height // 40),
+            strings[1],
+            palette[0],
+            scale=max(5, width // 170),
+        )
     return strings
 
 
@@ -460,9 +651,13 @@ def _render(
     fixture: Mapping[str, Any], phase: str, ordinal: int, key: bytes
 ) -> tuple[bytes, bytes, dict[str, Any]]:
     params = _row_parameters(fixture, phase, ordinal, key)
+    pack = str(params["pack"])
+    split_role = str(params["split_role"])
+    split_ordinal = int(params["split_ordinal"])
     if phase == "discovery":
-        membership_token = f"{ordinal + 1:03d}"
-        display_token = f"{ordinal + 1:02d}"
+        role_token = "t" if split_role == "training" else "e"
+        membership_token = f"{pack.lower()}-{role_token}-{split_ordinal + 1:03d}"
+        display_token = f"{pack}{role_token.upper()}{split_ordinal + 1:02d}"
     else:
         private_digest = hmac.new(
             key,
@@ -470,11 +665,17 @@ def _render(
             + b"\0private-membership-token\0"
             + str(fixture["fixture_id"]).encode("ascii")
             + b"\0"
-            + ordinal.to_bytes(4, "big"),
+            + pack.encode("ascii")
+            + b"\0"
+            + split_role.encode("ascii")
+            + b"\0"
+            + split_ordinal.to_bytes(4, "big"),
             hashlib.sha256,
         ).digest()
-        membership_token = private_digest.hex()[:16]
-        display_token = f"{int.from_bytes(private_digest[8:16], 'big') % 100_000_000:08d}"
+        membership_token = f"{pack.lower()}-{private_digest.hex()[:16]}"
+        display_token = (
+            f"{int.from_bytes(private_digest[8:16], 'big') % 100_000_000:08d}"
+        )
     width, height = (int(value) for value in params["dimensions"])
     image = Image.new("RGB", (width, height))
     family = str(fixture["family"])
@@ -493,18 +694,36 @@ def _render(
     pixels = image.tobytes()
     seed_domain = DISCOVERY_DOMAIN if phase == "discovery" else CONFIRMATION_DOMAIN
     row_id = f"{fixture['fixture_id'].lower()}-{phase}-{membership_token}"
+    # Stable semantic identity deliberately excludes phase, pack, split role,
+    # ordinals, row/member IDs, and confirmation-key-derived tokens. A candidate that
+    # merely relabels identical render semantics across D/C packs must fail the
+    # cross-pack duplicate gate.
     group_identity = {
-        "concept_identity": str(fixture["fixture_id"]),
+        "concept_identity": {
+            "social": "futurebound-first-party-social-design",
+            "product": "first-party-product-guardrail",
+            "logo_ui": "first-party-logo-ui-guardrail",
+        }[family],
         "family": family,
-        "layout_template_id": f"{phase}-{params['layout']}-{membership_token}",
-        "variation_id": f"{phase}-{membership_token}",
-        "phase_domain": phase,
+        "layout_semantics": {
+            key: params[key]
+            for key in (
+                "layout",
+                "shape_a",
+                "shape_b",
+                "accent_shift",
+                "dimensions",
+                "subtype",
+            )
+        },
     }
     row = {
         "row_id": row_id,
         "fixture_id": fixture["fixture_id"],
         "family": family,
         "phase": phase,
+        "pack": pack,
+        "split_role": split_role,
         "ordinal": ordinal,
         "relative_image_path": f"{fixture['fixture_id']}/{row_id}.png",
         "relative_caption_path": f"{fixture['fixture_id']}/{row_id}.txt",
@@ -553,7 +772,9 @@ def _dhash64(image_bytes: bytes) -> int:
 
 def _normalized_rgb(image_bytes: bytes) -> bytes:
     with Image.open(BytesIO(image_bytes)) as image:
-        return image.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR).tobytes()
+        return (
+            image.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR).tobytes()
+        )
 
 
 def _dedup_evidence(rows: Sequence[tuple[dict[str, Any], bytes]]) -> dict[str, Any]:
@@ -637,7 +858,9 @@ def _require_no_symlink_components(path: Path, label: str) -> None:
         try:
             metadata = component.lstat()
         except FileNotFoundError as exc:
-            raise FixtureError(f"{label} path component is absent: {component}") from exc
+            raise FixtureError(
+                f"{label} path component is absent: {component}"
+            ) from exc
         if stat.S_ISLNK(metadata.st_mode):
             raise FixtureError(f"{label} has a symlink component: {component}")
 
@@ -726,7 +949,9 @@ def _tree_inventory(root: Path, *, excluded: Iterable[str]) -> dict[str, Any]:
         for directory_name in directory_names:
             directory = current_path / directory_name
             if directory.is_symlink() or not directory.is_dir():
-                raise FixtureError(f"inventory contains an unsafe directory: {directory}")
+                raise FixtureError(
+                    f"inventory contains an unsafe directory: {directory}"
+                )
         for file_name in file_names:
             path = current_path / file_name
             relative = path.relative_to(root).as_posix()
@@ -771,6 +996,35 @@ def _phase_manifest(
     key: bytes,
     file_inventory: Mapping[str, Any],
 ) -> dict[str, Any]:
+    families: dict[str, Any] = {}
+    for fixture_id, rows in sorted(family_rows.items()):
+        packs: dict[str, Any] = {}
+        for row in rows:
+            packs.setdefault(row["pack"], []).append(row)
+        families[fixture_id] = {
+            "row_count": len(rows),
+            "rows": rows,
+            "packs": {
+                pack: {
+                    "row_count": len(pack_rows),
+                    "rows": pack_rows,
+                    "splits": {
+                        split_role: {
+                            "row_count": len(split_rows),
+                            "rows": split_rows,
+                        }
+                        for split_role, split_rows in (
+                            (
+                                role,
+                                [row for row in pack_rows if row["split_role"] == role],
+                            )
+                            for role in ("training", "evaluation")
+                        )
+                    },
+                }
+                for pack, pack_rows in sorted(packs.items())
+            },
+        }
     body = {
         "schema": SCHEMA,
         "kind": f"sn56-week7-hke-{phase}-manifest",
@@ -780,13 +1034,7 @@ def _phase_manifest(
             key, DISCOVERY_DOMAIN if phase == "discovery" else CONFIRMATION_DOMAIN
         ),
         "file_inventory": dict(file_inventory),
-        "families": {
-            fixture_id: {
-                "row_count": len(rows),
-                "rows": rows,
-            }
-            for fixture_id, rows in sorted(family_rows.items())
-        },
+        "families": families,
         "governance": {
             "human_review": "not_performed",
             "agent_is_not_human": True,
@@ -820,8 +1068,7 @@ def build_candidate(
         rights_owner=rights_owner,
         license_or_use_grant=license_or_use_grant,
     )
-    if hmac.compare_digest(discovery_key, confirmation_key):
-        raise FixtureError("discovery and confirmation keys must be distinct")
+    _require_distinct_phase_keys(discovery_key, confirmation_key)
     if _paths_overlap(public_output, custodian_output):
         raise FixtureError("public and custodian outputs must be disjoint trees")
     public_root = _ensure_new_root(public_output, "public output")
@@ -839,8 +1086,20 @@ def build_candidate(
         discovery_rows[fixture_id] = []
         confirmation_rows[fixture_id] = []
         for phase, count, key, root, target in (
-            ("discovery", int(fixture["discovery_count"]), discovery_key, public_root / "discovery", discovery_rows[fixture_id]),
-            ("confirmation", int(fixture["confirmation_count"]), confirmation_key, custodian_root / "confirmation", confirmation_rows[fixture_id]),
+            (
+                "discovery",
+                int(fixture["discovery_count"]),
+                discovery_key,
+                public_root / "discovery",
+                discovery_rows[fixture_id],
+            ),
+            (
+                "confirmation",
+                int(fixture["confirmation_count"]),
+                confirmation_key,
+                custodian_root / "confirmation",
+                confirmation_rows[fixture_id],
+            ),
         ):
             for ordinal in range(count):
                 image, caption, row = _render(fixture, phase, ordinal, key)
@@ -876,15 +1135,29 @@ def build_candidate(
         fixture_id = str(fixture["fixture_id"])
         private_rows = confirmation_rows[fixture_id]
         private_commitment = semantic_sha256(private_rows)
+        discovery_pack_rows = discovery_manifest["families"][fixture_id]["packs"]
+        confirmation_pack_rows = confirmation_manifest["families"][fixture_id]["packs"]
         public_families[fixture_id] = {
             "family": fixture["family"],
             "discovery": {
                 "row_count": len(discovery_rows[fixture_id]),
                 "rows": discovery_rows[fixture_id],
+                "packs": discovery_pack_rows,
             },
             "confirmation": {
                 "row_count": len(private_rows),
                 "semantic_commitment_sha256": private_commitment,
+                "packs": {
+                    pack: {
+                        "row_count": record["row_count"],
+                        "training_row_count": record["splits"]["training"]["row_count"],
+                        "evaluation_row_count": record["splits"]["evaluation"][
+                            "row_count"
+                        ],
+                        "semantic_commitment_sha256": semantic_sha256(record["rows"]),
+                    }
+                    for pack, record in sorted(confirmation_pack_rows.items())
+                },
                 "custodian_manifest_sha256": confirmation_manifest_sha,
             },
         }
@@ -900,6 +1173,8 @@ def build_candidate(
             "tree": generator_tree,
             "source_path": GENERATOR_SOURCE_PATH,
             "renderer_source_sha256": _source_sha256(),
+            "contract_path": DECLARATIVE_CONTRACT_SOURCE_PATH,
+            "contract_source_sha256": _contract_source_sha256(),
             "algorithm": "hmac-sha256-counter-parameters-plus-integer-pillow-primitives-v1",
             "dependencies": [
                 f"CPython=={platform.python_version()}",
@@ -909,14 +1184,18 @@ def build_candidate(
             "ambient_inputs": [],
         },
         "rights_record": rights_record,
-        "forbidden_inventories": {key: list(value) for key, value in FORBIDDEN_INVENTORIES.items()},
+        "forbidden_inventories": {
+            key: list(value) for key, value in FORBIDDEN_INVENTORIES.items()
+        },
         "families": public_families,
         "cross_candidate_evidence": dedup,
         "discovery_manifest_file_sha256": discovery_manifest_sha,
         "confirmation": {
             "separately_custodied": True,
             "public_membership_disclosed": False,
-            "total_row_count": sum(item["confirmation_count"] for item in FIXTURE_CONTRACT),
+            "total_row_count": sum(
+                item["confirmation_count"] for item in FIXTURE_CONTRACT
+            ),
             "custodian_manifest_sha256": confirmation_manifest_sha,
         },
         "governance": {
@@ -953,7 +1232,9 @@ def _validate_semantic_record(value: Mapping[str, Any], label: str) -> None:
         raise FixtureError(f"{label} semantic hash mismatch")
 
 
-def _verify_row_bytes(root: Path, row: Mapping[str, Any], *, phase: str) -> tuple[dict[str, Any], bytes]:
+def _verify_row_bytes(
+    root: Path, row: Mapping[str, Any], *, phase: str
+) -> tuple[dict[str, Any], bytes]:
     if not isinstance(row, dict) or set(row) != _ROW_KEYS:
         raise FixtureError(f"{phase} row schema mismatch")
     if row.get("phase") != phase or row.get("rights_declaration") != RIGHTS_DECLARATION:
@@ -964,10 +1245,20 @@ def _verify_row_bytes(root: Path, row: Mapping[str, Any], *, phase: str) -> tupl
         raise FixtureError(f"{phase} row record digest mismatch")
     if row.get("parameters_sha256") != semantic_sha256(row.get("parameters")):
         raise FixtureError(f"{phase} row parameter hash mismatch")
+    parameters = row.get("parameters")
+    if (
+        not isinstance(parameters, dict)
+        or parameters.get("pack") != row.get("pack")
+        or parameters.get("split_role") != row.get("split_role")
+        or parameters.get("phase_domain") != phase
+    ):
+        raise FixtureError(f"{phase} row split identity mismatch")
     if row.get("group_identity_sha256") != semantic_sha256(row.get("group_identity")):
         raise FixtureError(f"{phase} row group hash mismatch")
     image_path = _safe_row_path(root, row["relative_image_path"], "row image path")
-    caption_path = _safe_row_path(root, row["relative_caption_path"], "row caption path")
+    caption_path = _safe_row_path(
+        root, row["relative_caption_path"], "row caption path"
+    )
     image_bytes = _read_regular(image_path, "candidate image")
     caption_bytes = _read_regular(caption_path, "candidate caption")
     if (
@@ -1030,6 +1321,29 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
         ("confirmation manifest", confirmation),
     ):
         _validate_semantic_record(record, label)
+    if (
+        discovery.get("schema") != SCHEMA
+        or confirmation.get("schema") != SCHEMA
+        or discovery.get("kind") != "sn56-week7-hke-discovery-manifest"
+        or confirmation.get("kind") != "sn56-week7-hke-confirmation-manifest"
+    ):
+        raise FixtureError("candidate phase-manifest schema mismatch")
+    phase_manifest_keys = {
+        "schema",
+        "kind",
+        "status",
+        "phase",
+        "phase_key_commitment_sha256",
+        "file_inventory",
+        "families",
+        "governance",
+        "semantic_sha256",
+    }
+    if (
+        set(discovery) != phase_manifest_keys
+        or set(confirmation) != phase_manifest_keys
+    ):
+        raise FixtureError("candidate phase-manifest envelope mismatch")
     if set(candidate) != {
         "schema",
         "kind",
@@ -1053,6 +1367,8 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
         "commit",
         "tree",
         "source_path",
+        "contract_path",
+        "contract_source_sha256",
         "algorithm",
         "dependencies",
         "network_access",
@@ -1093,6 +1409,8 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
     if (
         generator["repository"] != GENERATOR_REPOSITORY
         or generator["source_path"] != GENERATOR_SOURCE_PATH
+        or generator["contract_path"] != DECLARATIVE_CONTRACT_SOURCE_PATH
+        or generator["contract_source_sha256"] != _contract_source_sha256()
         or generator["renderer_version"] != RENDERER_VERSION
         or generator["dependencies"]
         != [
@@ -1103,8 +1421,7 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
         or generator["ambient_inputs"] != []
         or _git_sha(generator["commit"], "candidate generator commit")
         != generator["commit"]
-        or _git_sha(generator["tree"], "candidate generator tree")
-        != generator["tree"]
+        or _git_sha(generator["tree"], "candidate generator tree") != generator["tree"]
     ):
         raise FixtureError("candidate generator revision binding mismatch")
     if (
@@ -1165,20 +1482,29 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
         public_family = candidate["families"][fixture_id]
         if set(public_family) != {"family", "discovery", "confirmation"}:
             raise FixtureError(f"{fixture_id} public family schema mismatch")
-        if set(public_family.get("discovery", {})) != {"row_count", "rows"} or set(
-            public_family.get("confirmation", {})
-        ) != {
+        if set(public_family.get("discovery", {})) != {
+            "row_count",
+            "rows",
+            "packs",
+        } or set(public_family.get("confirmation", {})) != {
             "row_count",
             "semantic_commitment_sha256",
+            "packs",
             "custodian_manifest_sha256",
         }:
             raise FixtureError(f"{fixture_id} public phase schema mismatch")
         discovery_family = discovery.get("families", {}).get(fixture_id)
         confirmation_family = confirmation.get("families", {}).get(fixture_id)
-        if not isinstance(discovery_family, dict) or not isinstance(confirmation_family, dict):
+        if not isinstance(discovery_family, dict) or not isinstance(
+            confirmation_family, dict
+        ):
             raise FixtureError(f"{fixture_id} phase manifest is absent")
         public_discovery = public_family.get("discovery")
-        if public_discovery != discovery_family:
+        if public_discovery != {
+            "row_count": discovery_family.get("row_count"),
+            "rows": discovery_family.get("rows"),
+            "packs": discovery_family.get("packs"),
+        }:
             raise FixtureError(f"{fixture_id} public discovery projection mismatch")
         discovery_rows = discovery_family.get("rows")
         private_rows = confirmation_family.get("rows")
@@ -1193,10 +1519,80 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
             != {
                 "row_count": fixture["confirmation_count"],
                 "semantic_commitment_sha256": semantic_sha256(private_rows),
+                "packs": {
+                    pack: {
+                        "row_count": record["row_count"],
+                        "training_row_count": record["splits"]["training"]["row_count"],
+                        "evaluation_row_count": record["splits"]["evaluation"][
+                            "row_count"
+                        ],
+                        "semantic_commitment_sha256": semantic_sha256(record["rows"]),
+                    }
+                    for pack, record in sorted(
+                        confirmation_family.get("packs", {}).items()
+                    )
+                },
                 "custodian_manifest_sha256": confirmation_file_sha,
             }
         ):
             raise FixtureError(f"{fixture_id} phase count or commitment mismatch")
+        for phase, family_record in (
+            ("discovery", discovery_family),
+            ("confirmation", confirmation_family),
+        ):
+            expected_packs = {
+                record["pack"]: {
+                    "training": record["training_count"],
+                    "evaluation": record["evaluation_count"],
+                }
+                for record in _phase_packs(fixture, phase)
+            }
+            actual_packs = family_record.get("packs")
+            if not isinstance(actual_packs, dict) or set(actual_packs) != set(
+                expected_packs
+            ):
+                raise FixtureError(f"{fixture_id} {phase} pack inventory mismatch")
+            flattened: list[dict[str, Any]] = []
+            for pack, expected_splits in expected_packs.items():
+                record = actual_packs[pack]
+                split_records = (
+                    record.get("splits") if isinstance(record, dict) else None
+                )
+                if (
+                    not isinstance(record, dict)
+                    or set(record) != {"row_count", "rows", "splits"}
+                    or record.get("row_count") != sum(expected_splits.values())
+                    or not isinstance(record.get("rows"), list)
+                    or len(record["rows"]) != sum(expected_splits.values())
+                    or any(row.get("pack") != pack for row in record["rows"])
+                    or not isinstance(split_records, dict)
+                    or set(split_records) != {"training", "evaluation"}
+                ):
+                    raise FixtureError(f"{fixture_id} {phase}/{pack} record mismatch")
+                split_projection: list[dict[str, Any]] = []
+                for split_role, expected_count in expected_splits.items():
+                    split = split_records[split_role]
+                    if (
+                        not isinstance(split, dict)
+                        or set(split) != {"row_count", "rows"}
+                        or split.get("row_count") != expected_count
+                        or not isinstance(split.get("rows"), list)
+                        or len(split["rows"]) != expected_count
+                        or any(
+                            row.get("split_role") != split_role for row in split["rows"]
+                        )
+                    ):
+                        raise FixtureError(
+                            f"{fixture_id} {phase}/{pack}/{split_role} mismatch"
+                        )
+                    split_projection.extend(split["rows"])
+                if split_projection != record["rows"]:
+                    raise FixtureError(
+                        f"{fixture_id} {phase}/{pack} split projection mismatch"
+                    )
+                flattened.extend(record["rows"])
+            if flattened != family_record.get("rows"):
+                raise FixtureError(f"{fixture_id} {phase} pack projection mismatch")
         for phase, rows, root in (
             ("discovery", discovery_rows, public_root / "discovery"),
             ("confirmation", private_rows, custodian_root / "confirmation"),
@@ -1206,6 +1602,9 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
                     row.get("fixture_id") != fixture_id
                     or row.get("family") != fixture["family"]
                     or row.get("ordinal") != ordinal
+                    or row.get("pack") != _pack_assignment(fixture, phase, ordinal)[0]
+                    or row.get("split_role")
+                    != _pack_assignment(fixture, phase, ordinal)[1]
                 ):
                     raise FixtureError(f"{fixture_id} {phase} row order mismatch")
                 verified, image_bytes = _verify_row_bytes(root, row, phase=phase)
@@ -1228,8 +1627,14 @@ def verify_candidate(public_root: Path, custodian_root: Path) -> dict[str, Any]:
     dedup = _dedup_evidence(rows_with_bytes)
     if candidate.get("cross_candidate_evidence") != dedup:
         raise FixtureError("candidate dedup evidence mismatch")
-    if candidate.get("confirmation", {}).get("total_row_count") != 28:
-        raise FixtureError("candidate confirmation total is not 28")
+    expected_confirmation_total = sum(
+        item["confirmation_count"] for item in FIXTURE_CONTRACT
+    )
+    if (
+        candidate.get("confirmation", {}).get("total_row_count")
+        != expected_confirmation_total
+    ):
+        raise FixtureError("candidate confirmation total is invalid")
     return {
         "candidate_manifest": candidate,
         "discovery_manifest": discovery,
@@ -1246,24 +1651,41 @@ def verify_replay(
     discovery_key: bytes | bytearray,
     confirmation_key: bytes | bytearray,
 ) -> dict[str, Any]:
-    """Rerender all 98 rows and require exact manifest and byte identities."""
+    """Rerender every row and require exact manifest and byte identities."""
 
     discovery_key = _validate_key(discovery_key, "discovery key")
     confirmation_key = _validate_key(confirmation_key, "confirmation key")
+    _require_distinct_phase_keys(discovery_key, confirmation_key)
     verified_candidate = verify_candidate(Path(public_output), Path(custodian_output))
     discovery = verified_candidate["discovery_manifest"]
     confirmation = verified_candidate["confirmation_manifest"]
     expected_manifests = {
         "discovery": (discovery, discovery_key, Path(public_output) / "discovery"),
-        "confirmation": (confirmation, confirmation_key, Path(custodian_output) / "confirmation"),
+        "confirmation": (
+            confirmation,
+            confirmation_key,
+            Path(custodian_output) / "confirmation",
+        ),
     }
     verified = 0
     replay_rows: list[tuple[dict[str, Any], bytes]] = []
     contract_by_id = {item["fixture_id"]: item for item in FIXTURE_CONTRACT}
+    phase_commitments = {
+        "discovery": _phase_key_commitment(discovery_key, DISCOVERY_DOMAIN),
+        "confirmation": _phase_key_commitment(confirmation_key, CONFIRMATION_DOMAIN),
+    }
     for phase, (manifest, key, root) in expected_manifests.items():
-        if manifest.get("phase") != phase or manifest.get("status") != "candidate_unreviewed":
+        if (
+            manifest.get("phase") != phase
+            or manifest.get("status") != "candidate_unreviewed"
+            or manifest.get("phase_key_commitment_sha256") != phase_commitments[phase]
+        ):
             raise FixtureError(f"{phase} manifest identity mismatch")
-        body = {key_name: value for key_name, value in manifest.items() if key_name != "semantic_sha256"}
+        body = {
+            key_name: value
+            for key_name, value in manifest.items()
+            if key_name != "semantic_sha256"
+        }
         if manifest.get("semantic_sha256") != semantic_sha256(body):
             raise FixtureError(f"{phase} manifest semantic hash mismatch")
         for fixture_id, family_record in manifest["families"].items():
@@ -1272,14 +1694,23 @@ def verify_replay(
                 raise FixtureError(f"unknown replay fixture: {fixture_id}")
             rows = family_record["rows"]
             expected_count = fixture[f"{phase}_count"]
-            if family_record["row_count"] != expected_count or len(rows) != expected_count:
+            if (
+                family_record["row_count"] != expected_count
+                or len(rows) != expected_count
+            ):
                 raise FixtureError(f"{fixture_id} {phase} count mismatch")
             for ordinal, recorded in enumerate(rows):
                 image, caption, replayed = _render(fixture, phase, ordinal, key)
                 if replayed != recorded:
-                    raise FixtureError(f"{fixture_id} {phase} row record replay mismatch")
-                actual_image = _read_regular(root / recorded["relative_image_path"], "candidate image")
-                actual_caption = _read_regular(root / recorded["relative_caption_path"], "candidate caption")
+                    raise FixtureError(
+                        f"{fixture_id} {phase} row record replay mismatch"
+                    )
+                actual_image = _read_regular(
+                    root / recorded["relative_image_path"], "candidate image"
+                )
+                actual_caption = _read_regular(
+                    root / recorded["relative_caption_path"], "candidate caption"
+                )
                 if actual_image != image or actual_caption != caption:
                     raise FixtureError(f"{fixture_id} {phase} candidate bytes changed")
                 replay_rows.append((replayed, image))
@@ -1296,6 +1727,10 @@ def verify_replay(
         "verified_rows": verified,
         "candidate_semantic_sha256": candidate["semantic_sha256"],
         "dedup_semantic_sha256": dedup["semantic_sha256"],
+        "discovery_key_commitment_sha256": phase_commitments["discovery"],
+        "confirmation_key_commitment_sha256": phase_commitments["confirmation"],
+        "contract_path": candidate["generator"]["contract_path"],
+        "contract_source_sha256": candidate["generator"]["contract_source_sha256"],
     }
 
 
@@ -1303,7 +1738,11 @@ def _read_key_file(path: Path, label: str) -> bytes:
     path = Path(os.path.abspath(os.path.expanduser(path)))
     _require_no_symlink_components(path, label)
     metadata = path.lstat()
-    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
         raise FixtureError(f"{label} must be a non-symlink regular file mode 0600")
     return _validate_key(_read_regular(path, label), label)
 
@@ -1333,7 +1772,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "public_output": args.public_output,
         "custodian_output": args.custodian_output,
         "discovery_key": _read_key_file(args.discovery_key_file, "discovery key"),
-        "confirmation_key": _read_key_file(args.confirmation_key_file, "confirmation key"),
+        "confirmation_key": _read_key_file(
+            args.confirmation_key_file, "confirmation key"
+        ),
     }
     result = (
         build_candidate(

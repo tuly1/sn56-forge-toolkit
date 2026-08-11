@@ -177,112 +177,122 @@ Outputs are UTC-named, checksum-bound, and create-only. `PARTIAL` is an honest
 terminal result when a public surface is missing or lagging; it must not be
 silently promoted to COMPLETE by inference.
 
-## Rights-clean HKE fixture candidates
+## Schema-3 rights-clean HKE fixture candidates
 
-`hke_procedural_renderer.py` is the CPU-only fixture source for the next Krea
-screen. It renders 98 first-party rows from integer geometry and a code-owned
-bitmap alphabet: social 10 discovery + 8 confirmation, product 28 + 10, and
-logo/UI 32 + 10. It has no network, font, reference-image, model-output, or
-tournament-content input. Discovery and confirmation use distinct key domains
-and must be written to disjoint create-only roots. The public candidate exposes
-only confirmation counts and commitments; exact confirmation membership stays
-in the custodian tree. Confirmation row IDs, file names, caption variation
-tokens, visible variation tokens, and group identities are all derived from the
-private confirmation key, so public source plus ordinal counts cannot recreate
-them.
+> **No legacy reuse:** every earlier candidate, review, admission, experiment
+> plan, timing record, training receipt, attachment receipt, score receipt, and
+> decision receipt is schema-invalid. Do not rehash, wrap, migrate, or reuse
+> any of it. Regenerate every schema-3 artifact in a fresh create-only root
+> after review of the exact pushed source SHA.
 
-```bash
-python ops/experiments/week7/hke_procedural_renderer.py build \
-  --public-output /absolute/create-only/public-candidate \
-  --custodian-output /absolute/create-only/private-confirmation \
-  --discovery-key-file /absolute/private/discovery-key.bin \
-  --confirmation-key-file /absolute/private/confirmation-key.bin \
-  --generator-commit EXACT_PUSHED_40_HEX_COMMIT \
-  --generator-tree EXACT_40_HEX_TREE \
-  --author-record 'SN56 first-party procedural renderer' \
-  --rights-owner 'NAMED RIGHTS OWNER' \
-  --license-or-use-grant 'EXACT OWNER-APPROVED USE OR LICENSE RECORD'
+`hke_procedural_renderer.py` is the CPU-only source for a new first-party Krea
+instrument. The schema-3 inventory is 144 rows:
 
-python ops/experiments/week7/hke_procedural_renderer.py verify \
-  --public-output /absolute/create-only/public-candidate \
-  --custodian-output /absolute/create-only/private-confirmation \
-  --discovery-key-file /absolute/private/discovery-key.bin \
-  --confirmation-key-file /absolute/private/confirmation-key.bin
-```
+| Family | Packs | Per-pack training | Per-pack held-out evaluation |
+|---|---|---:|---:|
+| social / FutureBound | D1, D2, C1, C2 | 10 | 8 |
+| product | D1, C1 | 10 | 8 |
+| logo/UI | D1, C1 | 10 | 8 |
 
-The result is deliberately `candidate_unreviewed`. Machine replay, rights
-declarations, and a zero-match exact/pixel/caption/perceptual screen are not
-human review.
+D1 is discovery, D2 is independent discovery replication, C1 is sealed
+confirmation, and social C2 is a separately sealed reserve. Every pack's 10
+training rows and 8 evaluation rows are disjoint. Discovery and confirmation
+use distinct private phase-key files, each held at mode `0600`. Training and
+evaluation use distinct derived split keys within those phases. All effective
+keys must be unequal across both separation axes and never reused for a
+different phase or split. Public discovery and private confirmation outputs
+also live in disjoint create-only trees.
 
-`hke_fixture_admission.py` enforces that missing authority. A custodian first
-creates the private 98-row review template. A named human fills every bound
-row check and chooses PASS; `seal-review` validates and seals that exact draft;
-then `admit` reruns candidate and keyed replay verification before emitting one
-receipt per family. Public receipts omit reviewer identity and confirmation row
-identities. The receipt honestly labels the named-human assertion as
-operator-attested; it does not cryptographically authenticate a person. Even a
-PASS authorizes fixture use only: owner ratification is still required and GPU
-and deployment remain false. Review drafts and seals must live outside the
-public candidate, candidate-custodian, and repository trees.
+The renderer uses integer geometry and a code-owned bitmap alphabet. It has no
+network, external font, reference-image, model-output, opponent, tournament,
+hidden/test-data, or validator-evaluation-row input. Confirmation identities,
+paths, captions, visible tokens, groups, and bytes remain unavailable from the
+public candidate; the public side exposes only counts and commitments.
 
-```bash
-python ops/experiments/week7/hke_fixture_admission.py review-template \
-  --public-root /absolute/public-candidate \
-  --custodian-root /absolute/private-confirmation \
-  --output /absolute/private/review-draft.json
+Fresh admission requires deterministic byte replay, exact generator
+commit/tree and source hashes, ownership/use records, cross-family,
+cross-phase, cross-pack, and train/evaluation deduplication, and named-human
+review of every image-caption row. The review record is
+`operator_attested`: its bindings establish internal consistency but do not
+cryptographically authenticate the named person. A PASS admits only that
+fixture revision after owner ratification. It grants no GPU, merge, release, or
+deployment authority.
 
-# A named human reviews and edits review-draft.json outside the repository.
+Confirmation stays sealed throughout D1 and D2. After D2, freeze the candidate
+recipe, checkpoint target, evaluator, inference settings, seed policy, and
+decision rule before any C1 identity or byte is revealed. C1 then supplies the
+single social confirmation and the product and logo/UI guardrails. Social C2
+may be opened only by a separate, predeclared borderline-C1 trigger; it must
+not be used routinely, to tune a threshold, or to rescue a failed C1 result.
 
-python ops/experiments/week7/hke_fixture_admission.py seal-review \
-  --public-root /absolute/public-candidate \
-  --custodian-root /absolute/private-confirmation \
-  --draft /absolute/private/review-draft.json \
-  --output /absolute/private/review-sealed.json
+## Schema-3 calibration-only HKE factor screen
 
-python ops/experiments/week7/hke_fixture_admission.py admit \
-  --public-root /absolute/public-candidate \
-  --custodian-root /absolute/private-confirmation \
-  --sealed-review /absolute/private/review-sealed.json \
-  --discovery-key-file /absolute/private/discovery-key.bin \
-  --confirmation-key-file /absolute/private/confirmation-key.bin \
-  --output-root /absolute/create-only/admission-receipts
-```
+`run_hke_factorial.py` describes a staged FutureBound-first screen. The D1 core
+is a matched 1,200-step loss (MAE versus MSE) × multires-noise factorial, with
+the exact retry reconstruction kept separate:
 
-## Calibration-only HKE factor screen
+| Cell | Loss | Multires noise | Terminal depth | Runtime |
+|---|---|---|---:|---|
+| R0 | retry recipe | retry setting | 1,166 exactly | incumbent |
+| A | MAE | off | 1,200 exactly | owned |
+| B | MSE | off | 1,200 exactly | owned |
+| C | MAE | 6 iterations, 0.3 discount | 1,200 exactly | owned |
+| D | MSE | 6 iterations, 0.3 discount | 1,200 exactly | owned |
 
-`run_hke_factorial.py` freezes the first controlled screen without adding a
-router or checkpoint promoter:
+The 1,200-step depth is fixed by the reviewed contract, not inferred from a
+timing profile. Score each natural periodic checkpoint and the terminal
+checkpoint, but do not require a synthetic 1,166 checkpoint from A–D. R0 ends
+at exactly 1,166 steps.
 
-- A: MAE + current dataset-size law;
-- B: MSE + current dataset-size law;
-- C: MAE + measured clock-fill; and
-- D: MSE + measured clock-fill.
+Before A–D, a no-multires incumbent-versus-owned runtime bridge must clear its
+predeclared equivalence tolerance. In the prelaunch plan, owned-runtime use is
+limited to that bridge and A–D; R0 remains on the incumbent runtime. This is an
+experiment boundary, not authority to swap the production runtime or change a
+non-Krea path.
 
-The CPU contract is frozen before rental. Clock-fill is materialized only after
-the mechanical H100 gate produces internally validated, bundle-bound,
-operator-attested profiles for the incumbent runtime and matching dataset
-regime. These records establish internal consistency, not independent proof of
-measurement, and every profile must name the same H100 80 GB identity. There
-is no hard-coded HKE seconds/step fallback. Product and logo/UI use A–D; the
-10-row social envelope uses A/D for operational reliability only. Decisions
-use terminal checkpoints and paired exact-score rows. A factor reaches
-discovery GO only with the same improving direction on both primary families,
-a 95% paired interval clearing zero on at least one, and no 1% regression. GO
-is not ship authority.
+The stage order is fail-closed:
 
-The serialized plan embeds the complete admission-set and complete timing
-profile/binding documents. Analysis reruns their semantic validators and
-recomputes every A–D config, including the unlaunched social MSE timing source;
-a plan digest alone is never treated as evidence. Training, attachment, and
-exact-score inputs are complete self-hashed receipt bodies bound to the plan,
-config, artifact, fixture, and evaluator. They are still explicitly
-operator-attested and do not independently prove that a human or GPU performed
-the declared work. The decision record preserves that limitation and carries
-no ship authority.
+1. Freeze the admitted D1 fixtures, evaluator, preprocessing, inference seeds,
+   prompted/blank weighting, runtime identities, and decision rules.
+2. Clear the runtime bridge, then run social D1 R0 and A–D against only D1's
+   held-out evaluation rows.
+3. Freeze one D1 recipe/checkpoint candidate, then compare it with the
+   incumbent on social D2 under the two predeclared finalist seeds.
+4. After D2, freeze the candidate, checkpoint target, evaluator, seed policy,
+   and decision rule before revealing C1.
+5. Run social C1 once, without reselection, then apply product C1 and logo/UI
+   C1 as guardrails.
+6. Keep social C2 sealed unless the separately predeclared borderline trigger
+   fires.
+
+Training directories and evaluation directories are independently inventoried
+and bound to their pack/split identities. Timing profiles and all execution,
+training, attachment, exact-score, freeze, and decision records are
+content-bound and `operator_attested`. They can demonstrate schema consistency
+and declared provenance; they are not independent proof that a human review,
+GPU run, attachment, or score event occurred.
+
+Every later-stage plan carries the complete prior-stage plan and evidence
+needed to reproduce it. Validation rebuilds the expected plan from that source
+chain and compares canonical bytes, so re-hashing an edited outer envelope
+cannot substitute a different generated config, optional-E cell, D2 finalist,
+confirmation candidate, or C2 input. D1's terminal record also preserves the
+predeclared MAE-versus-MSE and multires-noise factorial effects at the terminal
+checkpoint; these effects are descriptive experimental outputs, not execution
+or deployment authority.
+
+Private confirmation reveals bind the complete revealed row records to the
+family admission, phase commitment, physical training/evaluation inventories,
+and post-D2 freeze. Those records remain private after reveal and cannot be
+transplanted between families, packs, or an independently re-hashed authority
+envelope.
+
+The schema-3 contract and plan are CPU prelaunch artifacts only. They do not
+authorize a GPU rental or launch, fixture admission by themselves, checkpoint
+promotion, a semantic router, a merge, deployment, endpoint repoint, or any
+production mutation. Any later execution or release needs separate explicit
+owner authority.
 
 ```bash
 python ops/experiments/week7/run_hke_factorial.py contract
-python ops/experiments/week7/run_hke_factorial.py analyze \
-  --plan timing-bound-plan.json \
-  --evidence discovery-score-evidence.json
 ```

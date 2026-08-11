@@ -1,78 +1,136 @@
 # Week-7 HKE CPU prelaunch gates
 
-Status: **CPU WORK AUTHORIZED / GPU NOT AUTHORIZED**
+Status: **SCHEMA-3 CPU REMEDIATION ONLY / GPU NOT AUTHORIZED**
 Production status: **untouched**
+Authority: **no merge, rental, launch, admission, release, or deployment**
 
-This record translates the owner-approved immediate order into machine gates.
-It is not a quality claim, deployment authorization, fixture admission, or a
-FutureBound root-cause statement.
+> **Legacy artifacts are invalid.** Every earlier HKE candidate, review,
+> admission, experiment plan, timing record, training receipt, attachment
+> receipt, score receipt, and decision receipt uses a superseded schema. None
+> may be rehashed, wrapped, migrated, or reused. Regenerate all schema-3
+> material from the exact reviewed source SHA in fresh create-only roots.
 
-## Dependency gate
+This record defines CPU prelaunch contracts. It is not a quality claim, GPU
+request, fixture admission, FutureBound root-cause finding, or deployment
+authorization.
 
-The experiment branch is stacked on Forge remediation commit
-`8398825d28554c49357c6ea9a7d34ea85be7cea7`. An independent, exact-SHA PASS
-for that commit remains a prerequisite to freezing the remediation base. A
-PASS closes review findings only; it does not authorize deployment.
+## Evidence and dependency boundary
 
-## CPU lanes that may proceed now
+The FutureBound no-submission observation was a pre-retry snapshot, not the
+final result. The safe post-retry API snapshot records a scored submission at
+`0.0658568064`, rank `10 of 12`. The preserved evidence boundary is:
 
-1. **FutureBound evidence request.** Request validator-side assignment/retry,
-   worker/GPU, clone/build, container/exit, watchdog, output-directory, and
-   uploader evidence. Until those records identify and reconcile the first
-   failed stage, the cause remains unresolved.
-2. **Rights-clean fixture preparation.** Materialize independent first-party
-   procedural candidates for social (10 discovery + 8 confirmation), product
-   (28 + 10), and logo/UI (32 + 10). Confirmation membership remains sealed.
-3. **Calibration-only experiment code.** Predeclare A=MAE/current law,
-   B=MSE/current law, C=MAE/measured clock-fill, and D=MSE/measured clock-fill.
-   The clock-fill rate must come from a bundle-bound measured H100 profile, not
-   a copied field constant.
+- correction record:
+  `/Users/atulyashetty/Test/SN56-project/evidence/week7-post-retry-20260811/PR16-CORRECTION-RECORD-2026-08-11.md`;
+- safe API snapshot:
+  `/Users/atulyashetty/Test/SN56-project/evidence/week7-post-retry-20260811/public-api-safe/snapshots/20260811T142602.496953Z.json`;
+- snapshot SHA-256:
+  `a77f3c5da54b1b81c891a3a27ff62a7aa1464a03fbcd2ac20898989e29d0d9f5`.
 
-## Gates that stay closed
+The correction record identifies PR #16 head
+`ed99cee0d6c9cab1b68f43c742e2735fee99a0d0` and tree
+`d9cccfd31f906b9f2b4e282551e6657baa2d8501` as independently reviewed PASS.
+That is review authority only. PR #17 still requires a clean rebase onto that
+base, a pushed exact head/tree equality check, and an independent exact-SHA
+PASS before any fresh candidate is generated.
 
-- No fixture is admitted without exact ownership/source records,
-  deterministic byte replay, named-human row review, cross-family and
-  cross-phase exact/perceptual/group deduplication, and a sealed confirmation
-  commitment.
-- Agent review is never represented as human review.
-- Machine receipts label the named-human assertion as operator-attested; owner
-  ratification remains a separate prerequisite for later GPU authorization.
-- No GPU is rented until all three fixture admissions and the CPU experiment
-  contract pass. The initial rental may run only the mechanical gates and
-  timing observations listed below. Those observations must then produce a
-  timing-bound discovery plan before any quality-comparison cell launches.
-- No semantic router, live checkpoint promotion, runtime swap, deployment,
-  endpoint repoint, or production mutation is in this cycle.
-- Public tournament training archives can inform family and size priors only;
-  they are not fixture inputs.
+## Schema-3 fixture gate
 
-## First GPU signal, when CPU gates close
+Only the following fresh first-party packs are in scope:
 
-Request one H100 80 GB for 12–16 hours. Before quality comparisons, require:
+| Family | Pack | Role | Training rows | Held-out evaluation rows |
+|---|---|---|---:|---:|
+| social / FutureBound | D1 | discovery | 10 | 8 |
+| social / FutureBound | D2 | discovery replication | 10 | 8 |
+| social / FutureBound | C1 | sealed confirmation | 10 | 8 |
+| social / FutureBound | C2 | sealed borderline reserve | 10 | 8 |
+| product | D1 | discovery guardrail preparation | 10 | 8 |
+| product | C1 | sealed confirmation guardrail | 10 | 8 |
+| logo/UI | D1 | discovery guardrail preparation | 10 | 8 |
+| logo/UI | C1 | sealed confirmation guardrail | 10 | 8 |
 
-1. fresh builds of both Dockerfiles;
-2. incumbent/owned runtime identity and non-Krea isolation proofs;
-3. a production-shaped 10-pair, 0.75-hour end-to-end run;
-4. a forced-deadline valid fallback export;
-5. recovery and strict-abort proofs;
-6. clean ComfyUI LoRA attachment; and
-7. an actual bundle-specific throughput profile used by Arms C and D.
+Every training/evaluation split is disjoint, and every pack is independent.
+Discovery and confirmation require distinct private phase-key files, each held
+at mode `0600`. Training and evaluation require distinct derived split keys
+inside each phase. All effective keys must be unequal across both axes and
+never reused across phases or splits. Discovery and confirmation outputs must
+be separate create-only trees.
 
-All timing profiles must come from that same H100 identity. The resulting
-timing-bound discovery plan remains explicitly non-authorizing: it binds the
-recipes and evidence inputs but does not itself launch a cell. The plan embeds
-and revalidates the full fixture-admission and timing-profile/binding records;
-summary hashes alone are insufficient. Later training, attachment, and score
-receipts are content-bound but remain honestly operator-attested rather than
-independent proof of physical execution.
+Admission remains closed until the fresh candidate has exact ownership/use
+records, deterministic byte replay, complete source and dependency bindings,
+cross-family/cross-phase/cross-pack/train-evaluation deduplication, sealed
+confirmation commitments, named-human review of every image-caption row, and
+explicit owner ratification. Public tournament archives, opponent material,
+hidden/test data, and validator evaluation rows are not fixture inputs.
 
-The 10-pair replay can rule out a deterministic small-dataset failure in our
-code. It cannot reconstruct or establish the cause of FutureBound.
+## Schema-3 experiment gate
 
-## Predeclared discovery rule
+The primary D1 screen is an exact 1,200-step loss (MAE versus MSE) ×
+multires-noise factorial:
 
-Product and logo/UI receive A–D on Seed A. Social receives incumbent A versus
-D as a reliability envelope. A factor advances only when its effect points in
-the same direction on both primary families, clears paired uncertainty on at
-least one, and regresses neither family by 1% or more. Exact checkpoint scores
-are offline evidence; live promotion remains disabled.
+| Cell | Loss | Multires noise | Terminal depth | Runtime |
+|---|---|---|---:|---|
+| R0 | exact retry recipe | exact retry setting | 1,166 | incumbent |
+| A | MAE | off | 1,200 | owned |
+| B | MSE | off | 1,200 | owned |
+| C | MAE | 6 iterations, 0.3 discount | 1,200 | owned |
+| D | MSE | 6 iterations, 0.3 discount | 1,200 | owned |
+
+The factorial depth is fixed at 1,200; timing observations may establish
+feasibility but cannot redefine it. R0 must terminate at exactly 1,166. Score
+natural periodic and terminal checkpoints without inventing a 1,166 checkpoint
+for A–D.
+
+A no-multires incumbent-versus-owned bridge must clear its predeclared
+equivalence tolerance before A–D. In the prelaunch plan, the owned runtime is
+allowed only for the owned side of that bridge and A–D. R0 stays on the
+incumbent runtime. No runtime swap, non-Krea change, or production mutation is
+authorized.
+
+## Staged freeze and confirmation gate
+
+The plan must enforce this order:
+
+1. Freeze fixture identities, evaluator and preprocessing, inference seeds,
+   prompted/blank weighting, runtime identities, and decision rules.
+2. Clear the runtime bridge; then run and exact-score social D1 R0 and A–D only
+   against D1 held-out evaluation rows.
+3. Freeze one D1 recipe and checkpoint target; compare it with the incumbent on
+   social D2 under both predeclared finalist seeds.
+4. After D2, freeze the candidate digest, recipe, checkpoint target, evaluator,
+   inference settings, seed policy, and decision rule before any C1 identity
+   or byte is revealed.
+5. Run social C1 once without confirmation-driven reselection. Product C1 and
+   logo/UI C1 are guardrails, not co-equal discovery targets.
+6. Keep social C2 sealed unless a separate, predeclared borderline-C1 trigger
+   fires. C2 cannot tune a threshold, replace routine C1 confirmation, or
+   rescue a failed result.
+
+Training rows may never enter evaluation inventories. Confirmation results may
+not select a recipe, checkpoint, threshold, or router.
+
+## Evidence and authority gate
+
+Timing profiles and execution, training, attachment, score, freeze, and
+decision records must be complete, self-hashed, and bound to the exact plan,
+config, runtime, accelerator observation, artifact, fixture split, and
+evaluator. Their evidence class is `operator_attested`. These records can prove
+internal consistency and declared provenance; they are not independent proof
+that a person reviewed a row or that a GPU, attachment, or scoring event
+occurred.
+
+Later-stage validation must reproduce the complete D1, optional-E, D2,
+confirmation, and conditional-C2 source chain from embedded source plans and
+evidence. A digest-valid outer envelope is insufficient. The executed config
+must be the config rebuilt from the frozen source chain, revealed confirmation
+rows must reproduce their admission-bound commitments and physical
+inventories, and the terminal D1 freeze must retain the predeclared 2x2
+factorial effects. Any source/evidence transplant or post-hoc config mutation
+is a hard failure.
+
+CPU contract generation does not authorize GPU rental or execution. Even a
+future all-green experiment would produce evidence for a reviewed candidate,
+not merge or ship authority. GPU use, fixture admission, checkpoint promotion,
+semantic routing, release, deployment, endpoint repointing, and production
+changes each remain closed pending separate explicit owner authorization and
+their own review gates.
