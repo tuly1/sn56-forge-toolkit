@@ -18,11 +18,13 @@ explicitly.  Unknown bundles and incomplete manifests are fatal by design.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import stat
 import tempfile
 from typing import Any, Mapping
@@ -164,6 +166,68 @@ class KreaRuntimeContractError(RuntimeError):
     """An experimental recipe cannot be represented by the active runtime."""
 
 
+@dataclasses.dataclass
+class VerifiedRuntime:
+    """Private immutable materialization of the verified runtime tree.
+
+    The selected checkout remains untrusted mutable input.  Verification copies
+    its exact bytes into a private directory, verifies the copied Git tree, and
+    carries that directory descriptor into ``Popen``.  Neither replacing the
+    checkout path nor modifying one of its children can redirect execution.
+    """
+
+    runtime_dir: str
+    materialized_dir: str
+    directory_fd: int
+
+    def launch_cwd(self) -> str:
+        for root in ("/proc/self/fd", "/dev/fd"):
+            candidate = f"{root}/{self.directory_fd}"
+            if os.path.isdir(candidate):
+                return candidate
+        raise KreaRuntimeContractError(
+            "verified runtime descriptor has no executable fd namespace"
+        )
+
+    def popen_directory_kwargs(self) -> dict[str, Any]:
+        """Return platform-specific, descriptor-bound ``Popen`` arguments."""
+
+        proc_path = f"/proc/self/fd/{self.directory_fd}"
+        if os.path.isdir(proc_path):
+            return {
+                "cwd": proc_path,
+                "pass_fds": (self.directory_fd,),
+            }
+
+        # macOS exposes directory descriptors under /dev/fd but its subprocess
+        # chdir rejects that synthetic path.  No sampler thread exists yet at
+        # this boundary, so the fallback performs the single async-safe fchdir
+        # operation in the child before exec.  Production Linux takes the
+        # /proc path above and does not use preexec_fn.
+        return {
+            "cwd": None,
+            "pass_fds": (self.directory_fd,),
+            "preexec_fn": self._fchdir_for_exec,
+        }
+
+    def _fchdir_for_exec(self) -> None:
+        os.fchdir(self.directory_fd)
+
+    def close(self) -> None:
+        if self.directory_fd >= 0:
+            os.close(self.directory_fd)
+            self.directory_fd = -1
+        if self.materialized_dir:
+            _remove_materialized_runtime(self.materialized_dir)
+            self.materialized_dir = ""
+
+    def __enter__(self) -> "VerifiedRuntime":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
+
+
 def requested_bundle(model_type: str, environ: dict[str, str] | None = None) -> str:
     """Resolve the explicit Krea bundle without affecting any other model type."""
     if (model_type or "").strip().lower() != "krea2":
@@ -227,6 +291,19 @@ def _isolated_runtime_directories(
         raise KreaRuntimeContractError(
             "incumbent and owned runtime directories overlap"
         )
+    try:
+        incumbent_identity = os.stat(incumbent_dir, follow_symlinks=False)
+        owned_identity = os.stat(owned_dir, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if (incumbent_identity.st_dev, incumbent_identity.st_ino) == (
+            owned_identity.st_dev,
+            owned_identity.st_ino,
+        ):
+            raise KreaRuntimeContractError(
+                "incumbent and owned runtime directories alias the same root"
+            )
     return incumbent_dir, owned_dir
 
 
@@ -441,16 +518,34 @@ def verify_selected_runtime(
 ) -> str:
     """Fail before every launch unless the executable tree is the pinned tree."""
 
-    runtime_dir = runtime_directory(model_type, bundle, environ=environ)
+    with open_verified_runtime(
+        model_type,
+        bundle,
+        environ=environ,
+    ) as verified:
+        return verified.runtime_dir
+
+
+def open_verified_runtime(
+    model_type: str,
+    bundle: str,
+    *,
+    environ: dict[str, str] | None = None,
+) -> VerifiedRuntime:
+    """Verify and retain the exact directory descriptor used by the child."""
+
+    env = os.environ if environ is None else environ
+    runtime_dir = runtime_directory(model_type, bundle, environ=env)
     is_experimental_krea = (
         (model_type or "").strip().lower() == "krea2"
         and bundle != INCUMBENT_BUNDLE
     )
+    manifest: dict[str, Any] | None = None
     if is_experimental_krea:
         manifest = load_capability_manifest(
             model_type=model_type,
             bundle=bundle,
-            environ=environ,
+            environ=env,
         )
         require_capabilities(manifest, _BUNDLE_CAPABILITIES[bundle])
 
@@ -460,12 +555,166 @@ def verify_selected_runtime(
     expected_tree = (
         OWNED_RUNTIME_TREE if is_experimental_krea else PINNED_BASE_TREE
     )
-    _verify_runtime_tree(
-        runtime_dir,
-        expected_commit=expected_commit,
-        expected_tree_sha1=expected_tree,
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
     )
-    return runtime_dir
+    try:
+        root_fd = os.open(runtime_dir, flags)
+    except OSError as exc:
+        raise KreaRuntimeContractError(
+            "selected runtime checkout is unavailable"
+        ) from exc
+    materialized_dir = ""
+    materialized_fd = -1
+    expected_identity: dict[str, Any] | None = None
+    manifest_bytes = b""
+    try:
+        path_identity = os.stat(runtime_dir, follow_symlinks=False)
+        if _stable_stat_identity(os.fstat(root_fd)) != _stable_stat_identity(
+            path_identity
+        ):
+            raise KreaRuntimeContractError(
+                "selected runtime path changed before verification"
+            )
+        if is_experimental_krea:
+            assert manifest is not None
+            manifest_stat = os.stat(
+                CAPABILITY_MANIFEST_FILENAME,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            manifest_bytes = _read_fd_regular_bytes(
+                root_fd,
+                CAPABILITY_MANIFEST_FILENAME,
+                manifest_stat,
+                maximum_size=_MAX_ATTESTATION_BYTES,
+            )
+            try:
+                descriptor_manifest = json.loads(manifest_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise KreaRuntimeContractError(
+                    "descriptor-bound capability manifest is invalid"
+                ) from exc
+            if descriptor_manifest != manifest:
+                raise KreaRuntimeContractError(
+                    "capability manifest changed before runtime verification"
+                )
+            identity_stat = os.stat(
+                RUNTIME_IDENTITY_FILENAME,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            identity_bytes = _read_fd_regular_bytes(
+                root_fd,
+                RUNTIME_IDENTITY_FILENAME,
+                identity_stat,
+                maximum_size=_MAX_ATTESTATION_BYTES,
+            )
+            try:
+                descriptor_identity = json.loads(identity_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise KreaRuntimeContractError(
+                    "descriptor-bound runtime identity is invalid"
+                ) from exc
+            expected_identity = {
+                "schema": 1,
+                "runtime_repository": OWNED_RUNTIME_REPOSITORY,
+                "runtime_commit": OWNED_RUNTIME_COMMIT,
+                "capability_manifest_sha256": hashlib.sha256(
+                    manifest_bytes
+                ).hexdigest(),
+            }
+            if descriptor_identity != expected_identity:
+                raise KreaRuntimeContractError(
+                    "descriptor-bound runtime identity mismatch"
+                )
+        _verify_runtime_tree_fd(
+            root_fd,
+            expected_commit=expected_commit,
+            expected_tree_sha1=expected_tree,
+        )
+        if _stable_stat_identity(os.fstat(root_fd)) != _stable_stat_identity(
+            os.stat(runtime_dir, follow_symlinks=False)
+        ):
+            raise KreaRuntimeContractError(
+                "selected runtime path changed during verification"
+            )
+        materialized_dir = tempfile.mkdtemp(
+            prefix="sn56-runtime-exec-",
+            dir=os.path.realpath("/tmp"),
+        )
+        materialized_fd = os.open(materialized_dir, flags)
+        _copy_runtime_tree_fd(root_fd, materialized_fd, root=True)
+        allowed_root_extras = (
+            frozenset({RUNTIME_IDENTITY_FILENAME})
+            if is_experimental_krea
+            else frozenset()
+        )
+        materialized_tree = _git_tree_digest(
+            materialized_fd,
+            root=True,
+            allowed_root_extras=allowed_root_extras,
+        ).hex()
+        if materialized_tree != expected_tree:
+            raise KreaRuntimeContractError(
+                "materialized runtime executed tree mismatch"
+            )
+        if is_experimental_krea:
+            assert manifest is not None and expected_identity is not None
+            copied_manifest_stat = os.stat(
+                CAPABILITY_MANIFEST_FILENAME,
+                dir_fd=materialized_fd,
+                follow_symlinks=False,
+            )
+            copied_manifest_bytes = _read_fd_regular_bytes(
+                materialized_fd,
+                CAPABILITY_MANIFEST_FILENAME,
+                copied_manifest_stat,
+                maximum_size=_MAX_ATTESTATION_BYTES,
+            )
+            copied_identity_stat = os.stat(
+                RUNTIME_IDENTITY_FILENAME,
+                dir_fd=materialized_fd,
+                follow_symlinks=False,
+            )
+            copied_identity_bytes = _read_fd_regular_bytes(
+                materialized_fd,
+                RUNTIME_IDENTITY_FILENAME,
+                copied_identity_stat,
+                maximum_size=_MAX_ATTESTATION_BYTES,
+            )
+            if copied_manifest_bytes != manifest_bytes:
+                raise KreaRuntimeContractError(
+                    "materialized capability manifest mismatch"
+                )
+            try:
+                copied_identity = json.loads(copied_identity_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise KreaRuntimeContractError(
+                    "materialized runtime identity is invalid"
+                ) from exc
+            if copied_identity != expected_identity:
+                raise KreaRuntimeContractError(
+                    "materialized runtime identity mismatch"
+                )
+        os.fchmod(materialized_fd, 0o500)
+        os.close(root_fd)
+        root_fd = -1
+        return VerifiedRuntime(
+            runtime_dir=runtime_dir,
+            materialized_dir=materialized_dir,
+            directory_fd=materialized_fd,
+        )
+    except Exception:
+        if root_fd >= 0:
+            os.close(root_fd)
+        if materialized_fd >= 0:
+            os.close(materialized_fd)
+        _remove_materialized_runtime(materialized_dir)
+        raise
 
 
 def _git_sha1(data: bytes = b"") -> Any:
@@ -486,6 +735,174 @@ def _stable_stat_identity(value: os.stat_result) -> tuple[int, ...]:
         value.st_mtime_ns,
         value.st_ctime_ns,
     )
+
+
+def _copy_runtime_tree_fd(source_fd: int, destination_fd: int, *, root: bool) -> None:
+    """Copy one verified-tree candidate without following mutable pathnames."""
+
+    source_before = os.fstat(source_fd)
+    if not stat.S_ISDIR(source_before.st_mode):
+        raise KreaRuntimeContractError("selected runtime contains a non-directory")
+    try:
+        names = os.listdir(source_fd)
+    except OSError as exc:
+        raise KreaRuntimeContractError(
+            "selected runtime directory cannot be enumerated"
+        ) from exc
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    read_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    write_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for name in names:
+        if root and name == ".git":
+            continue
+        encoded_name = os.fsencode(name)
+        if not encoded_name or b"\x00" in encoded_name or b"/" in encoded_name:
+            raise KreaRuntimeContractError("selected runtime contains an invalid path")
+        try:
+            expected = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise KreaRuntimeContractError(
+                "selected runtime entry changed during materialization"
+            ) from exc
+        if stat.S_ISLNK(expected.st_mode):
+            raise KreaRuntimeContractError("selected runtime contains a symlink")
+        if stat.S_ISREG(expected.st_mode):
+            input_fd = -1
+            output_fd = -1
+            try:
+                input_fd = os.open(name, read_flags, dir_fd=source_fd)
+                try:
+                    output_fd = os.open(
+                        name, write_flags, 0o600, dir_fd=destination_fd
+                    )
+                except Exception:
+                    os.close(input_fd)
+                    input_fd = -1
+                    raise
+            except OSError as exc:
+                raise KreaRuntimeContractError(
+                    "selected runtime file cannot be materialized safely"
+                ) from exc
+            try:
+                before = os.fstat(input_fd)
+                if _stable_stat_identity(before) != _stable_stat_identity(expected):
+                    raise KreaRuntimeContractError(
+                        "selected runtime file changed before materialization"
+                    )
+                copied = 0
+                while True:
+                    chunk = os.read(input_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(output_fd, view)
+                        if written <= 0:  # pragma: no cover - OS contract
+                            raise KreaRuntimeContractError(
+                                "materialized runtime write made no progress"
+                            )
+                        view = view[written:]
+                    copied += len(chunk)
+                if copied != before.st_size or _stable_stat_identity(
+                    os.fstat(input_fd)
+                ) != _stable_stat_identity(before):
+                    raise KreaRuntimeContractError(
+                        "selected runtime file changed during materialization"
+                    )
+                os.fchmod(output_fd, 0o500 if expected.st_mode & 0o111 else 0o400)
+            finally:
+                if input_fd >= 0:
+                    os.close(input_fd)
+                if output_fd >= 0:
+                    os.close(output_fd)
+        elif stat.S_ISDIR(expected.st_mode):
+            input_fd = -1
+            output_fd = -1
+            try:
+                os.mkdir(name, 0o700, dir_fd=destination_fd)
+                input_fd = os.open(name, directory_flags, dir_fd=source_fd)
+                try:
+                    output_fd = os.open(
+                        name, directory_flags, dir_fd=destination_fd
+                    )
+                except Exception:
+                    os.close(input_fd)
+                    input_fd = -1
+                    raise
+            except OSError as exc:
+                raise KreaRuntimeContractError(
+                    "selected runtime directory cannot be materialized safely"
+                ) from exc
+            try:
+                if _stable_stat_identity(os.fstat(input_fd)) != _stable_stat_identity(
+                    expected
+                ):
+                    raise KreaRuntimeContractError(
+                        "selected runtime directory changed before materialization"
+                    )
+                _copy_runtime_tree_fd(input_fd, output_fd, root=False)
+                os.fchmod(output_fd, 0o500)
+            finally:
+                if input_fd >= 0:
+                    os.close(input_fd)
+                if output_fd >= 0:
+                    os.close(output_fd)
+        else:
+            raise KreaRuntimeContractError(
+                "selected runtime contains a non-regular entry"
+            )
+
+    if _stable_stat_identity(os.fstat(source_fd)) != _stable_stat_identity(
+        source_before
+    ):
+        raise KreaRuntimeContractError(
+            "selected runtime directory changed during materialization"
+        )
+
+
+def _remove_materialized_runtime(path: str) -> None:
+    """Remove a private read-only runtime without following external symlinks."""
+
+    if not path:
+        return
+    try:
+        if os.path.islink(path):
+            os.unlink(path)
+            return
+        for current, directories, files in os.walk(path, topdown=False):
+            for name in files:
+                candidate = os.path.join(current, name)
+                if os.path.islink(candidate):
+                    os.unlink(candidate)
+                else:
+                    os.chmod(candidate, 0o600, follow_symlinks=False)
+            for name in directories:
+                candidate = os.path.join(current, name)
+                if os.path.islink(candidate):
+                    os.unlink(candidate)
+                else:
+                    os.chmod(candidate, 0o700, follow_symlinks=False)
+            os.chmod(current, 0o700, follow_symlinks=False)
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return
 
 
 def _git_blob_digest(directory_fd: int, name: str, expected: os.stat_result) -> bytes:
@@ -628,6 +1045,35 @@ def _verify_runtime_tree(
             "selected runtime checkout is unavailable"
         ) from exc
     try:
+        _verify_runtime_tree_fd(
+            root_fd,
+            expected_commit=expected_commit,
+            expected_tree_sha1=expected_tree_sha1,
+        )
+    finally:
+        os.close(root_fd)
+
+
+def _verify_runtime_tree_fd(
+    root_fd: int,
+    *,
+    expected_commit: str,
+    expected_tree_sha1: str,
+) -> None:
+    """Verify a runtime through the same open directory used for execution."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        root_before = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_before.st_mode):
+            raise KreaRuntimeContractError(
+                "selected runtime checkout is not a directory"
+            )
         try:
             git_fd = os.open(".git", flags, dir_fd=root_fd)
         except OSError as exc:
@@ -661,8 +1107,16 @@ def _verify_runtime_tree(
         ).hex()
         if tree_sha1 != expected_tree_sha1:
             raise KreaRuntimeContractError("selected runtime executed tree mismatch")
-    finally:
-        os.close(root_fd)
+        if _stable_stat_identity(os.fstat(root_fd)) != _stable_stat_identity(
+            root_before
+        ):
+            raise KreaRuntimeContractError(
+                "selected runtime root changed during verification"
+            )
+    except OSError as exc:
+        raise KreaRuntimeContractError(
+            "selected runtime changed during verification"
+        ) from exc
 
 
 def _read_fd_regular_bytes(

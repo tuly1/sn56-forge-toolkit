@@ -988,6 +988,8 @@ def test_plural_holdout_and_quarantine_paths_are_excluded():
         "test%31",
         "test%2531",
         "test１",
+        "test١",
+        "holdout_v۲",
     ],
 )
 def test_numeric_and_version_suffixes_remain_prohibited_after_normalization(field):
@@ -1195,6 +1197,62 @@ def test_raw_and_redacted_query_metadata_cannot_coexist():
                 },
             },
         )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://us.aws.cdn.hf.co/xet-bridge-us/object%3FX-Amz-Signature%3Dsecret",
+        "https://us.aws.cdn.hf.co/xet-bridge-us/object%23X-Amz-Signature%3Dsecret",
+        "https://us.aws.cdn.hf.co/xet-bridge-us/object%253FX-Amz-Signature%253Dsecret",
+        "https://us.aws.cdn.hf.co/xet-bridge-us/object%2523X-Amz-Signature%253Dsecret",
+        "https://us.aws.cdn.hf.co/xet-bridge-us/object%",
+        "https://us.aws.cdn.hf.co/xet-bridge-us/object%2",
+        "https://us.aws.cdn.hf.co/xet-bridge-us/object%GG",
+        "https://us.aws.cdn.hf.co/xet-bridge-us/object?X-Amz-Signature=raw+plus",
+        "https://us.aws.cdn.hf.co/xet-bridge-us/object?X-Amz-Signature=%GG",
+        (
+            "https://us.aws.cdn.hf.co/xet-bridge-us/object/"
+            "X-Amz-Credential=SECRET?X-Amz-Signature=sig"
+        ),
+        (
+            "https://us.aws.cdn.hf.co/xet-bridge-us/object"
+            "%2FX-Amz-Credential%3DSECRET?X-Amz-Signature=sig"
+        ),
+        (
+            "https://us.aws.cdn.hf.co/xet-bridge-us/object"
+            ";X-Amz-Credential=SECRET?X-Amz-Signature=sig"
+        ),
+    ],
+)
+def test_xet_encoded_delimiters_malformed_escapes_and_raw_plus_fail_closed(url):
+    key = f"org/repo/{'1' * 40}/checkpoints/last.safetensors"
+    with pytest.raises(sync.IntegrityError, match="path|query|percent|plus"):
+        sync.validate_public_request_provenance(
+            "hf-file", key, {"status": 200, "request_url": url}
+        )
+
+
+def test_percent_encoded_plus_is_unambiguous_and_value_free():
+    key = f"org/repo/{'1' * 40}/checkpoints/last.safetensors"
+    sanitized = sync.validate_public_request_provenance(
+        "hf-file",
+        key,
+        {
+            "status": 200,
+            "request_url": (
+                "https://us.aws.cdn.hf.co/xet-bridge-us/object"
+                "?X-Amz-Signature=signed%2Bvalue"
+            ),
+        },
+    )
+    assert sanitized["request_url"].endswith("/xet-bridge-us/object")
+    assert sanitized["request_query"] == {
+        "redacted": True,
+        "keys": ["x-amz-signature"],
+        "pair_count": 1,
+    }
+    assert "signed" not in json.dumps(sanitized)
 
 
 def test_unscoped_observation_query_fails_closed_in_sync(tmp_path):

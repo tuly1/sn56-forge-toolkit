@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import time
 from types import SimpleNamespace
 
@@ -17,6 +18,15 @@ from forge.data.schema import ImageSpec
 
 
 SOURCE_RUN_ID = "runtime-contract:" + "a" * 32
+
+
+def _verified_runtime_for_test(path: Path) -> krea_runtime.VerifiedRuntime:
+    resolved = str(path.resolve())
+    return krea_runtime.VerifiedRuntime(
+        runtime_dir=resolved,
+        materialized_dir="",
+        directory_fd=os.open(resolved, os.O_RDONLY | os.O_DIRECTORY),
+    )
 
 
 def _write_training_safetensor(path: Path, *, step: int) -> Path:
@@ -315,6 +325,64 @@ def test_git_free_runtime_tree_verifier_rejects_every_executed_tree_drift(
         )
 
 
+def test_verified_runtime_descriptor_cannot_be_redirected_by_path_swap(
+    tmp_path, monkeypatch
+):
+    incumbent, commit, tree = _committed_runtime_tree(tmp_path)
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    monkeypatch.setattr(krea_runtime, "PINNED_BASE_COMMIT", commit)
+    monkeypatch.setattr(krea_runtime, "PINNED_BASE_TREE", tree)
+    env = {
+        krea_runtime.INCUMBENT_RUNTIME_DIR_ENV: str(incumbent),
+        krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV: str(owned),
+    }
+
+    with krea_runtime.open_verified_runtime(
+        "ideogram4", krea_runtime.INCUMBENT_BUNDLE, environ=env
+    ) as verified:
+        materialized_path = Path(verified.materialized_dir)
+        assert materialized_path.is_dir()
+        source_inode = incumbent.stat().st_ino
+        materialized_inode = os.fstat(verified.directory_fd).st_ino
+        archived = tmp_path / "verified-tree"
+        incumbent.rename(archived)
+        incumbent.mkdir()
+        (incumbent / "run.py").write_text(
+            "raise RuntimeError('replacement executed')\n", encoding="utf-8"
+        )
+        (archived / "run.py").write_text(
+            "raise RuntimeError('child mutated after verification')\n",
+            encoding="utf-8",
+        )
+
+        assert incumbent.stat().st_ino != source_inode
+        assert archived.stat().st_ino == source_inode
+        assert materialized_inode != source_inode
+        assert os.stat(verified.launch_cwd()).st_ino == materialized_inode
+        run_fd = os.open("run.py", os.O_RDONLY, dir_fd=verified.directory_fd)
+        try:
+            assert b"replacement executed" not in os.read(run_fd, 4096)
+        finally:
+            os.close(run_fd)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; print(Path('run.py').read_text())",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            **verified.popen_directory_kwargs(),
+        )
+        assert "replacement executed" not in completed.stdout
+        assert "child mutated after verification" not in completed.stdout
+        assert "print('exact')" in completed.stdout
+    assert not materialized_path.exists()
+
+
 @pytest.mark.parametrize(
     "layout",
     ["equal", "symlink-alias", "owned-inside-incumbent", "incumbent-inside-owned"],
@@ -351,6 +419,28 @@ def test_incumbent_and_owned_runtime_paths_must_be_disjoint(
         match="distinct|overlap|collision",
     ):
         krea_runtime.verify_selected_runtime(
+            "krea2",
+            krea_runtime.LEADER_BUNDLE,
+            environ=env,
+        )
+
+
+def test_case_variant_same_inode_runtime_roots_are_rejected(tmp_path):
+    incumbent = tmp_path / "RuntimeRoot"
+    incumbent.mkdir()
+    case_variant = tmp_path / "rUNTIMErOOT"
+    try:
+        if case_variant.stat().st_ino != incumbent.stat().st_ino:
+            pytest.skip("filesystem is case-sensitive")
+    except FileNotFoundError:
+        pytest.skip("filesystem is case-sensitive")
+
+    env = {
+        krea_runtime.INCUMBENT_RUNTIME_DIR_ENV: str(incumbent),
+        krea_runtime.OWNED_KREA_RUNTIME_DIR_ENV: str(case_variant),
+    }
+    with pytest.raises(krea_runtime.KreaRuntimeContractError, match="alias"):
+        krea_runtime.runtime_directory(
             "krea2",
             krea_runtime.LEADER_BUNDLE,
             environ=env,
@@ -1039,7 +1129,7 @@ def test_every_aitoolkit_launch_verifies_the_incumbent_runtime(
 
     def verify(selected_model_type, bundle, **_kwargs):
         verified.append((selected_model_type, bundle))
-        return str(toolkit_dir.resolve())
+        return _verified_runtime_for_test(toolkit_dir)
 
     class CompletedProcess:
         returncode = 0
@@ -1048,14 +1138,15 @@ def test_every_aitoolkit_launch_verifies_the_incumbent_runtime(
             return self.returncode
 
     popen_calls = []
-    monkeypatch.setattr(krea_runtime, "verify_selected_runtime", verify)
-    monkeypatch.setattr(
-        aitoolkit.subprocess,
-        "Popen",
-        lambda *args, **kwargs: (
-            popen_calls.append((args, kwargs)) or CompletedProcess()
-        ),
-    )
+
+    def popen(*args, **kwargs):
+        popen_calls.append(
+            (args, kwargs, os.fstat(kwargs["pass_fds"][0]).st_ino)
+        )
+        return CompletedProcess()
+
+    monkeypatch.setattr(krea_runtime, "open_verified_runtime", verify)
+    monkeypatch.setattr(aitoolkit.subprocess, "Popen", popen)
     monkeypatch.setattr(
         aitoolkit.subprocess,
         "run",
@@ -1083,7 +1174,8 @@ def test_every_aitoolkit_launch_verifies_the_incumbent_runtime(
     )
     assert verified == [(model_type, krea_runtime.INCUMBENT_BUNDLE)]
     assert len(popen_calls) == 1
-    assert popen_calls[0][1]["cwd"] == str(toolkit_dir.resolve())
+    assert popen_calls[0][2] == toolkit_dir.stat().st_ino
+    assert len(popen_calls[0][1]["pass_fds"]) == 1
 
 
 def test_incumbent_caller_toolkit_mismatch_aborts_before_popen(
@@ -1097,8 +1189,8 @@ def test_incumbent_caller_toolkit_mismatch_aborts_before_popen(
     caller.mkdir()
     monkeypatch.setattr(
         krea_runtime,
-        "verify_selected_runtime",
-        lambda *_args, **_kwargs: str(verified.resolve()),
+        "open_verified_runtime",
+        lambda *_args, **_kwargs: _verified_runtime_for_test(verified),
     )
     monkeypatch.setattr(
         aitoolkit.subprocess,
@@ -1179,12 +1271,8 @@ def test_attested_tree_different_from_executed_tree_aborts_before_launch(
     (executed / "run.py").write_text("pass\n", encoding="utf-8")
     monkeypatch.setattr(
         krea_runtime,
-        "_verify_runtime_tree",
-        lambda runtime_dir, **_kwargs: (
-            None
-            if runtime_dir == str(attested)
-            else pytest.fail("verifier received a parallel runtime path")
-        ),
+        "open_verified_runtime",
+        lambda *_args, **_kwargs: _verified_runtime_for_test(attested),
     )
     monkeypatch.setattr(
         aitoolkit.subprocess,
@@ -1304,8 +1392,8 @@ def test_integrated_fake_process_persists_first_and_terminal_observations(
     monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
     monkeypatch.setattr(
         krea_runtime,
-        "verify_selected_runtime",
-        lambda *_args, **_kwargs: str(toolkit_dir),
+        "open_verified_runtime",
+        lambda *_args, **_kwargs: _verified_runtime_for_test(toolkit_dir),
     )
     calls = []
     original_emit = adaptive_timing.emit_first_checkpoint_observation
@@ -1377,6 +1465,61 @@ def test_integrated_fake_process_persists_first_and_terminal_observations(
     assert hashlib.sha256(Path(spec.config_path).read_bytes()).hexdigest() == config_before
 
 
+def test_unexpected_deadline_error_reaps_child_before_runtime_cleanup(
+    tmp_path, monkeypatch
+):
+    spec = _spec()
+    _localize_spec(monkeypatch, tmp_path, spec)
+    source_runtime = tmp_path / "selected-runtime"
+    source_runtime.mkdir()
+    materialized_runtime = tmp_path / "materialized-runtime"
+    materialized_runtime.mkdir()
+    pid_marker = tmp_path / "child.pid"
+    (materialized_runtime / "run.py").write_text(
+        (
+            "import os, time\n"
+            f"open({str(pid_marker)!r}, 'w').write(str(os.getpid()))\n"
+            "time.sleep(60)\n"
+        ),
+        encoding="utf-8",
+    )
+    verified = krea_runtime.VerifiedRuntime(
+        runtime_dir=str(source_runtime.resolve()),
+        materialized_dir=str(materialized_runtime.resolve()),
+        directory_fd=os.open(
+            materialized_runtime, os.O_RDONLY | os.O_DIRECTORY
+        ),
+    )
+    monkeypatch.setattr(
+        krea_runtime,
+        "open_verified_runtime",
+        lambda *_args, **_kwargs: verified,
+    )
+    Path(spec.save_root).mkdir(parents=True)
+    scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+
+    class Deadline:
+        def remaining(self):
+            deadline = time.monotonic() + 2.0
+            while not pid_marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise RuntimeError("deadline source failed")
+
+    with pytest.raises(RuntimeError, match="deadline source failed"):
+        aitoolkit._run_toolkit(
+            str(tmp_path / "unused.yaml"),
+            Deadline(),
+            spec,
+            scope,
+            toolkit_dir=str(source_runtime),
+        )
+
+    child_pid = int(pid_marker.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    assert not materialized_runtime.exists()
+
+
 def test_clean_log_with_phantom_terminal_artifact_aborts(tmp_path, monkeypatch):
     spec = _spec()
     _localize_spec(monkeypatch, tmp_path, spec)
@@ -1413,8 +1556,8 @@ def test_clean_log_with_phantom_terminal_artifact_aborts(tmp_path, monkeypatch):
     monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
     monkeypatch.setattr(
         krea_runtime,
-        "verify_selected_runtime",
-        lambda *_args, **_kwargs: str(toolkit_dir),
+        "open_verified_runtime",
+        lambda *_args, **_kwargs: _verified_runtime_for_test(toolkit_dir),
     )
 
     class Deadline:
@@ -1478,8 +1621,8 @@ def test_experimental_profile_requires_post_run_checkpoint_observation(
     monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
     monkeypatch.setattr(
         krea_runtime,
-        "verify_selected_runtime",
-        lambda *_args, **_kwargs: str(toolkit_dir),
+        "open_verified_runtime",
+        lambda *_args, **_kwargs: _verified_runtime_for_test(toolkit_dir),
     )
 
     class Deadline:
@@ -1524,8 +1667,8 @@ def test_bootstrap_probe_requires_post_run_checkpoint_observation(
     monkeypatch.setattr(aitoolkit, "_POLL_SECONDS", 0.01)
     monkeypatch.setattr(
         krea_runtime,
-        "verify_selected_runtime",
-        lambda *_args, **_kwargs: str(toolkit_dir),
+        "open_verified_runtime",
+        lambda *_args, **_kwargs: _verified_runtime_for_test(toolkit_dir),
     )
 
     class Deadline:

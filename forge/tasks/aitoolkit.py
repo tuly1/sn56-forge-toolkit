@@ -313,15 +313,16 @@ def _run_toolkit(
     selected_toolkit_dir = toolkit_dir or krea_runtime.runtime_directory(
         spec.model_type, selected_bundle
     )
-    verified_toolkit_dir = krea_runtime.verify_selected_runtime(
+    verified_runtime = krea_runtime.open_verified_runtime(
         spec.model_type,
         selected_bundle,
     )
-    if os.path.realpath(selected_toolkit_dir) != verified_toolkit_dir:
+    if os.path.realpath(selected_toolkit_dir) != verified_runtime.runtime_dir:
+        verified_runtime.close()
         raise krea_runtime.KreaRuntimeContractError(
             "attested runtime differs from the selected executable tree"
         )
-    selected_toolkit_dir = verified_toolkit_dir
+    selected_toolkit_dir = verified_runtime.runtime_dir
     telemetry.event("toolkit_start")
     started = time.monotonic()
 
@@ -345,27 +346,39 @@ def _run_toolkit(
                 pass
             gpu_stop.wait(5)
 
-    try:
-        gpu_thread = threading.Thread(target=_sample_gpu, daemon=True)
-        gpu_thread.start()
-    except Exception:
-        gpu_thread = None
-
     stopped_by_deadline = False
     scoring_decision: bool | None = None
     first_checkpoint_observed = False
     launch_env = os.environ.copy()
     launch_env["PYTHONDONTWRITEBYTECODE"] = "1"
-    with open(log_path, "w", encoding="utf-8") as log:
+    try:
+        runtime_directory_kwargs = verified_runtime.popen_directory_kwargs()
+        log = open(log_path, "w", encoding="utf-8")
+    except Exception:
+        verified_runtime.close()
+        raise
+    with log:
         # New session → we can signal the whole process GROUP, so ai-toolkit's
         # DataLoader workers can't outlive the kill holding GPU memory while
-        # _finalize runs.
-        proc = subprocess.Popen(
-            cmd, cwd=selected_toolkit_dir,
-            stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env=launch_env,
-        )
+        # _finalize runs.  The descriptor-bound cwd means replacing the original
+        # pathname cannot redirect launch after verification.
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=launch_env,
+                **runtime_directory_kwargs,
+            )
+        except Exception:
+            verified_runtime.close()
+            raise
+
+        try:
+            gpu_thread = threading.Thread(target=_sample_gpu, daemon=True)
+            gpu_thread.start()
+        except Exception:
+            gpu_thread = None
 
         def observe_first_checkpoint_if_ready() -> None:
             nonlocal first_checkpoint_observed
@@ -404,51 +417,58 @@ def _run_toolkit(
             )
             first_checkpoint_observed = True
 
-        while proc.poll() is None:
+        try:
+            while proc.poll() is None:
+                try:
+                    observe_first_checkpoint_if_ready()
+                except Exception:
+                    _terminate(proc)
+                    raise
+                # remaining() already subtracts the 180s export reserve, so we begin
+                # terminating ~(reserve + margin) before the hard kill — leaving the
+                # whole reserve for _terminate + finalize rather than a 45s sliver.
+                remaining = deadline.remaining()
+                reserve = 0.0
+                if (
+                    scoring_reserve_s > 0
+                    and scoring_decision is None
+                    and remaining <= _STOP_MARGIN_S + scoring_reserve_s
+                ):
+                    # Decide once at the reserve boundary. Enabling the scorer later
+                    # would give it less time than the measured reserve and turn the
+                    # reserve into a predictable timeout.
+                    scoring_decision = _latch_scoring_decision(
+                        scoring_decision,
+                        remaining=remaining,
+                        reserve_s=scoring_reserve_s,
+                        candidates_ready=holdout.has_scoring_candidates(
+                            spec.save_root, scope
+                        ),
+                    )
+                    telemetry.event(
+                        "holdout_scoring_budget_decided",
+                        reserved=scoring_decision,
+                        remaining_s=round(remaining, 1),
+                    )
+                if scoring_decision is True:
+                    reserve = scoring_reserve_s
+                if remaining <= _STOP_MARGIN_S + reserve:
+                    stopped_by_deadline = True
+                    _terminate(proc)
+                    break
+                time.sleep(_POLL_SECONDS)
             try:
                 observe_first_checkpoint_if_ready()
             except Exception:
-                _terminate(proc)
+                if proc.poll() is None:
+                    _terminate(proc)
                 raise
-            # remaining() already subtracts the 180s export reserve, so we begin
-            # terminating ~(reserve + margin) before the hard kill — leaving the
-            # whole reserve for _terminate + finalize rather than a 45s sliver.
-            remaining = deadline.remaining()
-            reserve = 0.0
-            if (
-                scoring_reserve_s > 0
-                and scoring_decision is None
-                and remaining <= _STOP_MARGIN_S + scoring_reserve_s
-            ):
-                # Decide once at the reserve boundary. Enabling the scorer later
-                # would give it less time than the measured reserve and turn the
-                # reserve into a predictable timeout.
-                scoring_decision = _latch_scoring_decision(
-                    scoring_decision,
-                    remaining=remaining,
-                    reserve_s=scoring_reserve_s,
-                    candidates_ready=holdout.has_scoring_candidates(
-                        spec.save_root, scope
-                    ),
-                )
-                telemetry.event(
-                    "holdout_scoring_budget_decided",
-                    reserved=scoring_decision,
-                    remaining_s=round(remaining, 1),
-                )
-            if scoring_decision is True:
-                reserve = scoring_reserve_s
-            if remaining <= _STOP_MARGIN_S + reserve:
-                stopped_by_deadline = True
-                _terminate(proc)
-                break
-            time.sleep(_POLL_SECONDS)
-        try:
-            observe_first_checkpoint_if_ready()
-        except Exception:
+        except BaseException:
             if proc.poll() is None:
                 _terminate(proc)
             raise
+        finally:
+            verified_runtime.close()
     rc = proc.returncode
     elapsed_seconds = time.monotonic() - started
 

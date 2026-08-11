@@ -110,7 +110,7 @@ API_SCHEMA_VERSION = 1
 WATCHER_ROOT_SCHEMA = "sn56.week7.harvest-root-identity"
 WATCHER_ROOT_SCHEMA_VERSION = 1
 WATCHER_LEDGER_SCHEMA = "sn56.week7.safe-harvest-sync"
-WATCHER_LEDGER_SCHEMA_VERSION = 2
+WATCHER_LEDGER_SCHEMA_VERSIONS = frozenset({2, 3})
 HEADER_ROOT_SCHEMA = "sn56.week7.public-safetensors-header-root"
 HEADER_ROOT_SCHEMA_VERSION = 1
 HEADER_SCHEMA = "sn56.week7.public-safetensors-headers.inventory"
@@ -390,7 +390,7 @@ def _latest_complete_ledger(root: Path) -> tuple[str, bytes, dict[str, Any], byt
     if (
         value.get("schema") != WATCHER_LEDGER_SCHEMA
         or type(value.get("schema_version")) is not int
-        or value.get("schema_version") != WATCHER_LEDGER_SCHEMA_VERSION
+        or value.get("schema_version") not in WATCHER_LEDGER_SCHEMA_VERSIONS
     ):
         raise IntegrityError("newest raw-watcher ledger schema is invalid")
     sidecar_relative = relative.removesuffix(".json") + ".sha256"

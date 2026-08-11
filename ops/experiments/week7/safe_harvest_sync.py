@@ -55,7 +55,7 @@ import uuid
 
 
 SCHEMA = "sn56.week7.safe-harvest-sync"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 TOURNAMENT_RE = re.compile(r"tourn_[a-z0-9]+_[0-9]{8}")
 TASK_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -148,6 +148,11 @@ HF_XET_QUERY_KEYS = frozenset(
 HF_XET_SIGNATURE_KEYS = frozenset({"signature", "x-amz-signature"})
 MAX_QUERY_BYTES = 16 * 1024
 MAX_QUERY_FIELDS = 32
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_HF_XET_PATH_RE = re.compile(
+    r"/xet-bridge-[a-z0-9-]+(?:/[A-Za-z0-9._~-]+)+",
+    flags=re.ASCII,
+)
 
 
 class SyncError(RuntimeError):
@@ -509,7 +514,14 @@ def normalized_sensitive_text(value: str) -> str:
                 category = unicodedata.category(character)
                 if category.startswith("C") or category in {"Mn", "Me"}:
                     continue
-                if character.isalnum():
+                if character.isdecimal():
+                    # The prohibited-version matcher is intentionally ASCII so
+                    # its grammar stays reviewable.  Canonicalize every Unicode
+                    # decimal digit first; otherwise identifiers such as
+                    # ``test\u0661`` bypass the ``[0-9]+`` suffix boundary.
+                    result.append(str(unicodedata.decimal(character)))
+                    previous_separator = False
+                elif character.isalnum():
                     result.append(character)
                     previous_separator = False
                 elif not previous_separator:
@@ -518,6 +530,54 @@ def normalized_sensitive_text(value: str) -> str:
             return "".join(result)
         normalized = decoded
     raise IntegrityError("sensitive text did not reach a decoding fixed point")
+
+
+def _require_canonical_percent_encoding(value: str, *, label: str) -> None:
+    """Reject malformed escapes and raw query ``+`` before URL decoding.
+
+    ``urllib`` deliberately accepts malformed percent escapes and interprets a
+    raw plus in a query as a space.  Neither behavior is suitable for an
+    evidence boundary: after redaction, the accepted source spelling could no
+    longer be reconstructed unambiguously.  Percent-encoded ``%2B`` remains a
+    normal value byte and is discarded with every other credential value.
+    """
+
+    for index, character in enumerate(value):
+        if character != "%":
+            continue
+        if (
+            index + 2 >= len(value)
+            or value[index + 1] not in _HEX_DIGITS
+            or value[index + 2] not in _HEX_DIGITS
+        ):
+            raise IntegrityError(f"{label} contains malformed percent encoding")
+    if label == "observation request query" and "+" in value:
+        raise IntegrityError("observation request query contains ambiguous raw plus")
+
+
+def _decode_path_to_fixed_point(value: str) -> str:
+    """Decode a URL path completely so nested delimiters cannot hide syntax."""
+
+    current = value
+    for _ in range(8):
+        _require_canonical_percent_encoding(
+            current, label="observation request path"
+        )
+        decoded = unquote(current)
+        if decoded == current:
+            return decoded
+        current = decoded
+    raise IntegrityError("observation request path did not reach a decoding fixed point")
+
+
+def _is_public_xet_path(value: str) -> bool:
+    """Accept only object-path grammar; credentials belong in redacted query data."""
+
+    folded = value.casefold()
+    credential_keys = HF_XET_QUERY_KEYS | HF_XET_SIGNATURE_KEYS
+    if any(f"{name}=" in folded for name in credential_keys):
+        return False
+    return _HF_XET_PATH_RE.fullmatch(value) is not None
 
 
 def contains_forbidden_path(value: str) -> bool:
@@ -636,6 +696,9 @@ def _redacted_request_query(
             raise IntegrityError("observation carries raw and redacted query metadata")
         if len(parsed.query.encode("utf-8")) > MAX_QUERY_BYTES:
             raise IntegrityError("observation request query exceeds its safety ceiling")
+        _require_canonical_percent_encoding(
+            parsed.query, label="observation request query"
+        )
         try:
             pairs = parse_qsl(
                 parsed.query,
@@ -726,7 +789,12 @@ def validate_public_request_provenance(
         raise IntegrityError("observation request URL authority is invalid")
     if "?" in request_url and not parsed.query:
         raise IntegrityError("observation request query is malformed")
-    path = unquote(parsed.path)
+    path = _decode_path_to_fixed_point(parsed.path)
+    # A percent-encoded question mark/hash in a Xet path can carry credential
+    # syntax while ``urlsplit`` still reports an empty query/fragment.  Reject
+    # decoded URL delimiters rather than later publishing their encoded bytes.
+    if "?" in path or "#" in path:
+        raise IntegrityError("observation request path contains decoded URL delimiters")
     expected_host: str
     expected_path: str
     if source == "gradients-tournament":
@@ -763,12 +831,14 @@ def validate_public_request_provenance(
         expected_path = f"/api/resolve-cache/models/{repo}/{revision}/{file_path}"
     else:
         raise IntegrityError("observation source has no public endpoint contract")
-    xet_transport = bool(
+    xet_host = bool(
         source == "hf-file"
         and isinstance(parsed.hostname, str)
         and parsed.hostname.endswith(".cdn.hf.co")
-        and path.startswith("/xet-bridge-")
     )
+    if xet_host and path.startswith("/xet-bridge-") and not _is_public_xet_path(path):
+        raise IntegrityError("observation Xet path violates its public object grammar")
+    xet_transport = bool(xet_host and _is_public_xet_path(path))
     if xet_transport:
         # Hugging Face's public resolver records the final Xet CDN URL for
         # some small files.  The redirect URL cannot restate repo/revision/path;
