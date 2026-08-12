@@ -552,7 +552,7 @@ def test_private_record_read_rejects_parent_swap_after_validation(
     assert swapped is True
 
 
-def test_private_record_publish_rechecks_worktree_inventory_and_rolls_back(
+def test_private_record_publish_rechecks_worktree_inventory_without_unsafe_cleanup(
     candidate, tmp_path, monkeypatch
 ):
     public, custodian = candidate
@@ -590,7 +590,8 @@ def test_private_record_publish_rechecks_worktree_inventory_and_rolls_back(
             label="confirmation reveal",
         )
     assert registered is True
-    assert not target.exists()
+    assert target.exists()
+    assert target.read_text(encoding="ascii").find("private") >= 0
 
 
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(

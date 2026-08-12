@@ -410,7 +410,6 @@ def _write_private_new(
         label=label,
     )
     payload = canonical_bytes(value)
-    created: os.stat_result | None = None
     try:
         _assert_private_parent_bound(
             parent_descriptor,
@@ -421,9 +420,7 @@ def _write_private_new(
             label=label,
         )
         try:
-            created = renderer._write_exclusive_at(
-                parent_descriptor, checked.name, payload
-            )
+            renderer._write_exclusive_at(parent_descriptor, checked.name, payload)
         except FileExistsError as exc:
             raise AdmissionError(f"refusing to overwrite {checked}") from exc
         except renderer.FixtureError as exc:
@@ -438,20 +435,10 @@ def _write_private_new(
         )
         return hashlib.sha256(payload).hexdigest()
     except BaseException:
-        if created is not None:
-            try:
-                linked = os.stat(
-                    checked.name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if (linked.st_dev, linked.st_ino) == (
-                    created.st_dev,
-                    created.st_ino,
-                ):
-                    os.unlink(checked.name, dir_fd=parent_descriptor)
-            except OSError:
-                pass
+        # POSIX has no identity-conditional unlink.  If custody changes after
+        # creation, leave the create-only, rejected record as explicit debris;
+        # deleting by name could remove an unrelated replacement inserted
+        # between a stat and unlink.  No caller receives a success digest.
         raise
     finally:
         os.close(parent_descriptor)

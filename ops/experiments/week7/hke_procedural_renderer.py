@@ -991,12 +991,9 @@ def _ensure_new_root(path: Path, label: str) -> Path:
     parent_descriptor = _open_directory_chain_no_symlinks(
         path.parent, f"{label} parent"
     )
-    created = False
-    created_identity: os.stat_result | None = None
     try:
         try:
             os.mkdir(path.name, mode=0o700, dir_fd=parent_descriptor)
-            created = True
         except FileExistsError as exc:
             raise FileExistsError(f"refusing to replace {label}: {path}") from exc
         except OSError as exc:
@@ -1025,20 +1022,11 @@ def _ensure_new_root(path: Path, label: str) -> Path:
             raise FixtureError(f"{label} path changed during creation")
         return path
     except BaseException:
-        if created and created_identity is not None:
-            try:
-                linked = os.stat(
-                    path.name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if (linked.st_dev, linked.st_ino) == (
-                    created_identity.st_dev,
-                    created_identity.st_ino,
-                ):
-                    os.rmdir(path.name, dir_fd=parent_descriptor)
-            except OSError:
-                pass
+        # POSIX has no identity-conditional rmdir.  A stat-then-rmdir cleanup
+        # can delete an unrelated directory swapped into this name between the
+        # calls.  Leave create-only, invalid debris for explicit later cleanup;
+        # it cannot be mistaken for a complete candidate because manifests are
+        # written last and every consumer replays the full inventory.
         raise
     finally:
         os.close(parent_descriptor)
@@ -1466,8 +1454,9 @@ def build_candidate(
     try:
         custodian_root = _ensure_new_root(custodian_output, "custodian output")
     except BaseException:
-        # A custody failure must not leave a valid-looking public candidate tree.
-        public_root.rmdir()
+        # Never remove by a mutable pathname after a race.  The empty,
+        # manifest-free create-only directory is deliberately invalid and is
+        # safer than risking deletion of a replacement entry.
         raise
 
     discovery_rows: dict[str, list[dict[str, Any]]] = {}
