@@ -42,6 +42,7 @@ FACTOR_AUTHORITY_PATH = SCRIPT_PATH.with_name("run_hke_factorial.py")
 RENDERER_SOURCE_PATH = "ops/experiments/week7/hke_procedural_renderer.py"
 FACTOR_AUTHORITY_SOURCE_PATH = "ops/experiments/week7/run_hke_factorial.py"
 ADMISSION_SOURCE_PATH = "ops/experiments/week7/hke_fixture_admission.py"
+_HELD_PRIVATE_DESCRIPTORS: list[int] = []
 
 
 class AdmissionError(RuntimeError):
@@ -505,6 +506,7 @@ def _load_private_json(
             public_boundary_roots=public_boundary_roots,
             label=label,
         )
+        _HELD_PRIVATE_DESCRIPTORS.append(os.dup(parent_descriptor))
         return value
     finally:
         os.close(parent_descriptor)
@@ -574,6 +576,9 @@ def _write_private_new(
             public_boundary_roots=public_boundary_roots,
             label=label,
         )
+        _HELD_PRIVATE_DESCRIPTORS.append(os.dup(parent_descriptor))
+        if retained_descriptor is not None:
+            _HELD_PRIVATE_DESCRIPTORS.append(os.dup(retained_descriptor))
         return hashlib.sha256(payload).hexdigest()
     except BaseException:
         # POSIX has no identity-conditional unlink.  The renderer scrubs the
@@ -2008,6 +2013,20 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse(argv)
+    try:
+        return _main_with_held_private_descriptors(args)
+    finally:
+        while _HELD_PRIVATE_DESCRIPTORS:
+            descriptor = _HELD_PRIVATE_DESCRIPTORS.pop()
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
+    """Keep private ancestry/inodes open through the CLI process boundary."""
+
     private_scope = {
         "public_root": args.public_root,
         "custodian_root": args.custodian_root,
