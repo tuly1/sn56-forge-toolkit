@@ -1328,7 +1328,7 @@ class _CustodySession:
         self.public = public
         self.custodian = custodian
         self.boundaries = tuple(boundaries)
-        self._private_descriptors: list[int] = []
+        self._private_files: list[tuple[int, int, str]] = []
         self._private_directories: list[tuple[int, int, int]] = []
 
     def _assert_bindings(self) -> None:
@@ -1349,20 +1349,45 @@ class _CustodySession:
         self._assert_bindings()
 
     def retain_private_publish(
-        self, descriptor: int, _metadata: os.stat_result
+        self,
+        parent_descriptor: int,
+        name: str,
+        descriptor: int,
+        _metadata: os.stat_result,
     ) -> None:
-        """Retain one exact private inode after fast root-identity checks."""
+        """Retain one exact private path entry after fast root-identity checks."""
 
         self._assert_bindings()
-        self._private_descriptors.append(os.dup(descriptor))
+        self._private_files.append(
+            (os.dup(parent_descriptor), os.dup(descriptor), name)
+        )
 
     def validate_private_publish(
-        self, descriptor: int, _metadata: os.stat_result
+        self,
+        parent_descriptor: int,
+        name: str,
+        descriptor: int,
+        metadata: os.stat_result,
     ) -> None:
         """Validate custody while bytes remain open and retain their inode."""
 
         self.assert_live()
-        self._private_descriptors.append(os.dup(descriptor))
+        self.retain_private_publish(parent_descriptor, name, descriptor, metadata)
+
+    def private_publish_callback(
+        self, parent_descriptor: int, name: str, *, validate: bool
+    ) -> Callable[[int, os.stat_result], None]:
+        def callback(descriptor: int, metadata: os.stat_result) -> None:
+            if validate:
+                self.validate_private_publish(
+                    parent_descriptor, name, descriptor, metadata
+                )
+            else:
+                self.retain_private_publish(
+                    parent_descriptor, name, descriptor, metadata
+                )
+
+        return callback
 
     def retain_private_directory(
         self, parent_descriptor: int, name: str, descriptor: int
@@ -1381,11 +1406,28 @@ class _CustodySession:
         if verify:
             try:
                 self.assert_live()
-                for descriptor in self._private_descriptors:
+                for parent_descriptor, descriptor, name in self._private_files:
                     metadata = os.fstat(descriptor)
-                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    try:
+                        linked = os.stat(
+                            name,
+                            dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except OSError as exc:
                         raise FixtureError(
-                            "private candidate file is not single-link at completion"
+                            "private candidate file moved before completion"
+                        ) from exc
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or not stat.S_ISREG(linked.st_mode)
+                        or metadata.st_nlink != 1
+                        or linked.st_nlink != 1
+                        or (metadata.st_dev, metadata.st_ino, metadata.st_size)
+                        != (linked.st_dev, linked.st_ino, linked.st_size)
+                    ):
+                        raise FixtureError(
+                            "private candidate file moved or linked before completion"
                         )
                 for parent_descriptor, descriptor, name in self._private_directories:
                     held = os.fstat(descriptor)
@@ -1410,7 +1452,7 @@ class _CustodySession:
             except BaseException as exc:
                 scrub_private = True
                 verification_error = exc
-        for descriptor in self._private_descriptors:
+        for parent_descriptor, descriptor, _name in self._private_files:
             try:
                 if scrub_private:
                     os.ftruncate(descriptor, 0)
@@ -1419,7 +1461,8 @@ class _CustodySession:
                 pass
             finally:
                 os.close(descriptor)
-        self._private_descriptors.clear()
+                os.close(parent_descriptor)
+        self._private_files.clear()
         for parent_descriptor, descriptor, _name in self._private_directories:
             os.close(descriptor)
             os.close(parent_descriptor)
@@ -1878,7 +1921,11 @@ def _build_candidate_in_session(
                             image_path.name,
                             image,
                             post_write_validation=(
-                                session.retain_private_publish
+                                session.private_publish_callback(
+                                    directory_descriptor,
+                                    image_path.name,
+                                    validate=False,
+                                )
                                 if phase == "confirmation"
                                 else public_callback
                             ),
@@ -1888,7 +1935,11 @@ def _build_candidate_in_session(
                             caption_path.name,
                             caption,
                             post_write_validation=(
-                                session.validate_private_publish
+                                session.private_publish_callback(
+                                    directory_descriptor,
+                                    caption_path.name,
+                                    validate=True,
+                                )
                                 if phase == "confirmation"
                                 else public_callback
                             ),
@@ -1931,7 +1982,11 @@ def _build_candidate_in_session(
         session.custodian.descriptor,
         "CONFIRMATION-MANIFEST.json",
         confirmation_manifest,
-        post_write_validation=session.validate_private_publish,
+        post_write_validation=session.private_publish_callback(
+            session.custodian.descriptor,
+            "CONFIRMATION-MANIFEST.json",
+            validate=True,
+        ),
     )
     dedup = _dedup_evidence(all_rows)
     contract = _contract_record()
