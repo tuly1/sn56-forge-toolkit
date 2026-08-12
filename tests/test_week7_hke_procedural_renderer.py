@@ -901,6 +901,55 @@ def test_generation_completion_rechecks_custodian_after_inner_return(
     )
 
 
+def test_generation_completion_rejects_public_hard_link_to_private_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "hardlink-public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "hardlink-custodian"
+    public_link = boundary / "leaked-private-row"
+    tiny = dict(renderer.FIXTURE_CONTRACT[0])
+    tiny.update(
+        {
+            "discovery_packs": [
+                {"pack": "D1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "confirmation_packs": [
+                {"pack": "C1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "discovery_count": 2,
+            "confirmation_count": 2,
+        }
+    )
+    monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    original_build = renderer._build_candidate_in_session
+
+    def build_then_link(*args, **kwargs):
+        result = original_build(*args, **kwargs)
+        private_file = next(
+            path
+            for path in sorted(custodian.rglob("*"))
+            if path.is_file()
+        )
+        os.link(private_file, public_link)
+        return result
+
+    monkeypatch.setattr(renderer, "_build_candidate_in_session", build_then_link)
+    with pytest.raises(renderer.FixtureError, match="not single-link at completion"):
+        renderer.build_candidate(
+            public_output=public,
+            custodian_output=custodian,
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(boundary,),
+            **RIGHTS,
+        )
+    assert public_link.read_bytes() == b""
+
+
 def test_custody_rejects_symlink_ancestors_before_creation(tmp_path: Path) -> None:
     real_boundary = tmp_path / "real-public-boundary"
     real_boundary.mkdir()

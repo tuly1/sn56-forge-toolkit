@@ -1355,6 +1355,12 @@ class _CustodySession:
         if verify:
             try:
                 self.assert_live()
+                for descriptor in self._private_descriptors:
+                    metadata = os.fstat(descriptor)
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise FixtureError(
+                            "private candidate file is not single-link at completion"
+                        )
             except BaseException as exc:
                 scrub_private = True
                 verification_error = exc
