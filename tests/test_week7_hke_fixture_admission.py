@@ -424,9 +424,9 @@ def test_private_record_rejects_existing_registered_sibling_worktree(
     sibling = tmp_path / "sibling-worktree"
     sibling.mkdir()
     monkeypatch.setattr(
-        renderer,
+        admission.renderer,
         "_registered_worktree_roots",
-        lambda: (renderer.EXECUTABLE_REPOSITORY_ROOT, sibling),
+        lambda: (admission.renderer.EXECUTABLE_REPOSITORY_ROOT, sibling),
     )
     target = sibling / "PRIVATE-CONFIRMATION-REVEAL.json"
     with pytest.raises(admission.AdmissionError, match="registered-worktree"):
@@ -454,9 +454,9 @@ def test_private_record_rejects_case_alias_of_registered_worktree(
     if not same:
         pytest.skip("filesystem is case-sensitive")
     monkeypatch.setattr(
-        renderer,
+        admission.renderer,
         "_registered_worktree_roots",
-        lambda: (renderer.EXECUTABLE_REPOSITORY_ROOT, sibling),
+        lambda: (admission.renderer.EXECUTABLE_REPOSITORY_ROOT, sibling),
     )
     with pytest.raises(admission.AdmissionError, match="registered-worktree"):
         admission._private_record_path(
@@ -474,9 +474,9 @@ def test_private_record_rejects_missing_prunable_registered_worktree(
     public, custodian = candidate
     missing = tmp_path / "missing-prunable-worktree"
     monkeypatch.setattr(
-        renderer,
+        admission.renderer,
         "_registered_worktree_roots",
-        lambda: (renderer.EXECUTABLE_REPOSITORY_ROOT, missing),
+        lambda: (admission.renderer.EXECUTABLE_REPOSITORY_ROOT, missing),
     )
     with pytest.raises(admission.AdmissionError, match="registered-worktree"):
         admission._private_record_path(
@@ -494,9 +494,11 @@ def test_private_record_fails_closed_when_worktree_inventory_fails(
     public, custodian = candidate
 
     def fail_inventory():
-        raise renderer.FixtureError("worktree inventory failed closed")
+        raise admission.renderer.FixtureError("worktree inventory failed closed")
 
-    monkeypatch.setattr(renderer, "_registered_worktree_roots", fail_inventory)
+    monkeypatch.setattr(
+        admission.renderer, "_registered_worktree_roots", fail_inventory
+    )
     with pytest.raises(admission.AdmissionError, match="inventory failed closed"):
         admission._private_record_path(
             tmp_path / "outside" / "review.json",
