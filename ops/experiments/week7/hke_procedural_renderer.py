@@ -253,7 +253,7 @@ def semantic_sha256(value: Any) -> str:
 
 
 def _source_sha256() -> str:
-    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    return hashlib.sha256(_read_regular(SCRIPT_PATH, "renderer source")).hexdigest()
 
 
 def _contract_source_sha256() -> str:
