@@ -1350,7 +1350,14 @@ class _CustodySession:
         self.assert_live()
         self._private_descriptors.append(os.dup(descriptor))
 
-    def close(self, *, scrub_private: bool) -> None:
+    def close(self, *, scrub_private: bool, verify: bool = False) -> None:
+        verification_error: BaseException | None = None
+        if verify:
+            try:
+                self.assert_live()
+            except BaseException as exc:
+                scrub_private = True
+                verification_error = exc
         for descriptor in self._private_descriptors:
             try:
                 if scrub_private:
@@ -1365,6 +1372,8 @@ class _CustodySession:
             boundary.close()
         self.custodian.close()
         self.public.close()
+        if verification_error is not None:
+            raise verification_error
 
 
 def _mkdir_open_at(parent_descriptor: int, name: str, label: str) -> int:
@@ -2021,7 +2030,7 @@ def build_candidate(
     except BaseException:
         session.close(scrub_private=True)
         raise
-    session.close(scrub_private=False)
+    session.close(scrub_private=False, verify=True)
     return result
 
 

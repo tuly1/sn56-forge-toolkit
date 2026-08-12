@@ -609,6 +609,39 @@ def test_private_record_read_rejects_hard_link_created_mid_read(
     assert record.samefile(public_link)
 
 
+def test_private_record_read_rejects_hard_link_after_first_bound_read(
+    candidate, tmp_path, monkeypatch
+) -> None:
+    public, custodian = candidate
+    private_parent = tmp_path / "private-records-postread-hardlink"
+    private_parent.mkdir()
+    record = private_parent / "review.json"
+    record.write_bytes(admission.canonical_bytes({"source": "private"}))
+    public_link = public.parent / "published-postread-review.json"
+    original_read = admission.renderer._read_regular_at
+    reads = 0
+
+    def read_then_link(*args, **kwargs):
+        nonlocal reads
+        payload = original_read(*args, **kwargs)
+        reads += 1
+        if reads == 1:
+            os.link(record, public_link)
+        return payload
+
+    monkeypatch.setattr(admission.renderer, "_read_regular_at", read_then_link)
+    with pytest.raises(admission.AdmissionError, match="single-link regular file"):
+        admission._load_private_json(
+            record,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="human review draft",
+        )
+    assert reads == 1
+    assert record.samefile(public_link)
+
+
 def test_private_record_publish_rechecks_worktree_inventory_without_unsafe_cleanup(
     candidate, tmp_path, monkeypatch
 ):
@@ -766,6 +799,42 @@ def test_private_record_publish_rejects_live_parent_replacement_after_link_check
         )
     assert swapped is True
     assert target.read_bytes() == b"foreign-publication"
+    assert moved_target.read_bytes() == b""
+
+
+def test_private_record_publish_rejects_parent_replacement_after_writer_returns(
+    candidate, tmp_path, monkeypatch
+) -> None:
+    public, custodian = candidate
+    private_parent = tmp_path / "private-parent-after-writer"
+    private_parent.mkdir()
+    displaced = tmp_path / "private-parent-after-writer-displaced"
+    target = private_parent / "PRIVATE-CONFIRMATION-REVEAL.json"
+    moved_target = displaced / target.name
+    original_write = admission.renderer._write_exclusive_at
+    swapped = False
+
+    def write_then_replace(*args, **kwargs):
+        nonlocal swapped
+        result = original_write(*args, **kwargs)
+        private_parent.rename(displaced)
+        private_parent.mkdir()
+        target.write_bytes(b"foreign-after-writer")
+        swapped = True
+        return result
+
+    monkeypatch.setattr(admission.renderer, "_write_exclusive_at", write_then_replace)
+    with pytest.raises(admission.AdmissionError, match="parent changed|live payload"):
+        admission._write_private_new(
+            target,
+            {"revealed_rows": ["private"]},
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+    assert swapped is True
+    assert target.read_bytes() == b"foreign-after-writer"
     assert moved_target.read_bytes() == b""
 
 

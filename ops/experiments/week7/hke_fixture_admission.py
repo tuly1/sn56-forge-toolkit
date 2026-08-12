@@ -428,6 +428,37 @@ def _assert_private_target_bound(
             raise AdmissionError(f"{label} live target changed during publication")
 
 
+def _assert_private_payload_bound(
+    parent_descriptor: int,
+    path: Path,
+    expected_payload: bytes,
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    label: str,
+) -> None:
+    """Rebind a completed read/write to its requested live single-link path."""
+
+    for _ in range(2):
+        _assert_private_parent_bound(
+            parent_descriptor,
+            path,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        try:
+            live_payload = renderer._read_regular_at(
+                parent_descriptor, path.name, label
+            )
+        except renderer.FixtureError as exc:
+            raise AdmissionError(str(exc)) from exc
+        if not hmac.compare_digest(live_payload, expected_payload):
+            raise AdmissionError(f"{label} live payload changed")
+
+
 def _load_private_json(
     path: Path,
     *,
@@ -458,7 +489,17 @@ def _load_private_json(
             public_boundary_roots=public_boundary_roots,
             label=label,
         )
-        return _decode_json(raw, label)
+        value = _decode_json(raw, label)
+        _assert_private_payload_bound(
+            parent_descriptor,
+            checked,
+            raw,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        return value
     finally:
         os.close(parent_descriptor)
 
@@ -482,6 +523,24 @@ def _write_private_new(
         label=label,
     )
     payload = canonical_bytes(value)
+    retained_descriptor: int | None = None
+
+    def validate_and_retain(
+        descriptor: int, metadata: os.stat_result
+    ) -> None:
+        nonlocal retained_descriptor
+        _assert_private_target_bound(
+            parent_descriptor,
+            checked,
+            descriptor,
+            metadata,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        retained_descriptor = os.dup(descriptor)
+
     try:
         _assert_private_parent_bound(
             parent_descriptor,
@@ -496,28 +555,36 @@ def _write_private_new(
                 parent_descriptor,
                 checked.name,
                 payload,
-                post_write_validation=lambda descriptor, metadata: _assert_private_target_bound(
-                    parent_descriptor,
-                    checked,
-                    descriptor,
-                    metadata,
-                    public_root=public_root,
-                    custodian_root=custodian_root,
-                    public_boundary_roots=public_boundary_roots,
-                    label=label,
-                ),
+                post_write_validation=validate_and_retain,
             )
         except FileExistsError as exc:
             raise AdmissionError(f"refusing to overwrite {checked}") from exc
         except renderer.FixtureError as exc:
             raise AdmissionError(str(exc)) from exc
+        _assert_private_payload_bound(
+            parent_descriptor,
+            checked,
+            payload,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
         return hashlib.sha256(payload).hexdigest()
     except BaseException:
         # POSIX has no identity-conditional unlink.  The renderer scrubs the
         # exact created inode through its held descriptor if the post-write
         # custody check fails; this layer never deletes a mutable pathname.
+        if retained_descriptor is not None:
+            try:
+                os.ftruncate(retained_descriptor, 0)
+                os.fsync(retained_descriptor)
+            except OSError:
+                pass
         raise
     finally:
+        if retained_descriptor is not None:
+            os.close(retained_descriptor)
         os.close(parent_descriptor)
 
 

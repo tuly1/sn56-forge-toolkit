@@ -681,7 +681,7 @@ def test_new_root_cleanup_never_deletes_replacement_entry(
     monkeypatch.setattr(
         renderer, "_open_directory_chain_no_symlinks", replace_before_fresh_open
     )
-    with pytest.raises(renderer.FixtureError, match="path changed during creation"):
+    with pytest.raises(renderer.FixtureError, match="absolute path changed"):
         renderer._ensure_new_root(target, "private root")
     assert target.is_dir()
     assert moved.is_dir()
@@ -847,6 +847,58 @@ def test_generation_rejects_worktree_registered_after_preflight(
         )
     assert registered is True
     assert not (boundary / "candidate" / "CANDIDATE-MANIFEST.json").exists()
+
+
+def test_generation_completion_rechecks_custodian_after_inner_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "completion-public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "completion-custodian"
+    relocated = boundary / "late-relocated-private"
+    tiny = dict(renderer.FIXTURE_CONTRACT[0])
+    tiny.update(
+        {
+            "discovery_packs": [
+                {"pack": "D1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "confirmation_packs": [
+                {"pack": "C1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "discovery_count": 2,
+            "confirmation_count": 2,
+        }
+    )
+    monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    original_build = renderer._build_candidate_in_session
+    moved = False
+
+    def build_then_move(*args, **kwargs):
+        nonlocal moved
+        result = original_build(*args, **kwargs)
+        custodian.rename(relocated)
+        moved = True
+        return result
+
+    monkeypatch.setattr(renderer, "_build_candidate_in_session", build_then_move)
+    with pytest.raises(renderer.FixtureError, match="custodian output"):
+        renderer.build_candidate(
+            public_output=public,
+            custodian_output=custodian,
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(boundary,),
+            **RIGHTS,
+        )
+    assert moved is True
+    assert all(
+        path.stat().st_size == 0
+        for path in relocated.rglob("*")
+        if path.is_file()
+    )
 
 
 def test_custody_rejects_symlink_ancestors_before_creation(tmp_path: Path) -> None:
