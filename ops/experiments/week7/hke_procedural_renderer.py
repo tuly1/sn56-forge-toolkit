@@ -53,6 +53,7 @@ _DIRECTORY_OPEN_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_DIRECTORY", 0)
 )
+_ACTIVE_CUSTODY_SESSIONS: list["_CustodySession"] | None = None
 
 FIXTURE_CONTRACT: tuple[dict[str, Any], ...] = (
     {
@@ -1401,61 +1402,62 @@ class _CustodySession:
             (os.dup(parent_descriptor), os.dup(descriptor), name)
         )
 
+    def verify(self) -> None:
+        """Rebind roots, every private inode, and worktree custody."""
+
+        self.assert_live()
+        for parent_descriptor, descriptor, name in self._private_files:
+            metadata = os.fstat(descriptor)
+            try:
+                linked = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise FixtureError(
+                    "private candidate file moved before completion"
+                ) from exc
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or not stat.S_ISREG(linked.st_mode)
+                or metadata.st_nlink != 1
+                or linked.st_nlink != 1
+                or (metadata.st_dev, metadata.st_ino, metadata.st_size)
+                != (linked.st_dev, linked.st_ino, linked.st_size)
+            ):
+                raise FixtureError(
+                    "private candidate file moved or linked before completion"
+                )
+            # A private inode check can race with root relocation or a newly
+            # registered worktree. Rebind after every retained inode.
+            self.assert_live()
+        for parent_descriptor, descriptor, name in self._private_directories:
+            held = os.fstat(descriptor)
+            try:
+                linked = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise FixtureError(
+                    "private candidate subtree moved before completion"
+                ) from exc
+            if (
+                not stat.S_ISDIR(held.st_mode)
+                or not stat.S_ISDIR(linked.st_mode)
+                or (held.st_dev, held.st_ino) != (linked.st_dev, linked.st_ino)
+            ):
+                raise FixtureError("private candidate subtree moved before completion")
+            self.assert_live()
+        self.assert_live()
+
     def close(self, *, scrub_private: bool, verify: bool = False) -> None:
         verification_error: BaseException | None = None
         if verify:
             try:
-                self.assert_live()
-                for parent_descriptor, descriptor, name in self._private_files:
-                    metadata = os.fstat(descriptor)
-                    try:
-                        linked = os.stat(
-                            name,
-                            dir_fd=parent_descriptor,
-                            follow_symlinks=False,
-                        )
-                    except OSError as exc:
-                        raise FixtureError(
-                            "private candidate file moved before completion"
-                        ) from exc
-                    if (
-                        not stat.S_ISREG(metadata.st_mode)
-                        or not stat.S_ISREG(linked.st_mode)
-                        or metadata.st_nlink != 1
-                        or linked.st_nlink != 1
-                        or (metadata.st_dev, metadata.st_ino, metadata.st_size)
-                        != (linked.st_dev, linked.st_ino, linked.st_size)
-                    ):
-                        raise FixtureError(
-                            "private candidate file moved or linked before completion"
-                        )
-                    # A private inode check can race with root relocation or a
-                    # newly registered worktree. Rebind the whole custody
-                    # relation after every retained file, not only before the
-                    # verification loop.
-                    self.assert_live()
-                for parent_descriptor, descriptor, name in self._private_directories:
-                    held = os.fstat(descriptor)
-                    try:
-                        linked = os.stat(
-                            name,
-                            dir_fd=parent_descriptor,
-                            follow_symlinks=False,
-                        )
-                    except OSError as exc:
-                        raise FixtureError(
-                            "private candidate subtree moved before completion"
-                        ) from exc
-                    if (
-                        not stat.S_ISDIR(held.st_mode)
-                        or not stat.S_ISDIR(linked.st_mode)
-                        or (held.st_dev, held.st_ino) != (linked.st_dev, linked.st_ino)
-                    ):
-                        raise FixtureError(
-                            "private candidate subtree moved before completion"
-                        )
-                    self.assert_live()
-                self.assert_live()
+                self.verify()
             except BaseException as exc:
                 scrub_private = True
                 verification_error = exc
@@ -2155,8 +2157,36 @@ def build_candidate(
     except BaseException:
         session.close(scrub_private=True)
         raise
-    session.close(scrub_private=False, verify=True)
+    if _ACTIVE_CUSTODY_SESSIONS is None:
+        session.close(scrub_private=False, verify=True)
+    else:
+        try:
+            session.verify()
+        except BaseException:
+            session.close(scrub_private=True)
+            raise
+        _ACTIVE_CUSTODY_SESSIONS.append(session)
     return result
+
+
+def _verify_active_custody_sessions() -> None:
+    if _ACTIVE_CUSTODY_SESSIONS is None:
+        return
+    try:
+        for session in _ACTIVE_CUSTODY_SESSIONS:
+            session.verify()
+    except BaseException:
+        for session in _ACTIVE_CUSTODY_SESSIONS:
+            session.close(scrub_private=True)
+        _ACTIVE_CUSTODY_SESSIONS.clear()
+        raise
+
+
+def _close_active_custody_sessions() -> None:
+    if _ACTIVE_CUSTODY_SESSIONS is None:
+        return
+    while _ACTIVE_CUSTODY_SESSIONS:
+        _ACTIVE_CUSTODY_SESSIONS.pop().close(scrub_private=False)
 
 
 def _decode_json(raw: bytes, label: str) -> dict[str, Any]:
@@ -2744,7 +2774,12 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global _ACTIVE_CUSTODY_SESSIONS
+
     args = _parse(argv)
+    if _ACTIVE_CUSTODY_SESSIONS is not None:
+        raise FixtureError("custody session scope is already active")
+    _ACTIVE_CUSTODY_SESSIONS = []
     common = {
         "public_output": args.public_output,
         "custodian_output": args.custodian_output,
@@ -2754,20 +2789,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         "public_boundary_roots": args.public_boundary_roots,
     }
-    result = (
-        build_candidate(
-            **common,
-            generator_commit=args.generator_commit,
-            generator_tree=args.generator_tree,
-            author_record=args.author_record,
-            rights_owner=args.rights_owner,
-            license_or_use_grant=args.license_or_use_grant,
+    try:
+        result = (
+            build_candidate(
+                **common,
+                generator_commit=args.generator_commit,
+                generator_tree=args.generator_tree,
+                author_record=args.author_record,
+                rights_owner=args.rights_owner,
+                license_or_use_grant=args.license_or_use_grant,
+            )
+            if args.command == "build"
+            else verify_replay(**common)
         )
-        if args.command == "build"
-        else verify_replay(**common)
-    )
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
+        _verify_active_custody_sessions()
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    finally:
+        _close_active_custody_sessions()
+        _ACTIVE_CUSTODY_SESSIONS = None
 
 
 if __name__ == "__main__":  # pragma: no cover

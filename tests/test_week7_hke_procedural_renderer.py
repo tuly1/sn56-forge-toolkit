@@ -959,6 +959,64 @@ def test_generation_completion_rechecks_roots_after_retained_file_validation(
     )
 
 
+def test_renderer_cli_revalidates_custody_after_build_helper_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "cli-public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "cli-custodian"
+    relocated = boundary / "cli-relocated-private"
+    tiny = dict(renderer.FIXTURE_CONTRACT[0])
+    tiny.update(
+        {
+            "discovery_packs": [
+                {"pack": "D1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "confirmation_packs": [
+                {"pack": "C1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "discovery_count": 2,
+            "confirmation_count": 2,
+        }
+    )
+    monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "build",
+            "public_output": public,
+            "custodian_output": custodian,
+            "discovery_key_file": tmp_path / "discovery.key",
+            "confirmation_key_file": tmp_path / "confirmation.key",
+            "public_boundary_roots": (boundary,),
+            "generator_commit": GENERATOR_COMMIT,
+            "generator_tree": GENERATOR_TREE,
+            **RIGHTS,
+        },
+    )()
+    original_build = renderer.build_candidate
+
+    def build_then_move(**kwargs):
+        result = original_build(**kwargs)
+        custodian.rename(relocated)
+        return result
+
+    def key_for(path, _label):
+        return DISCOVERY_KEY if path == args.discovery_key_file else CONFIRMATION_KEY
+
+    monkeypatch.setattr(renderer, "_parse", lambda _argv: args)
+    monkeypatch.setattr(renderer, "_read_key_file", key_for)
+    monkeypatch.setattr(renderer, "build_candidate", build_then_move)
+    with pytest.raises(renderer.FixtureError, match="custodian output"):
+        renderer.main([])
+    assert all(
+        path.stat().st_size == 0 for path in relocated.rglob("*") if path.is_file()
+    )
+    assert renderer._ACTIVE_CUSTODY_SESSIONS is None
+
+
 def test_generation_completion_rejects_public_hard_link_to_private_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
