@@ -759,7 +759,7 @@ def _cell_identity_body(
     bundle_sha256: str,
     runtime_commit: str,
     accelerator_observation_sha256: str,
-    accelerator_uuid: str,
+    accelerator_identity: str,
 ) -> dict[str, Any]:
     checked_execution = _validate_execution_identity(execution_identity, "cell")
     for value, label in (
@@ -781,8 +781,12 @@ def _cell_identity_body(
         raise HKEContractError("cell arm is outside the staged protocol")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise HKEContractError("cell seed is invalid")
-    if not isinstance(accelerator_uuid, str) or not accelerator_uuid.startswith("GPU-"):
-        raise HKEContractError("cell accelerator UUID is invalid")
+    try:
+        accelerator_identity = adaptive_timing.validate_accelerator_identity(
+            accelerator_identity
+        )
+    except Exception as exc:
+        raise HKEContractError("cell accelerator identity is invalid") from exc
     if bundle_id not in {
         INCUMBENT_BUNDLE,
         OWNED_NO_MULTIRES_BUNDLE,
@@ -794,7 +798,7 @@ def _cell_identity_body(
     if runtime_commit != krea_runtime.runtime_commit_for_bundle(bundle_id):
         raise HKEContractError("cell runtime commit mismatch")
     return {
-        "schema": 1,
+        "schema": 2,
         "kind": "sn56-week7-hke-cell-identity",
         "family": family,
         "pack": pack,
@@ -815,7 +819,7 @@ def _cell_identity_body(
         "bundle_sha256": bundle_sha256,
         "runtime_commit": runtime_commit,
         "accelerator_observation_sha256": accelerator_observation_sha256,
-        "accelerator_uuid": accelerator_uuid,
+        "accelerator_identity": accelerator_identity,
     }
 
 
@@ -851,7 +855,7 @@ def _validate_cell_identity(value: Any, label: str) -> dict[str, Any]:
         bundle_sha256=document.get("bundle_sha256"),
         runtime_commit=document.get("runtime_commit"),
         accelerator_observation_sha256=document.get("accelerator_observation_sha256"),
-        accelerator_uuid=document.get("accelerator_uuid"),
+        accelerator_identity=document.get("accelerator_identity"),
     )
     if document != expected or declared != canonical_sha256(expected):
         raise HKEContractError(f"{label} cell identity digest mismatch")
@@ -880,7 +884,7 @@ CELL_BINDING_FIELDS = frozenset(
         "runtime_commit",
         "cell_sha256",
         "accelerator_observation_sha256",
-        "accelerator_uuid",
+        "accelerator_identity",
     }
 )
 
@@ -1448,8 +1452,7 @@ def _validate_training_source_record(
         or timing.get("current_dataset_size") != fixture["training_row_count"]
         or timing.get("dataset_regime")
         != adaptive_timing.dataset_regime(fixture["training_row_count"])
-        or identity["accelerator_uuid"]
-        not in str(timing_accelerator_identity)
+        or timing_accelerator_identity != identity["accelerator_identity"]
     ):
         raise HKEContractError(f"{label} source timing/accelerator mismatch")
     return {**body, "source_record_sha256": declared}
@@ -2675,7 +2678,11 @@ def _plan_cell(
         bundle_sha256=krea_runtime.bundle_contract_sha256(bundle_id),
         runtime_commit=krea_runtime.runtime_commit_for_bundle(bundle_id),
         accelerator_observation_sha256=observation["observation_sha256"],
-        accelerator_uuid=observation["device"]["uuid"],
+        accelerator_identity=adaptive_timing.accelerator_identity(
+            name=observation["device"]["name"],
+            memory_total_mib=observation["device"]["memory_total_mib"],
+            uuid=observation["device"]["uuid"],
+        ),
     )
     return {
         "config": config_value,

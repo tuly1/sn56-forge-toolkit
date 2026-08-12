@@ -27,6 +27,7 @@ import stat
 import subprocess
 import sys
 from typing import Any, Iterable, Mapping, Sequence
+import unicodedata
 
 import PIL
 from PIL import Image, ImageDraw
@@ -46,6 +47,12 @@ PNG_FORMAT = "PNG"
 SCRIPT_PATH = Path(__file__).resolve()
 EXECUTABLE_REPOSITORY_ROOT = SCRIPT_PATH.parents[3]
 FIXED_GIT = Path("/usr/bin/git")
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+)
 
 FIXTURE_CONTRACT: tuple[dict[str, Any], ...] = (
     {
@@ -832,24 +839,175 @@ def _dedup_evidence(rows: Sequence[tuple[dict[str, Any], bytes]]) -> dict[str, A
     return {**evidence, "semantic_sha256": semantic_sha256(evidence)}
 
 
-def _ensure_new_root(path: Path, label: str) -> Path:
-    path = Path(os.path.abspath(os.path.expanduser(path)))
-    current = path.parent
-    while current != current.parent:
-        if current.is_symlink():
-            raise FixtureError(f"{label} has a symlink ancestor: {current}")
-        current = current.parent
-    if not path.parent.is_dir() or path.parent.is_symlink():
-        raise FixtureError(f"{label} parent is not a real directory")
-    try:
-        path.mkdir(mode=0o700)
-    except FileExistsError as exc:
-        raise FileExistsError(f"refusing to replace {label}: {path}") from exc
-    return path
-
-
 def _absolute(path: Path) -> Path:
     return Path(os.path.abspath(os.path.expanduser(path)))
+
+
+def _normalized_path_component(value: str) -> str:
+    """Return a conservative textual identity for an unresolved component."""
+
+    return unicodedata.normalize("NFC", value).casefold()
+
+
+def _open_directory_chain_no_symlinks(path: Path, label: str) -> int:
+    """Open an existing directory by descriptor without following any symlink."""
+
+    path = _absolute(path)
+    try:
+        descriptor = os.open(path.anchor, _DIRECTORY_OPEN_FLAGS)
+    except OSError as exc:
+        raise FixtureError(f"cannot safely open {label}: {path}") from exc
+    try:
+        for component in path.parts[1:]:
+            try:
+                child = os.open(
+                    component,
+                    _DIRECTORY_OPEN_FLAGS,
+                    dir_fd=descriptor,
+                )
+            except OSError as exc:
+                raise FixtureError(f"cannot safely open {label}: {path}") from exc
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _path_identity_plan(path: Path) -> tuple[tuple[str, int | None, int | None], ...]:
+    """Describe a path with inode ancestry and conservative missing suffixes.
+
+    Existing components are opened without following symlinks and represented
+    by filesystem identity.  After the first absent component, NFC+casefolded
+    names preserve a conservative lexical relation for missing/prunable Git
+    worktrees.  This catches case aliases on case-insensitive filesystems while
+    retaining fail-closed coverage for paths that do not exist yet.
+    """
+
+    path = _absolute(path)
+    try:
+        descriptor = os.open(path.anchor, _DIRECTORY_OPEN_FLAGS)
+    except OSError as exc:
+        raise FixtureError(f"cannot inspect path identity: {path}") from exc
+    root_stat = os.fstat(descriptor)
+    plan: list[tuple[str, int | None, int | None]] = [
+        (_normalized_path_component(path.anchor), root_stat.st_dev, root_stat.st_ino)
+    ]
+    components = path.parts[1:]
+    try:
+        for index, component in enumerate(components):
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+                os, "O_NOFOLLOW", 0
+            )
+            if index < len(components) - 1:
+                flags |= getattr(os, "O_DIRECTORY", 0)
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                plan.extend(
+                    (_normalized_path_component(item), None, None)
+                    for item in components[index:]
+                )
+                return tuple(plan)
+            except OSError as exc:
+                raise FixtureError(f"cannot inspect path identity: {path}") from exc
+            metadata = os.fstat(child)
+            plan.append(
+                (
+                    _normalized_path_component(component),
+                    metadata.st_dev,
+                    metadata.st_ino,
+                )
+            )
+            os.close(descriptor)
+            descriptor = child
+        return tuple(plan)
+    finally:
+        os.close(descriptor)
+
+
+def _plan_component_equal(
+    left: tuple[str, int | None, int | None],
+    right: tuple[str, int | None, int | None],
+) -> bool:
+    if left[1] is not None and right[1] is not None:
+        return left[1:] == right[1:]
+    return left[0] == right[0]
+
+
+def _path_is_descendant(child: Path, parent: Path, *, strict: bool = False) -> bool:
+    child_plan = _path_identity_plan(child)
+    parent_plan = _path_identity_plan(parent)
+    if len(child_plan) < len(parent_plan) or (
+        strict and len(child_plan) == len(parent_plan)
+    ):
+        return False
+    return all(
+        _plan_component_equal(child_item, parent_item)
+        for child_item, parent_item in zip(child_plan, parent_plan, strict=False)
+    )
+
+
+def _paths_equivalent(left: Path, right: Path) -> bool:
+    left_plan = _path_identity_plan(left)
+    right_plan = _path_identity_plan(right)
+    return len(left_plan) == len(right_plan) and all(
+        _plan_component_equal(left_item, right_item)
+        for left_item, right_item in zip(left_plan, right_plan, strict=True)
+    )
+
+
+def _ensure_new_root(path: Path, label: str) -> Path:
+    """Create one root through a held parent descriptor and verify its linkage."""
+
+    path = _absolute(path)
+    if path == Path(path.anchor) or not path.name:
+        raise FixtureError(f"{label} is not a creatable child directory")
+    parent_descriptor = _open_directory_chain_no_symlinks(
+        path.parent, f"{label} parent"
+    )
+    created = False
+    try:
+        try:
+            os.mkdir(path.name, mode=0o700, dir_fd=parent_descriptor)
+            created = True
+        except FileExistsError as exc:
+            raise FileExistsError(f"refusing to replace {label}: {path}") from exc
+        except OSError as exc:
+            raise FixtureError(f"cannot safely create {label}: {path}") from exc
+        try:
+            created_descriptor = os.open(
+                path.name,
+                _DIRECTORY_OPEN_FLAGS,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as exc:
+            raise FixtureError(f"cannot bind created {label}: {path}") from exc
+        try:
+            created_identity = os.fstat(created_descriptor)
+        finally:
+            os.close(created_descriptor)
+        fresh_descriptor = _open_directory_chain_no_symlinks(path, label)
+        try:
+            fresh_identity = os.fstat(fresh_descriptor)
+        finally:
+            os.close(fresh_descriptor)
+        if (created_identity.st_dev, created_identity.st_ino) != (
+            fresh_identity.st_dev,
+            fresh_identity.st_ino,
+        ):
+            raise FixtureError(f"{label} path changed during creation")
+        return path
+    except BaseException:
+        if created:
+            try:
+                os.rmdir(path.name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(parent_descriptor)
 
 
 def _require_no_symlink_components(path: Path, label: str) -> None:
@@ -870,9 +1028,7 @@ def _require_no_symlink_components(path: Path, label: str) -> None:
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
-    left = _absolute(left)
-    right = _absolute(right)
-    return left == right or left in right.parents or right in left.parents
+    return _path_is_descendant(left, right) or _path_is_descendant(right, left)
 
 
 def _require_no_symlink_ancestors_allow_missing(path: Path, label: str) -> None:
@@ -994,7 +1150,11 @@ def _validate_custody_boundary(
         raise FixtureError("public_boundary_roots is malformed") from exc
     if not boundaries:
         raise FixtureError("public_boundary_roots must not be empty")
-    if len(set(boundaries)) != len(boundaries):
+    if any(
+        _paths_equivalent(left, right)
+        for index, left in enumerate(boundaries)
+        for right in boundaries[index + 1 :]
+    ):
         raise FixtureError("public_boundary_roots contains duplicates")
     public_root = _absolute(public_root)
     custodian_root = _absolute(custodian_root)
@@ -1002,7 +1162,10 @@ def _validate_custody_boundary(
         _require_no_symlink_ancestors_allow_missing(
             boundary, f"public boundary {index}"
         )
-    if not any(boundary in public_root.parents for boundary in boundaries):
+    if not any(
+        _path_is_descendant(public_root, boundary, strict=True)
+        for boundary in boundaries
+    ):
         raise FixtureError(
             "public output must be strictly inside a declared public boundary"
         )
@@ -1037,15 +1200,23 @@ def _safe_row_path(root: Path, relative: Any, label: str) -> Path:
 
 
 def _write_exclusive(path: Path, payload: bytes) -> None:
-    descriptor = os.open(
-        path,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
+    path = _absolute(path)
+    parent_descriptor = _open_directory_chain_no_symlinks(
+        path.parent, "output parent"
     )
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    finally:
+        os.close(parent_descriptor)
     try:
         offset = 0
         while offset < len(payload):

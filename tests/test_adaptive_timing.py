@@ -328,6 +328,41 @@ def test_accelerator_environment_cannot_override_live_observation(monkeypatch):
     ) == ACCELERATOR_IDENTITY
 
 
+def test_accelerator_probe_uses_fixed_executable_and_sanitized_environment():
+    observed = {}
+
+    def runner(argv, **kwargs):
+        observed.update(argv=argv, kwargs=kwargs)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=f"NVIDIA H100 PCIe, {ACCELERATOR_UUID}, 81559\n",
+            stderr="",
+        )
+
+    assert adaptive_timing.current_accelerator_identity(
+        environ={"PATH": "/attacker", "HOME": "/attacker-home"},
+        runner=runner,
+    ) == ACCELERATOR_IDENTITY
+    assert observed["argv"] == [
+        "/usr/bin/nvidia-smi",
+        "--query-gpu=name,uuid,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    assert observed["kwargs"] == {
+        "cwd": "/",
+        "env": {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/nonexistent-sn56-accelerator-identity",
+            "LANG": "C",
+            "LC_ALL": "C",
+        },
+        "capture_output": True,
+        "text": True,
+        "timeout": 10,
+        "check": False,
+    }
+
+
 def test_profile_producer_rejects_source_record_symlink(tmp_path):
     source = _write_source_record(tmp_path)
     link = tmp_path / "source-record-link.json"

@@ -38,6 +38,13 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _BUNDLE_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _SOURCE_RUN_ID_RE = re.compile(r".+:[0-9a-f]{32}")
+_FIXED_NVIDIA_SMI = "/usr/bin/nvidia-smi"
+_ACCELERATOR_PROBE_ENVIRONMENT = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent-sn56-accelerator-identity",
+    "LANG": "C",
+    "LC_ALL": "C",
+}
 _ACCELERATOR_IDENTITY_RE = re.compile(
     r"[^|\r\n]+\|[1-9][0-9]*-MiB\|"
     r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -304,14 +311,19 @@ def current_accelerator_identity(
     source and cannot override this observation.
     """
 
+    # The caller's environment is deliberately not inherited.  Both the
+    # executable and its complete environment are fixed so an ambient PATH or
+    # shell configuration cannot manufacture hardware evidence.
     del environ
     try:
         completed = runner(
             [
-                "nvidia-smi",
+                _FIXED_NVIDIA_SMI,
                 "--query-gpu=name,uuid,memory.total",
                 "--format=csv,noheader,nounits",
             ],
+            cwd="/",
+            env=dict(_ACCELERATOR_PROBE_ENVIRONMENT),
             capture_output=True,
             text=True,
             timeout=10,

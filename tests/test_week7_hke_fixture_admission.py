@@ -417,6 +417,96 @@ def test_private_review_records_cannot_be_written_in_candidate_or_repo(candidate
         )
 
 
+def test_private_record_rejects_existing_registered_sibling_worktree(
+    candidate, tmp_path, monkeypatch
+):
+    public, custodian = candidate
+    sibling = tmp_path / "sibling-worktree"
+    sibling.mkdir()
+    monkeypatch.setattr(
+        renderer,
+        "_registered_worktree_roots",
+        lambda: (renderer.EXECUTABLE_REPOSITORY_ROOT, sibling),
+    )
+    target = sibling / "PRIVATE-CONFIRMATION-REVEAL.json"
+    with pytest.raises(admission.AdmissionError, match="registered-worktree"):
+        admission._private_record_path(
+            target,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+    assert not target.exists()
+
+
+def test_private_record_rejects_case_alias_of_registered_worktree(
+    candidate, tmp_path, monkeypatch
+):
+    public, custodian = candidate
+    sibling = tmp_path / "SiblingWorktree"
+    sibling.mkdir()
+    alias = sibling.with_name(sibling.name.swapcase())
+    try:
+        same = alias.samefile(sibling)
+    except FileNotFoundError:
+        pytest.skip("filesystem is case-sensitive")
+    if not same:
+        pytest.skip("filesystem is case-sensitive")
+    monkeypatch.setattr(
+        renderer,
+        "_registered_worktree_roots",
+        lambda: (renderer.EXECUTABLE_REPOSITORY_ROOT, sibling),
+    )
+    with pytest.raises(admission.AdmissionError, match="registered-worktree"):
+        admission._private_record_path(
+            alias / "PRIVATE-CONFIRMATION-REVEAL.json",
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+
+
+def test_private_record_rejects_missing_prunable_registered_worktree(
+    candidate, tmp_path, monkeypatch
+):
+    public, custodian = candidate
+    missing = tmp_path / "missing-prunable-worktree"
+    monkeypatch.setattr(
+        renderer,
+        "_registered_worktree_roots",
+        lambda: (renderer.EXECUTABLE_REPOSITORY_ROOT, missing),
+    )
+    with pytest.raises(admission.AdmissionError, match="registered-worktree"):
+        admission._private_record_path(
+            missing / "private" / "PRIVATE-CONFIRMATION-REVEAL.json",
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+
+
+def test_private_record_fails_closed_when_worktree_inventory_fails(
+    candidate, tmp_path, monkeypatch
+):
+    public, custodian = candidate
+
+    def fail_inventory():
+        raise renderer.FixtureError("worktree inventory failed closed")
+
+    monkeypatch.setattr(renderer, "_registered_worktree_roots", fail_inventory)
+    with pytest.raises(admission.AdmissionError, match="inventory failed closed"):
+        admission._private_record_path(
+            tmp_path / "outside" / "review.json",
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="review",
+        )
+
+
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(
     candidate, tmp_path: Path
 ) -> None:

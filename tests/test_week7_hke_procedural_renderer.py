@@ -609,6 +609,60 @@ def test_custody_rejects_executable_repo_and_every_registered_worktree(
     assert not (boundary / "candidate-b").exists()
 
 
+def test_path_overlap_uses_filesystem_identity_for_case_aliases(tmp_path: Path) -> None:
+    root = tmp_path / "CaseSensitiveProbe"
+    root.mkdir()
+    alias = root.with_name(root.name.swapcase())
+    try:
+        same = alias.samefile(root)
+    except FileNotFoundError:
+        pytest.skip("filesystem is case-sensitive")
+    if not same:
+        pytest.skip("filesystem is case-sensitive")
+    assert renderer._paths_equivalent(alias, root)
+    assert renderer._paths_overlap(alias / "private", root)
+    assert renderer._path_is_descendant(alias / "private", root, strict=True)
+
+
+def test_custodian_creation_rejects_parent_swap_to_public_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "public-boundary"
+    boundary.mkdir()
+    private_parent = tmp_path / "private-parent"
+    private_parent.mkdir()
+    abandoned_parent = tmp_path / "private-parent-abandoned"
+    original_mkdir = renderer.os.mkdir
+    swapped = False
+
+    def swap_parent_before_mkdir(path, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "custodian" and dir_fd is not None and not swapped:
+            private_parent.rename(abandoned_parent)
+            private_parent.symlink_to(boundary, target_is_directory=True)
+            swapped = True
+        if dir_fd is None:
+            return original_mkdir(path, mode)
+        return original_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(renderer.os, "mkdir", swap_parent_before_mkdir)
+    with pytest.raises(renderer.FixtureError, match="cannot safely open custodian"):
+        renderer.build_candidate(
+            public_output=boundary / "candidate",
+            custodian_output=private_parent / "custodian",
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(boundary,),
+            **RIGHTS,
+        )
+    assert swapped is True
+    assert not (boundary / "custodian").exists()
+    assert not (abandoned_parent / "custodian").exists()
+    assert not (boundary / "candidate").exists()
+
+
 def test_custody_rejects_symlink_ancestors_before_creation(tmp_path: Path) -> None:
     real_boundary = tmp_path / "real-public-boundary"
     real_boundary.mkdir()

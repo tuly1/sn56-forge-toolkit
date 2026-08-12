@@ -744,7 +744,7 @@ def _curve_for_cell(plan, cell, fixture, label: str, value: float):
         source_run_id=source_run_id,
         dataset_size=fixture["training_row_count"],
         accelerator_identity=(
-            "NVIDIA H100 PCIe|81559-MiB|" + identity["accelerator_uuid"]
+            identity["accelerator_identity"]
         ),
         timing_mode=timing_mode,
         profile_sha256=profile_sha256,
@@ -1199,6 +1199,8 @@ def test_plan_binds_every_pack_cell_to_physical_inputs(base_config):
     for arm in H.ARMS:
         cell = plan["cells"]["d1_core"][arm]
         identity = H._validate_cell_identity(cell["cell_identity"], "test")
+        assert identity["schema"] == 2
+        assert identity["accelerator_identity"] == _accelerator_label(_observation())
         assert (
             identity["evaluation_inventory_sha256"]
             == plan["fixture"]["evaluation_inventory_sha256"]
@@ -1910,6 +1912,30 @@ def test_training_source_rejects_rehashed_execution_tampering(base_config, mutat
     with pytest.raises(H.HKEContractError):
         H._validate_training_source_record(
             source, cell, plan["fixture"], order, "tampered"
+        )
+
+
+@pytest.mark.parametrize("arm", ["A", "C"])
+def test_training_source_rejects_same_uuid_with_changed_gpu_class(
+    base_config, arm
+):
+    plan = _plan(base_config)
+    cell = plan["cells"]["d1_core"][arm]
+    curve = _curve(plan, "d1_core", arm, 0.9)
+    order = curve["execution_order"]
+    source = copy.deepcopy(curve["training_receipt"]["source_record"])
+    expected_uuid = _observation()["device"]["uuid"]
+    source["effective_runtime_record"]["timing"]["accelerator_identity"] = (
+        f"NVIDIA A100-SXM4-40GB|40960-MiB|{expected_uuid}"
+    )
+    _rehash_runtime_record(source["effective_runtime_record"])
+    source["effective_runtime_record_file_sha256"] = hashlib.sha256(
+        H._runtime_record_bytes(source["effective_runtime_record"])
+    ).hexdigest()
+    _rehash_source_record(source)
+    with pytest.raises(H.HKEContractError, match="source timing/accelerator mismatch"):
+        H._validate_training_source_record(
+            source, cell, plan["fixture"], order, "changed-class"
         )
 
 

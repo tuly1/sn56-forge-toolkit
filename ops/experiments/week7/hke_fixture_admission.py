@@ -263,17 +263,24 @@ def _private_record_path(
         )
     except renderer.FixtureError as exc:
         raise AdmissionError(str(exc)) from exc
-    if (
-        renderer._paths_overlap(path, public_root)
-        or renderer._paths_overlap(path, custodian_root)
-        or renderer._paths_overlap(path, REPO_ROOT)
-        or any(
-            renderer._paths_overlap(path, boundary)
-            for boundary in public_boundary_roots
+    try:
+        worktree_roots = renderer._registered_worktree_roots()
+        forbidden_roots = (
+            public_root,
+            custodian_root,
+            REPO_ROOT,
+            *worktree_roots,
+            *(Path(boundary) for boundary in public_boundary_roots),
         )
-    ):
+        overlaps_forbidden = any(
+            renderer._paths_overlap(path, root) for root in forbidden_roots
+        )
+    except renderer.FixtureError as exc:
+        raise AdmissionError(str(exc)) from exc
+    if overlaps_forbidden:
         raise AdmissionError(
-            f"{label} must be outside public, candidate-custodian, and repository trees"
+            f"{label} must be outside public, candidate-custodian, repository, "
+            "and every registered-worktree tree"
         )
     renderer._require_no_symlink_components(path.parent, f"{label} parent")
     if not path.parent.is_dir():
