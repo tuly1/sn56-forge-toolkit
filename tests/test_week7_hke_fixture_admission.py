@@ -570,9 +570,16 @@ def test_private_record_publish_rechecks_worktree_inventory_without_unsafe_clean
 
     def register_during_publish(*args, **kwargs):
         nonlocal registered
-        identity = original_write(*args, **kwargs)
-        registered = True
-        return identity
+        validation = kwargs["post_write_validation"]
+
+        def register_then_validate():
+            nonlocal registered
+            registered = True
+            validation()
+
+        return original_write(
+            *args, **{**kwargs, "post_write_validation": register_then_validate}
+        )
 
     monkeypatch.setattr(
         admission.renderer, "_registered_worktree_roots", worktrees
