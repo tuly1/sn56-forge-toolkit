@@ -660,7 +660,7 @@ def test_private_record_real_postwrite_check_rejects_destination_swap(
         admission, "_assert_private_parent_bound", swap_then_run_real_check
     )
     with pytest.raises(
-        admission.renderer.FixtureError, match="changed during descriptor-bound publish"
+        admission.AdmissionError, match="changed during descriptor-bound publish"
     ):
         admission._write_private_new(
             target,
