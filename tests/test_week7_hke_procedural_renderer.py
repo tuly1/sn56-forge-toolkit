@@ -754,12 +754,12 @@ def test_generation_rejects_custodian_move_into_public_boundary(
     original_validate = renderer._CustodySession.validate_private_publish
     moved = False
 
-    def move_then_validate(self, descriptor, metadata):
+    def move_then_validate(self, parent_descriptor, name, descriptor, metadata):
         nonlocal moved
         if not moved:
             self.custodian.path.rename(relocated)
             moved = True
-        return original_validate(self, descriptor, metadata)
+        return original_validate(self, parent_descriptor, name, descriptor, metadata)
 
     monkeypatch.setattr(
         renderer._CustodySession,
