@@ -194,9 +194,12 @@ def test_exact_shapes_candidate_governance_and_row_evidence(built) -> None:
     assert result["cross_candidate_evidence"]["group_identity_duplicate_count"] == 0
     assert result["cross_candidate_evidence"]["perceptual_near_duplicate_count"] == 0
     assert result["rights_record"]["rights_owner"] == RIGHTS["rights_owner"]
-    assert renderer.verify_candidate(
-        public, custodian, public_boundary_roots=(public.parent,)
-    )["verified_rows"] == 144
+    assert (
+        renderer.verify_candidate(
+            public, custodian, public_boundary_roots=(public.parent,)
+        )["verified_rows"]
+        == 144
+    )
 
 
 def test_confirmation_is_custodian_only_and_public_manifest_leaks_no_membership(
@@ -334,9 +337,7 @@ def test_keys_and_domains_are_distinct_and_wrong_key_fails_replay(
             confirmation_key=DISCOVERY_KEY,
             generator_commit=GENERATOR_COMMIT,
             generator_tree=GENERATOR_TREE,
-            public_boundary_roots=(
-                tmp_path / "same-key-boundary",
-            ),
+            public_boundary_roots=(tmp_path / "same-key-boundary",),
             **RIGHTS,
         )
     with pytest.raises(renderer.FixtureError, match="must be distinct"):
@@ -345,9 +346,7 @@ def test_keys_and_domains_are_distinct_and_wrong_key_fails_replay(
             custodian_output=tmp_path / "same-key-internally-consistent-private",
             discovery_key=DISCOVERY_KEY,
             confirmation_key=DISCOVERY_KEY,
-            public_boundary_roots=(
-                tmp_path / "same-key-boundary",
-            ),
+            public_boundary_roots=(tmp_path / "same-key-boundary",),
         )
 
 
@@ -781,9 +780,7 @@ def test_generation_rejects_custodian_move_into_public_boundary(
     assert moved is True
     assert not (public / "CANDIDATE-MANIFEST.json").exists()
     assert all(
-        path.stat().st_size == 0
-        for path in relocated.rglob("*")
-        if path.is_file()
+        path.stat().st_size == 0 for path in relocated.rglob("*") if path.is_file()
     )
 
 
@@ -895,9 +892,7 @@ def test_generation_completion_rechecks_custodian_after_inner_return(
         )
     assert moved is True
     assert all(
-        path.stat().st_size == 0
-        for path in relocated.rglob("*")
-        if path.is_file()
+        path.stat().st_size == 0 for path in relocated.rglob("*") if path.is_file()
     )
 
 
@@ -928,9 +923,7 @@ def test_generation_completion_rejects_public_hard_link_to_private_file(
     def build_then_link(*args, **kwargs):
         result = original_build(*args, **kwargs)
         private_file = next(
-            path
-            for path in sorted(custodian.rglob("*"))
-            if path.is_file()
+            path for path in sorted(custodian.rglob("*")) if path.is_file()
         )
         os.link(private_file, public_link)
         return result
@@ -1009,10 +1002,11 @@ def test_fixed_git_worktree_inventory_is_config_isolated_and_malformed_fails(
     observed: dict[str, object] = {}
 
     def fake_run(argv, *, cwd, env, check, capture_output):
-        observed.update(argv=argv, cwd=cwd, env=env, check=check, capture=capture_output)
+        observed.update(
+            argv=argv, cwd=cwd, env=env, check=check, capture=capture_output
+        )
         output = (
-            f"worktree {renderer.EXECUTABLE_REPOSITORY_ROOT}\0"
-            f"HEAD {'a' * 40}\0\0"
+            f"worktree {renderer.EXECUTABLE_REPOSITORY_ROOT}\0" f"HEAD {'a' * 40}\0\0"
         ).encode()
         return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
 

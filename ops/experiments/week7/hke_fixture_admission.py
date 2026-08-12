@@ -385,9 +385,7 @@ def _assert_private_target_bound(
             )
             held_parent_metadata = os.fstat(parent_descriptor)
             live_parent_metadata = os.fstat(live_parent)
-            live_target = os.stat(
-                path.name, dir_fd=live_parent, follow_symlinks=False
-            )
+            live_target = os.stat(path.name, dir_fd=live_parent, follow_symlinks=False)
             created_now = os.fstat(created_descriptor)
         except (OSError, renderer.FixtureError) as exc:
             raise AdmissionError(f"{label} live target is unavailable") from exc
@@ -525,9 +523,7 @@ def _write_private_new(
     payload = canonical_bytes(value)
     retained_descriptor: int | None = None
 
-    def validate_and_retain(
-        descriptor: int, metadata: os.stat_result
-    ) -> None:
+    def validate_and_retain(descriptor: int, metadata: os.stat_result) -> None:
         nonlocal retained_descriptor
         _assert_private_target_bound(
             parent_descriptor,

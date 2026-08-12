@@ -553,9 +553,7 @@ def test_private_record_read_rejects_parent_swap_after_validation(
     assert swapped is True
 
 
-def test_private_record_read_rejects_public_hard_link(
-    candidate, tmp_path
-) -> None:
+def test_private_record_read_rejects_public_hard_link(candidate, tmp_path) -> None:
     public, custodian = candidate
     private_parent = tmp_path / "private-records-hardlink"
     private_parent.mkdir()
@@ -671,9 +669,7 @@ def test_private_record_publish_rechecks_worktree_inventory_without_unsafe_clean
             *args, **{**kwargs, "post_write_validation": register_then_validate}
         )
 
-    monkeypatch.setattr(
-        admission.renderer, "_registered_worktree_roots", worktrees
-    )
+    monkeypatch.setattr(admission.renderer, "_registered_worktree_roots", worktrees)
     monkeypatch.setattr(
         admission.renderer, "_write_exclusive_at", register_during_publish
     )
@@ -711,9 +707,7 @@ def test_private_record_failed_postwrite_scrubs_created_inode_not_replacement(
             raise admission.AdmissionError("post-write custody changed")
         return original_assert(*args, **kwargs)
 
-    monkeypatch.setattr(
-        admission, "_assert_private_parent_bound", swap_at_postwrite
-    )
+    monkeypatch.setattr(admission, "_assert_private_parent_bound", swap_at_postwrite)
     with pytest.raises(admission.AdmissionError, match="post-write custody changed"):
         admission._write_private_new(
             target,
@@ -848,7 +842,9 @@ def test_admission_rejects_relocated_custodian_inside_evidence_boundary(
     relocated_custodian = evidence / "private-confirmation"
     shutil.copytree(public, copied_public)
     shutil.copytree(custodian, relocated_custodian)
-    with pytest.raises(admission.AdmissionError, match="custodian output must be outside"):
+    with pytest.raises(
+        admission.AdmissionError, match="custodian output must be outside"
+    ):
         admission.build_review_template(
             copied_public,
             relocated_custodian,

@@ -897,9 +897,12 @@ def _path_identity_plan(path: Path) -> tuple[tuple[str, int | None, int | None],
     components = path.parts[1:]
     try:
         for index, component in enumerate(components):
-            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-                os, "O_NOFOLLOW", 0
-            ) | getattr(os, "O_NONBLOCK", 0)
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
             if index < len(components) - 1:
                 flags |= getattr(os, "O_DIRECTORY", 0)
             try:
@@ -1024,7 +1027,9 @@ class _BoundDirectory:
             path.parent, f"{label} parent"
         )
         try:
-            descriptor = os.open(path.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_descriptor)
+            descriptor = os.open(
+                path.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_descriptor
+            )
         except BaseException:
             os.close(parent_descriptor)
             raise
@@ -1082,10 +1087,14 @@ class _BoundDirectory:
     def assert_live(self) -> None:
         try:
             held = os.fstat(self.descriptor)
-            if not stat.S_ISDIR(held.st_mode) or (
-                held.st_dev,
-                held.st_ino,
-            ) != self.identity:
+            if (
+                not stat.S_ISDIR(held.st_mode)
+                or (
+                    held.st_dev,
+                    held.st_ino,
+                )
+                != self.identity
+            ):
                 raise FixtureError(f"{self.label} descriptor identity changed")
             if self.parent_descriptor is not None:
                 linked = os.stat(
@@ -1093,14 +1102,16 @@ class _BoundDirectory:
                     dir_fd=self.parent_descriptor,
                     follow_symlinks=False,
                 )
-                if not stat.S_ISDIR(linked.st_mode) or (
-                    linked.st_dev,
-                    linked.st_ino,
-                ) != self.identity:
+                if (
+                    not stat.S_ISDIR(linked.st_mode)
+                    or (
+                        linked.st_dev,
+                        linked.st_ino,
+                    )
+                    != self.identity
+                ):
                     raise FixtureError(f"{self.label} parent entry changed")
-            fresh_descriptor = _open_directory_chain_no_symlinks(
-                self.path, self.label
-            )
+            fresh_descriptor = _open_directory_chain_no_symlinks(self.path, self.label)
             try:
                 fresh = os.fstat(fresh_descriptor)
             finally:
@@ -1181,7 +1192,9 @@ def _parse_worktree_roots(raw: bytes) -> tuple[Path, ...]:
                 sys.getfilesystemencoding(), "strict"
             )
         except UnicodeDecodeError as exc:
-            raise FixtureError("Git worktree path is not valid filesystem text") from exc
+            raise FixtureError(
+                "Git worktree path is not valid filesystem text"
+            ) from exc
         root = Path(value)
         if not value or not root.is_absolute() or "\x00" in value:
             raise FixtureError("Git worktree path is not absolute")
@@ -1453,17 +1466,14 @@ def _write_exclusive_at(
         try:
             offset = 0
             while offset < len(payload):
-                offset += os.write(
-                    descriptor, payload[offset : offset + 1024 * 1024]
-                )
+                offset += os.write(descriptor, payload[offset : offset + 1024 * 1024])
             os.fsync(descriptor)
             created = os.fstat(descriptor)
             linked = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
             if (
                 not stat.S_ISREG(created.st_mode)
                 or not stat.S_ISREG(linked.st_mode)
-                or (created.st_dev, created.st_ino)
-                != (linked.st_dev, linked.st_ino)
+                or (created.st_dev, created.st_ino) != (linked.st_dev, linked.st_ino)
                 or created.st_size != len(payload)
                 or linked.st_size != len(payload)
                 or created.st_nlink != 1
@@ -1489,9 +1499,7 @@ def _write_exclusive_at(
 
 def _write_exclusive(path: Path, payload: bytes) -> None:
     path = _absolute(path)
-    parent_descriptor = _open_directory_chain_no_symlinks(
-        path.parent, "output parent"
-    )
+    parent_descriptor = _open_directory_chain_no_symlinks(path.parent, "output parent")
     try:
         _write_exclusive_at(parent_descriptor, path.name, payload)
     finally:
@@ -1641,7 +1649,9 @@ def _tree_inventory_at(
                     f"cannot inspect descriptor-bound inventory entry: {relative}"
                 ) from exc
             if stat.S_ISDIR(metadata.st_mode):
-                child = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_descriptor)
+                child = os.open(
+                    name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_descriptor
+                )
                 try:
                     visit(child, prefix / name)
                 finally:
