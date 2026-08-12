@@ -455,6 +455,14 @@ def _assert_private_payload_bound(
             raise AdmissionError(str(exc)) from exc
         if not hmac.compare_digest(live_payload, expected_payload):
             raise AdmissionError(f"{label} live payload changed")
+        _assert_private_parent_bound(
+            parent_descriptor,
+            path,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
 
 
 def _load_private_json(

@@ -1329,6 +1329,7 @@ class _CustodySession:
         self.custodian = custodian
         self.boundaries = tuple(boundaries)
         self._private_descriptors: list[int] = []
+        self._private_directories: list[tuple[int, int, int]] = []
 
     def _assert_bindings(self) -> None:
         self.public.assert_live()
@@ -1363,6 +1364,18 @@ class _CustodySession:
         self.assert_live()
         self._private_descriptors.append(os.dup(descriptor))
 
+    def retain_private_directory(
+        self, parent_descriptor: int, name: str, descriptor: int
+    ) -> None:
+        """Retain an exact private subtree entry through completion."""
+
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise FixtureError("private candidate subtree is not a directory")
+        self._private_directories.append(
+            (os.dup(parent_descriptor), os.dup(descriptor), name)
+        )
+
     def close(self, *, scrub_private: bool, verify: bool = False) -> None:
         verification_error: BaseException | None = None
         if verify:
@@ -1373,6 +1386,21 @@ class _CustodySession:
                     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                         raise FixtureError(
                             "private candidate file is not single-link at completion"
+                        )
+                for parent_descriptor, descriptor, name in self._private_directories:
+                    held = os.fstat(descriptor)
+                    linked = os.stat(
+                        name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        not stat.S_ISDIR(held.st_mode)
+                        or not stat.S_ISDIR(linked.st_mode)
+                        or (held.st_dev, held.st_ino) != (linked.st_dev, linked.st_ino)
+                    ):
+                        raise FixtureError(
+                            "private candidate subtree moved before completion"
                         )
             except BaseException as exc:
                 scrub_private = True
@@ -1387,6 +1415,10 @@ class _CustodySession:
             finally:
                 os.close(descriptor)
         self._private_descriptors.clear()
+        for parent_descriptor, descriptor, _name in self._private_directories:
+            os.close(descriptor)
+            os.close(parent_descriptor)
+        self._private_directories.clear()
         for boundary in reversed(self.boundaries):
             boundary.close()
         self.custodian.close()
@@ -1774,6 +1806,11 @@ def _build_candidate_in_session(
             "confirmation",
             "private confirmation root",
         )
+        session.retain_private_directory(
+            session.custodian.descriptor,
+            "confirmation",
+            private_confirmation_descriptor,
+        )
         session.assert_live()
         discovery_rows: dict[str, list[dict[str, Any]]] = {}
         confirmation_rows: dict[str, list[dict[str, Any]]] = {}
@@ -1792,6 +1829,11 @@ def _build_candidate_in_session(
                     private_confirmation_descriptor,
                     fixture_id,
                     f"private fixture {fixture_id}",
+                )
+                session.retain_private_directory(
+                    private_confirmation_descriptor,
+                    fixture_id,
+                    private_fixture_descriptor,
                 )
                 session.assert_live()
                 discovery_rows[fixture_id] = []

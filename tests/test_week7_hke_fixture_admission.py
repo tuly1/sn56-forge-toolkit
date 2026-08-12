@@ -832,6 +832,43 @@ def test_private_record_publish_rejects_parent_replacement_after_writer_returns(
     assert moved_target.read_bytes() == b""
 
 
+def test_private_record_publish_rechecks_parent_after_final_payload_read(
+    candidate, tmp_path, monkeypatch
+) -> None:
+    public, custodian = candidate
+    private_parent = tmp_path / "private-parent-after-final-read"
+    private_parent.mkdir()
+    displaced = tmp_path / "private-parent-after-final-read-displaced"
+    target = private_parent / "PRIVATE-CONFIRMATION-REVEAL.json"
+    moved_target = displaced / target.name
+    original_read = admission.renderer._read_regular_at
+    reads = 0
+
+    def read_then_replace(*args, **kwargs):
+        nonlocal reads
+        payload = original_read(*args, **kwargs)
+        reads += 1
+        if reads == 2:
+            private_parent.rename(displaced)
+            private_parent.mkdir()
+            target.write_bytes(b"foreign-after-final-read")
+        return payload
+
+    monkeypatch.setattr(admission.renderer, "_read_regular_at", read_then_replace)
+    with pytest.raises(admission.AdmissionError, match="parent changed"):
+        admission._write_private_new(
+            target,
+            {"revealed_rows": ["private"]},
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+    assert reads == 2
+    assert target.read_bytes() == b"foreign-after-final-read"
+    assert moved_target.read_bytes() == b""
+
+
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(
     candidate, tmp_path: Path
 ) -> None:
