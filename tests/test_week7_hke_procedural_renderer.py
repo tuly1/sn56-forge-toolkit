@@ -700,8 +700,12 @@ def test_custodian_creation_rejects_parent_swap_to_public_symlink(
         )
     assert swapped is True
     assert not (boundary / "custodian").exists()
-    assert not (abandoned_parent / "custodian").exists()
-    assert not (boundary / "candidate").exists()
+    # Exceptional cleanup is deliberately nondestructive: create-only debris
+    # remains manifest-free and therefore cannot validate as a candidate.
+    assert (abandoned_parent / "custodian").is_dir()
+    assert not any((abandoned_parent / "custodian").iterdir())
+    assert (boundary / "candidate").is_dir()
+    assert not any((boundary / "candidate").iterdir())
 
 
 def test_custody_rejects_symlink_ancestors_before_creation(tmp_path: Path) -> None:
