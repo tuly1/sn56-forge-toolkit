@@ -433,22 +433,6 @@ def _assert_private_target_bound(
             public_boundary_roots=public_boundary_roots,
             label=label,
         )
-        try:
-            live_payload = renderer._read_regular_at(
-                parent_descriptor, path.name, label
-            )
-        except renderer.FixtureError as exc:
-            raise AdmissionError(str(exc)) from exc
-        if not hmac.compare_digest(live_payload, expected_payload):
-            raise AdmissionError(f"{label} live payload changed")
-        _assert_private_parent_bound(
-            parent_descriptor,
-            path,
-            public_root=public_root,
-            custodian_root=custodian_root,
-            public_boundary_roots=public_boundary_roots,
-            label=label,
-        )
         live_parent: int | None = None
         try:
             live_parent = renderer._open_directory_chain_no_symlinks(
@@ -510,6 +494,22 @@ def _assert_private_payload_bound(
     """Rebind a completed read/write to its requested live single-link path."""
 
     for _ in range(2):
+        _assert_private_parent_bound(
+            parent_descriptor,
+            path,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        try:
+            live_payload = renderer._read_regular_at(
+                parent_descriptor, path.name, label
+            )
+        except renderer.FixtureError as exc:
+            raise AdmissionError(str(exc)) from exc
+        if not hmac.compare_digest(live_payload, expected_payload):
+            raise AdmissionError(f"{label} live payload changed")
         _assert_private_parent_bound(
             parent_descriptor,
             path,
