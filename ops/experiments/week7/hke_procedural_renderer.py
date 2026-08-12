@@ -911,6 +911,18 @@ def _path_identity_plan(path: Path) -> tuple[tuple[str, int | None, int | None],
                 )
                 return tuple(plan)
             except OSError as exc:
+                try:
+                    metadata = os.stat(
+                        component,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    metadata = None
+                if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                    raise FixtureError(
+                        f"path identity has a symlink component: {component}"
+                    ) from exc
                 raise FixtureError(f"cannot inspect path identity: {path}") from exc
             metadata = os.fstat(child)
             plan.append(
