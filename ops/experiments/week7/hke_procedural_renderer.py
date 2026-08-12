@@ -1389,11 +1389,16 @@ class _CustodySession:
                         )
                 for parent_descriptor, descriptor, name in self._private_directories:
                     held = os.fstat(descriptor)
-                    linked = os.stat(
-                        name,
-                        dir_fd=parent_descriptor,
-                        follow_symlinks=False,
-                    )
+                    try:
+                        linked = os.stat(
+                            name,
+                            dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except OSError as exc:
+                        raise FixtureError(
+                            "private candidate subtree moved before completion"
+                        ) from exc
                     if (
                         not stat.S_ISDIR(held.st_mode)
                         or not stat.S_ISDIR(linked.st_mode)
