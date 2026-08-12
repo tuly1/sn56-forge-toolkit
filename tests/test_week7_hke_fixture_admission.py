@@ -591,7 +591,43 @@ def test_private_record_publish_rechecks_worktree_inventory_without_unsafe_clean
         )
     assert registered is True
     assert target.exists()
-    assert target.read_text(encoding="ascii").find("private") >= 0
+    assert target.read_bytes() == b""
+
+
+def test_private_record_failed_postwrite_scrubs_created_inode_not_replacement(
+    candidate, tmp_path, monkeypatch
+):
+    public, custodian = candidate
+    private_parent = tmp_path / "private-records"
+    private_parent.mkdir()
+    target = private_parent / "PRIVATE-CONFIRMATION-REVEAL.json"
+    moved = private_parent / "created-private-record-moved"
+    original_assert = admission._assert_private_parent_bound
+    calls = 0
+
+    def swap_at_postwrite(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            target.rename(moved)
+            target.write_bytes(b"foreign replacement")
+            raise admission.AdmissionError("post-write custody changed")
+        return original_assert(*args, **kwargs)
+
+    monkeypatch.setattr(
+        admission, "_assert_private_parent_bound", swap_at_postwrite
+    )
+    with pytest.raises(admission.AdmissionError, match="post-write custody changed"):
+        admission._write_private_new(
+            target,
+            {"revealed_rows": ["private"]},
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+    assert target.read_bytes() == b"foreign replacement"
+    assert moved.read_bytes() == b""
 
 
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(

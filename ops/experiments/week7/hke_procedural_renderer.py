@@ -26,7 +26,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import subprocess
 import sys
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 import unicodedata
 
 import PIL
@@ -1226,7 +1226,13 @@ def _validate_leaf_name(name: str, label: str) -> None:
         raise FixtureError(f"{label} name is not one canonical path component")
 
 
-def _write_exclusive_at(parent_descriptor: int, name: str, payload: bytes) -> os.stat_result:
+def _write_exclusive_at(
+    parent_descriptor: int,
+    name: str,
+    payload: bytes,
+    *,
+    post_write_validation: Callable[[], None] | None = None,
+) -> os.stat_result:
     """Create one file relative to a caller-held, already validated directory."""
 
     _validate_leaf_name(name, "output")
@@ -1241,11 +1247,26 @@ def _write_exclusive_at(parent_descriptor: int, name: str, payload: bytes) -> os
         dir_fd=parent_descriptor,
     )
     try:
-        offset = 0
-        while offset < len(payload):
-            offset += os.write(descriptor, payload[offset : offset + 1024 * 1024])
-        os.fsync(descriptor)
-        return os.fstat(descriptor)
+        try:
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(
+                    descriptor, payload[offset : offset + 1024 * 1024]
+                )
+            os.fsync(descriptor)
+            if post_write_validation is not None:
+                post_write_validation()
+            return os.fstat(descriptor)
+        except BaseException:
+            # The held descriptor identifies the bytes we created even if the
+            # pathname has been swapped.  Scrub that exact inode without ever
+            # unlinking a mutable path or risking an unrelated replacement.
+            try:
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+            except OSError:
+                pass
+            raise
     finally:
         os.close(descriptor)
 

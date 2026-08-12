@@ -420,25 +420,28 @@ def _write_private_new(
             label=label,
         )
         try:
-            renderer._write_exclusive_at(parent_descriptor, checked.name, payload)
+            renderer._write_exclusive_at(
+                parent_descriptor,
+                checked.name,
+                payload,
+                post_write_validation=lambda: _assert_private_parent_bound(
+                    parent_descriptor,
+                    checked,
+                    public_root=public_root,
+                    custodian_root=custodian_root,
+                    public_boundary_roots=public_boundary_roots,
+                    label=label,
+                ),
+            )
         except FileExistsError as exc:
             raise AdmissionError(f"refusing to overwrite {checked}") from exc
         except renderer.FixtureError as exc:
             raise AdmissionError(str(exc)) from exc
-        _assert_private_parent_bound(
-            parent_descriptor,
-            checked,
-            public_root=public_root,
-            custodian_root=custodian_root,
-            public_boundary_roots=public_boundary_roots,
-            label=label,
-        )
         return hashlib.sha256(payload).hexdigest()
     except BaseException:
-        # POSIX has no identity-conditional unlink.  If custody changes after
-        # creation, leave the create-only, rejected record as explicit debris;
-        # deleting by name could remove an unrelated replacement inserted
-        # between a stat and unlink.  No caller receives a success digest.
+        # POSIX has no identity-conditional unlink.  The renderer scrubs the
+        # exact created inode through its held descriptor if the post-write
+        # custody check fails; this layer never deletes a mutable pathname.
         raise
     finally:
         os.close(parent_descriptor)
