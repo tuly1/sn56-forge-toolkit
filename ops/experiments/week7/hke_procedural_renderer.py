@@ -1327,13 +1327,20 @@ class _CustodySession:
         """Sandwich mutable custody/worktree checks between inode bindings."""
 
         self._assert_bindings()
-        for _ in range(2):
-            _validate_custody_boundary(
-                public_root=self.public.path,
-                custodian_root=self.custodian.path,
-                public_boundary_roots=tuple(item.path for item in self.boundaries),
-            )
-            self._assert_bindings()
+        _validate_custody_boundary(
+            public_root=self.public.path,
+            custodian_root=self.custodian.path,
+            public_boundary_roots=tuple(item.path for item in self.boundaries),
+        )
+        self._assert_bindings()
+
+    def retain_private_publish(
+        self, descriptor: int, _metadata: os.stat_result
+    ) -> None:
+        """Retain one exact private inode after fast root-identity checks."""
+
+        self._assert_bindings()
+        self._private_descriptors.append(os.dup(descriptor))
 
     def validate_private_publish(
         self, descriptor: int, _metadata: os.stat_result
@@ -1787,24 +1794,28 @@ def _build_candidate_in_session(
                             or len(caption_path.parts) != 2
                         ):
                             raise FixtureError("rendered row path escaped its fixture")
-                        session.assert_live()
-                        callback = (
-                            session.validate_private_publish
-                            if phase == "confirmation"
-                            else lambda _descriptor, _metadata: session.assert_live()
+                        public_callback = (
+                            lambda _descriptor, _metadata: session._assert_bindings()
                         )
                         _write_exclusive_at(
                             directory_descriptor,
                             image_path.name,
                             image,
-                            post_write_validation=callback,
+                            post_write_validation=(
+                                session.retain_private_publish
+                                if phase == "confirmation"
+                                else public_callback
+                            ),
                         )
-                        session.assert_live()
                         _write_exclusive_at(
                             directory_descriptor,
                             caption_path.name,
                             caption,
-                            post_write_validation=callback,
+                            post_write_validation=(
+                                session.validate_private_publish
+                                if phase == "confirmation"
+                                else public_callback
+                            ),
                         )
                         target.append(row)
                         all_rows.append((row, image))

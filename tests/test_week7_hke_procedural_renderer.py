@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -638,6 +639,27 @@ def test_path_overlap_uses_terminal_identity_across_apfs_firmlink() -> None:
     assert renderer._path_is_descendant(alias / "private", canonical, strict=True)
 
 
+def test_path_identity_rejects_fifo_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fifo = tmp_path / "custody-fifo"
+    os.mkfifo(fifo)
+    original_open = renderer.os.open
+    observed_nonblock = False
+
+    def require_nonblock(path, flags, *args, **kwargs):
+        nonlocal observed_nonblock
+        if path == fifo.name and kwargs.get("dir_fd") is not None:
+            assert flags & os.O_NONBLOCK
+            observed_nonblock = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(renderer.os, "open", require_nonblock)
+    with pytest.raises(renderer.FixtureError, match="not a regular file or directory"):
+        renderer._path_identity_plan(fifo)
+    assert observed_nonblock is True
+
+
 def test_new_root_cleanup_never_deletes_replacement_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -706,6 +728,125 @@ def test_custodian_creation_rejects_parent_swap_to_public_symlink(
     assert not any((abandoned_parent / "custodian").iterdir())
     assert (boundary / "candidate").is_dir()
     assert not any((boundary / "candidate").iterdir())
+
+
+def test_generation_rejects_custodian_move_into_public_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "custodian"
+    relocated = boundary / "relocated-private"
+    tiny = dict(renderer.FIXTURE_CONTRACT[0])
+    tiny.update(
+        {
+            "discovery_packs": [
+                {"pack": "D1", "training_count": 1, "evaluation_count": 0}
+            ],
+            "confirmation_packs": [
+                {"pack": "C1", "training_count": 1, "evaluation_count": 0}
+            ],
+            "discovery_count": 1,
+            "confirmation_count": 1,
+        }
+    )
+    monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    original_validate = renderer._CustodySession.validate_private_publish
+    moved = False
+
+    def move_then_validate(self, descriptor, metadata):
+        nonlocal moved
+        if not moved:
+            self.custodian.path.rename(relocated)
+            moved = True
+        return original_validate(self, descriptor, metadata)
+
+    monkeypatch.setattr(
+        renderer._CustodySession,
+        "validate_private_publish",
+        move_then_validate,
+    )
+    with pytest.raises(renderer.FixtureError, match="custodian output"):
+        renderer.build_candidate(
+            public_output=public,
+            custodian_output=custodian,
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(boundary,),
+            **RIGHTS,
+        )
+    assert moved is True
+    assert not (public / "CANDIDATE-MANIFEST.json").exists()
+    assert all(
+        path.stat().st_size == 0
+        for path in relocated.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_generation_rejects_worktree_registered_after_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    (repository / "anchor.txt").write_text("anchor\n", encoding="ascii")
+    subprocess.run(["git", "add", "anchor.txt"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=SN56 Test",
+            "-c",
+            "user.email=sn56@example.invalid",
+            "commit",
+            "-qm",
+            "anchor",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    boundary = tmp_path / "public-boundary"
+    boundary.mkdir()
+    worktree = tmp_path / "late-worktree"
+    custodian = worktree / "private"
+    original_create = renderer._BoundDirectory.create.__func__
+    registered = False
+
+    def register_then_create(cls, path, label):
+        nonlocal registered
+        if label == "custodian output" and not registered:
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree), "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            registered = True
+        return original_create(cls, path, label)
+
+    monkeypatch.setattr(renderer, "EXECUTABLE_REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(
+        renderer._BoundDirectory,
+        "create",
+        classmethod(register_then_create),
+    )
+    with pytest.raises(renderer.FixtureError, match="custodian output must be outside"):
+        renderer.build_candidate(
+            public_output=boundary / "candidate",
+            custodian_output=custodian,
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(boundary,),
+            **RIGHTS,
+        )
+    assert registered is True
+    assert not (boundary / "candidate" / "CANDIDATE-MANIFEST.json").exists()
 
 
 def test_custody_rejects_symlink_ancestors_before_creation(tmp_path: Path) -> None:

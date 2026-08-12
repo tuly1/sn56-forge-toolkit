@@ -6,6 +6,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -552,6 +553,60 @@ def test_private_record_read_rejects_parent_swap_after_validation(
     assert swapped is True
 
 
+def test_private_record_read_rejects_public_hard_link(
+    candidate, tmp_path
+) -> None:
+    public, custodian = candidate
+    private_parent = tmp_path / "private-records-hardlink"
+    private_parent.mkdir()
+    record = private_parent / "review.json"
+    record.write_bytes(admission.canonical_bytes({"source": "private"}))
+    public_link = public.parent / "published-review.json"
+    os.link(record, public_link)
+    assert record.samefile(public_link)
+    assert record.stat().st_nlink == 2
+    with pytest.raises(admission.AdmissionError, match="single-link regular file"):
+        admission._load_private_json(
+            record,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="human review draft",
+        )
+
+
+def test_private_record_read_rejects_hard_link_created_mid_read(
+    candidate, tmp_path, monkeypatch
+) -> None:
+    public, custodian = candidate
+    private_parent = tmp_path / "private-records-midread-hardlink"
+    private_parent.mkdir()
+    record = private_parent / "review.json"
+    record.write_bytes(admission.canonical_bytes({"source": "private"}))
+    public_link = public.parent / "published-midread-review.json"
+    original_read = admission.renderer.os.read
+    linked = False
+
+    def link_then_read(descriptor, length):
+        nonlocal linked
+        if not linked:
+            os.link(record, public_link)
+            linked = True
+        return original_read(descriptor, length)
+
+    monkeypatch.setattr(admission.renderer.os, "read", link_then_read)
+    with pytest.raises(admission.AdmissionError, match="descriptor-bound read"):
+        admission._load_private_json(
+            record,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="human review draft",
+        )
+    assert linked is True
+    assert record.samefile(public_link)
+
+
 def test_private_record_publish_rechecks_worktree_inventory_without_unsafe_cleanup(
     candidate, tmp_path, monkeypatch
 ):
@@ -572,10 +627,10 @@ def test_private_record_publish_rechecks_worktree_inventory_without_unsafe_clean
         nonlocal registered
         validation = kwargs["post_write_validation"]
 
-        def register_then_validate():
+        def register_then_validate(descriptor, metadata):
             nonlocal registered
             registered = True
-            validation()
+            validation(descriptor, metadata)
 
         return original_write(
             *args, **{**kwargs, "post_write_validation": register_then_validate}
@@ -672,6 +727,44 @@ def test_private_record_real_postwrite_check_rejects_destination_swap(
         )
     assert target.read_bytes() == b"foreign replacement"
     assert moved.read_bytes() == b""
+
+
+def test_private_record_publish_rejects_live_parent_replacement_after_link_check(
+    candidate, tmp_path, monkeypatch
+) -> None:
+    public, custodian = candidate
+    private_parent = tmp_path / "private-parent-final-race"
+    private_parent.mkdir()
+    displaced = tmp_path / "private-parent-final-race-displaced"
+    target = private_parent / "PRIVATE-CONFIRMATION-REVEAL.json"
+    moved_target = displaced / target.name
+    original_target_check = admission._assert_private_target_bound
+    swapped = False
+
+    def replace_parent_then_check(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            private_parent.rename(displaced)
+            private_parent.mkdir()
+            target.write_bytes(b"foreign-publication")
+            swapped = True
+        return original_target_check(*args, **kwargs)
+
+    monkeypatch.setattr(
+        admission, "_assert_private_target_bound", replace_parent_then_check
+    )
+    with pytest.raises(admission.AdmissionError, match="parent changed|live target"):
+        admission._write_private_new(
+            target,
+            {"revealed_rows": ["private"]},
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+    assert swapped is True
+    assert target.read_bytes() == b"foreign-publication"
+    assert moved_target.read_bytes() == b""
 
 
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(
