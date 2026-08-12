@@ -394,3 +394,21 @@ def test_degraded_override_never_activates_candidate(
     cfg = config.build_config(_spec(), 36, 0.75)
     assert cfg["config"]["process"][0]["train"]["lr"] == 0.0004
     assert policy.checkpoint_control(cfg) is None
+
+
+def test_degraded_krea_config_keeps_the_recovery_cadence_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec(model_type="krea2")
+    monkeypatch.setattr(
+        config,
+        "_apply_overrides",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    cfg = config.build_config(spec, 36, 1.0)
+
+    process = cfg["config"]["process"][0]
+    assert process["train"]["steps"] == 2000
+    assert process["save"]["save_every"] == 200
+    assert policy.checkpoint_control(cfg) is None

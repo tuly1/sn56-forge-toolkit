@@ -283,13 +283,20 @@ def _run_toolkit(
     except Exception:
         pass
 
+    current_checkpoint = _has_current_lora(spec, scope)
+    _record_toolkit_exit(
+        rc,
+        stopped_by_deadline=stopped_by_deadline,
+        checkpoint_available=current_checkpoint,
+    )
+
     # A clean exit (0) or a deadline stop are both success: a checkpoint should be
     # on disk. A nonzero exit we did NOT trigger means ai-toolkit failed — but if
     # it still wrote a LoRA we keep it; the CLI fallback covers the empty case.
     if (
         rc not in (0, None)
         and not stopped_by_deadline
-        and not _has_current_lora(spec, scope)
+        and not current_checkpoint
     ):
         _tail_log(log_path)
         raise RuntimeError(f"ai-toolkit failed (rc={rc}) with no checkpoint")
@@ -305,6 +312,38 @@ def _run_toolkit(
         deadline.remaining() >= scoring_reserve_s + _STOP_MARGIN_S
         and holdout.has_scoring_candidates(spec.save_root, scope)
     )
+
+
+def _record_toolkit_exit(
+    returncode: int | None,
+    *,
+    stopped_by_deadline: bool,
+    checkpoint_available: bool,
+) -> str:
+    """Emit a bounded public exit class without publishing the raw return code.
+
+    The full recorder already retains ``returncode`` and
+    ``stopped_by_deadline`` privately, but its public projection intentionally
+    strips both.  That made the Aug-10 early Krea exit indistinguishable from a
+    natural completion after the ephemeral container disappeared.  The event
+    name exposes only the operational class and whether Forge could salvage a
+    current-run checkpoint; no log text, signal number, or return code leaves
+    the private record.
+    """
+    if stopped_by_deadline:
+        category = "deadline"
+    elif returncode == 0:
+        category = "zero"
+    elif returncode is None:
+        category = "unknown"
+    elif returncode < 0:
+        category = "signal"
+    else:
+        category = "nonzero"
+    artifact = "salvaged" if checkpoint_available else "empty"
+    name = f"toolkit_exit_{category}_{artifact}"
+    telemetry.event(name)
+    return name
 
 
 def _latch_scoring_decision(
@@ -386,7 +425,10 @@ def _finalize(spec: ImageSpec, scope: dict | None = None) -> None:
 
 
 def _has_current_lora(spec: ImageSpec, scope: dict) -> bool:
-    return bool(checkpoints.current_loras(spec.save_root, scope))
+    try:
+        return bool(checkpoints.current_loras(spec.save_root, scope))
+    except Exception:
+        return False
 
 
 def _terminate(proc: subprocess.Popen) -> None:
