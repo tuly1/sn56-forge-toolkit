@@ -108,12 +108,12 @@ def test_toolkit_log_parser_preserves_exponent_and_terminal_step(tmp_path):
 @pytest.mark.parametrize(
     ("returncode", "stopped", "checkpoint", "expected"),
     [
-        (0, False, True, "toolkit_exit_zero_salvaged"),
-        (7, False, True, "toolkit_exit_nonzero_salvaged"),
-        (-9, False, True, "toolkit_exit_signal_salvaged"),
-        (None, False, False, "toolkit_exit_unknown_empty"),
-        (-15, True, True, "toolkit_exit_deadline_salvaged"),
-        (1, True, False, "toolkit_exit_deadline_empty"),
+        (0, False, True, "toolkit_exit_zero_present"),
+        (7, False, True, "toolkit_exit_nonzero_present"),
+        (-9, False, True, "toolkit_exit_signal_present"),
+        (None, False, False, "toolkit_exit_unknown_absent"),
+        (-15, True, True, "toolkit_exit_deadline_present"),
+        (1, True, False, "toolkit_exit_deadline_absent"),
     ],
 )
 def test_toolkit_exit_classification_is_public_safe(
@@ -129,7 +129,7 @@ def test_toolkit_exit_classification_is_public_safe(
     actual = aitoolkit._record_toolkit_exit(
         returncode,
         stopped_by_deadline=stopped,
-        checkpoint_available=checkpoint,
+        checkpoint_present=checkpoint,
     )
 
     assert actual == expected
@@ -144,14 +144,86 @@ def test_toolkit_exit_classification_survives_the_public_projection():
     name = aitoolkit._record_toolkit_exit(
         7,
         stopped_by_deadline=False,
-        checkpoint_available=True,
+        checkpoint_present=True,
     )
 
     public = telemetry.public_record("0" * 64)
     exit_events = [event for event in public["events"] if event["name"] == name]
     assert len(exit_events) == 1
     assert set(exit_events[0]) == {"t", "name"}
-    assert exit_events[0]["name"] == "toolkit_exit_nonzero_salvaged"
+    assert exit_events[0]["name"] == "toolkit_exit_nonzero_present"
+
+
+def test_truncated_current_checkpoint_is_present_but_not_claimed_salvaged(
+    tmp_path,
+    monkeypatch,
+):
+    """Presence telemetry must not outrun the finalizer's validity decision."""
+    from forge import telemetry
+
+    root = tmp_path / "checkpoints"
+    root.mkdir()
+    scope = checkpoints.begin_run(str(root), "repo")
+    truncated = root / "repo_000000200.safetensors"
+    truncated.write_bytes(b"truncated-current-run-checkpoint")
+
+    class Spec:
+        save_root = str(root)
+        expected_repo_name = "repo"
+        config_path = str(tmp_path / "config.yaml")
+        task_id = "task"
+
+    class Deadline:
+        def remaining(self):
+            return 1000.0
+
+    class FailedChild:
+        returncode = 7
+        pid = 12345
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: FailedChild(),
+    )
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "run",
+        lambda *_args, **_kwargs: aitoolkit.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        ),
+    )
+
+    assert checkpoints.current_loras(str(root), scope) == [str(truncated)]
+    assert aitoolkit._has_current_checkpoint_entry(Spec(), scope) is True
+
+    telemetry.start_run(task_id="redacted")
+    assert aitoolkit._run_toolkit(
+        Spec.config_path,
+        Deadline(),
+        Spec(),
+        scope,
+    ) is False
+    public_names = {
+        event["name"] for event in telemetry.public_record("0" * 64)["events"]
+    }
+    assert "toolkit_exit_nonzero_present" in public_names
+    assert not any("salvaged" in name for name in public_names)
+
+    # Structural validation happens later. The truncated named file is not a
+    # usable artifact and cannot produce checkpoint_finalized.
+    with pytest.raises(RuntimeError, match="no valid current or prior LoRA"):
+        aitoolkit._finalize(Spec(), scope)
+    public_names = {
+        event["name"] for event in telemetry.public_record("0" * 64)["events"]
+    }
+    assert "toolkit_exit_nonzero_present" in public_names
+    assert "checkpoint_unavailable" in public_names
+    assert "checkpoint_finalized" not in public_names
+    assert not (root / "last.safetensors").exists()
 
 
 def test_schema_model_type_normalized():

@@ -52,16 +52,24 @@ certificate; a production H100 smoke remains required before release.
 
 The public recorder now emits one bounded event name after the toolkit exits:
 
-- `toolkit_exit_zero_{salvaged|empty}`
-- `toolkit_exit_deadline_{salvaged|empty}`
-- `toolkit_exit_nonzero_{salvaged|empty}`
-- `toolkit_exit_signal_{salvaged|empty}`
-- `toolkit_exit_unknown_{salvaged|empty}`
+- `toolkit_exit_zero_{present|absent}`
+- `toolkit_exit_deadline_{present|absent}`
+- `toolkit_exit_nonzero_{present|absent}`
+- `toolkit_exit_signal_{present|absent}`
+- `toolkit_exit_unknown_{present|absent}`
 
-Raw return codes, signal numbers, and log text remain private. Never-forfeit
-behavior is unchanged: an unexpected nonzero exit with a valid current-run
-LoRA is still finalized; an unexpected nonzero exit with no current-run LoRA
-still raises into the existing fallback path.
+`present` means only that a current-run filename and filesystem identity were
+observed. It deliberately does not claim that the bytes are structurally valid
+or that promotion succeeded. The later `checkpoint_finalized` event proves
+only that finalization yielded a usable artifact; the public projection does
+not reveal whether that artifact came from the observed current-run candidate
+or a preserved prior fallback. A truncated-file regression pins this
+distinction. Raw return codes, signal numbers, and log text remain private.
+Never-forfeit behavior is unchanged: an unexpected nonzero exit with a valid
+current-run LoRA is still finalized; an unexpected nonzero exit with no
+current-run checkpoint entry raises immediately into the existing fallback
+path; a present but invalid entry fails the later finalizer and reaches that
+same fallback without a false public salvage claim.
 
 ## Evidence anchors
 

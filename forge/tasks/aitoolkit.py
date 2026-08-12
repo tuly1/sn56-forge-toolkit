@@ -283,20 +283,23 @@ def _run_toolkit(
     except Exception:
         pass
 
-    current_checkpoint = _has_current_lora(spec, scope)
+    current_checkpoint_present = _has_current_checkpoint_entry(spec, scope)
     _record_toolkit_exit(
         rc,
         stopped_by_deadline=stopped_by_deadline,
-        checkpoint_available=current_checkpoint,
+        checkpoint_present=current_checkpoint_present,
     )
 
-    # A clean exit (0) or a deadline stop are both success: a checkpoint should be
-    # on disk. A nonzero exit we did NOT trigger means ai-toolkit failed — but if
-    # it still wrote a LoRA we keep it; the CLI fallback covers the empty case.
+    # A clean exit (0) or a deadline stop are both success: a checkpoint should
+    # be on disk. A nonzero exit we did NOT trigger means ai-toolkit failed — but
+    # if it left a current-run checkpoint entry, defer structural validation to
+    # the finalizer so never-forfeit salvage remains unchanged. The public exit
+    # event above claims only presence. checkpoint_finalized proves only that
+    # finalization yielded a usable artifact; it may be a preserved prior fallback.
     if (
         rc not in (0, None)
         and not stopped_by_deadline
-        and not current_checkpoint
+        and not current_checkpoint_present
     ):
         _tail_log(log_path)
         raise RuntimeError(f"ai-toolkit failed (rc={rc}) with no checkpoint")
@@ -318,7 +321,7 @@ def _record_toolkit_exit(
     returncode: int | None,
     *,
     stopped_by_deadline: bool,
-    checkpoint_available: bool,
+    checkpoint_present: bool,
 ) -> str:
     """Emit a bounded public exit class without publishing the raw return code.
 
@@ -326,8 +329,12 @@ def _record_toolkit_exit(
     ``stopped_by_deadline`` privately, but its public projection intentionally
     strips both.  That made the Aug-10 early Krea exit indistinguishable from a
     natural completion after the ephemeral container disappeared.  The event
-    name exposes only the operational class and whether Forge could salvage a
-    current-run checkpoint; no log text, signal number, or return code leaves
+    name exposes only the operational class and whether Forge observed a
+    current-run checkpoint *name and filesystem identity*. Presence is not a
+    validity or salvage claim. The later ``checkpoint_finalized`` event proves
+    only that finalization yielded a usable artifact; the public projection does
+    not reveal whether it came from the observed current-run candidate or a
+    preserved prior fallback. No log text, signal number, or return code leaves
     the private record.
     """
     if stopped_by_deadline:
@@ -340,8 +347,8 @@ def _record_toolkit_exit(
         category = "signal"
     else:
         category = "nonzero"
-    artifact = "salvaged" if checkpoint_available else "empty"
-    name = f"toolkit_exit_{category}_{artifact}"
+    presence = "present" if checkpoint_present else "absent"
+    name = f"toolkit_exit_{category}_{presence}"
     telemetry.event(name)
     return name
 
@@ -424,7 +431,13 @@ def _finalize(spec: ImageSpec, scope: dict | None = None) -> None:
     telemetry.note_peak_memory()
 
 
-def _has_current_lora(spec: ImageSpec, scope: dict) -> bool:
+def _has_current_checkpoint_entry(spec: ImageSpec, scope: dict) -> bool:
+    """Return whether a current-run checkpoint pathname/identity is present.
+
+    This deliberately does not validate safetensors bytes. Callers must not
+    treat it as proof of a usable artifact; ``checkpoints.finalize`` owns that
+    later decision.
+    """
     try:
         return bool(checkpoints.current_loras(spec.save_root, scope))
     except Exception:
