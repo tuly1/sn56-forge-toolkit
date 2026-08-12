@@ -624,6 +624,47 @@ def test_path_overlap_uses_filesystem_identity_for_case_aliases(tmp_path: Path) 
     assert renderer._path_is_descendant(alias / "private", root, strict=True)
 
 
+def test_path_overlap_uses_terminal_identity_across_apfs_firmlink() -> None:
+    canonical = renderer.EXECUTABLE_REPOSITORY_ROOT
+    alias = Path("/System/Volumes/Data") / canonical.relative_to(canonical.anchor)
+    try:
+        same = alias.samefile(canonical)
+    except FileNotFoundError:
+        pytest.skip("APFS /System/Volumes/Data firmlink is unavailable")
+    if not same:
+        pytest.skip("alternate APFS path is not a filesystem alias")
+    assert renderer._paths_equivalent(alias, canonical)
+    assert renderer._paths_overlap(alias / "private", canonical)
+    assert renderer._path_is_descendant(alias / "private", canonical, strict=True)
+
+
+def test_new_root_cleanup_never_deletes_replacement_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "target"
+    moved = parent / "created-by-function"
+    original_open_chain = renderer._open_directory_chain_no_symlinks
+    calls = 0
+
+    def replace_before_fresh_open(path, label):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            target.rename(moved)
+            target.mkdir()
+        return original_open_chain(path, label)
+
+    monkeypatch.setattr(
+        renderer, "_open_directory_chain_no_symlinks", replace_before_fresh_open
+    )
+    with pytest.raises(renderer.FixtureError, match="path changed during creation"):
+        renderer._ensure_new_root(target, "private root")
+    assert target.is_dir()
+    assert moved.is_dir()
+
+
 def test_custodian_creation_rejects_parent_swap_to_public_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

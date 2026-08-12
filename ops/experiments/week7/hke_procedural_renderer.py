@@ -951,23 +951,35 @@ def _plan_component_equal(
 def _path_is_descendant(child: Path, parent: Path, *, strict: bool = False) -> bool:
     child_plan = _path_identity_plan(child)
     parent_plan = _path_identity_plan(parent)
-    if len(child_plan) < len(parent_plan) or (
-        strict and len(child_plan) == len(parent_plan)
-    ):
-        return False
-    return all(
-        _plan_component_equal(child_item, parent_item)
-        for child_item, parent_item in zip(child_plan, parent_plan, strict=False)
+    # APFS firmlinks can expose one inode subtree through prefixes of different
+    # lengths (for example /Users and /System/Volumes/Data/Users).  Anchor the
+    # relation at the parent's deepest existing inode rather than assuming
+    # that the two textual ancestry vectors begin at the same component.
+    parent_anchor_index = max(
+        index for index, item in enumerate(parent_plan) if item[1] is not None
     )
+    parent_anchor = parent_plan[parent_anchor_index]
+    parent_suffix = parent_plan[parent_anchor_index + 1 :]
+    for child_anchor_index, child_item in enumerate(child_plan):
+        if not _plan_component_equal(child_item, parent_anchor):
+            continue
+        endpoint = child_anchor_index + 1 + len(parent_suffix)
+        if endpoint > len(child_plan):
+            continue
+        child_suffix = child_plan[child_anchor_index + 1 : endpoint]
+        if not all(
+            _plan_component_equal(child_component, parent_component)
+            for child_component, parent_component in zip(
+                child_suffix, parent_suffix, strict=True
+            )
+        ):
+            continue
+        return endpoint < len(child_plan) if strict else True
+    return False
 
 
 def _paths_equivalent(left: Path, right: Path) -> bool:
-    left_plan = _path_identity_plan(left)
-    right_plan = _path_identity_plan(right)
-    return len(left_plan) == len(right_plan) and all(
-        _plan_component_equal(left_item, right_item)
-        for left_item, right_item in zip(left_plan, right_plan, strict=True)
-    )
+    return _path_is_descendant(left, right) and _path_is_descendant(right, left)
 
 
 def _ensure_new_root(path: Path, label: str) -> Path:
@@ -980,6 +992,7 @@ def _ensure_new_root(path: Path, label: str) -> Path:
         path.parent, f"{label} parent"
     )
     created = False
+    created_identity: os.stat_result | None = None
     try:
         try:
             os.mkdir(path.name, mode=0o700, dir_fd=parent_descriptor)
@@ -1012,9 +1025,18 @@ def _ensure_new_root(path: Path, label: str) -> Path:
             raise FixtureError(f"{label} path changed during creation")
         return path
     except BaseException:
-        if created:
+        if created and created_identity is not None:
             try:
-                os.rmdir(path.name, dir_fd=parent_descriptor)
+                linked = os.stat(
+                    path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (linked.st_dev, linked.st_ino) == (
+                    created_identity.st_dev,
+                    created_identity.st_ino,
+                ):
+                    os.rmdir(path.name, dir_fd=parent_descriptor)
             except OSError:
                 pass
         raise
@@ -1211,31 +1233,44 @@ def _safe_row_path(root: Path, relative: Any, label: str) -> Path:
     return root / parsed
 
 
+def _validate_leaf_name(name: str, label: str) -> None:
+    if not name or name in {".", ".."} or Path(name).name != name:
+        raise FixtureError(f"{label} name is not one canonical path component")
+
+
+def _write_exclusive_at(parent_descriptor: int, name: str, payload: bytes) -> os.stat_result:
+    """Create one file relative to a caller-held, already validated directory."""
+
+    _validate_leaf_name(name, "output")
+    descriptor = os.open(
+        name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset : offset + 1024 * 1024])
+        os.fsync(descriptor)
+        return os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _write_exclusive(path: Path, payload: bytes) -> None:
     path = _absolute(path)
     parent_descriptor = _open_directory_chain_no_symlinks(
         path.parent, "output parent"
     )
     try:
-        descriptor = os.open(
-            path.name,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=parent_descriptor,
-        )
+        _write_exclusive_at(parent_descriptor, path.name, payload)
     finally:
         os.close(parent_descriptor)
-    try:
-        offset = 0
-        while offset < len(payload):
-            offset += os.write(descriptor, payload[offset : offset + 1024 * 1024])
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _write_json(path: Path, value: Any) -> str:
@@ -1244,12 +1279,20 @@ def _write_json(path: Path, value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _read_regular(path: Path, label: str) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+def _read_regular_at(parent_descriptor: int, name: str, label: str) -> bytes:
+    """Read one regular file relative to a caller-held directory descriptor."""
+
+    _validate_leaf_name(name, label)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
     except OSError as exc:
-        raise FixtureError(f"cannot safely read {label}: {path}") from exc
+        raise FixtureError(f"cannot safely read {label}: {name}") from exc
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -1263,6 +1306,17 @@ def _read_regular(path: Path, label: str) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def _read_regular(path: Path, label: str) -> bytes:
+    path = _absolute(path)
+    parent_descriptor = _open_directory_chain_no_symlinks(
+        path.parent, f"{label} parent"
+    )
+    try:
+        return _read_regular_at(parent_descriptor, path.name, label)
+    finally:
+        os.close(parent_descriptor)
 
 
 def _tree_inventory(root: Path, *, excluded: Iterable[str]) -> dict[str, Any]:

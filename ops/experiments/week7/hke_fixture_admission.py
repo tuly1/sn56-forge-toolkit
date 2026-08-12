@@ -204,6 +204,10 @@ def semantic_sha256(value: Any) -> str:
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
     raw = renderer._read_regular(Path(path), label)
+    return _decode_json(raw, label)
+
+
+def _decode_json(raw: bytes, label: str) -> dict[str, Any]:
     try:
         value = json.loads(raw.decode("ascii"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -286,6 +290,171 @@ def _private_record_path(
     if not path.parent.is_dir():
         raise AdmissionError(f"{label} parent is unavailable")
     return path
+
+
+def _assert_private_parent_bound(
+    parent_descriptor: int,
+    path: Path,
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    label: str,
+) -> None:
+    """Recheck custody and bind the live pathname to one held parent inode."""
+
+    checked = _private_record_path(
+        path,
+        public_root=public_root,
+        custodian_root=custodian_root,
+        public_boundary_roots=public_boundary_roots,
+        label=label,
+    )
+    try:
+        live_plan = renderer._path_identity_plan(checked.parent)
+        held = os.fstat(parent_descriptor)
+    except (OSError, renderer.FixtureError) as exc:
+        raise AdmissionError(f"{label} parent identity is unavailable") from exc
+    live = live_plan[-1]
+    if live[1] is None or (live[1], live[2]) != (held.st_dev, held.st_ino):
+        raise AdmissionError(f"{label} parent changed after custody validation")
+
+
+def _open_private_parent(
+    path: Path,
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    label: str,
+) -> tuple[Path, int]:
+    checked = _private_record_path(
+        path,
+        public_root=public_root,
+        custodian_root=custodian_root,
+        public_boundary_roots=public_boundary_roots,
+        label=label,
+    )
+    try:
+        descriptor = renderer._open_directory_chain_no_symlinks(
+            checked.parent, f"{label} parent"
+        )
+    except renderer.FixtureError as exc:
+        raise AdmissionError(str(exc)) from exc
+    try:
+        _assert_private_parent_bound(
+            descriptor,
+            checked,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return checked, descriptor
+
+
+def _load_private_json(
+    path: Path,
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    label: str,
+) -> dict[str, Any]:
+    """Read a private record through the descriptor used for custody checks."""
+
+    checked, parent_descriptor = _open_private_parent(
+        path,
+        public_root=public_root,
+        custodian_root=custodian_root,
+        public_boundary_roots=public_boundary_roots,
+        label=label,
+    )
+    try:
+        try:
+            raw = renderer._read_regular_at(parent_descriptor, checked.name, label)
+        except renderer.FixtureError as exc:
+            raise AdmissionError(str(exc)) from exc
+        _assert_private_parent_bound(
+            parent_descriptor,
+            checked,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        return _decode_json(raw, label)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _write_private_new(
+    path: Path,
+    value: Any,
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    label: str,
+) -> str:
+    """Publish privately through one held parent and recheck worktree custody."""
+
+    checked, parent_descriptor = _open_private_parent(
+        path,
+        public_root=public_root,
+        custodian_root=custodian_root,
+        public_boundary_roots=public_boundary_roots,
+        label=label,
+    )
+    payload = canonical_bytes(value)
+    created: os.stat_result | None = None
+    try:
+        _assert_private_parent_bound(
+            parent_descriptor,
+            checked,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        try:
+            created = renderer._write_exclusive_at(
+                parent_descriptor, checked.name, payload
+            )
+        except FileExistsError as exc:
+            raise AdmissionError(f"refusing to overwrite {checked}") from exc
+        except renderer.FixtureError as exc:
+            raise AdmissionError(str(exc)) from exc
+        _assert_private_parent_bound(
+            parent_descriptor,
+            checked,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        return hashlib.sha256(payload).hexdigest()
+    except BaseException:
+        if created is not None:
+            try:
+                linked = os.stat(
+                    checked.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (linked.st_dev, linked.st_ino) == (
+                    created.st_dev,
+                    created.st_ino,
+                ):
+                    os.unlink(checked.name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(parent_descriptor)
 
 
 def _rows(verified: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1704,95 +1873,68 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse(argv)
+    private_scope = {
+        "public_root": args.public_root,
+        "custodian_root": args.custodian_root,
+        "public_boundary_roots": args.public_boundary_roots,
+    }
     if args.command == "review-template":
-        output = _private_record_path(
-            args.output,
-            public_root=args.public_root,
-            custodian_root=args.custodian_root,
-            public_boundary_roots=args.public_boundary_roots,
-            label="human review template",
-        )
         value = build_review_template(
             args.public_root,
             args.custodian_root,
             public_boundary_roots=args.public_boundary_roots,
         )
-        _write_new(output, value)
+        _write_private_new(
+            args.output, value, label="human review template", **private_scope
+        )
         return 0
     if args.command == "seal-review":
-        draft_path = _private_record_path(
+        draft = _load_private_json(
             args.draft,
-            public_root=args.public_root,
-            custodian_root=args.custodian_root,
-            public_boundary_roots=args.public_boundary_roots,
             label="human review draft",
+            **private_scope,
         )
-        output = _private_record_path(
-            args.output,
-            public_root=args.public_root,
-            custodian_root=args.custodian_root,
-            public_boundary_roots=args.public_boundary_roots,
-            label="sealed human review",
-        )
-        draft = _load_json(draft_path, "human review draft")
         value = seal_review(
             public_root=args.public_root,
             custodian_root=args.custodian_root,
             public_boundary_roots=args.public_boundary_roots,
             draft=draft,
         )
-        _write_new(output, value)
+        _write_private_new(
+            args.output, value, label="sealed human review", **private_scope
+        )
         return 0
     if args.command in {"ratification-template", "seal-ratification"}:
-        sealed_path = _private_record_path(
+        sealed = _load_private_json(
             args.sealed_review,
-            public_root=args.public_root,
-            custodian_root=args.custodian_root,
-            public_boundary_roots=args.public_boundary_roots,
             label="sealed human review",
-        )
-        output = _private_record_path(
-            args.output,
-            public_root=args.public_root,
-            custodian_root=args.custodian_root,
-            public_boundary_roots=args.public_boundary_roots,
-            label="owner ratification",
+            **private_scope,
         )
         admission_set = _load_json(args.admission_set, "admission set")
-        sealed = _load_json(sealed_path, "sealed human review")
         if args.command == "ratification-template":
             value = build_owner_ratification_template(
                 admission_set=admission_set, sealed_review=sealed
             )
         else:
-            draft_path = _private_record_path(
+            draft = _load_private_json(
                 args.draft,
-                public_root=args.public_root,
-                custodian_root=args.custodian_root,
-                public_boundary_roots=args.public_boundary_roots,
                 label="owner ratification draft",
+                **private_scope,
             )
             value = seal_owner_ratification(
-                draft=_load_json(draft_path, "owner ratification draft"),
+                draft=draft,
                 admission_set=admission_set,
                 sealed_review=sealed,
             )
-        _write_new(output, value)
+        _write_private_new(
+            args.output, value, label="owner ratification", **private_scope
+        )
         return 0
     if args.command == "reveal-confirmation":
-        authority_path = _private_record_path(
+        authority = _load_private_json(
             args.confirmation_authority,
-            public_root=args.public_root,
-            custodian_root=args.custodian_root,
-            public_boundary_roots=args.public_boundary_roots,
             label="confirmation authority",
-        )
-        output = _private_record_path(
-            args.output,
-            public_root=args.public_root,
-            custodian_root=args.custodian_root,
-            public_boundary_roots=args.public_boundary_roots,
-            label="confirmation reveal",
+            **private_scope,
         )
         value = build_confirmation_reveal(
             public_root=args.public_root,
@@ -1801,18 +1943,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             admission_set=_load_json(args.admission_set, "admission set"),
             family=args.family,
             pack=args.pack,
-            confirmation_authority=_load_json(authority_path, "confirmation authority"),
+            confirmation_authority=authority,
         )
-        _write_new(output, value)
+        _write_private_new(
+            args.output, value, label="confirmation reveal", **private_scope
+        )
         return 0
-    sealed_path = _private_record_path(
+    sealed = _load_private_json(
         args.sealed_review,
-        public_root=args.public_root,
-        custodian_root=args.custodian_root,
-        public_boundary_roots=args.public_boundary_roots,
         label="sealed human review",
+        **private_scope,
     )
-    sealed = _load_json(sealed_path, "sealed human review")
     root, receipts = build_admissions(
         public_root=args.public_root,
         custodian_root=args.custodian_root,

@@ -509,6 +509,90 @@ def test_private_record_fails_closed_when_worktree_inventory_fails(
         )
 
 
+def test_private_record_read_rejects_parent_swap_after_validation(
+    candidate, tmp_path, monkeypatch
+):
+    public, custodian = candidate
+    safe_parent = tmp_path / "safe-private"
+    safe_parent.mkdir()
+    record = safe_parent / "review.json"
+    record.write_text('{"source":"safe"}', encoding="ascii")
+    displaced = tmp_path / "safe-private-displaced"
+    worktree = tmp_path / "registered-worktree"
+    worktree.mkdir()
+    (worktree / record.name).write_text(
+        '{"source":"registered-worktree"}', encoding="ascii"
+    )
+    monkeypatch.setattr(
+        admission.renderer,
+        "_registered_worktree_roots",
+        lambda: (admission.renderer.EXECUTABLE_REPOSITORY_ROOT, worktree),
+    )
+    original_check = admission._private_record_path
+    swapped = False
+
+    def validate_then_swap(*args, **kwargs):
+        nonlocal swapped
+        checked = original_check(*args, **kwargs)
+        if not swapped:
+            safe_parent.rename(displaced)
+            safe_parent.symlink_to(worktree, target_is_directory=True)
+            swapped = True
+        return checked
+
+    monkeypatch.setattr(admission, "_private_record_path", validate_then_swap)
+    with pytest.raises(admission.AdmissionError, match="cannot safely open"):
+        admission._load_private_json(
+            record,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="human review draft",
+        )
+    assert swapped is True
+
+
+def test_private_record_publish_rechecks_worktree_inventory_and_rolls_back(
+    candidate, tmp_path, monkeypatch
+):
+    public, custodian = candidate
+    private_parent = tmp_path / "private-records"
+    private_parent.mkdir()
+    target = private_parent / "PRIVATE-CONFIRMATION-REVEAL.json"
+    registered = False
+    original_write = admission.renderer._write_exclusive_at
+
+    def worktrees():
+        roots = [admission.renderer.EXECUTABLE_REPOSITORY_ROOT]
+        if registered:
+            roots.append(private_parent)
+        return tuple(roots)
+
+    def register_during_publish(*args, **kwargs):
+        nonlocal registered
+        identity = original_write(*args, **kwargs)
+        registered = True
+        return identity
+
+    monkeypatch.setattr(
+        admission.renderer, "_registered_worktree_roots", worktrees
+    )
+    monkeypatch.setattr(
+        admission.renderer, "_write_exclusive_at", register_during_publish
+    )
+    with pytest.raises(admission.AdmissionError, match="registered-worktree"):
+        admission._write_private_new(
+            target,
+            {"revealed_rows": ["private"]},
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+    assert registered is True
+    assert not target.exists()
+
+
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(
     candidate, tmp_path: Path
 ) -> None:

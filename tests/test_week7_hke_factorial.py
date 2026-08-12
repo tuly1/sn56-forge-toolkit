@@ -1915,13 +1915,21 @@ def test_training_source_rejects_rehashed_execution_tampering(base_config, mutat
         )
 
 
-@pytest.mark.parametrize("arm", ["A", "C"])
+@pytest.mark.parametrize(
+    ("stage", "arm"),
+    [
+        ("bridge", "incumbent"),
+        ("d1_core", "R0"),
+        ("d1_core", "A"),
+        ("d1_core", "C"),
+    ],
+)
 def test_training_source_rejects_same_uuid_with_changed_gpu_class(
-    base_config, arm
+    base_config, stage, arm
 ):
     plan = _plan(base_config)
-    cell = plan["cells"]["d1_core"][arm]
-    curve = _curve(plan, "d1_core", arm, 0.9)
+    cell = plan["cells"][stage][arm]
+    curve = _curve(plan, stage, arm, 0.9)
     order = curve["execution_order"]
     source = copy.deepcopy(curve["training_receipt"]["source_record"])
     expected_uuid = _observation()["device"]["uuid"]
