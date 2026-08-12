@@ -35,8 +35,8 @@ explicit-`request_query`, and invalid-UTF-8 defects at exact head
 `6e9143d06b711f4521f4244a26873b7cc55d73de`. An independent exact-SHA audit
 returned PASS-WITH-FOLLOWUPS with no P0--P2 findings and explicitly cleared
 that head as PR #17's base. PR #17 is now rebased directly onto that revision.
-Its new exact head must still be pushed, read back, and independently audited
-before any fresh candidate is generated.
+Its new exact head must be pushed, read back, and independently audited before
+any fresh candidate is generated.
 
 ## Schema-3 fixture gate
 
