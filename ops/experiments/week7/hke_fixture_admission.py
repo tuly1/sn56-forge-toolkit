@@ -21,6 +21,7 @@ in the public admission receipts.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import hmac
@@ -42,11 +43,64 @@ FACTOR_AUTHORITY_PATH = SCRIPT_PATH.with_name("run_hke_factorial.py")
 RENDERER_SOURCE_PATH = "ops/experiments/week7/hke_procedural_renderer.py"
 FACTOR_AUTHORITY_SOURCE_PATH = "ops/experiments/week7/run_hke_factorial.py"
 ADMISSION_SOURCE_PATH = "ops/experiments/week7/hke_fixture_admission.py"
-_HELD_PRIVATE_DESCRIPTORS: list[int] = []
+_ACTIVE_PRIVATE_AUTHORITIES: list["_PrivateAuthority"] | None = None
 
 
 class AdmissionError(RuntimeError):
     """The human/replay/admission chain is incomplete or misbound."""
+
+
+@dataclass(frozen=True)
+class _PrivateAuthority:
+    """One descriptor-bound private input/output retained through CLI success."""
+
+    path: Path
+    parent_descriptor: int
+    leaf_descriptor: int
+    metadata: os.stat_result
+    payload: bytes
+    public_root: Path
+    custodian_root: Path
+    public_boundary_roots: tuple[Path, ...]
+    label: str
+    scrub_on_failure: bool
+
+    def verify(self) -> None:
+        _assert_private_target_bound(
+            self.parent_descriptor,
+            self.path,
+            self.leaf_descriptor,
+            self.metadata,
+            public_root=self.public_root,
+            custodian_root=self.custodian_root,
+            public_boundary_roots=self.public_boundary_roots,
+            label=self.label,
+        )
+        _assert_private_payload_bound(
+            self.parent_descriptor,
+            self.path,
+            self.payload,
+            public_root=self.public_root,
+            custodian_root=self.custodian_root,
+            public_boundary_roots=self.public_boundary_roots,
+            label=self.label,
+        )
+
+    def scrub(self) -> None:
+        if not self.scrub_on_failure:
+            return
+        try:
+            os.ftruncate(self.leaf_descriptor, 0)
+            os.fsync(self.leaf_descriptor)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        for descriptor in (self.leaf_descriptor, self.parent_descriptor):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _read_regular_source_bytes(path: Path) -> bytes:
@@ -379,6 +433,22 @@ def _assert_private_target_bound(
             public_boundary_roots=public_boundary_roots,
             label=label,
         )
+        try:
+            live_payload = renderer._read_regular_at(
+                parent_descriptor, path.name, label
+            )
+        except renderer.FixtureError as exc:
+            raise AdmissionError(str(exc)) from exc
+        if not hmac.compare_digest(live_payload, expected_payload):
+            raise AdmissionError(f"{label} live payload changed")
+        _assert_private_parent_bound(
+            parent_descriptor,
+            path,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
         live_parent: int | None = None
         try:
             live_parent = renderer._open_directory_chain_no_symlinks(
@@ -448,22 +518,64 @@ def _assert_private_payload_bound(
             public_boundary_roots=public_boundary_roots,
             label=label,
         )
-        try:
-            live_payload = renderer._read_regular_at(
-                parent_descriptor, path.name, label
-            )
-        except renderer.FixtureError as exc:
-            raise AdmissionError(str(exc)) from exc
-        if not hmac.compare_digest(live_payload, expected_payload):
-            raise AdmissionError(f"{label} live payload changed")
-        _assert_private_parent_bound(
-            parent_descriptor,
-            path,
-            public_root=public_root,
-            custodian_root=custodian_root,
-            public_boundary_roots=public_boundary_roots,
-            label=label,
-        )
+
+
+def _retain_private_authority(
+    *,
+    path: Path,
+    parent_descriptor: int,
+    leaf_descriptor: int,
+    metadata: os.stat_result,
+    payload: bytes,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    label: str,
+    scrub_on_failure: bool,
+) -> None:
+    """Retain an exact private path authority when running under the CLI."""
+
+    if _ACTIVE_PRIVATE_AUTHORITIES is None:
+        return
+    authority = _PrivateAuthority(
+        path=path,
+        parent_descriptor=os.dup(parent_descriptor),
+        leaf_descriptor=os.dup(leaf_descriptor),
+        metadata=metadata,
+        payload=payload,
+        public_root=public_root,
+        custodian_root=custodian_root,
+        public_boundary_roots=tuple(public_boundary_roots),
+        label=label,
+        scrub_on_failure=scrub_on_failure,
+    )
+    try:
+        authority.verify()
+    except BaseException:
+        authority.close()
+        raise
+    _ACTIVE_PRIVATE_AUTHORITIES.append(authority)
+
+
+def _verify_private_authorities() -> None:
+    """Rebind every retained private path immediately before CLI success."""
+
+    if _ACTIVE_PRIVATE_AUTHORITIES is None:
+        return
+    try:
+        for authority in _ACTIVE_PRIVATE_AUTHORITIES:
+            authority.verify()
+    except BaseException:
+        for authority in _ACTIVE_PRIVATE_AUTHORITIES:
+            authority.scrub()
+        raise
+
+
+def _close_private_authorities() -> None:
+    if _ACTIVE_PRIVATE_AUTHORITIES is None:
+        return
+    while _ACTIVE_PRIVATE_AUTHORITIES:
+        _ACTIVE_PRIVATE_AUTHORITIES.pop().close()
 
 
 def _load_private_json(
@@ -483,6 +595,7 @@ def _load_private_json(
         public_boundary_roots=public_boundary_roots,
         label=label,
     )
+    leaf_descriptor: int | None = None
     try:
         try:
             raw = renderer._read_regular_at(parent_descriptor, checked.name, label)
@@ -506,9 +619,43 @@ def _load_private_json(
             public_boundary_roots=public_boundary_roots,
             label=label,
         )
-        _HELD_PRIVATE_DESCRIPTORS.append(os.dup(parent_descriptor))
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            leaf_descriptor = os.open(checked.name, flags, dir_fd=parent_descriptor)
+            metadata = os.fstat(leaf_descriptor)
+        except OSError as exc:
+            raise AdmissionError(f"{label} cannot be retained") from exc
+        _assert_private_target_bound(
+            parent_descriptor,
+            checked,
+            leaf_descriptor,
+            metadata,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        _retain_private_authority(
+            path=checked,
+            parent_descriptor=parent_descriptor,
+            leaf_descriptor=leaf_descriptor,
+            metadata=metadata,
+            payload=raw,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+            scrub_on_failure=False,
+        )
         return value
     finally:
+        if leaf_descriptor is not None:
+            os.close(leaf_descriptor)
         os.close(parent_descriptor)
 
 
@@ -576,9 +723,21 @@ def _write_private_new(
             public_boundary_roots=public_boundary_roots,
             label=label,
         )
-        _HELD_PRIVATE_DESCRIPTORS.append(os.dup(parent_descriptor))
-        if retained_descriptor is not None:
-            _HELD_PRIVATE_DESCRIPTORS.append(os.dup(retained_descriptor))
+        if retained_descriptor is None:
+            raise AdmissionError(f"{label} created inode was not retained")
+        retained_metadata = os.fstat(retained_descriptor)
+        _retain_private_authority(
+            path=checked,
+            parent_descriptor=parent_descriptor,
+            leaf_descriptor=retained_descriptor,
+            metadata=retained_metadata,
+            payload=payload,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+            scrub_on_failure=True,
+        )
         return hashlib.sha256(payload).hexdigest()
     except BaseException:
         # POSIX has no identity-conditional unlink.  The renderer scrubs the
@@ -2012,20 +2171,23 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global _ACTIVE_PRIVATE_AUTHORITIES
+
     args = _parse(argv)
+    if _ACTIVE_PRIVATE_AUTHORITIES is not None:
+        raise AdmissionError("private authority scope is already active")
+    _ACTIVE_PRIVATE_AUTHORITIES = []
     try:
-        return _main_with_held_private_descriptors(args)
+        result = _main_with_held_private_descriptors(args)
+        _verify_private_authorities()
+        return result
     finally:
-        while _HELD_PRIVATE_DESCRIPTORS:
-            descriptor = _HELD_PRIVATE_DESCRIPTORS.pop()
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+        _close_private_authorities()
+        _ACTIVE_PRIVATE_AUTHORITIES = None
 
 
 def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
-    """Keep private ancestry/inodes open through the CLI process boundary."""
+    """Keep private authority leases open through the CLI process boundary."""
 
     private_scope = {
         "public_root": args.public_root,

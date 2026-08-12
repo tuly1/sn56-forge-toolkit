@@ -1429,6 +1429,11 @@ class _CustodySession:
                         raise FixtureError(
                             "private candidate file moved or linked before completion"
                         )
+                    # A private inode check can race with root relocation or a
+                    # newly registered worktree. Rebind the whole custody
+                    # relation after every retained file, not only before the
+                    # verification loop.
+                    self.assert_live()
                 for parent_descriptor, descriptor, name in self._private_directories:
                     held = os.fstat(descriptor)
                     try:
@@ -1449,6 +1454,8 @@ class _CustodySession:
                         raise FixtureError(
                             "private candidate subtree moved before completion"
                         )
+                    self.assert_live()
+                self.assert_live()
             except BaseException as exc:
                 scrub_private = True
                 verification_error = exc

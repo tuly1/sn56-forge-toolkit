@@ -869,6 +869,71 @@ def test_private_record_publish_rechecks_parent_after_final_payload_read(
     assert moved_target.read_bytes() == b""
 
 
+def test_cli_revalidates_private_output_authority_after_helper_returns(
+    candidate, tmp_path, monkeypatch
+) -> None:
+    public, custodian = candidate
+    private_parent = tmp_path / "private-cli-output"
+    private_parent.mkdir()
+    displaced = tmp_path / "private-cli-output-displaced"
+    target = private_parent / "PRIVATE-CONFIRMATION-REVEAL.json"
+    moved_target = displaced / target.name
+
+    def command(_args):
+        admission._write_private_new(
+            target,
+            {"revealed_rows": ["private"]},
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+        private_parent.rename(displaced)
+        private_parent.mkdir()
+        target.write_bytes(b"foreign-after-helper")
+        return 0
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: object())
+    monkeypatch.setattr(admission, "_main_with_held_private_descriptors", command)
+    with pytest.raises(admission.AdmissionError, match="parent changed|live target"):
+        admission.main([])
+    assert target.read_bytes() == b"foreign-after-helper"
+    assert moved_target.read_bytes() == b""
+    assert admission._ACTIVE_PRIVATE_AUTHORITIES is None
+
+
+def test_cli_revalidates_private_input_link_count_after_helper_returns(
+    candidate, tmp_path, monkeypatch
+) -> None:
+    public, custodian = candidate
+    private_parent = tmp_path / "private-cli-input"
+    private_parent.mkdir()
+    record = private_parent / "review.json"
+    record.write_bytes(admission.canonical_bytes({"source": "private"}))
+    public_link = public.parent / "published-after-helper.json"
+
+    def command(_args):
+        assert admission._load_private_json(
+            record,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="human review draft",
+        ) == {"source": "private"}
+        os.link(record, public_link)
+        return 0
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: object())
+    monkeypatch.setattr(admission, "_main_with_held_private_descriptors", command)
+    with pytest.raises(
+        admission.AdmissionError, match="live target changed|single-link regular file"
+    ):
+        admission.main([])
+    assert record.samefile(public_link)
+    assert record.stat().st_nlink == 2
+    assert admission._ACTIVE_PRIVATE_AUTHORITIES is None
+
+
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(
     candidate, tmp_path: Path
 ) -> None:

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 
 import pytest
@@ -879,6 +880,68 @@ def test_generation_completion_rechecks_custodian_after_inner_return(
         return result
 
     monkeypatch.setattr(renderer, "_build_candidate_in_session", build_then_move)
+    with pytest.raises(renderer.FixtureError, match="custodian output"):
+        renderer.build_candidate(
+            public_output=public,
+            custodian_output=custodian,
+            discovery_key=DISCOVERY_KEY,
+            confirmation_key=CONFIRMATION_KEY,
+            generator_commit=GENERATOR_COMMIT,
+            generator_tree=GENERATOR_TREE,
+            public_boundary_roots=(boundary,),
+            **RIGHTS,
+        )
+    assert moved is True
+    assert all(
+        path.stat().st_size == 0 for path in relocated.rglob("*") if path.is_file()
+    )
+
+
+def test_generation_completion_rechecks_roots_after_retained_file_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "close-loop-public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "close-loop-custodian"
+    relocated = boundary / "close-loop-relocated-private"
+    tiny = dict(renderer.FIXTURE_CONTRACT[0])
+    tiny.update(
+        {
+            "discovery_packs": [
+                {"pack": "D1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "confirmation_packs": [
+                {"pack": "C1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "discovery_count": 2,
+            "confirmation_count": 2,
+        }
+    )
+    monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    original_close = renderer._CustodySession.close
+    original_fstat = renderer.os.fstat
+    inside_verified_close = False
+    moved = False
+
+    def track_close(self, *, scrub_private, verify=False):
+        nonlocal inside_verified_close
+        inside_verified_close = verify
+        try:
+            return original_close(self, scrub_private=scrub_private, verify=verify)
+        finally:
+            inside_verified_close = False
+
+    def move_during_first_private_file_check(descriptor):
+        nonlocal moved
+        metadata = original_fstat(descriptor)
+        if inside_verified_close and not moved and stat.S_ISREG(metadata.st_mode):
+            custodian.rename(relocated)
+            moved = True
+        return metadata
+
+    monkeypatch.setattr(renderer._CustodySession, "close", track_close)
+    monkeypatch.setattr(renderer.os, "fstat", move_during_first_private_file_check)
     with pytest.raises(renderer.FixtureError, match="custodian output"):
         renderer.build_candidate(
             public_output=public,
