@@ -899,7 +899,7 @@ def _path_identity_plan(path: Path) -> tuple[tuple[str, int | None, int | None],
         for index, component in enumerate(components):
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
                 os, "O_NOFOLLOW", 0
-            )
+            ) | getattr(os, "O_NONBLOCK", 0)
             if index < len(components) - 1:
                 flags |= getattr(os, "O_DIRECTORY", 0)
             try:
@@ -925,6 +925,13 @@ def _path_identity_plan(path: Path) -> tuple[tuple[str, int | None, int | None],
                     ) from exc
                 raise FixtureError(f"cannot inspect path identity: {path}") from exc
             metadata = os.fstat(child)
+            if index == len(components) - 1 and not (
+                stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+            ):
+                os.close(child)
+                raise FixtureError(
+                    f"path identity terminal is not a regular file or directory: {path}"
+                )
             plan.append(
                 (
                     _normalized_path_component(component),
@@ -982,54 +989,143 @@ def _paths_equivalent(left: Path, right: Path) -> bool:
     return _path_is_descendant(left, right) and _path_is_descendant(right, left)
 
 
-def _ensure_new_root(path: Path, label: str) -> Path:
-    """Create one root through a held parent descriptor and verify its linkage."""
+class _BoundDirectory:
+    """Keep one directory bound to its parent entry and absolute pathname."""
 
-    path = _absolute(path)
-    if path == Path(path.anchor) or not path.name:
-        raise FixtureError(f"{label} is not a creatable child directory")
-    parent_descriptor = _open_directory_chain_no_symlinks(
-        path.parent, f"{label} parent"
-    )
-    try:
-        try:
-            os.mkdir(path.name, mode=0o700, dir_fd=parent_descriptor)
-        except FileExistsError as exc:
-            raise FileExistsError(f"refusing to replace {label}: {path}") from exc
-        except OSError as exc:
-            raise FixtureError(f"cannot safely create {label}: {path}") from exc
-        try:
-            created_descriptor = os.open(
-                path.name,
-                _DIRECTORY_OPEN_FLAGS,
-                dir_fd=parent_descriptor,
+    def __init__(
+        self,
+        *,
+        path: Path,
+        label: str,
+        parent_descriptor: int | None,
+        descriptor: int,
+    ) -> None:
+        self.path = _absolute(path)
+        self.label = label
+        self.parent_descriptor = parent_descriptor
+        self.descriptor = descriptor
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise FixtureError(f"{label} is not a directory")
+        self.identity = (metadata.st_dev, metadata.st_ino)
+
+    @classmethod
+    def open_existing(cls, path: Path, label: str) -> "_BoundDirectory":
+        path = _absolute(path)
+        if path == Path(path.anchor):
+            descriptor = _open_directory_chain_no_symlinks(path, label)
+            return cls(
+                path=path,
+                label=label,
+                parent_descriptor=None,
+                descriptor=descriptor,
             )
+        parent_descriptor = _open_directory_chain_no_symlinks(
+            path.parent, f"{label} parent"
+        )
+        try:
+            descriptor = os.open(path.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_descriptor)
+        except BaseException:
+            os.close(parent_descriptor)
+            raise
+        try:
+            result = cls(
+                path=path,
+                label=label,
+                parent_descriptor=parent_descriptor,
+                descriptor=descriptor,
+            )
+            result.assert_live()
+            return result
+        except BaseException:
+            os.close(descriptor)
+            os.close(parent_descriptor)
+            raise
+
+    @classmethod
+    def create(cls, path: Path, label: str) -> "_BoundDirectory":
+        path = _absolute(path)
+        if path == Path(path.anchor) or not path.name:
+            raise FixtureError(f"{label} is not a creatable child directory")
+        parent_descriptor = _open_directory_chain_no_symlinks(
+            path.parent, f"{label} parent"
+        )
+        try:
+            try:
+                os.mkdir(path.name, mode=0o700, dir_fd=parent_descriptor)
+            except FileExistsError as exc:
+                raise FileExistsError(f"refusing to replace {label}: {path}") from exc
+            except OSError as exc:
+                raise FixtureError(f"cannot safely create {label}: {path}") from exc
+            try:
+                descriptor = os.open(
+                    path.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_descriptor
+                )
+            except OSError as exc:
+                raise FixtureError(f"cannot bind created {label}: {path}") from exc
+            try:
+                result = cls(
+                    path=path,
+                    label=label,
+                    parent_descriptor=parent_descriptor,
+                    descriptor=descriptor,
+                )
+                result.assert_live()
+                return result
+            except BaseException:
+                os.close(descriptor)
+                raise
+        except BaseException:
+            os.close(parent_descriptor)
+            raise
+
+    def assert_live(self) -> None:
+        try:
+            held = os.fstat(self.descriptor)
+            if not stat.S_ISDIR(held.st_mode) or (
+                held.st_dev,
+                held.st_ino,
+            ) != self.identity:
+                raise FixtureError(f"{self.label} descriptor identity changed")
+            if self.parent_descriptor is not None:
+                linked = os.stat(
+                    self.path.name,
+                    dir_fd=self.parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(linked.st_mode) or (
+                    linked.st_dev,
+                    linked.st_ino,
+                ) != self.identity:
+                    raise FixtureError(f"{self.label} parent entry changed")
+            fresh_descriptor = _open_directory_chain_no_symlinks(
+                self.path, self.label
+            )
+            try:
+                fresh = os.fstat(fresh_descriptor)
+            finally:
+                os.close(fresh_descriptor)
+            if (fresh.st_dev, fresh.st_ino) != self.identity:
+                raise FixtureError(f"{self.label} absolute path changed")
+        except FixtureError:
+            raise
         except OSError as exc:
-            raise FixtureError(f"cannot bind created {label}: {path}") from exc
-        try:
-            created_identity = os.fstat(created_descriptor)
-        finally:
-            os.close(created_descriptor)
-        fresh_descriptor = _open_directory_chain_no_symlinks(path, label)
-        try:
-            fresh_identity = os.fstat(fresh_descriptor)
-        finally:
-            os.close(fresh_descriptor)
-        if (created_identity.st_dev, created_identity.st_ino) != (
-            fresh_identity.st_dev,
-            fresh_identity.st_ino,
-        ):
-            raise FixtureError(f"{label} path changed during creation")
-        return path
-    except BaseException:
-        # POSIX has no identity-conditional rmdir.  A stat-then-rmdir cleanup
-        # can delete an unrelated directory swapped into this name between the
-        # calls.  Leave create-only, invalid debris for explicit later cleanup;
-        # it cannot be mistaken for a complete candidate because manifests are
-        # written last and every consumer replays the full inventory.
-        raise
+            raise FixtureError(f"{self.label} binding is unavailable") from exc
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+        if self.parent_descriptor is not None:
+            os.close(self.parent_descriptor)
+
+
+def _ensure_new_root(path: Path, label: str) -> Path:
+    """Create one root through held descriptors and verify its live pathname."""
+
+    binding = _BoundDirectory.create(path, label)
+    try:
+        return binding.path
     finally:
-        os.close(parent_descriptor)
+        binding.close()
 
 
 def _require_no_symlink_components(path: Path, label: str) -> None:
@@ -1206,6 +1302,91 @@ def _validate_custody_boundary(
     return public_root, custodian_root, boundaries
 
 
+class _CustodySession:
+    """Hold and repeatedly revalidate every root governing private output."""
+
+    def __init__(
+        self,
+        *,
+        public: _BoundDirectory,
+        custodian: _BoundDirectory,
+        boundaries: Sequence[_BoundDirectory],
+    ) -> None:
+        self.public = public
+        self.custodian = custodian
+        self.boundaries = tuple(boundaries)
+        self._private_descriptors: list[int] = []
+
+    def _assert_bindings(self) -> None:
+        self.public.assert_live()
+        self.custodian.assert_live()
+        for boundary in self.boundaries:
+            boundary.assert_live()
+
+    def assert_live(self) -> None:
+        """Sandwich mutable custody/worktree checks between inode bindings."""
+
+        self._assert_bindings()
+        for _ in range(2):
+            _validate_custody_boundary(
+                public_root=self.public.path,
+                custodian_root=self.custodian.path,
+                public_boundary_roots=tuple(item.path for item in self.boundaries),
+            )
+            self._assert_bindings()
+
+    def validate_private_publish(
+        self, descriptor: int, _metadata: os.stat_result
+    ) -> None:
+        """Validate custody while bytes remain open and retain their inode."""
+
+        self.assert_live()
+        self._private_descriptors.append(os.dup(descriptor))
+
+    def close(self, *, scrub_private: bool) -> None:
+        for descriptor in self._private_descriptors:
+            try:
+                if scrub_private:
+                    os.ftruncate(descriptor, 0)
+                    os.fsync(descriptor)
+            except OSError:
+                pass
+            finally:
+                os.close(descriptor)
+        self._private_descriptors.clear()
+        for boundary in reversed(self.boundaries):
+            boundary.close()
+        self.custodian.close()
+        self.public.close()
+
+
+def _mkdir_open_at(parent_descriptor: int, name: str, label: str) -> int:
+    """Create and retain one directory below a held parent descriptor."""
+
+    _validate_leaf_name(name, label)
+    descriptor: int | None = None
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+        descriptor = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_descriptor)
+        linked = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        created = os.fstat(descriptor)
+        if not stat.S_ISDIR(linked.st_mode) or (
+            linked.st_dev,
+            linked.st_ino,
+        ) != (created.st_dev, created.st_ino):
+            raise FixtureError(f"{label} changed during descriptor-bound creation")
+        return descriptor
+    except FileExistsError:
+        raise
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
 def _safe_row_path(root: Path, relative: Any, label: str) -> Path:
     if not isinstance(relative, str):
         raise FixtureError(f"{label} must be a relative path")
@@ -1231,7 +1412,7 @@ def _write_exclusive_at(
     name: str,
     payload: bytes,
     *,
-    post_write_validation: Callable[[], None] | None = None,
+    post_write_validation: Callable[[int, os.stat_result], None] | None = None,
 ) -> os.stat_result:
     """Create one file relative to a caller-held, already validated directory."""
 
@@ -1254,8 +1435,6 @@ def _write_exclusive_at(
                     descriptor, payload[offset : offset + 1024 * 1024]
                 )
             os.fsync(descriptor)
-            if post_write_validation is not None:
-                post_write_validation()
             created = os.fstat(descriptor)
             linked = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
             if (
@@ -1269,6 +1448,8 @@ def _write_exclusive_at(
                 or linked.st_nlink != 1
             ):
                 raise FixtureError("output changed during descriptor-bound publish")
+            if post_write_validation is not None:
+                post_write_validation(descriptor, created)
             return created
         except BaseException:
             # The held descriptor identifies the bytes we created even if the
@@ -1301,6 +1482,23 @@ def _write_json(path: Path, value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _write_json_at(
+    parent_descriptor: int,
+    name: str,
+    value: Any,
+    *,
+    post_write_validation: Callable[[int, os.stat_result], None] | None = None,
+) -> str:
+    payload = canonical_bytes(value) + b"\n"
+    _write_exclusive_at(
+        parent_descriptor,
+        name,
+        payload,
+        post_write_validation=post_write_validation,
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _read_regular_at(parent_descriptor: int, name: str, label: str) -> bytes:
     """Read one regular file relative to a caller-held directory descriptor."""
 
@@ -1316,15 +1514,32 @@ def _read_regular_at(parent_descriptor: int, name: str, label: str) -> bytes:
     except OSError as exc:
         raise FixtureError(f"cannot safely read {label}: {name}") from exc
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise FixtureError(f"{label} is not a regular file")
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise FixtureError(f"{label} is not a single-link regular file")
         chunks: list[bytes] = []
         while True:
             block = os.read(descriptor, 1024 * 1024)
             if not block:
                 break
             chunks.append(block)
+        after = os.fstat(descriptor)
+        try:
+            linked = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except OSError as exc:
+            raise FixtureError(f"{label} changed during descriptor-bound read") from exc
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or before.st_nlink != 1
+            or after.st_nlink != 1
+            or linked.st_nlink != 1
+            or (before.st_dev, before.st_ino, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_size)
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (linked.st_dev, linked.st_ino, linked.st_size)
+        ):
+            raise FixtureError(f"{label} changed during descriptor-bound read")
         return b"".join(chunks)
     finally:
         os.close(descriptor)
@@ -1374,6 +1589,56 @@ def _tree_inventory(root: Path, *, excluded: Iterable[str]) -> dict[str, Any]:
                     "sha256": hashlib.sha256(raw).hexdigest(),
                 }
             )
+    files.sort(key=lambda item: item["path"])
+    body = {"files": files, "file_count": len(files)}
+    return {**body, "semantic_sha256": semantic_sha256(body)}
+
+
+def _tree_inventory_at(
+    root_descriptor: int, *, excluded: Iterable[str]
+) -> dict[str, Any]:
+    """Inventory a tree exclusively through a caller-held root descriptor."""
+
+    excluded_set = set(excluded)
+    files: list[dict[str, Any]] = []
+
+    def visit(directory_descriptor: int, prefix: PurePosixPath) -> None:
+        try:
+            names = sorted(os.listdir(directory_descriptor))
+        except OSError as exc:
+            raise FixtureError("cannot inventory descriptor-bound tree") from exc
+        for name in names:
+            _validate_leaf_name(name, "inventory entry")
+            relative = (prefix / name).as_posix()
+            try:
+                metadata = os.stat(
+                    name, dir_fd=directory_descriptor, follow_symlinks=False
+                )
+            except OSError as exc:
+                raise FixtureError(
+                    f"cannot inspect descriptor-bound inventory entry: {relative}"
+                ) from exc
+            if stat.S_ISDIR(metadata.st_mode):
+                child = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_descriptor)
+                try:
+                    visit(child, prefix / name)
+                finally:
+                    os.close(child)
+                continue
+            if relative in excluded_set:
+                continue
+            raw = _read_regular_at(
+                directory_descriptor, name, f"inventory file {relative}"
+            )
+            files.append(
+                {
+                    "path": relative,
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+
+    visit(root_descriptor, PurePosixPath())
     files.sort(key=lambda item: item["path"])
     body = {"files": files, "file_count": len(files)}
     return {**body, "semantic_sha256": semantic_sha256(body)}
@@ -1454,98 +1719,130 @@ def _phase_manifest(
     return {**body, "semantic_sha256": semantic_sha256(body)}
 
 
-def build_candidate(
+def _build_candidate_in_session(
     *,
-    public_output: Path,
-    custodian_output: Path,
-    discovery_key: bytes | bytearray,
-    confirmation_key: bytes | bytearray,
+    session: _CustodySession,
+    discovery_key: bytes,
+    confirmation_key: bytes,
     generator_commit: str,
     generator_tree: str,
-    author_record: str,
-    rights_owner: str,
-    license_or_use_grant: str,
-    public_boundary_roots: Sequence[Path],
+    rights_record: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Create discovery and separately held confirmation candidate outputs."""
+    """Build one candidate while all custody roots remain descriptor-bound."""
 
-    discovery_key = _validate_key(discovery_key, "discovery key")
-    confirmation_key = _validate_key(confirmation_key, "confirmation key")
-    generator_commit = _git_sha(generator_commit, "generator commit")
-    generator_tree = _git_sha(generator_tree, "generator tree")
-    rights_record = _rights_record(
-        author_record=author_record,
-        rights_owner=rights_owner,
-        license_or_use_grant=license_or_use_grant,
+    session.assert_live()
+    public_discovery_descriptor = _mkdir_open_at(
+        session.public.descriptor, "discovery", "public discovery root"
     )
-    _require_distinct_phase_keys(discovery_key, confirmation_key)
-    public_output, custodian_output, boundaries = _validate_custody_boundary(
-        public_root=public_output,
-        custodian_root=custodian_output,
-        public_boundary_roots=public_boundary_roots,
+    session.assert_live()
+    private_confirmation_descriptor = _mkdir_open_at(
+        session.custodian.descriptor, "confirmation", "private confirmation root"
     )
-    public_root = _ensure_new_root(public_output, "public output")
-    try:
-        custodian_root = _ensure_new_root(custodian_output, "custodian output")
-    except BaseException:
-        # Never remove by a mutable pathname after a race.  The empty,
-        # manifest-free create-only directory is deliberately invalid and is
-        # safer than risking deletion of a replacement entry.
-        raise
-
+    session.assert_live()
     discovery_rows: dict[str, list[dict[str, Any]]] = {}
     confirmation_rows: dict[str, list[dict[str, Any]]] = {}
     all_rows: list[tuple[dict[str, Any], bytes]] = []
-    for fixture in FIXTURE_CONTRACT:
-        fixture_id = str(fixture["fixture_id"])
-        public_fixture = public_root / "discovery" / fixture_id
-        public_fixture.mkdir(parents=True, mode=0o700)
-        private_fixture = custodian_root / "confirmation" / fixture_id
-        private_fixture.mkdir(parents=True, mode=0o700)
-        discovery_rows[fixture_id] = []
-        confirmation_rows[fixture_id] = []
-        for phase, count, key, root, target in (
-            (
-                "discovery",
-                int(fixture["discovery_count"]),
-                discovery_key,
-                public_root / "discovery",
-                discovery_rows[fixture_id],
-            ),
-            (
-                "confirmation",
-                int(fixture["confirmation_count"]),
-                confirmation_key,
-                custodian_root / "confirmation",
-                confirmation_rows[fixture_id],
-            ),
-        ):
-            for ordinal in range(count):
-                image, caption, row = _render(fixture, phase, ordinal, key)
-                _write_exclusive(root / row["relative_image_path"], image)
-                _write_exclusive(root / row["relative_caption_path"], caption)
-                target.append(row)
-                all_rows.append((row, image))
+    try:
+        for fixture in FIXTURE_CONTRACT:
+            fixture_id = str(fixture["fixture_id"])
+            public_fixture_descriptor = _mkdir_open_at(
+                public_discovery_descriptor,
+                fixture_id,
+                f"public fixture {fixture_id}",
+            )
+            session.assert_live()
+            private_fixture_descriptor = _mkdir_open_at(
+                private_confirmation_descriptor,
+                fixture_id,
+                f"private fixture {fixture_id}",
+            )
+            try:
+                session.assert_live()
+                discovery_rows[fixture_id] = []
+                confirmation_rows[fixture_id] = []
+                for phase, count, key, directory_descriptor, target in (
+                    (
+                        "discovery",
+                        int(fixture["discovery_count"]),
+                        discovery_key,
+                        public_fixture_descriptor,
+                        discovery_rows[fixture_id],
+                    ),
+                    (
+                        "confirmation",
+                        int(fixture["confirmation_count"]),
+                        confirmation_key,
+                        private_fixture_descriptor,
+                        confirmation_rows[fixture_id],
+                    ),
+                ):
+                    for ordinal in range(count):
+                        image, caption, row = _render(fixture, phase, ordinal, key)
+                        image_path = PurePosixPath(row["relative_image_path"])
+                        caption_path = PurePosixPath(row["relative_caption_path"])
+                        if (
+                            image_path.parts[0] != fixture_id
+                            or caption_path.parts[0] != fixture_id
+                            or len(image_path.parts) != 2
+                            or len(caption_path.parts) != 2
+                        ):
+                            raise FixtureError("rendered row path escaped its fixture")
+                        session.assert_live()
+                        callback = (
+                            session.validate_private_publish
+                            if phase == "confirmation"
+                            else lambda _descriptor, _metadata: session.assert_live()
+                        )
+                        _write_exclusive_at(
+                            directory_descriptor,
+                            image_path.name,
+                            image,
+                            post_write_validation=callback,
+                        )
+                        session.assert_live()
+                        _write_exclusive_at(
+                            directory_descriptor,
+                            caption_path.name,
+                            caption,
+                            post_write_validation=callback,
+                        )
+                        target.append(row)
+                        all_rows.append((row, image))
+            finally:
+                os.close(private_fixture_descriptor)
+                os.close(public_fixture_descriptor)
+    finally:
+        os.close(private_confirmation_descriptor)
+        os.close(public_discovery_descriptor)
 
-    discovery_inventory = _tree_inventory(
-        public_root,
+    session.assert_live()
+    discovery_inventory = _tree_inventory_at(
+        session.public.descriptor,
         excluded={"CANDIDATE-MANIFEST.json", "DISCOVERY-MANIFEST.json"},
     )
-    confirmation_inventory = _tree_inventory(
-        custodian_root,
+    session.assert_live()
+    confirmation_inventory = _tree_inventory_at(
+        session.custodian.descriptor,
         excluded={"CONFIRMATION-MANIFEST.json"},
     )
+    session.assert_live()
     discovery_manifest = _phase_manifest(
         "discovery", discovery_rows, discovery_key, discovery_inventory
     )
-    discovery_manifest_sha = _write_json(
-        public_root / "DISCOVERY-MANIFEST.json", discovery_manifest
+    discovery_manifest_sha = _write_json_at(
+        session.public.descriptor,
+        "DISCOVERY-MANIFEST.json",
+        discovery_manifest,
+        post_write_validation=lambda _descriptor, _metadata: session.assert_live(),
     )
     confirmation_manifest = _phase_manifest(
         "confirmation", confirmation_rows, confirmation_key, confirmation_inventory
     )
-    confirmation_manifest_sha = _write_json(
-        custodian_root / "CONFIRMATION-MANIFEST.json", confirmation_manifest
+    confirmation_manifest_sha = _write_json_at(
+        session.custodian.descriptor,
+        "CONFIRMATION-MANIFEST.json",
+        confirmation_manifest,
+        post_write_validation=session.validate_private_publish,
     )
     dedup = _dedup_evidence(all_rows)
     contract = _contract_record()
@@ -1613,7 +1910,7 @@ def build_candidate(
             "separately_custodied": True,
             "custody_policy": {
                 "classification": "caller-boundary-and-live-worktree-verified",
-                "public_boundary_count": len(boundaries),
+                "public_boundary_count": len(session.boundaries),
                 "custodian_outside_executable_repository": True,
                 "custodian_outside_all_registered_worktrees": True,
                 "custodian_outside_all_public_boundaries": True,
@@ -1632,7 +1929,82 @@ def build_candidate(
         },
     }
     result = {**body, "semantic_sha256": semantic_sha256(body)}
-    _write_json(public_root / "CANDIDATE-MANIFEST.json", result)
+    _write_json_at(
+        session.public.descriptor,
+        "CANDIDATE-MANIFEST.json",
+        result,
+        post_write_validation=lambda _descriptor, _metadata: session.assert_live(),
+    )
+    session.assert_live()
+    return result
+
+
+def build_candidate(
+    *,
+    public_output: Path,
+    custodian_output: Path,
+    discovery_key: bytes | bytearray,
+    confirmation_key: bytes | bytearray,
+    generator_commit: str,
+    generator_tree: str,
+    author_record: str,
+    rights_owner: str,
+    license_or_use_grant: str,
+    public_boundary_roots: Sequence[Path],
+) -> dict[str, Any]:
+    """Create discovery and separately held confirmation candidate outputs."""
+
+    discovery_key = _validate_key(discovery_key, "discovery key")
+    confirmation_key = _validate_key(confirmation_key, "confirmation key")
+    generator_commit = _git_sha(generator_commit, "generator commit")
+    generator_tree = _git_sha(generator_tree, "generator tree")
+    rights_record = _rights_record(
+        author_record=author_record,
+        rights_owner=rights_owner,
+        license_or_use_grant=license_or_use_grant,
+    )
+    _require_distinct_phase_keys(discovery_key, confirmation_key)
+    public_output, custodian_output, boundaries = _validate_custody_boundary(
+        public_root=public_output,
+        custodian_root=custodian_output,
+        public_boundary_roots=public_boundary_roots,
+    )
+    boundary_bindings: list[_BoundDirectory] = []
+    public_binding: _BoundDirectory | None = None
+    custodian_binding: _BoundDirectory | None = None
+    try:
+        boundary_bindings = [
+            _BoundDirectory.open_existing(path, f"public boundary {index}")
+            for index, path in enumerate(boundaries)
+        ]
+        public_binding = _BoundDirectory.create(public_output, "public output")
+        custodian_binding = _BoundDirectory.create(custodian_output, "custodian output")
+    except BaseException:
+        if custodian_binding is not None:
+            custodian_binding.close()
+        if public_binding is not None:
+            public_binding.close()
+        for boundary in reversed(boundary_bindings):
+            boundary.close()
+        raise
+    session = _CustodySession(
+        public=public_binding,
+        custodian=custodian_binding,
+        boundaries=boundary_bindings,
+    )
+    try:
+        result = _build_candidate_in_session(
+            session=session,
+            discovery_key=discovery_key,
+            confirmation_key=confirmation_key,
+            generator_commit=generator_commit,
+            generator_tree=generator_tree,
+            rights_record=rights_record,
+        )
+    except BaseException:
+        session.close(scrub_private=True)
+        raise
+    session.close(scrub_private=False)
     return result
 
 

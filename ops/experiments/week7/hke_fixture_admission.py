@@ -356,6 +356,76 @@ def _open_private_parent(
     return checked, descriptor
 
 
+def _assert_private_target_bound(
+    parent_descriptor: int,
+    path: Path,
+    created_descriptor: int,
+    created_metadata: os.stat_result,
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    label: str,
+) -> None:
+    """Bind success to the requested live path and the exact created inode."""
+
+    for _ in range(2):
+        _assert_private_parent_bound(
+            parent_descriptor,
+            path,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        try:
+            live_parent = renderer._open_directory_chain_no_symlinks(
+                path.parent, f"{label} live parent"
+            )
+            held_parent_metadata = os.fstat(parent_descriptor)
+            live_parent_metadata = os.fstat(live_parent)
+            live_target = os.stat(
+                path.name, dir_fd=live_parent, follow_symlinks=False
+            )
+            created_now = os.fstat(created_descriptor)
+        except (OSError, renderer.FixtureError) as exc:
+            raise AdmissionError(f"{label} live target is unavailable") from exc
+        finally:
+            try:
+                os.close(live_parent)
+            except (NameError, OSError):
+                pass
+        if (
+            (held_parent_metadata.st_dev, held_parent_metadata.st_ino)
+            != (live_parent_metadata.st_dev, live_parent_metadata.st_ino)
+            or not stat.S_ISREG(live_target.st_mode)
+            or not stat.S_ISREG(created_now.st_mode)
+            or live_target.st_nlink != 1
+            or created_now.st_nlink != 1
+            or (
+                live_target.st_dev,
+                live_target.st_ino,
+                live_target.st_size,
+            )
+            != (
+                created_metadata.st_dev,
+                created_metadata.st_ino,
+                created_metadata.st_size,
+            )
+            or (
+                created_now.st_dev,
+                created_now.st_ino,
+                created_now.st_size,
+            )
+            != (
+                created_metadata.st_dev,
+                created_metadata.st_ino,
+                created_metadata.st_size,
+            )
+        ):
+            raise AdmissionError(f"{label} live target changed during publication")
+
+
 def _load_private_json(
     path: Path,
     *,
@@ -424,9 +494,11 @@ def _write_private_new(
                 parent_descriptor,
                 checked.name,
                 payload,
-                post_write_validation=lambda: _assert_private_parent_bound(
+                post_write_validation=lambda descriptor, metadata: _assert_private_target_bound(
                     parent_descriptor,
                     checked,
+                    descriptor,
+                    metadata,
                     public_root=public_root,
                     custodian_root=custodian_root,
                     public_boundary_roots=public_boundary_roots,
