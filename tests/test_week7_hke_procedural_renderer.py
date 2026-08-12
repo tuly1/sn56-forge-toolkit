@@ -929,7 +929,9 @@ def test_generation_completion_rejects_public_hard_link_to_private_file(
         return result
 
     monkeypatch.setattr(renderer, "_build_candidate_in_session", build_then_link)
-    with pytest.raises(renderer.FixtureError, match="moved or linked before completion"):
+    with pytest.raises(
+        renderer.FixtureError, match="moved or linked before completion"
+    ):
         renderer.build_candidate(
             public_output=public,
             custodian_output=custodian,
