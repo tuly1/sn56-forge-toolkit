@@ -1256,7 +1256,20 @@ def _write_exclusive_at(
             os.fsync(descriptor)
             if post_write_validation is not None:
                 post_write_validation()
-            return os.fstat(descriptor)
+            created = os.fstat(descriptor)
+            linked = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(created.st_mode)
+                or not stat.S_ISREG(linked.st_mode)
+                or (created.st_dev, created.st_ino)
+                != (linked.st_dev, linked.st_ino)
+                or created.st_size != len(payload)
+                or linked.st_size != len(payload)
+                or created.st_nlink != 1
+                or linked.st_nlink != 1
+            ):
+                raise FixtureError("output changed during descriptor-bound publish")
+            return created
         except BaseException:
             # The held descriptor identifies the bytes we created even if the
             # pathname has been swapped.  Scrub that exact inode without ever

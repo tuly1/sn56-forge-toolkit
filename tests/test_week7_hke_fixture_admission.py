@@ -637,6 +637,43 @@ def test_private_record_failed_postwrite_scrubs_created_inode_not_replacement(
     assert moved.read_bytes() == b""
 
 
+def test_private_record_real_postwrite_check_rejects_destination_swap(
+    candidate, tmp_path, monkeypatch
+):
+    public, custodian = candidate
+    private_parent = tmp_path / "private-records"
+    private_parent.mkdir()
+    target = private_parent / "PRIVATE-CONFIRMATION-REVEAL.json"
+    moved = private_parent / "created-private-record-moved"
+    original_assert = admission._assert_private_parent_bound
+    calls = 0
+
+    def swap_then_run_real_check(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            target.rename(moved)
+            target.write_bytes(b"foreign replacement")
+        return original_assert(*args, **kwargs)
+
+    monkeypatch.setattr(
+        admission, "_assert_private_parent_bound", swap_then_run_real_check
+    )
+    with pytest.raises(
+        admission.renderer.FixtureError, match="changed during descriptor-bound publish"
+    ):
+        admission._write_private_new(
+            target,
+            {"revealed_rows": ["private"]},
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+    assert target.read_bytes() == b"foreign replacement"
+    assert moved.read_bytes() == b""
+
+
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(
     candidate, tmp_path: Path
 ) -> None:
