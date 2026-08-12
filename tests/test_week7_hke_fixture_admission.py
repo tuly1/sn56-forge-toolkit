@@ -586,10 +586,12 @@ def test_private_record_read_rejects_hard_link_created_mid_read(
     public_link = public.parent / "published-midread-review.json"
     original_read = admission.renderer.os.read
     linked = False
+    record_identity = (record.stat().st_dev, record.stat().st_ino)
 
     def link_then_read(descriptor, length):
         nonlocal linked
-        if not linked:
+        metadata = os.fstat(descriptor)
+        if not linked and (metadata.st_dev, metadata.st_ino) == record_identity:
             os.link(record, public_link)
             linked = True
         return original_read(descriptor, length)
@@ -715,7 +717,7 @@ def test_private_record_real_postwrite_check_rejects_destination_swap(
         admission, "_assert_private_parent_bound", swap_then_run_real_check
     )
     with pytest.raises(
-        admission.AdmissionError, match="changed during descriptor-bound publish"
+        admission.AdmissionError, match="live target changed during publication"
     ):
         admission._write_private_new(
             target,

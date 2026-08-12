@@ -1741,15 +1741,18 @@ def _build_candidate_in_session(
     public_discovery_descriptor = _mkdir_open_at(
         session.public.descriptor, "discovery", "public discovery root"
     )
-    session.assert_live()
-    private_confirmation_descriptor = _mkdir_open_at(
-        session.custodian.descriptor, "confirmation", "private confirmation root"
-    )
-    session.assert_live()
-    discovery_rows: dict[str, list[dict[str, Any]]] = {}
-    confirmation_rows: dict[str, list[dict[str, Any]]] = {}
-    all_rows: list[tuple[dict[str, Any], bytes]] = []
+    private_confirmation_descriptor: int | None = None
     try:
+        session.assert_live()
+        private_confirmation_descriptor = _mkdir_open_at(
+            session.custodian.descriptor,
+            "confirmation",
+            "private confirmation root",
+        )
+        session.assert_live()
+        discovery_rows: dict[str, list[dict[str, Any]]] = {}
+        confirmation_rows: dict[str, list[dict[str, Any]]] = {}
+        all_rows: list[tuple[dict[str, Any], bytes]] = []
         for fixture in FIXTURE_CONTRACT:
             fixture_id = str(fixture["fixture_id"])
             public_fixture_descriptor = _mkdir_open_at(
@@ -1757,13 +1760,14 @@ def _build_candidate_in_session(
                 fixture_id,
                 f"public fixture {fixture_id}",
             )
-            session.assert_live()
-            private_fixture_descriptor = _mkdir_open_at(
-                private_confirmation_descriptor,
-                fixture_id,
-                f"private fixture {fixture_id}",
-            )
+            private_fixture_descriptor: int | None = None
             try:
+                session.assert_live()
+                private_fixture_descriptor = _mkdir_open_at(
+                    private_confirmation_descriptor,
+                    fixture_id,
+                    f"private fixture {fixture_id}",
+                )
                 session.assert_live()
                 discovery_rows[fixture_id] = []
                 confirmation_rows[fixture_id] = []
@@ -1820,10 +1824,12 @@ def _build_candidate_in_session(
                         target.append(row)
                         all_rows.append((row, image))
             finally:
-                os.close(private_fixture_descriptor)
+                if private_fixture_descriptor is not None:
+                    os.close(private_fixture_descriptor)
                 os.close(public_fixture_descriptor)
     finally:
-        os.close(private_confirmation_descriptor)
+        if private_confirmation_descriptor is not None:
+            os.close(private_confirmation_descriptor)
         os.close(public_discovery_descriptor)
 
     session.assert_live()

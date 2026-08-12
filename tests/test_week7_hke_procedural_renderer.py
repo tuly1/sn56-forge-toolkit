@@ -742,13 +742,13 @@ def test_generation_rejects_custodian_move_into_public_boundary(
     tiny.update(
         {
             "discovery_packs": [
-                {"pack": "D1", "training_count": 1, "evaluation_count": 0}
+                {"pack": "D1", "training_count": 1, "evaluation_count": 1}
             ],
             "confirmation_packs": [
-                {"pack": "C1", "training_count": 1, "evaluation_count": 0}
+                {"pack": "C1", "training_count": 1, "evaluation_count": 1}
             ],
-            "discovery_count": 1,
-            "confirmation_count": 1,
+            "discovery_count": 2,
+            "confirmation_count": 2,
         }
     )
     monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))

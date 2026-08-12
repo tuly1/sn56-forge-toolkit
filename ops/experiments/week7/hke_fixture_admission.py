@@ -378,6 +378,7 @@ def _assert_private_target_bound(
             public_boundary_roots=public_boundary_roots,
             label=label,
         )
+        live_parent: int | None = None
         try:
             live_parent = renderer._open_directory_chain_no_symlinks(
                 path.parent, f"{label} live parent"
@@ -391,10 +392,11 @@ def _assert_private_target_bound(
         except (OSError, renderer.FixtureError) as exc:
             raise AdmissionError(f"{label} live target is unavailable") from exc
         finally:
-            try:
-                os.close(live_parent)
-            except (NameError, OSError):
-                pass
+            if live_parent is not None:
+                try:
+                    os.close(live_parent)
+                except OSError:
+                    pass
         if (
             (held_parent_metadata.st_dev, held_parent_metadata.st_ino)
             != (live_parent_metadata.st_dev, live_parent_metadata.st_ino)
