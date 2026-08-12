@@ -2169,24 +2169,33 @@ def build_candidate(
     return result
 
 
-def _verify_active_custody_sessions() -> None:
+def _close_active_custody_sessions(*, verify: bool, scrub_private: bool) -> None:
+    """Final-check and release all CLI custody leases before success output."""
+
     if _ACTIVE_CUSTODY_SESSIONS is None:
         return
-    try:
-        for session in _ACTIVE_CUSTODY_SESSIONS:
-            session.verify()
-    except BaseException:
-        for session in _ACTIVE_CUSTODY_SESSIONS:
-            session.close(scrub_private=True)
-        _ACTIVE_CUSTODY_SESSIONS.clear()
-        raise
-
-
-def _close_active_custody_sessions() -> None:
-    if _ACTIVE_CUSTODY_SESSIONS is None:
-        return
-    while _ACTIVE_CUSTODY_SESSIONS:
-        _ACTIVE_CUSTODY_SESSIONS.pop().close(scrub_private=False)
+    sessions = list(_ACTIVE_CUSTODY_SESSIONS)
+    _ACTIVE_CUSTODY_SESSIONS.clear()
+    verification_error: BaseException | None = None
+    if verify:
+        try:
+            for session in sessions:
+                session.verify()
+        except BaseException as exc:
+            scrub_private = True
+            verification_error = exc
+    close_error: BaseException | None = None
+    for session in reversed(sessions):
+        try:
+            session.close(scrub_private=scrub_private)
+        except BaseException as exc:
+            scrub_private = True
+            if close_error is None:
+                close_error = exc
+    if verification_error is not None:
+        raise verification_error
+    if close_error is not None:
+        raise close_error
 
 
 def _decode_json(raw: bytes, label: str) -> dict[str, Any]:
@@ -2780,16 +2789,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if _ACTIVE_CUSTODY_SESSIONS is not None:
         raise FixtureError("custody session scope is already active")
     _ACTIVE_CUSTODY_SESSIONS = []
-    common = {
-        "public_output": args.public_output,
-        "custodian_output": args.custodian_output,
-        "discovery_key": _read_key_file(args.discovery_key_file, "discovery key"),
-        "confirmation_key": _read_key_file(
-            args.confirmation_key_file, "confirmation key"
-        ),
-        "public_boundary_roots": args.public_boundary_roots,
-    }
+    succeeded = False
+    rendered_result: str | None = None
     try:
+        common = {
+            "public_output": args.public_output,
+            "custodian_output": args.custodian_output,
+            "discovery_key": _read_key_file(args.discovery_key_file, "discovery key"),
+            "confirmation_key": _read_key_file(
+                args.confirmation_key_file, "confirmation key"
+            ),
+            "public_boundary_roots": args.public_boundary_roots,
+        }
         result = (
             build_candidate(
                 **common,
@@ -2802,12 +2813,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.command == "build"
             else verify_replay(**common)
         )
-        _verify_active_custody_sessions()
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
+        rendered_result = json.dumps(result, indent=2, sort_keys=True)
+        succeeded = True
     finally:
-        _close_active_custody_sessions()
-        _ACTIVE_CUSTODY_SESSIONS = None
+        try:
+            _close_active_custody_sessions(
+                verify=succeeded, scrub_private=not succeeded
+            )
+        finally:
+            _ACTIVE_CUSTODY_SESSIONS = None
+    if rendered_result is None:  # pragma: no cover - success sets the payload
+        raise FixtureError("renderer completed without a result")
+    print(rendered_result)
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

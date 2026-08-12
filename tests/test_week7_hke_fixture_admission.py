@@ -902,6 +902,53 @@ def test_cli_revalidates_private_output_authority_after_helper_returns(
     assert admission._ACTIVE_PRIVATE_AUTHORITIES is None
 
 
+def test_admission_cli_final_close_reverifies_before_success_return(
+    candidate, tmp_path, monkeypatch
+) -> None:
+    public, custodian = candidate
+    private_parent = tmp_path / "private-cli-final-close"
+    private_parent.mkdir()
+    relocated = public.parent / f"private-cli-final-close-{tmp_path.name}"
+    target = private_parent / "PRIVATE-CONFIRMATION-REVEAL.json"
+    moved_target = relocated / target.name
+    original_close = admission._close_private_authorities
+    moved = False
+    expected_payload = b""
+
+    def command(_args):
+        admission._write_private_new(
+            target,
+            {"revealed_rows": ["private"]},
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(public.parent,),
+            label="confirmation reveal",
+        )
+        return 0
+
+    def relocate_then_close(*, verify, scrub_outputs):
+        nonlocal moved, expected_payload
+        assert verify is True
+        expected_payload = target.read_bytes()
+        assert expected_payload
+        private_parent.rename(relocated)
+        private_parent.mkdir()
+        target.write_bytes(b"foreign-replacement")
+        moved = True
+        return original_close(verify=verify, scrub_outputs=scrub_outputs)
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: object())
+    monkeypatch.setattr(admission, "_main_with_held_private_descriptors", command)
+    monkeypatch.setattr(admission, "_close_private_authorities", relocate_then_close)
+    with pytest.raises(admission.AdmissionError, match="parent changed"):
+        admission.main([])
+    assert moved is True
+    assert expected_payload
+    assert moved_target.read_bytes() == b""
+    assert target.read_bytes() == b"foreign-replacement"
+    assert admission._ACTIVE_PRIVATE_AUTHORITIES is None
+
+
 def test_cli_revalidates_private_input_link_count_after_helper_returns(
     candidate, tmp_path, monkeypatch
 ) -> None:

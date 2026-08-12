@@ -1017,6 +1017,82 @@ def test_renderer_cli_revalidates_custody_after_build_helper_returns(
     assert renderer._ACTIVE_CUSTODY_SESSIONS is None
 
 
+def test_renderer_cli_final_close_reverifies_before_success_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "cli-final-close-public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "cli-final-close-custodian"
+    relocated = boundary / "cli-final-close-private"
+    replacement = custodian / "FOREIGN"
+    tiny = dict(renderer.FIXTURE_CONTRACT[0])
+    tiny.update(
+        {
+            "discovery_packs": [
+                {"pack": "D1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "confirmation_packs": [
+                {"pack": "C1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "discovery_count": 2,
+            "confirmation_count": 2,
+        }
+    )
+    monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "build",
+            "public_output": public,
+            "custodian_output": custodian,
+            "discovery_key_file": tmp_path / "discovery.key",
+            "confirmation_key_file": tmp_path / "confirmation.key",
+            "public_boundary_roots": (boundary,),
+            "generator_commit": GENERATOR_COMMIT,
+            "generator_tree": GENERATOR_TREE,
+            **RIGHTS,
+        },
+    )()
+    original_close = renderer._close_active_custody_sessions
+    moved_paths: list[Path] = []
+    emitted: list[str] = []
+
+    def key_for(path, _label):
+        return DISCOVERY_KEY if path == args.discovery_key_file else CONFIRMATION_KEY
+
+    def relocate_then_close(*, verify, scrub_private):
+        assert verify is True
+        moved_paths.extend(
+            path.relative_to(custodian)
+            for path in sorted(custodian.rglob("*"))
+            if path.is_file()
+        )
+        assert moved_paths
+        assert any((custodian / path).read_bytes() for path in moved_paths)
+        custodian.rename(relocated)
+        custodian.mkdir()
+        replacement.write_bytes(b"foreign-replacement")
+        return original_close(verify=verify, scrub_private=scrub_private)
+
+    monkeypatch.setattr(renderer, "_parse", lambda _argv: args)
+    monkeypatch.setattr(renderer, "_read_key_file", key_for)
+    monkeypatch.setattr(renderer, "_close_active_custody_sessions", relocate_then_close)
+    monkeypatch.setattr(
+        renderer,
+        "print",
+        lambda value: emitted.append(value),
+        raising=False,
+    )
+    with pytest.raises(renderer.FixtureError, match="custodian output"):
+        renderer.main([])
+    assert emitted == []
+    assert all((relocated / path).read_bytes() == b"" for path in moved_paths)
+    assert replacement.read_bytes() == b"foreign-replacement"
+    assert renderer._ACTIVE_CUSTODY_SESSIONS is None
+
+
 def test_generation_completion_rejects_public_hard_link_to_private_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

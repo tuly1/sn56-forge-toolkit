@@ -557,25 +557,35 @@ def _retain_private_authority(
     _ACTIVE_PRIVATE_AUTHORITIES.append(authority)
 
 
-def _verify_private_authorities() -> None:
-    """Rebind every retained private path immediately before CLI success."""
+def _close_private_authorities(*, verify: bool, scrub_outputs: bool) -> None:
+    """Final-check and release all CLI private leases before success return."""
 
     if _ACTIVE_PRIVATE_AUTHORITIES is None:
         return
-    try:
-        for authority in _ACTIVE_PRIVATE_AUTHORITIES:
-            authority.verify()
-    except BaseException:
-        for authority in _ACTIVE_PRIVATE_AUTHORITIES:
+    authorities = list(_ACTIVE_PRIVATE_AUTHORITIES)
+    _ACTIVE_PRIVATE_AUTHORITIES.clear()
+    verification_error: BaseException | None = None
+    if verify:
+        try:
+            for authority in authorities:
+                authority.verify()
+        except BaseException as exc:
+            scrub_outputs = True
+            verification_error = exc
+    if scrub_outputs:
+        for authority in authorities:
             authority.scrub()
-        raise
-
-
-def _close_private_authorities() -> None:
-    if _ACTIVE_PRIVATE_AUTHORITIES is None:
-        return
-    while _ACTIVE_PRIVATE_AUTHORITIES:
-        _ACTIVE_PRIVATE_AUTHORITIES.pop().close()
+    close_error: BaseException | None = None
+    for authority in reversed(authorities):
+        try:
+            authority.close()
+        except BaseException as exc:
+            if close_error is None:
+                close_error = exc
+    if verification_error is not None:
+        raise verification_error
+    if close_error is not None:
+        raise close_error
 
 
 def _load_private_json(
@@ -2177,13 +2187,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if _ACTIVE_PRIVATE_AUTHORITIES is not None:
         raise AdmissionError("private authority scope is already active")
     _ACTIVE_PRIVATE_AUTHORITIES = []
+    succeeded = False
     try:
         result = _main_with_held_private_descriptors(args)
-        _verify_private_authorities()
+        succeeded = True
         return result
     finally:
-        _close_private_authorities()
-        _ACTIVE_PRIVATE_AUTHORITIES = None
+        try:
+            _close_private_authorities(verify=succeeded, scrub_outputs=not succeeded)
+        finally:
+            _ACTIVE_PRIVATE_AUTHORITIES = None
 
 
 def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
