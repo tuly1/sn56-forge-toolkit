@@ -32,7 +32,7 @@ The dataset-preparation/Backblaze B2 incident is **Gradients-reported**, not
 independently established by this packet. No validator-side incident notice or
 storage event ledger is archived here; obtaining that source record is the
 purpose of this request. Keep that reported incident, the original attempt,
-the retry assignment, the successful retry upload, and the retry's
+the retry assignment, the successful public retry publication, and the retry's
 model-quality result as five distinct facts.
 
 ## Requested validator-side records
@@ -52,7 +52,8 @@ attempt and the retry, containing only operational metadata:
 4. The exact object version selected by the repository-publication worker,
    plus the publication transaction and final submission ID it produced.
 5. A causal link, if one exists in the logs, between the original attempt's
-   terminal state, the retry assignment, and the successful retry object.
+   terminal state, the retry assignment, and the object version used for the
+   successful public retry, if any.
 
 Do not provide secrets, signed URLs, authorization headers, bucket
 credentials, hidden/test dataset identifiers, evaluator rows, prompts, or

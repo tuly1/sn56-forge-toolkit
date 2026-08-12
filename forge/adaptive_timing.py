@@ -152,7 +152,7 @@ class ThroughputProfile:
     """An operator-attested timing claim for one experimental bundle.
 
     ``training_elapsed_seconds`` and ``first_checkpoint_elapsed_seconds`` are
-    declared relative to subprocess launch. Schema 3 conservatively includes
+    declared relative to subprocess launch. Schema 4 conservatively includes
     startup in the rate and therefore records ``startup_seconds`` as zero. The
     declared rate must equal
     ``(training_elapsed_seconds - startup_seconds) / completed_steps`` within

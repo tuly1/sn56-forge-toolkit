@@ -29,11 +29,14 @@ final result. The safe post-retry API snapshot records a scored submission at
 
 The correction record's earlier PASS claim for PR #16 head
 `ed99cee0d6c9cab1b68f43c742e2735fee99a0d0` was superseded by a later
-independent HOLD: prohibited-path aliases, explicit `request_query: null`, and
-invalid UTF-8 query encodings remained accepted. PR #16 must receive a new
-exact-SHA independent PASS after those defects are fixed. PR #17 must then be
-rebased onto that exact cleared base, pushed, read back, and independently
-audited before any fresh candidate is generated.
+independent HOLD. PR #16 subsequently closed the prohibited-path-alias,
+explicit-`request_query`, and invalid-UTF-8 defects at exact head
+`0a6e61e813b9dcd80d067a4853d2425d4dbcf668`, tree
+`6e9143d06b711f4521f4244a26873b7cc55d73de`. An independent exact-SHA audit
+returned PASS-WITH-FOLLOWUPS with no P0--P2 findings and explicitly cleared
+that head as PR #17's base. PR #17 is now rebased directly onto that revision.
+Its new exact head must still be pushed, read back, and independently audited
+before any fresh candidate is generated.
 
 ## Schema-3 fixture gate
 

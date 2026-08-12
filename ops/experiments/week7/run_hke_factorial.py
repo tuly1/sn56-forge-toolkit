@@ -159,8 +159,9 @@ class HKEContractError(RuntimeError):
 class BoundTimingProfile:
     """One validated timing claim plus its experiment-specific binding.
 
-    ``ThroughputProfile`` binds a runtime bundle and accelerator class, but it
-    does not by itself say which factorial loss/config produced the timing.
+    ``ThroughputProfile`` binds a runtime bundle and physical accelerator
+    identity, but it does not by itself say which factorial loss/config
+    produced the timing.
     This outer record closes that gap and is itself content addressed.
     """
 
