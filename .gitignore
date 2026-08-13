@@ -2,4 +2,7 @@
 .pytest_cache/
 __pycache__/
 experiments/
+!ops/experiments/
+!ops/experiments/week7/
+!ops/experiments/week7/hke_fixture_compatibility.py
 *.pyc

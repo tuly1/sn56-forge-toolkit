@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import replace
 import copy
 import hashlib
+import importlib
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -13,6 +15,7 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+import types
 
 import pytest
 import yaml
@@ -1179,6 +1182,149 @@ def test_futurebound_factorial_is_depth_matched_and_isolates_two_factors(base_co
     }
     assert H._train_node(arms["C"])["multires_noise_iterations"] == 6
     assert H._train_node(arms["C"])["multires_noise_discount"] == pytest.approx(0.3)
+
+
+def _exact_owned_train_config(monkeypatch):
+    """Load the real pinned runtime TrainConfig without accelerator dependencies."""
+
+    runtime_text = os.environ.get("SN56_OWNED_RUNTIME_SOURCE", "")
+    if not runtime_text:
+        pytest.skip("set SN56_OWNED_RUNTIME_SOURCE for the cross-repository gate")
+    runtime = Path(runtime_text).resolve(strict=True)
+    git = ["/usr/bin/git", "-C", str(runtime)]
+    assert subprocess.run(
+        [*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip() == krea_runtime.OWNED_RUNTIME_COMMIT
+    assert subprocess.run(
+        [*git, "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == krea_runtime.OWNED_RUNTIME_TREE
+    assert subprocess.run(
+        [*git, "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+    ).stdout == b""
+
+    torch = types.ModuleType("torch")
+    torch.Tensor = type("Tensor", (), {})
+    torch.Generator = type("Generator", (), {})
+    torch.backends = types.SimpleNamespace(
+        mps=types.SimpleNamespace(is_available=lambda: False)
+    )
+    torch_nn = types.ModuleType("torch.nn")
+    torch_nn_functional = types.ModuleType("torch.nn.functional")
+    torch.nn = torch_nn
+    torch_nn.functional = torch_nn_functional
+    stubs = {
+        "torch": torch,
+        "torch.nn": torch_nn,
+        "torch.nn.functional": torch_nn_functional,
+        "torchaudio": types.ModuleType("torchaudio"),
+        "torchao": types.ModuleType("torchao"),
+        "torchao.quantization": types.ModuleType("torchao.quantization"),
+        "torchao.quantization.quant_primitives": types.ModuleType(
+            "torchao.quantization.quant_primitives"
+        ),
+        "toolkit.audio.album_artwork": types.ModuleType(
+            "toolkit.audio.album_artwork"
+        ),
+        "toolkit.prompt_utils": types.ModuleType("toolkit.prompt_utils"),
+    }
+    stubs["torchao.quantization.quant_primitives"]._DTYPE_TO_BIT_WIDTH = {}
+    stubs["toolkit.audio.album_artwork"].add_album_artwork = lambda *a, **k: None
+    stubs["toolkit.prompt_utils"].PromptEmbeds = type("PromptEmbeds", (), {})
+    for name in tuple(sys.modules):
+        if name == "toolkit" or name.startswith("toolkit."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    for name, module in stubs.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.syspath_prepend(str(runtime))
+    train_config = importlib.import_module("toolkit.config_modules").TrainConfig
+    assert Path(inspect.getsourcefile(train_config)).resolve().is_relative_to(runtime)
+    return train_config
+
+
+def _generated_owned_bridge_and_arms(base_config):
+    profiles = _bound_profiles(base_config, 10)
+    return {
+        "bridge-owned": H.materialize_runtime_bridge(base_config)["owned"],
+        **H.materialize_arms(
+            base_config,
+            num_images=10,
+            hours_to_complete=0.75,
+            profiles=profiles,
+        ),
+    }
+
+
+def test_live_generated_bridge_and_arms_reach_exact_owned_train_config(
+    base_config, monkeypatch
+):
+    train_config = _exact_owned_train_config(monkeypatch)
+    configs = _generated_owned_bridge_and_arms(base_config)
+    expected_yaml_sha256 = {
+        "bridge-owned": "24693563c69d3a0a92e0a484ecebc3f023767a131a40700c8fab67a83214ecfd",
+        "A": "24693563c69d3a0a92e0a484ecebc3f023767a131a40700c8fab67a83214ecfd",
+        "B": "da1e093fcd4936e509ef7e0d4ec2429fdd6abbf4f666111b5fe3a4c6d7e0ee37",
+        "C": "ce3932fef53495854fd88a1f7265063f81ac9541f2b67e9868a792fb0b166c55",
+        "D": "d43bbc061f5bf457fd5d2fa5fa3e5a87232c5d648334b4e818468de5d2310626",
+    }
+    for name, generated in configs.items():
+        assert hashlib.sha256(H._generated_config_bytes(generated)).hexdigest() == (
+            expected_yaml_sha256[name]
+        )
+        parsed = train_config(**copy.deepcopy(H._train_node(generated)))
+        assert parsed.diff_output_preservation is False
+        assert parsed.diff_output_preservation_multiplier == 1
+        assert parsed.diff_output_preservation_class == "person"
+        assert parsed.switch_boundary_every == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("diff_output_preservation", "false"),
+        ("diff_output_preservation_multiplier", "1.0"),
+        ("diff_output_preservation_class", 7),
+        ("switch_boundary_every", 1.0),
+    ],
+)
+def test_live_generated_arm_rejects_inherited_field_type_drift(
+    base_config, monkeypatch, field, bad_value
+):
+    train_config = _exact_owned_train_config(monkeypatch)
+    train = copy.deepcopy(
+        H._train_node(_generated_owned_bridge_and_arms(base_config)["C"])
+    )
+    train[field] = bad_value
+    with pytest.raises(ValueError, match=field):
+        train_config(**train)
+
+
+@pytest.mark.parametrize(
+    ("field", "typo"),
+    [
+        ("diff_output_preservation", "diff_output_preservtion"),
+        (
+            "diff_output_preservation_multiplier",
+            "diff_output_preservation_mulitplier",
+        ),
+        ("diff_output_preservation_class", "diff_output_preservation_clas"),
+        ("switch_boundary_every", "switch_boundry_every"),
+    ],
+)
+def test_live_generated_arm_rejects_inherited_field_typos(
+    base_config, monkeypatch, field, typo
+):
+    train_config = _exact_owned_train_config(monkeypatch)
+    train = copy.deepcopy(
+        H._train_node(_generated_owned_bridge_and_arms(base_config)["D"])
+    )
+    train[typo] = train.pop(field)
+    with pytest.raises(ValueError, match=typo):
+        train_config(**train)
 
 
 def test_plan_binds_every_pack_cell_to_physical_inputs(base_config):

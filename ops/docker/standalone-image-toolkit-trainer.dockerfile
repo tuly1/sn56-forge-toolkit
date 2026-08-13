@@ -46,11 +46,11 @@ RUN retry_network() { \
     cd /opt/sn56/krea-ai-toolkit && \
     git init && \
     git remote add origin https://github.com/tuly1/sn56-ai-toolkit-mirror.git && \
-    retry_network git fetch --depth=1 origin 71e133b4e73a716d1094f22355a46be07953b828 && \
+    retry_network git fetch --depth=1 origin 4dbb85e6b842c4689f79ca20fb19f38212f76aae && \
     git checkout --detach FETCH_HEAD && \
-    test "$(git rev-parse HEAD)" = 71e133b4e73a716d1094f22355a46be07953b828 && \
+    test "$(git rev-parse HEAD)" = 4dbb85e6b842c4689f79ca20fb19f38212f76aae && \
     test -f sn56_krea_runtime_capabilities.json && \
-    python3 -c 'import hashlib,json,pathlib; p=pathlib.Path("sn56_krea_runtime_capabilities.json"); v={"schema":1,"runtime_repository":"https://github.com/tuly1/sn56-ai-toolkit-mirror.git","runtime_commit":"71e133b4e73a716d1094f22355a46be07953b828","capability_manifest_sha256":hashlib.sha256(p.read_bytes()).hexdigest()}; pathlib.Path(".sn56-runtime-identity.json").write_text(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")'
+    python3 -c 'import hashlib,json,pathlib; p=pathlib.Path("sn56_krea_runtime_capabilities.json"); v={"schema":1,"runtime_repository":"https://github.com/tuly1/sn56-ai-toolkit-mirror.git","runtime_commit":"4dbb85e6b842c4689f79ca20fb19f38212f76aae","capability_manifest_sha256":hashlib.sha256(p.read_bytes()).hexdigest()}; pathlib.Path(".sn56-runtime-identity.json").write_text(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")'
 
 # ai-toolkit currently pins torchcodec 0.9.1, whose compiled extension targets
 # Torch 2.9.  G.O.D deliberately pins this image to Torch 2.6/cu124; the official
@@ -101,7 +101,7 @@ RUN retry_network() { \
         --lock /opt/sn56/image-runtime-lock.txt \
         --constraints /opt/sn56/image-runtime-phase1-constraints.txt && \
     test "$(git -C /app/ai-toolkit rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
-    test "$(git -C /opt/sn56/krea-ai-toolkit rev-parse HEAD)" = 71e133b4e73a716d1094f22355a46be07953b828 && \
+    test "$(git -C /opt/sn56/krea-ai-toolkit rev-parse HEAD)" = 4dbb85e6b842c4689f79ca20fb19f38212f76aae && \
     find /app/ai-toolkit /opt/sn56/krea-ai-toolkit -xdev \
         -type d -name __pycache__ -prune -exec rm -rf -- {} +
 

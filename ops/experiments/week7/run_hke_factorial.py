@@ -40,6 +40,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from forge import adaptive_timing, krea_runtime, recipe  # noqa: E402
+from ops.experiments.week7 import hke_fixture_compatibility  # noqa: E402
 
 SCHEMA = 3
 KIND = "sn56-week7-hke-factorial"
@@ -2329,7 +2330,9 @@ def _validate_admission(value: Mapping[str, Any], family: str) -> dict[str, Any]
     raise HKEContractError(f"{family} fixture admission schema is superseded")
 
 
-def _validate_admission_set_v3(value: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_admission_set_v3(
+    value: Mapping[str, Any], *, historical_authority: bool = False
+) -> dict[str, Any]:
     required = {
         "schema",
         "kind",
@@ -2453,7 +2456,7 @@ def _validate_admission_set_v3(value: Mapping[str, Any]) -> dict[str, Any]:
         )
     ):
         raise HKEContractError("fixture admission-set pinned refs are invalid")
-    if not all(
+    if not historical_authority and not all(
         _literal_revision_identity(ref, ())["commit"] == revision["commit"]
         for ref in refs
     ):
@@ -2465,22 +2468,26 @@ def _validate_admission_set_v3(value: Mapping[str, Any]) -> dict[str, Any]:
         or revision["admission_authority_path"] != admission_path
         or revision["admission_authority_source_sha256"]
         != literal["blob_sha256"][admission_path]
-        or revision["admission_authority_source_sha256"]
-        != sha256_file(ADMISSION_AUTHORITY_PATH)
         or revision["factor_authority_path"] != factor_path
         or revision["factor_authority_source_sha256"]
         != literal["blob_sha256"][factor_path]
-        or revision["factor_authority_source_sha256"]
-        != sha256_file(REPO_ROOT / factor_path)
         or revision["renderer_source_sha256"] != literal["blob_sha256"][renderer_path]
-        or revision["renderer_source_sha256"] != sha256_file(REPO_ROOT / renderer_path)
         or revision["contract_path"] != expected_contract_path
         or revision["contract_source_sha256"]
         != literal["blob_sha256"][expected_contract_path]
-        or revision["contract_source_sha256"]
-        != sha256_file(REPO_ROOT / expected_contract_path)
         or replay["contract_path"] != revision["contract_path"]
         or replay["contract_source_sha256"] != revision["contract_source_sha256"]
+    ):
+        raise HKEContractError("fixture admission-set source binding mismatch")
+    if not historical_authority and (
+        revision["admission_authority_source_sha256"]
+        != sha256_file(ADMISSION_AUTHORITY_PATH)
+        or revision["factor_authority_source_sha256"]
+        != sha256_file(REPO_ROOT / factor_path)
+        or revision["renderer_source_sha256"]
+        != sha256_file(REPO_ROOT / renderer_path)
+        or revision["contract_source_sha256"]
+        != sha256_file(REPO_ROOT / expected_contract_path)
     ):
         raise HKEContractError("fixture admission-set source binding mismatch")
     receipts = value["receipts"]
@@ -2536,6 +2543,12 @@ def _validate_admission_set(value: Mapping[str, Any]) -> dict[str, Any]:
 
     if isinstance(value, Mapping) and value.get("schema") == SCHEMA:
         return _validate_admission_set_v3(value)
+    raise HKEContractError("fixture admission-set schema is superseded")
+
+
+def _validate_historical_admission_set(value: Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(value, Mapping) and value.get("schema") == SCHEMA:
+        return _validate_admission_set_v3(value, historical_authority=True)
     raise HKEContractError("fixture admission-set schema is superseded")
 
 
@@ -2704,6 +2717,7 @@ def build_prelaunch_plan(
     *,
     admission_set: Mapping[str, Any],
     owner_ratification: Mapping[str, Any],
+    fixture_compatibility_receipt: Mapping[str, Any] | None = None,
     profiles_by_family: Mapping[str, Mapping[str, Mapping[str, BoundTimingProfile]]],
     evaluator_identity: Mapping[str, Any],
     execution_identities: Mapping[str, Mapping[str, str]],
@@ -2712,14 +2726,30 @@ def build_prelaunch_plan(
     """Build only the launchable bridge + D1 plan for the staged protocol."""
 
     source_identity = _verify_incumbent_source(base_config)
-    checked_set = _validate_admission_set(admission_set)
+    checked_set = (
+        _validate_admission_set(admission_set)
+        if fixture_compatibility_receipt is None
+        else _validate_historical_admission_set(admission_set)
+    )
     ratification = _validate_owner_ratification(
         owner_ratification, admission_set=admission_set
     )
     evaluator = _validate_evaluator_identity(evaluator_identity)
     evaluator_sha = canonical_sha256(evaluator)
     executions = _execution_identities(execution_identities)
+    compatibility = None
     reviewed_tree = checked_set["generator_revision"]["tree"]
+    if fixture_compatibility_receipt is not None:
+        try:
+            compatibility = hke_fixture_compatibility.validate_receipt(
+                fixture_compatibility_receipt,
+                admission_set=admission_set,
+                owner_ratification=ratification,
+                execution_identities=executions,
+            )
+        except hke_fixture_compatibility.CompatibilityError as exc:
+            raise HKEContractError(str(exc)) from exc
+        reviewed_tree = compatibility["execution_authority"]["forge_tree"]
     if any(
         execution["code_tree"] != reviewed_tree for execution in executions.values()
     ):
@@ -2896,6 +2926,7 @@ def build_prelaunch_plan(
         "execution_identities": executions,
         "admission_set": copy.deepcopy(dict(admission_set)),
         "admission_set_sha256": checked_set["admission_set_sha256"],
+        "fixture_compatibility_receipt": compatibility,
         "owner_ratification": ratification,
         "owner_ratification_sha256": ratification["owner_ratification_sha256"],
         "fixture": fixture,
@@ -3129,6 +3160,7 @@ def _validate_plan_v3(value: Mapping[str, Any]) -> dict[str, Any]:
         "execution_identities",
         "admission_set",
         "admission_set_sha256",
+        "fixture_compatibility_receipt",
         "owner_ratification",
         "owner_ratification_sha256",
         "fixture",
@@ -3164,7 +3196,12 @@ def _validate_plan_v3(value: Mapping[str, Any]) -> dict[str, Any]:
     source_config = yaml.safe_load(INCUMBENT_TEMPLATE_PATH.read_text(encoding="utf-8"))
     if body["source"] != _verify_incumbent_source(source_config):
         raise HKEContractError("staged plan incumbent source mismatch")
-    checked_set = _validate_admission_set(body["admission_set"])
+    compatibility = body["fixture_compatibility_receipt"]
+    checked_set = (
+        _validate_admission_set(body["admission_set"])
+        if compatibility is None
+        else _validate_historical_admission_set(body["admission_set"])
+    )
     if checked_set["admission_set_sha256"] != body["admission_set_sha256"]:
         raise HKEContractError("staged plan admission root mismatch")
     ratification = _validate_owner_ratification(
@@ -3202,6 +3239,7 @@ def _validate_plan_v3(value: Mapping[str, Any]) -> dict[str, Any]:
         source_config,
         admission_set=body["admission_set"],
         owner_ratification=ratification,
+        fixture_compatibility_receipt=compatibility,
         profiles_by_family={"social": {"D1": profiles}},
         evaluator_identity=evaluator,
         execution_identities=executions,
@@ -4344,7 +4382,11 @@ def _validate_frozen_candidate(
 def _public_discovery_fixture(
     prelaunch: Mapping[str, Any], *, family: str, pack: str
 ) -> dict[str, Any]:
-    checked_set = _validate_admission_set(prelaunch["admission_set"])
+    checked_set = (
+        _validate_admission_set(prelaunch["admission_set"])
+        if prelaunch.get("fixture_compatibility_receipt") is None
+        else _validate_historical_admission_set(prelaunch["admission_set"])
+    )
     receipt = checked_set["receipts"][family]
     record = receipt["packs"][pack]
     spec = EXPECTED_PACKS[family][pack]
@@ -4794,6 +4836,7 @@ def _validate_confirmation_reveal_record(
     admission_set: Mapping[str, Any],
     expected_authority_kind: str = "sn56-week7-hke-confirmation-candidate-freeze",
     expected_authority_sha256: str | None = None,
+    historical_fixture_authority: bool = False,
 ) -> dict[str, Any]:
     fields = {
         "schema",
@@ -4824,7 +4867,11 @@ def _validate_confirmation_reveal_record(
     declared = body.pop("confirmation_reveal_sha256")
     if declared != canonical_sha256(body):
         raise HKEContractError(f"{family}/{pack} confirmation reveal digest mismatch")
-    checked_set = _validate_admission_set(admission_set)
+    checked_set = (
+        _validate_historical_admission_set(admission_set)
+        if historical_fixture_authority
+        else _validate_admission_set(admission_set)
+    )
     receipt = checked_set["receipts"][family]
     receipt_pack = receipt["packs"][pack]
     commitment = confirmation_freeze["confirmation_commitments"][family][pack]
@@ -5056,6 +5103,12 @@ def build_confirmation_plan(
             pack="C1",
             confirmation_freeze=freeze,
             admission_set=d2_plan["source_prelaunch_plan"]["admission_set"],
+            historical_fixture_authority=(
+                d2_plan["source_prelaunch_plan"].get(
+                    "fixture_compatibility_receipt"
+                )
+                is not None
+            ),
         )
         for family in ("social", "product", "logo_ui")
     }
@@ -5354,6 +5407,10 @@ def build_c2_plan(
         pack="C2",
         confirmation_freeze=freeze,
         admission_set=d2_plan["source_prelaunch_plan"]["admission_set"],
+        historical_fixture_authority=(
+            d2_plan["source_prelaunch_plan"].get("fixture_compatibility_receipt")
+            is not None
+        ),
         expected_authority_kind="sn56-week7-hke-c2-reveal-authorization",
         expected_authority_sha256=expected_authority["c2_authority_sha256"],
     )
