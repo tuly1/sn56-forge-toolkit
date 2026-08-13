@@ -495,18 +495,40 @@ def _run_toolkit(
     except Exception:
         pass
 
-    if (
+    timing_observation_required = (
         (throughput_profile is not None or timing_probe)
         and timing_record_required
-        and not first_checkpoint_observed
-    ):
+    )
+
+    # An unsolicited nonzero exit is the primary failure when no current entry
+    # exists or when required timing evidence never reached a durable checkpoint.
+    # A loader crash may leave a merely named or truncated file, so filesystem
+    # presence alone must not let the secondary timing postcondition mask it.
+    if rc not in (0, None) and not stopped_by_deadline:
+        failed_checkpoint_present = _has_current_checkpoint_entry(spec, scope)
+        if not failed_checkpoint_present or (
+            timing_observation_required and not first_checkpoint_observed
+        ):
+            _record_toolkit_exit(
+                rc,
+                stopped_by_deadline=False,
+                checkpoint_present=failed_checkpoint_present,
+            )
+            _tail_log(log_path)
+            if not failed_checkpoint_present:
+                raise RuntimeError(
+                    f"ai-toolkit failed (rc={rc}) with no checkpoint"
+                )
+            raise RuntimeError(
+                f"ai-toolkit failed (rc={rc}) before required "
+                "first-checkpoint timing observation"
+            )
+
+    if timing_observation_required and not first_checkpoint_observed:
         raise adaptive_timing.TimingProfileError(
             "required first-checkpoint timing observation was not produced"
         )
-    if (
-        (throughput_profile is not None or timing_probe)
-        and timing_record_required
-    ):
+    if timing_observation_required:
         terminal_artifact = _terminal_current_artifact_path(
             spec,
             scope,
@@ -530,19 +552,11 @@ def _run_toolkit(
     )
 
     # A clean exit (0) or a deadline stop are both success: a checkpoint should
-    # be on disk. A nonzero exit we did NOT trigger means ai-toolkit failed — but
-    # if it left a current-run checkpoint entry, defer structural validation to
-    # the finalizer so never-forfeit salvage remains unchanged. The public exit
-    # event above claims only presence. checkpoint_finalized proves only that
+    # be on disk. Once required timing evidence exists (or was not required), a
+    # nonzero exit with a current-run checkpoint entry may continue to the
+    # finalizer so never-forfeit salvage remains unchanged. The public exit event
+    # above claims only presence. checkpoint_finalized proves only that
     # finalization yielded a usable artifact; it may be a preserved prior fallback.
-    if (
-        rc not in (0, None)
-        and not stopped_by_deadline
-        and not current_checkpoint_present
-    ):
-        _tail_log(log_path)
-        raise RuntimeError(f"ai-toolkit failed (rc={rc}) with no checkpoint")
-
     if scoring_reserve_s <= 0:
         return False
     if scoring_decision is not None:
