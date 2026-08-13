@@ -1166,6 +1166,10 @@ def test_futurebound_factorial_is_depth_matched_and_isolates_two_factors(base_co
         profiles=profiles,
     )
     assert {H._train_node(config)["steps"] for config in arms.values()} == {1200}
+    assert {H._save_node(config)["save_every"] for config in arms.values()} == {200}
+    assert {
+        tuple(H.required_checkpoint_steps(config)) for config in arms.values()
+    } == {(200, 400, 600, 800, 1000, 1200)}
     assert H.changed_pointers(arms["A"], arms["B"]) == {
         "/config/process/0/train/loss_type"
     }
@@ -1195,7 +1199,17 @@ def test_plan_binds_every_pack_cell_to_physical_inputs(base_config):
     )
     assert set(plan["cells"]) == {"bridge", "d1_core"}
     assert set(plan["cells"]["d1_core"]) == {"R0", "A", "B", "C", "D"}
-    assert plan["cells"]["d1_core"]["R0"]["required_checkpoint_steps"][-1] == 1166
+    assert plan["cells"]["d1_core"]["R0"]["config"]["config"]["process"][0][
+        "save"
+    ]["save_every"] == 200
+    assert plan["cells"]["d1_core"]["R0"]["required_checkpoint_steps"] == [
+        200,
+        400,
+        600,
+        800,
+        1000,
+        1166,
+    ]
     for arm in H.ARMS:
         cell = plan["cells"]["d1_core"][arm]
         identity = H._validate_cell_identity(cell["cell_identity"], "test")
@@ -1207,7 +1221,15 @@ def test_plan_binds_every_pack_cell_to_physical_inputs(base_config):
         )
         assert identity["runtime_commit"] == krea_runtime.OWNED_RUNTIME_COMMIT
         assert 1166 not in cell["required_checkpoint_steps"]
-        assert cell["required_checkpoint_steps"][-1] == 1200
+        assert cell["config"]["config"]["process"][0]["save"]["save_every"] == 200
+        assert cell["required_checkpoint_steps"] == [
+            200,
+            400,
+            600,
+            800,
+            1000,
+            1200,
+        ]
     assert plan["authorization"]["d1_factorial_launch_authorized"] is False
     assert plan["authorization"]["gpu_execution_authorized"] is False
     assert plan["authorization"]["bridge_launch_authorized"] is False

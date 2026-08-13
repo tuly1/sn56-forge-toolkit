@@ -1991,8 +1991,8 @@ def materialize_current_law_configs(
         config = copy.deepcopy(original)
         _train_node(config)["loss_type"] = ARMS[arm_id]["loss"]
         _train_node(config)["steps"] = FACTORIAL_STEPS
-        _save_node(config)["save_every"] = recipe.kill_safe_save_every(
-            FACTORIAL_STEPS, template_cadence
+        _save_node(config)["save_every"] = recipe.checkpoint_save_every(
+            "krea2", FACTORIAL_STEPS, template_cadence
         )
         effective, bundle = krea_runtime.materialize_week7_factorial_config(
             config, multires_noise=True
@@ -2028,8 +2028,8 @@ def materialize_arms(
         config = copy.deepcopy(original)
         _train_node(config)["loss_type"] = arm["loss"]
         _train_node(config)["steps"] = FACTORIAL_STEPS
-        _save_node(config)["save_every"] = recipe.kill_safe_save_every(
-            FACTORIAL_STEPS, template_cadence
+        _save_node(config)["save_every"] = recipe.checkpoint_save_every(
+            "krea2", FACTORIAL_STEPS, template_cadence
         )
         effective, bundle = krea_runtime.materialize_week7_factorial_config(
             config, multires_noise=bool(arm["multires_noise"])
@@ -2112,8 +2112,8 @@ def materialize_r0(
     config = _materialize_airgapped_krea_base(base_config)
     _process_node(config)["training_seed"] = seed
     _train_node(config)["steps"] = R0_STEPS
-    _save_node(config)["save_every"] = recipe.kill_safe_save_every(
-        R0_STEPS, int(_save_node(config)["save_every"])
+    _save_node(config)["save_every"] = recipe.checkpoint_save_every(
+        "krea2", R0_STEPS, int(_save_node(config)["save_every"])
     )
     _train_node(config).pop("multires_noise_iterations", None)
     _train_node(config).pop("multires_noise_discount", None)
@@ -2129,8 +2129,8 @@ def materialize_runtime_bridge(
     incumbent = _materialize_airgapped_krea_base(base_config)
     _process_node(incumbent)["training_seed"] = seed
     _train_node(incumbent)["steps"] = FACTORIAL_STEPS
-    _save_node(incumbent)["save_every"] = recipe.kill_safe_save_every(
-        FACTORIAL_STEPS, int(_save_node(incumbent)["save_every"])
+    _save_node(incumbent)["save_every"] = recipe.checkpoint_save_every(
+        "krea2", FACTORIAL_STEPS, int(_save_node(incumbent)["save_every"])
     )
     _train_node(incumbent).pop("multires_noise_iterations", None)
     _train_node(incumbent).pop("multires_noise_discount", None)
@@ -4012,8 +4012,10 @@ def build_optional_e_plan(
     source_cell = plan["cells"]["d1_core"][selected_arm]
     config = copy.deepcopy(source_cell["config"])
     _train_node(config)["steps"] = clock_steps
-    _save_node(config)["save_every"] = recipe.kill_safe_save_every(
-        clock_steps, int(_save_node(source_cell["config"])["save_every"])
+    _save_node(config)["save_every"] = recipe.checkpoint_save_every(
+        "krea2",
+        clock_steps,
+        int(_save_node(source_cell["config"])["save_every"]),
     )
     observation = _validate_h100_observation(
         profile.accelerator_observation,
@@ -4197,8 +4199,10 @@ def freeze_d1_candidate(
         raise HKEContractError("optional E was supplied when the gate was not eligible")
     frozen_config = copy.deepcopy(selected_cell["config"])
     _train_node(frozen_config)["steps"] = selected_step
-    _save_node(frozen_config)["save_every"] = recipe.kill_safe_save_every(
-        selected_step, int(_save_node(selected_cell["config"])["save_every"])
+    _save_node(frozen_config)["save_every"] = recipe.checkpoint_save_every(
+        "krea2",
+        selected_step,
+        int(_save_node(selected_cell["config"])["save_every"]),
     )
     candidate = {
         "arm": selected_arm,
@@ -4303,7 +4307,8 @@ def _validate_frozen_candidate(
         source_cell = plan["cells"]["d1_core"][arm]
     expected_config = copy.deepcopy(source_cell["config"])
     _train_node(expected_config)["steps"] = candidate["checkpoint_step"]
-    _save_node(expected_config)["save_every"] = recipe.kill_safe_save_every(
+    _save_node(expected_config)["save_every"] = recipe.checkpoint_save_every(
+        "krea2",
         candidate["checkpoint_step"],
         int(_save_node(source_cell["config"])["save_every"]),
     )
@@ -4407,8 +4412,10 @@ def build_d2_replication_plan(
         candidate = copy.deepcopy(selected_source)
         _process_node(candidate)["training_seed"] = seed
         _train_node(candidate)["steps"] = selected_step
-        _save_node(candidate)["save_every"] = recipe.kill_safe_save_every(
-            selected_step, int(_save_node(selected_source)["save_every"])
+        _save_node(candidate)["save_every"] = recipe.checkpoint_save_every(
+            "krea2",
+            selected_step,
+            int(_save_node(selected_source)["save_every"]),
         )
         for role, config, bundle, execution_key in (
             ("incumbent", incumbent, INCUMBENT_BUNDLE, "incumbent"),

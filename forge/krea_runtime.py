@@ -1711,12 +1711,15 @@ def timing_contract_projection(cfg: dict[str, Any], *, bundle: str) -> dict[str,
             WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
             WEEK7_FACTORIAL_MULTIRES_BUNDLE,
         }:
+            # Import lazily to avoid a module-cycle at package import time. The
+            # experiment must inherit the exact merged production Krea cadence,
+            # including PR #18's 200-step unsaved-window ceiling.
+            from forge import recipe
+
             concrete_seed = p.get("training_seed")
             concrete_cadence = p["save"].get("save_every")
-            expected_cadence = (
-                max(1, min(200, max(1, concrete_steps // 2), concrete_steps))
-                if concrete_steps < 25
-                else max(1, min(max(25, concrete_steps // 5 + 1), concrete_steps))
+            expected_cadence = recipe.checkpoint_save_every(
+                "krea2", concrete_steps, 200
             )
             if (
                 isinstance(concrete_seed, bool)
@@ -1774,7 +1777,20 @@ def _reference_bundle_projection(bundle: str) -> dict[str, Any]:
         }:
             p["training_seed"] = 42_565_431
         p["train"]["steps"] = 1234
-        p["save"]["save_every"] = 247
+        if bundle in {
+            WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+            WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        }:
+            # Keep the synthetic reference projection on the same production
+            # Krea checkpoint policy as real Week-7 cells.  PR #18 caps the
+            # durable unsaved window at 200 steps.
+            from forge import recipe
+
+            p["save"]["save_every"] = recipe.checkpoint_save_every(
+                "krea2", 1234, 247
+            )
+        else:
+            p["save"]["save_every"] = 247
         if bundle in {LEADER_BUNDLE, LEADER_COMFY_TE_BUNDLE}:
             _apply_source_derived_rank1(cfg)
             if bundle == LEADER_COMFY_TE_BUNDLE:

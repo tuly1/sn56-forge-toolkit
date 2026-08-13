@@ -640,8 +640,8 @@ def test_week7_factorial_timing_source_can_emit_and_produce_profile(
     process["training_seed"] = 42_565_431
     process["train"]["loss_type"] = loss_type
     process["train"]["steps"] = 1200
-    process["save"]["save_every"] = recipe.kill_safe_save_every(
-        1200, int(process["save"]["save_every"])
+    process["save"]["save_every"] = recipe.checkpoint_save_every(
+        "krea2", 1200, int(process["save"]["save_every"])
     )
     cfg, bundle = krea_runtime.materialize_week7_factorial_config(
         cfg, multires_noise=True
@@ -706,6 +706,25 @@ def test_week7_factorial_timing_source_can_emit_and_produce_profile(
         profile["provenance"]["source_generated_config_sha256"]
         == record["generated_config_sha256"]
     )
+
+
+def test_week7_factorial_timing_projection_rejects_pre_pr18_cadence():
+    template_path = Path(krea_runtime.__file__).with_name("templates") / (
+        "base_diffusion_krea2.yaml"
+    )
+    cfg = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    process = cfg["config"]["process"][0]
+    process["training_seed"] = 42_565_431
+    process["train"]["steps"] = 1200
+    process["save"]["save_every"] = 241
+    with pytest.raises(
+        krea_runtime.KreaRuntimeContractError,
+        match="invalid Krea config for timing projection",
+    ):
+        krea_runtime.timing_contract_projection(
+            cfg,
+            bundle=krea_runtime.WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        )
 
 
 def test_week7_multires_factor_fails_closed_when_runtime_capability_is_inert(
