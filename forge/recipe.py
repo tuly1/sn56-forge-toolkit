@@ -710,10 +710,12 @@ SEC_PER_IT = {
     #
     # DOWNSIDE IF WE ARE SLOWER THAN THAT.  A deadline stop DEGRADES depth, it
     # does not forfeit: `_run_toolkit -> _terminate -> _finalize` promotes the
-    # newest valid periodic save.  On the R1 shape `kill_safe_save_every(1432)`
-    # is 287, so a stop anywhere in (1148, 1432) ships 1148 — still 1.4x the 823
-    # we actually shipped on Aug-3, and the fit below puts 1148 at rank ~10, the
-    # same band the 1336 that SEC=1.5 would have produced.  The bet is bounded.
+    # newest valid periodic save.  The Krea-specific recovery policy caps the
+    # R1 shape's cadence at 200, so even a stop immediately before the 1432-step
+    # exact final ships step 1400.  The Aug-10 incident showed why the bound is
+    # needed: its generic 335-step cadence could preserve only step 1340 from a
+    # 1672-step plan after an unexpected child exit.  The recovery bet is now
+    # bounded independently of this throughput constant.
     "krea2": 1.35,
     # ideogram4 3.0 -> 4.2.  NOTE THIS GOES UP, AND IT IS THE ONE PLACE THE TWO
     # WEEK-6 AUDITS DISAGREE.  The field bound of 2.05 s/step was measured on
@@ -1017,8 +1019,8 @@ def first_save_wall_s(model_type, steps, save_every):
 def kill_safe_save_every(steps, template_save_every):
     """Budget about four useful periodic candidates plus the exact final.
 
-    Saving is the only mid-run kill-safety, but each tournament save took tens of
-    seconds.  A fixed candidate budget is easier to reason about than ``steps//8``:
+    Saving is the only mid-run kill-safety and has nonzero I/O cost.  A fixed
+    candidate budget is easier to reason about than ``steps//8``:
     target four periodic saves and do not save more often than every 25 steps on
     short jobs.  The first ordinary candidate lands at about 20% of the planned
     run, while the very-short-run branch emits a recovery point near halfway.
@@ -1044,3 +1046,22 @@ def kill_safe_save_every(steps, template_save_every):
             return int(template_save_every)
         except Exception:
             return 100
+
+
+def checkpoint_save_every(model_type, steps, template_save_every):
+    """Return the recovery cadence, with a Krea-only loss-window ceiling.
+
+    The generic fixed-candidate policy deliberately limits checkpoint I/O, but
+    a deep Krea run can then hold more than 300 optimizer steps only in memory.
+    The Aug-10 field run ended unexpectedly between saves and uploaded step
+    1340 from a 1672-step plan.  Keep every other model byte-for-byte on the
+    existing policy while bounding Krea's worst-case unsaved interval to 199
+    completed steps.  This is a recovery/selection change, not a depth change.
+    """
+    cadence = kill_safe_save_every(steps, template_save_every)
+    try:
+        if str(model_type or "").strip().lower() == "krea2":
+            return max(1, min(int(cadence), 200))
+    except Exception:
+        pass
+    return cadence

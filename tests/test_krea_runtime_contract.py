@@ -194,16 +194,17 @@ def test_incumbent_path_is_the_same_object_and_never_reads_manifest(monkeypatch)
     assert manifest is None
 
 
-def test_incumbent_config_is_golden_equal_to_served_4152f4cd(monkeypatch):
+def test_incumbent_config_is_golden_equal_to_merged_pr18_base(monkeypatch):
     monkeypatch.delenv(krea_runtime.BUNDLE_ENV, raising=False)
 
     cfg = config.build_config(_spec(), num_images=18, hours_to_complete=0.75)
     canonical = json.dumps(cfg, sort_keys=True, separators=(",", ":")).encode()
 
-    # Generated independently from the immutable deployed fallback for this
-    # exact task shape. This catches a "dormant" feature changing the incumbent.
+    # Generated independently from PR #18's immutable squash tree
+    # (8623743f / tree 5297c16b) for this exact task shape. This catches a
+    # dormant experiment changing the newly integrated incumbent control.
     assert hashlib.sha256(canonical).hexdigest() == (
-        "19191fafc831036baf9f3479233427f6df8a1b871ee3988281394729acd06d3a"
+        "98224f1bf6bf73e40ff0a455b3312fae127835492b0ad04770c33d5681d683f3"
     )
 
 
@@ -1405,6 +1406,25 @@ def test_integrated_fake_process_persists_first_and_terminal_observations(
     monkeypatch.setattr(
         adaptive_timing, "emit_first_checkpoint_observation", capture
     )
+    integration_order = []
+    original_completion = aitoolkit._persist_training_completion_observation
+    original_event = aitoolkit.telemetry.event
+
+    def capture_completion(*args, **kwargs):
+        integration_order.append("training_completion_persisted")
+        return original_completion(*args, **kwargs)
+
+    def capture_event(name, **fields):
+        if name.startswith("toolkit_exit_"):
+            integration_order.append(name)
+        return original_event(name, **fields)
+
+    monkeypatch.setattr(
+        aitoolkit,
+        "_persist_training_completion_observation",
+        capture_completion,
+    )
+    monkeypatch.setattr(aitoolkit.telemetry, "event", capture_event)
 
     class Deadline:
         def remaining(self):
@@ -1431,6 +1451,10 @@ def test_integrated_fake_process_persists_first_and_terminal_observations(
     )
     assert result is False
     assert len(calls) == 1
+    assert integration_order == [
+        "training_completion_persisted",
+        "toolkit_exit_zero_present",
+    ]
     assert record["first_checkpoint_observation"]["checkpoint_step"] == 200
     assert record["first_checkpoint_observation"]["active_planned_steps"] == planned
     assert record["first_checkpoint_observation"]["active_plan_mutable"] is False

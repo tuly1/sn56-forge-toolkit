@@ -72,7 +72,7 @@ from forge.data.schema import ImageSpec
 # `num_images` — the only input the depth law takes — is exact.
 # --------------------------------------------------------------------------- #
 REAL_TASKS = [
-    ("41025fb5", 1, "krea2", "design", 21, 18, 0.75, 1000, 824, 1432, 287,
+    ("41025fb5", 1, "krea2", "design", 21, 18, 0.75, 1000, 824, 1432, 200,
      887, (21, 21), {(1024, 768): 21}),
     ("7421f056", 2, "qwen-image", "design", 28, 25, 1.25, 850, 836, 836, 168,
      887, (28, 28), {(1024, 768): 28}),
@@ -89,13 +89,13 @@ REAL_TASKS = [
      873, (0, 15), {(1195, 896): 15}),
     ("241cda6c", 3, "flux", "product", 15, 13, 0.75, 754, 726, 754, 151,
      873, (0, 15), {(1195, 896): 15}),
-    ("db9f7244", 3, "krea2", "design", 43, 38, 1.0, 2012, 1172, 1860, 373,
+    ("db9f7244", 3, "krea2", "design", 43, 38, 1.0, 2012, 1172, 1860, 200,
      758, (26, 43), {(768, 1376): 18, (1408, 768): 17, (1376, 768): 8}),
     ("ff643470", 4, "qwen-image", "social", 41, 36, 1.5, 1095, 1027, 1023, 205,
      887, (41, 41), {(1024, 768): 41}),
     ("1365fa1c", 5, "ideogram4", "product", 14, 12, 0.75, 174, 99, 414, 83,
      None, None, {(1195, 896): 13, (1376, 768): 1}),
-    ("3e0fdcde", 5, "krea2", "design", 42, 37, 1.0, 2012, 1172, 1843, 369,
+    ("3e0fdcde", 5, "krea2", "design", 42, 37, 1.0, 2012, 1172, 1843, 200,
      887, (42, 42), {(1024, 768): 42}),
     ("4782f46f", 5, "qwen-image", "logo", 31, 27, 1.5, 949, 1027, 947, 190,
      747, (31, 31), {(1408, 768): 31}),
@@ -109,7 +109,7 @@ REAL_TASKS = [
     # below, so this column is documentation for this row — but it was wrong.
     ("b72da8c6", 5, "ideogram4", "style", 40, 36, 1.0, 1100, 171, 589, 118,
      None, None, {(1024, 768): 40}),
-    ("f6725c2b", 5, "krea2", "design", 50, 45, 1.0, 2012, 1172, 1974, 395,
+    ("f6725c2b", 5, "krea2", "design", 50, 45, 1.0, 2012, 1172, 1974, 200,
      887, (50, 50), {(1024, 768): 50}),
 ]
 
@@ -540,7 +540,7 @@ def test_materialized_steps(row, dataset_dirs, monkeypatch):
 
 
 @pytest.mark.parametrize("row", REAL_TASKS, ids=IDS)
-def test_save_cadence_leaves_four_periodic_candidates(row, dataset_dirs, monkeypatch):
+def test_save_cadence_bounds_the_recovery_window(row, dataset_dirs, monkeypatch):
     task = row[0]
     after, save_every = row[9], row[10]
     cfg = _build(task, dataset_dirs[task], monkeypatch=monkeypatch)
@@ -551,7 +551,11 @@ def test_save_cadence_leaves_four_periodic_candidates(row, dataset_dirs, monkeyp
     # final after the loop (BaseSDTrainProcess.py:2332,2596-2601).
     periodic = (after - 1) // save_every
     assert periodic >= 3, f"{task}: only {periodic} mid-run recovery points"
-    assert periodic <= 5
+    if row[2] == "krea2":
+        assert save_every <= 200
+        assert periodic <= 9
+    else:
+        assert periodic <= 5
 
 
 @pytest.mark.parametrize("row", REAL_TASKS, ids=IDS)
@@ -796,9 +800,10 @@ def test_no_shape_can_forfeit_even_far_below_its_modelled_rate(row):
 def test_krea2_overrun_degrades_depth_instead_of_forfeiting(tmp_path):
     """Kill-safety for the 1.35 decision, exercised through the real finalizer.
 
-    The R1 plan is 1432 steps with `save_every` 287.  If the box is slower than
-    the field's tightest krea2 bound the run is terminated, and the only thing
-    standing between us and an empty upload is `checkpoints.finalize` promoting
+    The R1 plan is 1432 steps with Krea's `save_every` capped at 200. If the box
+    is slower than the field's tightest krea2 bound the run is terminated. The
+    only thing standing between us and an empty upload is
+    `checkpoints.finalize` promoting
     the newest periodic save.  Verified here at the chosen rate AND at the two
     rejected candidates, so "is 1.35 kill-safe?" is answered by execution rather
     than by argument.
@@ -811,7 +816,7 @@ def test_krea2_overrun_degrades_depth_instead_of_forfeiting(tmp_path):
             _pure_law("krea2", pairs),
             int((hours * 3600.0 * recipe.margin_for("krea2") - 480.0) / sec_per_it),
         )
-        save_every = recipe.kill_safe_save_every(planned, 250)
+        save_every = recipe.checkpoint_save_every("krea2", planned, 250)
         # Terminate the run 1 step before the plan: the worst case that still
         # loses a whole save interval.
         stopped_at = planned - 1
