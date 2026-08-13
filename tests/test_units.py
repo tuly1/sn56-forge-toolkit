@@ -105,6 +105,127 @@ def test_toolkit_log_parser_preserves_exponent_and_terminal_step(tmp_path):
     assert step == 36
 
 
+@pytest.mark.parametrize(
+    ("returncode", "stopped", "checkpoint", "expected"),
+    [
+        (0, False, True, "toolkit_exit_zero_present"),
+        (7, False, True, "toolkit_exit_nonzero_present"),
+        (-9, False, True, "toolkit_exit_signal_present"),
+        (None, False, False, "toolkit_exit_unknown_absent"),
+        (-15, True, True, "toolkit_exit_deadline_present"),
+        (1, True, False, "toolkit_exit_deadline_absent"),
+    ],
+)
+def test_toolkit_exit_classification_is_public_safe(
+    monkeypatch, returncode, stopped, checkpoint, expected
+):
+    emitted = []
+    monkeypatch.setattr(
+        aitoolkit.telemetry,
+        "event",
+        lambda name, **values: emitted.append((name, values)),
+    )
+
+    actual = aitoolkit._record_toolkit_exit(
+        returncode,
+        stopped_by_deadline=stopped,
+        checkpoint_present=checkpoint,
+    )
+
+    assert actual == expected
+    assert emitted == [(expected, {})]
+    assert str(returncode) not in actual
+
+
+def test_toolkit_exit_classification_survives_the_public_projection():
+    from forge import telemetry
+
+    telemetry.start_run(task_id="redacted")
+    name = aitoolkit._record_toolkit_exit(
+        7,
+        stopped_by_deadline=False,
+        checkpoint_present=True,
+    )
+
+    public = telemetry.public_record("0" * 64)
+    exit_events = [event for event in public["events"] if event["name"] == name]
+    assert len(exit_events) == 1
+    assert set(exit_events[0]) == {"t", "name"}
+    assert exit_events[0]["name"] == "toolkit_exit_nonzero_present"
+
+
+def test_truncated_current_checkpoint_is_present_but_not_claimed_salvaged(
+    tmp_path,
+    monkeypatch,
+):
+    """Presence telemetry must not outrun the finalizer's validity decision."""
+    from forge import telemetry
+
+    root = tmp_path / "checkpoints"
+    root.mkdir()
+    scope = checkpoints.begin_run(str(root), "repo")
+    truncated = root / "repo_000000200.safetensors"
+    truncated.write_bytes(b"truncated-current-run-checkpoint")
+
+    class Spec:
+        save_root = str(root)
+        expected_repo_name = "repo"
+        config_path = str(tmp_path / "config.yaml")
+        task_id = "task"
+
+    class Deadline:
+        def remaining(self):
+            return 1000.0
+
+    class FailedChild:
+        returncode = 7
+        pid = 12345
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: FailedChild(),
+    )
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "run",
+        lambda *_args, **_kwargs: aitoolkit.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        ),
+    )
+
+    assert checkpoints.current_loras(str(root), scope) == [str(truncated)]
+    assert aitoolkit._has_current_checkpoint_entry(Spec(), scope) is True
+
+    telemetry.start_run(task_id="redacted")
+    assert aitoolkit._run_toolkit(
+        Spec.config_path,
+        Deadline(),
+        Spec(),
+        scope,
+    ) is False
+    public_names = {
+        event["name"] for event in telemetry.public_record("0" * 64)["events"]
+    }
+    assert "toolkit_exit_nonzero_present" in public_names
+    assert not any("salvaged" in name for name in public_names)
+
+    # Structural validation happens later. The truncated named file is not a
+    # usable artifact and cannot produce checkpoint_finalized.
+    with pytest.raises(RuntimeError, match="no valid current or prior LoRA"):
+        aitoolkit._finalize(Spec(), scope)
+    public_names = {
+        event["name"] for event in telemetry.public_record("0" * 64)["events"]
+    }
+    assert "toolkit_exit_nonzero_present" in public_names
+    assert "checkpoint_unavailable" in public_names
+    assert "checkpoint_finalized" not in public_names
+    assert not (root / "last.safetensors").exists()
+
+
 def test_schema_model_type_normalized():
     s = _spec(model_type="  FLUX ")
     assert s.model_type == "flux"
@@ -318,6 +439,20 @@ def test_recipe_save_every():
     assert recipe.kill_safe_save_every(2, 250) == 1
 
 
+def test_krea_checkpoint_cadence_caps_only_the_unsaved_loss_window():
+    # Replays the Aug-10 plan: generic fixed-candidate cadence was 335, while
+    # the Krea-specific recovery policy now bounds an unexpected-exit haircut
+    # to at most 199 completed steps.
+    assert recipe.kill_safe_save_every(1672, 200) == 335
+    assert recipe.checkpoint_save_every("krea2", 1672, 200) == 200
+    # Short Krea runs retain the existing cadence; the cap never adds I/O when
+    # the generic policy is already tighter.
+    assert recipe.checkpoint_save_every("krea2", 824, 250) == 165
+    # Every untouched model remains exactly on the incumbent policy.
+    for model_type in ("flux", "ideogram4", "z-image", "qwen-image"):
+        assert recipe.checkpoint_save_every(model_type, 1672, 200) == 335
+
+
 # --------------------------------------------------------------------------- #
 # 9. config build per type
 # --------------------------------------------------------------------------- #
@@ -369,6 +504,7 @@ def test_config_krea2():
     # See forge/templates/base_diffusion_krea2.yaml for the full citation and
     # the honest count of the replication.
     assert p["train"]["loss_type"] == "mae"
+    assert p["save"]["save_every"] == 200
     assert p["network"]["lokr_full_rank"] is True
     mk = p["model"]["model_kwargs"]
     assert mk["text_encoder_path"] == "/cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct"

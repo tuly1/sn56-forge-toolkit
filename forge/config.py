@@ -106,12 +106,16 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
                 mk["vae_path"] = spec.cached_model_dir
         except Exception:
             pass
-        # Apply the same fixed candidate/I/O budget even on the degraded path;
-        # the raw template's 200-250 cadence would miss most short jobs.
+        # Apply the same recovery/I/O policy even on the degraded path; the raw
+        # template's fixed cadence would miss most short jobs, while deep Krea
+        # runs need the same 200-step maximum unsaved window as the ordinary
+        # path.
         try:
             p = cfg["config"]["process"][0]
-            p["save"]["save_every"] = recipe.kill_safe_save_every(
-                p["train"]["steps"], p["save"].get("save_every", 250)
+            p["save"]["save_every"] = recipe.checkpoint_save_every(
+                spec.model_type,
+                p["train"]["steps"],
+                p["save"].get("save_every", 250),
             )
         except Exception:
             pass
@@ -148,8 +152,8 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
         spec.model_type, num_images, hours_to_complete, template_steps
     )
     p["train"]["steps"] = steps
-    p["save"]["save_every"] = recipe.kill_safe_save_every(
-        steps, p["save"].get("save_every", 250)
+    p["save"]["save_every"] = recipe.checkpoint_save_every(
+        spec.model_type, steps, p["save"].get("save_every", 250)
     )
 
     _apply_eval_geometry(p, spec)
