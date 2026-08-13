@@ -44,6 +44,8 @@ RENDERER_SOURCE_PATH = "ops/experiments/week7/hke_procedural_renderer.py"
 FACTOR_AUTHORITY_SOURCE_PATH = "ops/experiments/week7/run_hke_factorial.py"
 ADMISSION_SOURCE_PATH = "ops/experiments/week7/hke_fixture_admission.py"
 _ACTIVE_PRIVATE_AUTHORITIES: list["_PrivateAuthority"] | None = None
+_ACTIVE_ADMISSION_OUTPUTS: list["_AdmissionOutputAuthority"] | None = None
+_ACTIVE_PHASE_KEY_PAIR: Any | None = None
 
 
 class AdmissionError(RuntimeError):
@@ -97,6 +99,266 @@ class _PrivateAuthority:
 
     def close(self) -> None:
         for descriptor in (self.leaf_descriptor, self.parent_descriptor):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+class _AdmissionOutputAuthority:
+    """Retain exact public admission bytes until every CLI authority closes."""
+
+    def __init__(
+        self,
+        *,
+        root: Any,
+        public_root: Path,
+        custodian_root: Path,
+    ) -> None:
+        self.root = root
+        self.public_root = renderer._absolute(public_root)
+        self.custodian_root = renderer._absolute(custodian_root)
+        self._files: list[tuple[int, int, os.stat_result, str, bytes]] = []
+
+    @classmethod
+    def create(
+        cls,
+        path: Path,
+        *,
+        public_root: Path,
+        custodian_root: Path,
+    ) -> "_AdmissionOutputAuthority":
+        path = renderer._absolute(path)
+        if renderer._paths_overlap(path, public_root) or renderer._paths_overlap(
+            path, custodian_root
+        ):
+            raise AdmissionError(
+                "admission output must be disjoint from candidate trees"
+            )
+        try:
+            binding = renderer._BoundDirectory.create(path, "admission output")
+        except renderer.FixtureError as exc:
+            raise AdmissionError(str(exc)) from exc
+        result = cls(
+            root=binding,
+            public_root=public_root,
+            custodian_root=custodian_root,
+        )
+        try:
+            result.verify()
+        except BaseException:
+            result.close()
+            raise
+        return result
+
+    @staticmethod
+    def _read_descriptor(descriptor: int, label: str) -> bytes:
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                chunks.append(block)
+            return b"".join(chunks)
+        except OSError as exc:
+            raise AdmissionError(f"{label} descriptor is unreadable") from exc
+
+    def verify(self) -> None:
+        self.root.assert_live()
+        if renderer._paths_overlap(
+            self.root.path, self.public_root
+        ) or renderer._paths_overlap(self.root.path, self.custodian_root):
+            raise AdmissionError(
+                "admission output moved into a candidate tree before completion"
+            )
+        for write_descriptor, read_descriptor, expected, name, payload in self._files:
+            try:
+                held = os.fstat(read_descriptor)
+                writable = os.fstat(write_descriptor)
+                linked = os.stat(
+                    name,
+                    dir_fd=self.root.descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise AdmissionError(
+                    "admission output changed before completion"
+                ) from exc
+            expected_identity = (
+                expected.st_dev,
+                expected.st_ino,
+                expected.st_size,
+            )
+            if (
+                not stat.S_ISREG(held.st_mode)
+                or not stat.S_ISREG(writable.st_mode)
+                or not stat.S_ISREG(linked.st_mode)
+                or held.st_nlink != 1
+                or writable.st_nlink != 1
+                or linked.st_nlink != 1
+                or (held.st_dev, held.st_ino, held.st_size) != expected_identity
+                or (writable.st_dev, writable.st_ino, writable.st_size)
+                != expected_identity
+                or (linked.st_dev, linked.st_ino, linked.st_size)
+                != expected_identity
+                or not hmac.compare_digest(
+                    self._read_descriptor(read_descriptor, "admission output"),
+                    payload,
+                )
+            ):
+                raise AdmissionError(
+                    "admission output changed before completion"
+                )
+            self.root.assert_live()
+        try:
+            live_names = sorted(
+                name
+                for name in os.listdir(self.root.descriptor)
+                if name not in {".", ".."}
+            )
+        except OSError as exc:
+            raise AdmissionError("admission output inventory is unavailable") from exc
+        if live_names != sorted(name for _w, _r, _m, name, _p in self._files):
+            raise AdmissionError("admission output inventory changed before completion")
+        self.root.assert_live()
+
+    def write(self, name: str, value: Any) -> str:
+        payload = canonical_bytes(value)
+        retained_write: tuple[int, os.stat_result] | None = None
+
+        def bind(descriptor: int, metadata: os.stat_result) -> None:
+            nonlocal retained_write
+            self.root.assert_live()
+            retained_write = (os.dup(descriptor), metadata)
+
+        try:
+            renderer._write_exclusive_at(
+                self.root.descriptor,
+                name,
+                payload,
+                post_write_validation=bind,
+            )
+        except FileExistsError as exc:
+            raise AdmissionError(
+                f"refusing to overwrite admission output: {name}"
+            ) from exc
+        except renderer.FixtureError as exc:
+            raise AdmissionError(str(exc)) from exc
+        if retained_write is None:
+            raise AdmissionError("admission output inode was not retained")
+        write_descriptor, metadata = retained_write
+        read_descriptor: int | None = None
+        try:
+            read_descriptor = os.open(
+                name,
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=self.root.descriptor,
+            )
+            read_metadata = os.fstat(read_descriptor)
+            if (read_metadata.st_dev, read_metadata.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise AdmissionError("admission output changed during publication")
+        except BaseException:
+            try:
+                os.ftruncate(write_descriptor, 0)
+                os.fsync(write_descriptor)
+            except OSError:
+                pass
+            os.close(write_descriptor)
+            if read_descriptor is not None:
+                os.close(read_descriptor)
+            raise
+        try:
+            self._files.append(
+                (write_descriptor, read_descriptor, metadata, name, payload)
+            )
+        except BaseException:
+            # The pathname already contains authoritative-looking JSON, but it
+            # is not yet reachable through ``self._files``.  Invalidate the
+            # exact retained inode here so outer cleanup cannot miss it.
+            try:
+                os.ftruncate(write_descriptor, 0)
+                os.fsync(write_descriptor)
+            except OSError:
+                pass
+            for descriptor in (read_descriptor, write_descriptor):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+        try:
+            self.verify()
+        except BaseException:
+            self.scrub()
+            raise
+        return hashlib.sha256(payload).hexdigest()
+
+    def scrub(self) -> None:
+        for descriptor, _reader, _metadata, _name, _payload in self._files:
+            try:
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+            except OSError:
+                pass
+
+    def retain_rollback(self) -> "_AdmissionOutputRollback":
+        """Duplicate write-only inode handles for post-authority rollback."""
+
+        descriptors: list[int] = []
+        try:
+            for descriptor, _reader, _metadata, _name, _payload in self._files:
+                duplicate = os.dup(descriptor)
+                try:
+                    descriptors.append(duplicate)
+                except BaseException:
+                    os.close(duplicate)
+                    raise
+        except BaseException:
+            for descriptor in descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+        return _AdmissionOutputRollback(tuple(descriptors))
+
+    def close(self, *, verify: bool = False) -> None:
+        if verify:
+            self.verify()
+        for descriptor, reader, _metadata, _name, _payload in reversed(self._files):
+            for item in (reader, descriptor):
+                try:
+                    os.close(item)
+                except OSError:
+                    pass
+        self._files.clear()
+        self.root.close()
+
+
+@dataclass(frozen=True)
+class _AdmissionOutputRollback:
+    """Raw inode handles that can only invalidate or close public receipts."""
+
+    descriptors: tuple[int, ...]
+
+    def scrub(self) -> None:
+        for descriptor in self.descriptors:
+            try:
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        for descriptor in reversed(self.descriptors):
             try:
                 os.close(descriptor)
             except OSError:
@@ -558,30 +820,89 @@ def _retain_private_authority(
 
 
 def _close_private_authorities(*, verify: bool, scrub_outputs: bool) -> None:
-    """Final-check and release all CLI private leases before success return."""
+    """Final-check and release every CLI authority before success return."""
 
     if _ACTIVE_PRIVATE_AUTHORITIES is None:
         return
     authorities = list(_ACTIVE_PRIVATE_AUTHORITIES)
     _ACTIVE_PRIVATE_AUTHORITIES.clear()
+    admission_outputs = list(_ACTIVE_ADMISSION_OUTPUTS or ())
+    if _ACTIVE_ADMISSION_OUTPUTS is not None:
+        _ACTIVE_ADMISSION_OUTPUTS.clear()
     verification_error: BaseException | None = None
-    if verify:
+    close_error: BaseException | None = None
+    rollbacks: list[_AdmissionOutputRollback] = []
+    for output in admission_outputs:
         try:
-            for authority in authorities:
-                authority.verify()
+            rollbacks.append(output.retain_rollback())
         except BaseException as exc:
             scrub_outputs = True
-            verification_error = exc
+            output.scrub()
+            if verification_error is None:
+                verification_error = exc
     if scrub_outputs:
         for authority in authorities:
             authority.scrub()
-    close_error: BaseException | None = None
+        for output in admission_outputs:
+            output.scrub()
+    # Joint terminal gate: private inputs/outputs, public admission receipts,
+    # and both key authorities remain descriptor-bound throughout both passes.
+    # Its completion is the semantic commit point; no governed check follows.
+    if verify and verification_error is None:
+        try:
+            for _pass in range(2):
+                for authority in authorities:
+                    authority.verify()
+                for output in admission_outputs:
+                    output.verify()
+                if _ACTIVE_PHASE_KEY_PAIR is not None:
+                    _ACTIVE_PHASE_KEY_PAIR.verify()
+        except BaseException as exc:
+            scrub_outputs = True
+            verification_error = (
+                AdmissionError(str(exc))
+                if isinstance(exc, renderer.FixtureError)
+                else exc
+            )
+    if scrub_outputs:
+        for authority in authorities:
+            authority.scrub()
+        for output in admission_outputs:
+            output.scrub()
+    # After the joint gate, release authorities without semantic/path checks.
+    # Only raw rollback fds survive these releases.
+    for output in reversed(admission_outputs):
+        try:
+            output.close(verify=False)
+        except BaseException as exc:
+            scrub_outputs = True
+            if close_error is None:
+                close_error = exc
     for authority in reversed(authorities):
         try:
             authority.close()
         except BaseException as exc:
+            scrub_outputs = True
             if close_error is None:
                 close_error = exc
+    if _ACTIVE_PHASE_KEY_PAIR is not None:
+        try:
+            _ACTIVE_PHASE_KEY_PAIR.close(verify=False)
+        except BaseException as exc:
+            scrub_outputs = True
+            if verification_error is None:
+                verification_error = (
+                    AdmissionError(str(exc))
+                    if isinstance(exc, renderer.FixtureError)
+                    else exc
+                )
+    # Raw fds can only invalidate exact inodes or close, so every terminal
+    # failure leaves no consumable admission receipt.
+    if scrub_outputs or verification_error is not None or close_error is not None:
+        for rollback in rollbacks:
+            rollback.scrub()
+    for rollback in reversed(rollbacks):
+        rollback.close()
     if verification_error is not None:
         raise verification_error
     if close_error is not None:
@@ -2125,10 +2446,6 @@ def validate_confirmation_reveal(
     return dict(value)
 
 
-def _read_key(path: Path, label: str) -> bytes:
-    return renderer._read_key_file(Path(path), label)
-
-
 def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2181,26 +2498,46 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    global _ACTIVE_PRIVATE_AUTHORITIES
+    global _ACTIVE_PRIVATE_AUTHORITIES, _ACTIVE_ADMISSION_OUTPUTS
+    global _ACTIVE_PHASE_KEY_PAIR
 
     args = _parse(argv)
-    if _ACTIVE_PRIVATE_AUTHORITIES is not None:
-        raise AdmissionError("private authority scope is already active")
+    if (
+        _ACTIVE_PRIVATE_AUTHORITIES is not None
+        or _ACTIVE_ADMISSION_OUTPUTS is not None
+        or _ACTIVE_PHASE_KEY_PAIR is not None
+    ):
+        raise AdmissionError("CLI authority scope is already active")
     _ACTIVE_PRIVATE_AUTHORITIES = []
+    _ACTIVE_ADMISSION_OUTPUTS = []
     succeeded = False
+    finalization_error: BaseException | None = None
     try:
         result = _main_with_held_private_descriptors(args)
         succeeded = True
         return result
     finally:
         try:
-            _close_private_authorities(verify=succeeded, scrub_outputs=not succeeded)
+            try:
+                _close_private_authorities(
+                    verify=succeeded, scrub_outputs=not succeeded
+                )
+            except BaseException as exc:
+                succeeded = False
+                if finalization_error is None:
+                    finalization_error = exc
         finally:
+            _ACTIVE_PHASE_KEY_PAIR = None
+            _ACTIVE_ADMISSION_OUTPUTS = None
             _ACTIVE_PRIVATE_AUTHORITIES = None
+        if finalization_error is not None:
+            raise finalization_error
 
 
 def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
     """Keep private authority leases open through the CLI process boundary."""
+
+    global _ACTIVE_PHASE_KEY_PAIR
 
     private_scope = {
         "public_root": args.public_root,
@@ -2278,28 +2615,108 @@ def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
             args.output, value, label="confirmation reveal", **private_scope
         )
         return 0
-    sealed = _load_private_json(
-        args.sealed_review,
-        label="sealed human review",
-        **private_scope,
-    )
-    root, receipts = build_admissions(
-        public_root=args.public_root,
-        custodian_root=args.custodian_root,
-        discovery_key=_read_key(args.discovery_key_file, "discovery key"),
-        confirmation_key=_read_key(args.confirmation_key_file, "confirmation key"),
-        public_boundary_roots=args.public_boundary_roots,
-        sealed_review=sealed,
-    )
-    if renderer._paths_overlap(
-        args.output_root, args.public_root
-    ) or renderer._paths_overlap(args.output_root, args.custodian_root):
-        raise AdmissionError("admission output must be disjoint from candidate trees")
-    output_root = renderer._ensure_new_root(args.output_root, "admission output")
-    _write_new(output_root / "ADMISSION-SET.json", root)
-    for family, receipt in receipts.items():
-        _write_new(output_root / f"{family}.json", receipt)
-    return 0
+    retained = _ACTIVE_PRIVATE_AUTHORITIES is not None
+    pair = None
+    local_output: _AdmissionOutputAuthority | None = None
+    local_succeeded = False
+    try:
+        try:
+            pair = renderer._BoundPhaseKeyPair.open(
+                discovery_path=args.discovery_key_file,
+                confirmation_path=args.confirmation_key_file,
+                public_root=args.public_root,
+                custodian_root=args.custodian_root,
+                public_boundary_roots=args.public_boundary_roots,
+            )
+        except renderer.FixtureError as exc:
+            raise AdmissionError(str(exc)) from exc
+        if retained:
+            if _ACTIVE_PHASE_KEY_PAIR is not None:
+                raise AdmissionError("phase-key authority scope is already active")
+            _ACTIVE_PHASE_KEY_PAIR = pair
+        sealed = _load_private_json(
+            args.sealed_review,
+            label="sealed human review",
+            **private_scope,
+        )
+        root, receipts = build_admissions(
+            public_root=args.public_root,
+            custodian_root=args.custodian_root,
+            discovery_key=pair.discovery.payload,
+            confirmation_key=pair.confirmation.payload,
+            public_boundary_roots=args.public_boundary_roots,
+            sealed_review=sealed,
+        )
+        output_authority = _AdmissionOutputAuthority.create(
+            args.output_root,
+            public_root=args.public_root,
+            custodian_root=args.custodian_root,
+        )
+        retained_output = _ACTIVE_ADMISSION_OUTPUTS is not None
+        try:
+            output_authority.write("ADMISSION-SET.json", root)
+            for family, receipt in receipts.items():
+                output_authority.write(f"{family}.json", receipt)
+            if retained_output:
+                _ACTIVE_ADMISSION_OUTPUTS.append(output_authority)
+            else:
+                local_output = output_authority
+        except BaseException:
+            output_authority.scrub()
+            output_authority.close()
+            raise
+        local_succeeded = True
+        return 0
+    finally:
+        finalization_error: BaseException | None = None
+        local_rollback: _AdmissionOutputRollback | None = None
+        if local_output is not None:
+            try:
+                local_rollback = local_output.retain_rollback()
+            except BaseException as exc:
+                local_succeeded = False
+                local_output.scrub()
+                finalization_error = exc
+        if local_succeeded and finalization_error is None:
+            try:
+                for _pass in range(2):
+                    if local_output is not None:
+                        local_output.verify()
+                    if pair is not None:
+                        pair.verify()
+            except BaseException as exc:
+                local_succeeded = False
+                finalization_error = (
+                    AdmissionError(str(exc))
+                    if isinstance(exc, renderer.FixtureError)
+                    else exc
+                )
+        if local_output is not None:
+            try:
+                if not local_succeeded:
+                    local_output.scrub()
+                local_output.close(verify=False)
+            except BaseException as exc:
+                local_succeeded = False
+                if finalization_error is None:
+                    finalization_error = exc
+        if pair is not None and not retained:
+            try:
+                pair.close(verify=False)
+            except BaseException as exc:
+                local_succeeded = False
+                if finalization_error is None:
+                    finalization_error = (
+                        AdmissionError(str(exc))
+                        if isinstance(exc, renderer.FixtureError)
+                        else exc
+                    )
+        if local_rollback is not None:
+            if not local_succeeded or finalization_error is not None:
+                local_rollback.scrub()
+            local_rollback.close()
+        if finalization_error is not None:
+            raise finalization_error
 
 
 if __name__ == "__main__":  # pragma: no cover

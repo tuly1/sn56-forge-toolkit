@@ -54,6 +54,27 @@ def _rewrite_semantic(path: Path, value: dict) -> None:
     path.write_bytes(renderer.canonical_bytes(value) + b"\n")
 
 
+def _write_phase_key(path: Path, payload: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    path.chmod(0o600)
+    return path
+
+
+def _phase_key_scope(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
+    boundary = tmp_path / "key-public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "key-custodian"
+    discovery = _write_phase_key(
+        tmp_path / "keys" / "discovery.key", DISCOVERY_KEY
+    )
+    confirmation = _write_phase_key(
+        tmp_path / "keys" / "confirmation.key", CONFIRMATION_KEY
+    )
+    return boundary, public, custodian, discovery, confirmation
+
+
 @pytest.fixture(scope="module")
 def built(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path, dict]:
     root = tmp_path_factory.mktemp("week7-hke-renderer")
@@ -959,6 +980,517 @@ def test_generation_completion_rechecks_roots_after_retained_file_validation(
     )
 
 
+@pytest.mark.parametrize("forbidden_kind", ("public", "custodian", "worktree"))
+def test_phase_key_pair_rejects_governed_locations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forbidden_kind: str,
+) -> None:
+    boundary, public, custodian, discovery, confirmation = _phase_key_scope(tmp_path)
+    if forbidden_kind == "public":
+        discovery = _write_phase_key(boundary / "published.key", DISCOVERY_KEY)
+    elif forbidden_kind == "custodian":
+        discovery = _write_phase_key(custodian / "private.key", DISCOVERY_KEY)
+    else:
+        worktree = tmp_path / "registered-worktree"
+        discovery = _write_phase_key(worktree / "phase.key", DISCOVERY_KEY)
+        monkeypatch.setattr(
+            renderer,
+            "_registered_worktree_roots",
+            lambda: (renderer.EXECUTABLE_REPOSITORY_ROOT, worktree),
+        )
+
+    with pytest.raises(renderer.FixtureError, match="must be outside"):
+        renderer._BoundPhaseKeyPair.open(
+            discovery_path=discovery,
+            confirmation_path=confirmation,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(boundary,),
+        )
+
+
+def test_phase_key_pair_rejects_same_path_and_hard_linked_inode(
+    tmp_path: Path,
+) -> None:
+    boundary, public, custodian, discovery, confirmation = _phase_key_scope(tmp_path)
+    with pytest.raises(renderer.FixtureError, match="paths must be distinct"):
+        renderer._BoundPhaseKeyPair.open(
+            discovery_path=discovery,
+            confirmation_path=discovery,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(boundary,),
+        )
+
+    confirmation.unlink()
+    os.link(discovery, confirmation)
+    assert discovery.samefile(confirmation)
+    with pytest.raises(
+        renderer.FixtureError,
+        match="paths must be distinct|single-link regular file",
+    ):
+        renderer._BoundPhaseKeyPair.open(
+            discovery_path=discovery,
+            confirmation_path=confirmation,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(boundary,),
+        )
+
+
+def test_phase_key_pair_rejects_unrelated_git_repository_and_late_init(
+    tmp_path: Path,
+) -> None:
+    boundary, public, custodian, discovery, confirmation = _phase_key_scope(tmp_path)
+    repository = tmp_path / "standalone-repository"
+    repository.mkdir()
+    subprocess.run(
+        ["/usr/bin/git", "init", "-q", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    discovery_in_repo = _write_phase_key(repository / "discovery.key", DISCOVERY_KEY)
+    with pytest.raises(renderer.FixtureError, match="every Git repository"):
+        renderer._BoundPhaseKeyPair.open(
+            discovery_path=discovery_in_repo,
+            confirmation_path=confirmation,
+            public_root=public,
+            custodian_root=custodian,
+            public_boundary_roots=(boundary,),
+        )
+
+    pair = renderer._BoundPhaseKeyPair.open(
+        discovery_path=discovery,
+        confirmation_path=confirmation,
+        public_root=public,
+        custodian_root=custodian,
+        public_boundary_roots=(boundary,),
+    )
+    try:
+        subprocess.run(
+            ["/usr/bin/git", "init", "-q", str(discovery.parent)],
+            check=True,
+            capture_output=True,
+        )
+        with pytest.raises(renderer.FixtureError, match="every Git repository"):
+            pair.verify()
+    finally:
+        pair.close(verify=False)
+
+
+@pytest.mark.parametrize("mutation", ("rewrite", "mode", "replace", "hardlink"))
+def test_phase_key_pair_revalidates_inode_payload_permissions_and_links(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    boundary, public, custodian, discovery, confirmation = _phase_key_scope(tmp_path)
+    pair = renderer._BoundPhaseKeyPair.open(
+        discovery_path=discovery,
+        confirmation_path=confirmation,
+        public_root=public,
+        custodian_root=custodian,
+        public_boundary_roots=(boundary,),
+    )
+    try:
+        if mutation == "rewrite":
+            discovery.write_bytes(b"x" * len(DISCOVERY_KEY))
+        elif mutation == "mode":
+            discovery.chmod(0o644)
+        elif mutation == "replace":
+            replacement = _write_phase_key(
+                discovery.with_suffix(".replacement"), DISCOVERY_KEY
+            )
+            os.replace(replacement, discovery)
+        else:
+            os.link(discovery, boundary / "late-publication.key")
+        with pytest.raises(
+            renderer.FixtureError,
+            match="payload changed|inode, permissions, or link count changed",
+        ):
+            pair.verify()
+    finally:
+        pair.close(verify=False)
+
+
+def test_phase_key_pair_holds_and_closes_descriptors(
+    tmp_path: Path,
+) -> None:
+    boundary, public, custodian, discovery, confirmation = _phase_key_scope(tmp_path)
+    pair = renderer._BoundPhaseKeyPair.open(
+        discovery_path=discovery,
+        confirmation_path=confirmation,
+        public_root=public,
+        custodian_root=custodian,
+        public_boundary_roots=(boundary,),
+    )
+    descriptors = (pair.discovery.descriptor, pair.confirmation.descriptor)
+    assert all(os.fstat(descriptor).st_nlink == 1 for descriptor in descriptors)
+    pair.close(verify=True)
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.parametrize("tail_mutation", ("relocate", "late-worktree"))
+def test_renderer_cli_revalidates_phase_keys_before_printing_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tail_mutation: str,
+) -> None:
+    boundary, public, custodian, discovery, confirmation = _phase_key_scope(tmp_path)
+    key_parent = discovery.parent
+    emitted: list[str] = []
+    late_inventory = False
+    original_worktrees = renderer._registered_worktree_roots
+
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "build",
+            "public_output": public,
+            "custodian_output": custodian,
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "public_boundary_roots": (boundary,),
+            "generator_commit": GENERATOR_COMMIT,
+            "generator_tree": GENERATOR_TREE,
+            **RIGHTS,
+        },
+    )()
+
+    def worktrees():
+        roots = original_worktrees()
+        return roots + ((key_parent,) if late_inventory else ())
+
+    def build_then_mutate(**kwargs):
+        nonlocal late_inventory
+        assert kwargs["discovery_key"] == DISCOVERY_KEY
+        assert kwargs["confirmation_key"] == CONFIRMATION_KEY
+        if tail_mutation == "relocate":
+            key_parent.rename(boundary / "published-keys")
+        else:
+            late_inventory = True
+        return {"status": "candidate_unreviewed"}
+
+    monkeypatch.setattr(renderer, "_parse", lambda _argv: args)
+    monkeypatch.setattr(renderer, "_registered_worktree_roots", worktrees)
+    monkeypatch.setattr(renderer, "build_candidate", build_then_mutate)
+    monkeypatch.setattr(renderer, "print", emitted.append, raising=False)
+    with pytest.raises(renderer.FixtureError):
+        renderer.main([])
+    assert emitted == []
+    assert renderer._ACTIVE_PHASE_KEY_PAIR is None
+    assert renderer._ACTIVE_CUSTODY_SESSIONS is None
+
+
+def test_renderer_joint_terminal_gate_revalidates_phase_key_before_raw_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary, public, custodian, discovery, confirmation = _phase_key_scope(tmp_path)
+    emitted: list[str] = []
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "build",
+            "public_output": public,
+            "custodian_output": custodian,
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "public_boundary_roots": (boundary,),
+            "generator_commit": GENERATOR_COMMIT,
+            "generator_tree": GENERATOR_TREE,
+            **RIGHTS,
+        },
+    )()
+    original_verify = renderer._BoundPhaseKeyPair.verify
+    mutated = False
+    verify_calls = 0
+
+    def mutate_between_joint_passes(self):
+        nonlocal mutated, verify_calls
+        verify_calls += 1
+        result = original_verify(self)
+        if verify_calls == 1:
+            discovery.write_bytes(b"z" * len(DISCOVERY_KEY))
+            mutated = True
+        return result
+
+    monkeypatch.setattr(renderer, "_parse", lambda _argv: args)
+    monkeypatch.setattr(
+        renderer,
+        "build_candidate",
+        lambda **_kwargs: {"status": "candidate_unreviewed"},
+    )
+    monkeypatch.setattr(
+        renderer._BoundPhaseKeyPair, "verify", mutate_between_joint_passes
+    )
+    monkeypatch.setattr(renderer, "print", emitted.append, raising=False)
+    with pytest.raises(renderer.FixtureError, match="payload changed"):
+        renderer.main([])
+    assert mutated is True
+    assert emitted == []
+    assert renderer._ACTIVE_PHASE_KEY_PAIR is None
+    assert renderer._ACTIVE_CUSTODY_SESSIONS is None
+
+
+def test_renderer_terminal_closes_custody_before_keys_and_scrubs_on_key_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "terminal-order-public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "terminal-order-custodian"
+    discovery = _write_phase_key(
+        tmp_path / "terminal-order-keys" / "discovery.key", DISCOVERY_KEY
+    )
+    confirmation = _write_phase_key(
+        tmp_path / "terminal-order-keys" / "confirmation.key", CONFIRMATION_KEY
+    )
+    tiny = dict(renderer.FIXTURE_CONTRACT[0])
+    tiny.update(
+        {
+            "discovery_packs": [
+                {"pack": "D1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "confirmation_packs": [
+                {"pack": "C1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "discovery_count": 2,
+            "confirmation_count": 2,
+        }
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "build",
+            "public_output": public,
+            "custodian_output": custodian,
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "public_boundary_roots": (boundary,),
+            "generator_commit": GENERATOR_COMMIT,
+            "generator_tree": GENERATOR_TREE,
+            **RIGHTS,
+        },
+    )()
+    original_assert_live = renderer._CustodySession.assert_live
+    original_verify = renderer._CustodySession.verify
+    original_duplicate = renderer._CustodySession.duplicate_private_rollback_descriptors
+    original_pair_verify = renderer._BoundPhaseKeyPair.verify
+    pair_verify_started = False
+    pair_verify_finished = False
+    pair_verify_calls = 0
+    rewritten = False
+    private_paths: list[Path] = []
+    events: list[str] = []
+    emitted: list[str] = []
+
+    def assert_session_authority_open(event: str) -> None:
+        assert not pair_verify_finished, (
+            f"custody authority {event} ran after the joint terminal gate"
+        )
+        events.append(event)
+
+    def tracked_assert_live(self):
+        assert_session_authority_open("session.assert_live")
+        return original_assert_live(self)
+
+    def tracked_verify(self):
+        assert_session_authority_open("session.verify")
+        return original_verify(self)
+
+    def tracked_duplicate(self):
+        assert_session_authority_open("session.duplicate_rollback")
+        return original_duplicate(self)
+
+    def verify_then_rewrite_key(self):
+        nonlocal rewritten
+        assert_session_authority_open("session.verify")
+        result = original_verify(self)
+        private_paths.extend(
+            path.relative_to(custodian)
+            for path in sorted(custodian.rglob("*"))
+            if path.is_file()
+        )
+        assert private_paths
+        assert all((custodian / path).read_bytes() for path in private_paths)
+        discovery.write_bytes(b"z" * len(DISCOVERY_KEY))
+        rewritten = True
+        events.append("session.verified-and-key-rewritten")
+        return result
+
+    def tracked_pair_verify(self):
+        nonlocal pair_verify_started, pair_verify_finished, pair_verify_calls
+        pair_verify_calls += 1
+        if pair_verify_calls == 1:
+            return original_pair_verify(self)
+        assert rewritten is True
+        assert events[-1] == "session.verified-and-key-rewritten"
+        pair_verify_started = True
+        events.append("pair.verify")
+        try:
+            return original_pair_verify(self)
+        finally:
+            pair_verify_finished = True
+            events.append("pair.verified")
+
+    monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    monkeypatch.setattr(renderer, "_parse", lambda _argv: args)
+    monkeypatch.setattr(renderer._CustodySession, "assert_live", tracked_assert_live)
+    monkeypatch.setattr(renderer._CustodySession, "verify", verify_then_rewrite_key)
+    monkeypatch.setattr(
+        renderer._CustodySession,
+        "duplicate_private_rollback_descriptors",
+        tracked_duplicate,
+    )
+    monkeypatch.setattr(renderer._BoundPhaseKeyPair, "verify", tracked_pair_verify)
+    monkeypatch.setattr(renderer, "print", emitted.append, raising=False)
+
+    with pytest.raises(renderer.FixtureError, match="payload changed"):
+        renderer.main([])
+
+    assert pair_verify_started is True
+    assert pair_verify_finished is True
+    assert emitted == []
+    assert all((custodian / path).read_bytes() == b"" for path in private_paths)
+    assert events[-2:] == ["pair.verify", "pair.verified"]
+    assert renderer._ACTIVE_PHASE_KEY_PAIR is None
+    assert renderer._ACTIVE_CUSTODY_SESSIONS is None
+
+
+def test_renderer_reporting_failure_scrubs_descriptor_bound_private_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "reporting-failure-public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "reporting-failure-custodian"
+    discovery = _write_phase_key(
+        tmp_path / "reporting-failure-keys" / "discovery.key", DISCOVERY_KEY
+    )
+    confirmation = _write_phase_key(
+        tmp_path / "reporting-failure-keys" / "confirmation.key", CONFIRMATION_KEY
+    )
+    tiny = dict(renderer.FIXTURE_CONTRACT[0])
+    tiny.update(
+        {
+            "discovery_packs": [
+                {"pack": "D1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "confirmation_packs": [
+                {"pack": "C1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "discovery_count": 2,
+            "confirmation_count": 2,
+        }
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "build",
+            "public_output": public,
+            "custodian_output": custodian,
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "public_boundary_roots": (boundary,),
+            "generator_commit": GENERATOR_COMMIT,
+            "generator_tree": GENERATOR_TREE,
+            **RIGHTS,
+        },
+    )()
+    private_paths: list[Path] = []
+
+    def fail_reporting(_value: str) -> None:
+        private_paths.extend(
+            path.relative_to(custodian)
+            for path in sorted(custodian.rglob("*"))
+            if path.is_file()
+        )
+        assert private_paths
+        assert all((custodian / path).read_bytes() for path in private_paths)
+        raise BrokenPipeError("simulated stdout failure")
+
+    monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    monkeypatch.setattr(renderer, "_parse", lambda _argv: args)
+    monkeypatch.setattr(renderer, "print", fail_reporting, raising=False)
+    with pytest.raises(BrokenPipeError, match="stdout failure"):
+        renderer.main([])
+    assert all((custodian / path).read_bytes() == b"" for path in private_paths)
+    assert renderer._ACTIVE_PHASE_KEY_PAIR is None
+    assert renderer._ACTIVE_CUSTODY_SESSIONS is None
+
+
+def test_renderer_session_registration_failure_scrubs_private_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "registration-failure-public-boundary"
+    boundary.mkdir()
+    public = boundary / "candidate"
+    custodian = tmp_path / "registration-failure-custodian"
+    discovery = _write_phase_key(
+        tmp_path / "registration-failure-keys" / "discovery.key", DISCOVERY_KEY
+    )
+    confirmation = _write_phase_key(
+        tmp_path / "registration-failure-keys" / "confirmation.key", CONFIRMATION_KEY
+    )
+    tiny = dict(renderer.FIXTURE_CONTRACT[0])
+    tiny.update(
+        {
+            "discovery_packs": [
+                {"pack": "D1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "confirmation_packs": [
+                {"pack": "C1", "training_count": 1, "evaluation_count": 1}
+            ],
+            "discovery_count": 2,
+            "confirmation_count": 2,
+        }
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "build",
+            "public_output": public,
+            "custodian_output": custodian,
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "public_boundary_roots": (boundary,),
+            "generator_commit": GENERATOR_COMMIT,
+            "generator_tree": GENERATOR_TREE,
+            **RIGHTS,
+        },
+    )()
+    original_build = renderer._build_candidate_in_session
+
+    class RejectingList(list):
+        def append(self, _value) -> None:
+            raise MemoryError("simulated session-retention failure")
+
+    def build_then_reject_registration(**kwargs):
+        result = original_build(**kwargs)
+        renderer._ACTIVE_CUSTODY_SESSIONS = RejectingList()
+        return result
+
+    monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    monkeypatch.setattr(renderer, "_parse", lambda _argv: args)
+    monkeypatch.setattr(
+        renderer, "_build_candidate_in_session", build_then_reject_registration
+    )
+    with pytest.raises(MemoryError, match="session-retention failure"):
+        renderer.main([])
+    private_files = [path for path in custodian.rglob("*") if path.is_file()]
+    assert private_files
+    assert all(path.read_bytes() == b"" for path in private_files)
+    assert renderer._ACTIVE_PHASE_KEY_PAIR is None
+    assert renderer._ACTIVE_CUSTODY_SESSIONS is None
+
+
 def test_renderer_cli_revalidates_custody_after_build_helper_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -981,6 +1513,12 @@ def test_renderer_cli_revalidates_custody_after_build_helper_returns(
         }
     )
     monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    discovery_key_file = _write_phase_key(
+        tmp_path / "discovery.key", DISCOVERY_KEY
+    )
+    confirmation_key_file = _write_phase_key(
+        tmp_path / "confirmation.key", CONFIRMATION_KEY
+    )
     args = type(
         "Args",
         (),
@@ -988,8 +1526,8 @@ def test_renderer_cli_revalidates_custody_after_build_helper_returns(
             "command": "build",
             "public_output": public,
             "custodian_output": custodian,
-            "discovery_key_file": tmp_path / "discovery.key",
-            "confirmation_key_file": tmp_path / "confirmation.key",
+            "discovery_key_file": discovery_key_file,
+            "confirmation_key_file": confirmation_key_file,
             "public_boundary_roots": (boundary,),
             "generator_commit": GENERATOR_COMMIT,
             "generator_tree": GENERATOR_TREE,
@@ -1003,11 +1541,7 @@ def test_renderer_cli_revalidates_custody_after_build_helper_returns(
         custodian.rename(relocated)
         return result
 
-    def key_for(path, _label):
-        return DISCOVERY_KEY if path == args.discovery_key_file else CONFIRMATION_KEY
-
     monkeypatch.setattr(renderer, "_parse", lambda _argv: args)
-    monkeypatch.setattr(renderer, "_read_key_file", key_for)
     monkeypatch.setattr(renderer, "build_candidate", build_then_move)
     with pytest.raises(renderer.FixtureError, match="custodian output"):
         renderer.main([])
@@ -1040,6 +1574,12 @@ def test_renderer_cli_final_close_reverifies_before_success_output(
         }
     )
     monkeypatch.setattr(renderer, "FIXTURE_CONTRACT", (tiny,))
+    discovery_key_file = _write_phase_key(
+        tmp_path / "discovery.key", DISCOVERY_KEY
+    )
+    confirmation_key_file = _write_phase_key(
+        tmp_path / "confirmation.key", CONFIRMATION_KEY
+    )
     args = type(
         "Args",
         (),
@@ -1047,8 +1587,8 @@ def test_renderer_cli_final_close_reverifies_before_success_output(
             "command": "build",
             "public_output": public,
             "custodian_output": custodian,
-            "discovery_key_file": tmp_path / "discovery.key",
-            "confirmation_key_file": tmp_path / "confirmation.key",
+            "discovery_key_file": discovery_key_file,
+            "confirmation_key_file": confirmation_key_file,
             "public_boundary_roots": (boundary,),
             "generator_commit": GENERATOR_COMMIT,
             "generator_tree": GENERATOR_TREE,
@@ -1058,9 +1598,6 @@ def test_renderer_cli_final_close_reverifies_before_success_output(
     original_close = renderer._close_active_custody_sessions
     moved_paths: list[Path] = []
     emitted: list[str] = []
-
-    def key_for(path, _label):
-        return DISCOVERY_KEY if path == args.discovery_key_file else CONFIRMATION_KEY
 
     def relocate_then_close(*, verify, scrub_private):
         assert verify is True
@@ -1077,7 +1614,6 @@ def test_renderer_cli_final_close_reverifies_before_success_output(
         return original_close(verify=verify, scrub_private=scrub_private)
 
     monkeypatch.setattr(renderer, "_parse", lambda _argv: args)
-    monkeypatch.setattr(renderer, "_read_key_file", key_for)
     monkeypatch.setattr(renderer, "_close_active_custody_sessions", relocate_then_close)
     monkeypatch.setattr(
         renderer,

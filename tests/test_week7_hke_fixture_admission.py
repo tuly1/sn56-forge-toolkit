@@ -86,6 +86,13 @@ def _rewrite_semantic(path: Path, value: dict) -> None:
     path.write_bytes(renderer.canonical_bytes(value) + b"\n")
 
 
+def _write_phase_key(path: Path, payload: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    path.chmod(0o600)
+    return path
+
+
 def generator_probe():
     return {
         "repository": renderer.GENERATOR_REPOSITORY,
@@ -979,6 +986,438 @@ def test_cli_revalidates_private_input_link_count_after_helper_returns(
     assert record.samefile(public_link)
     assert record.stat().st_nlink == 2
     assert admission._ACTIVE_PRIVATE_AUTHORITIES is None
+
+
+def test_admit_cli_rejects_phase_key_inside_public_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "admit-public-boundary"
+    public = boundary / "candidate"
+    public.mkdir(parents=True)
+    custodian = tmp_path / "admit-custodian"
+    custodian.mkdir()
+    discovery = _write_phase_key(boundary / "published.key", DISCOVERY_KEY)
+    confirmation = _write_phase_key(
+        tmp_path / "admit-keys" / "confirmation.key", CONFIRMATION_KEY
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "admit",
+            "public_root": public,
+            "custodian_root": custodian,
+            "public_boundary_roots": (boundary,),
+            "sealed_review": tmp_path / "review.json",
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "output_root": tmp_path / "admissions",
+        },
+    )()
+    monkeypatch.setattr(admission, "_parse", lambda _argv: args)
+    monkeypatch.setattr(
+        admission,
+        "build_admissions",
+        lambda **_kwargs: pytest.fail("admission consumer ran before key rejection"),
+    )
+    with pytest.raises(admission.AdmissionError, match="must be outside"):
+        admission.main([])
+    assert admission._ACTIVE_PHASE_KEY_PAIR is None
+    assert admission._ACTIVE_PRIVATE_AUTHORITIES is None
+
+
+@pytest.mark.parametrize(
+    "tail_mutation", ("rewrite", "late-worktree", "between-pass-rewrite")
+)
+def test_admit_cli_revalidates_phase_keys_after_consumer_and_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tail_mutation: str,
+) -> None:
+    boundary = tmp_path / "admit-tail-public-boundary"
+    public = boundary / "candidate"
+    public.mkdir(parents=True)
+    custodian = tmp_path / "admit-tail-custodian"
+    custodian.mkdir()
+    key_parent = tmp_path / "admit-tail-keys"
+    discovery = _write_phase_key(key_parent / "discovery.key", DISCOVERY_KEY)
+    confirmation = _write_phase_key(
+        key_parent / "confirmation.key", CONFIRMATION_KEY
+    )
+    output_root = tmp_path / "admit-tail-output"
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "admit",
+            "public_root": public,
+            "custodian_root": custodian,
+            "public_boundary_roots": (boundary,),
+            "sealed_review": tmp_path / "review.json",
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "output_root": output_root,
+        },
+    )()
+    late_inventory = False
+    original_worktrees = admission.renderer._registered_worktree_roots
+    original_pair_verify = admission.renderer._BoundPhaseKeyPair.verify
+    between_pass_mutated = False
+
+    def worktrees():
+        roots = original_worktrees()
+        return roots + ((key_parent,) if late_inventory else ())
+
+    def consume_then_mutate(**kwargs):
+        nonlocal late_inventory
+        assert kwargs["discovery_key"] == DISCOVERY_KEY
+        assert kwargs["confirmation_key"] == CONFIRMATION_KEY
+        if tail_mutation == "rewrite":
+            discovery.write_bytes(b"z" * len(DISCOVERY_KEY))
+        elif tail_mutation == "late-worktree":
+            late_inventory = True
+        return (
+            {"status": "fixture_admission_authorized"},
+            {"social": {"status": "fixture_admission_authorized"}},
+        )
+
+    def verify_with_between_pass_mutation(self):
+        nonlocal between_pass_mutated
+        result = original_pair_verify(self)
+        if (
+            tail_mutation == "between-pass-rewrite"
+            and not between_pass_mutated
+            and (output_root / "ADMISSION-SET.json").exists()
+        ):
+            discovery.write_bytes(b"z" * len(DISCOVERY_KEY))
+            between_pass_mutated = True
+        return result
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: args)
+    monkeypatch.setattr(admission, "_load_private_json", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(admission.renderer, "_registered_worktree_roots", worktrees)
+    monkeypatch.setattr(
+        admission.renderer._BoundPhaseKeyPair,
+        "verify",
+        verify_with_between_pass_mutation,
+    )
+    monkeypatch.setattr(admission, "build_admissions", consume_then_mutate)
+    with pytest.raises(admission.AdmissionError):
+        admission.main([])
+    for path in (
+        output_root / "ADMISSION-SET.json",
+        output_root / "social.json",
+    ):
+        assert not path.exists() or path.read_bytes() == b""
+    assert admission._ACTIVE_PHASE_KEY_PAIR is None
+    assert admission._ACTIVE_ADMISSION_OUTPUTS is None
+    assert admission._ACTIVE_PRIVATE_AUTHORITIES is None
+    if tail_mutation == "between-pass-rewrite":
+        assert between_pass_mutated is True
+
+
+@pytest.mark.parametrize("private_close_action", ("rewrite-key", "raise"))
+def test_admit_cli_keeps_receipt_rollback_live_through_private_and_key_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    private_close_action: str,
+) -> None:
+    boundary = tmp_path / "admit-close-public-boundary"
+    public = boundary / "candidate"
+    public.mkdir(parents=True)
+    custodian = tmp_path / "admit-close-custodian"
+    custodian.mkdir()
+    key_parent = tmp_path / "admit-close-keys"
+    discovery = _write_phase_key(key_parent / "discovery.key", DISCOVERY_KEY)
+    confirmation = _write_phase_key(
+        key_parent / "confirmation.key", CONFIRMATION_KEY
+    )
+    output_root = tmp_path / "admit-close-output"
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "admit",
+            "public_root": public,
+            "custodian_root": custodian,
+            "public_boundary_roots": (boundary,),
+            "sealed_review": tmp_path / "review.json",
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "output_root": output_root,
+        },
+    )()
+
+    class TailPrivateAuthority:
+        mutated = False
+
+        def verify(self) -> None:
+            if private_close_action == "rewrite-key" and not self.mutated:
+                discovery.write_bytes(b"z" * len(DISCOVERY_KEY))
+                self.mutated = True
+            return None
+
+        def scrub(self) -> None:
+            return None
+
+        def close(self) -> None:
+            if private_close_action == "raise":
+                raise admission.AdmissionError("private authority close failed")
+
+    def load_and_retain(*_args, **_kwargs):
+        assert admission._ACTIVE_PRIVATE_AUTHORITIES is not None
+        admission._ACTIVE_PRIVATE_AUTHORITIES.append(TailPrivateAuthority())
+        return {}
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: args)
+    monkeypatch.setattr(admission, "_load_private_json", load_and_retain)
+    monkeypatch.setattr(
+        admission,
+        "build_admissions",
+        lambda **_kwargs: (
+            {"status": "fixture_admission_authorized"},
+            {"social": {"status": "fixture_admission_authorized"}},
+        ),
+    )
+    with pytest.raises(
+        (admission.AdmissionError, admission.renderer.FixtureError),
+        match="payload changed|private authority close failed",
+    ):
+        admission.main([])
+    for path in (
+        output_root / "ADMISSION-SET.json",
+        output_root / "social.json",
+    ):
+        assert not path.exists() or path.read_bytes() == b""
+    assert admission._ACTIVE_PHASE_KEY_PAIR is None
+    assert admission._ACTIVE_ADMISSION_OUTPUTS is None
+    assert admission._ACTIVE_PRIVATE_AUTHORITIES is None
+
+
+def test_direct_admit_helper_scrubs_receipts_when_terminal_key_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    boundary = tmp_path / "direct-admit-public-boundary"
+    public = boundary / "candidate"
+    public.mkdir(parents=True)
+    custodian = tmp_path / "direct-admit-custodian"
+    custodian.mkdir()
+    key_parent = tmp_path / "direct-admit-keys"
+    discovery = _write_phase_key(key_parent / "discovery.key", DISCOVERY_KEY)
+    confirmation = _write_phase_key(
+        key_parent / "confirmation.key", CONFIRMATION_KEY
+    )
+    output_root = tmp_path / "direct-admit-output"
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "admit",
+            "public_root": public,
+            "custodian_root": custodian,
+            "public_boundary_roots": (boundary,),
+            "sealed_review": tmp_path / "review.json",
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "output_root": output_root,
+        },
+    )()
+    original_pair_verify = admission.renderer._BoundPhaseKeyPair.verify
+    between_pass_mutated = False
+
+    def verify_after_output(self):
+        nonlocal between_pass_mutated
+        result = original_pair_verify(self)
+        if (
+            not between_pass_mutated
+            and (output_root / "ADMISSION-SET.json").exists()
+        ):
+            discovery.write_bytes(b"z" * len(DISCOVERY_KEY))
+            between_pass_mutated = True
+        return result
+
+    monkeypatch.setattr(admission, "_load_private_json", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        admission,
+        "build_admissions",
+        lambda **_kwargs: (
+            {"status": "fixture_admission_authorized"},
+            {"social": {"status": "fixture_admission_authorized"}},
+        ),
+    )
+    monkeypatch.setattr(
+        admission.renderer._BoundPhaseKeyPair, "verify", verify_after_output
+    )
+    assert admission._ACTIVE_PRIVATE_AUTHORITIES is None
+    assert admission._ACTIVE_ADMISSION_OUTPUTS is None
+    assert admission._ACTIVE_PHASE_KEY_PAIR is None
+    with pytest.raises(admission.AdmissionError, match="payload changed"):
+        admission._main_with_held_private_descriptors(args)
+    assert between_pass_mutated is True
+    for path in (
+        output_root / "ADMISSION-SET.json",
+        output_root / "social.json",
+    ):
+        assert not path.exists() or path.read_bytes() == b""
+
+
+def test_admit_cli_joint_gate_rejects_output_link_between_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    boundary = tmp_path / "last-authority-public-boundary"
+    public = boundary / "candidate"
+    public.mkdir(parents=True)
+    custodian = tmp_path / "last-authority-custodian"
+    custodian.mkdir()
+    key_parent = tmp_path / "last-authority-keys"
+    discovery = _write_phase_key(key_parent / "discovery.key", DISCOVERY_KEY)
+    confirmation = _write_phase_key(
+        key_parent / "confirmation.key", CONFIRMATION_KEY
+    )
+    output_root = tmp_path / "last-authority-output"
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "admit",
+            "public_root": public,
+            "custodian_root": custodian,
+            "public_boundary_roots": (boundary,),
+            "sealed_review": tmp_path / "review.json",
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "output_root": output_root,
+        },
+    )()
+    raw_close_started = False
+    linked_between_passes = False
+    public_alias = tmp_path / "linked-admission-set.json"
+    original_output_verify = admission._AdmissionOutputAuthority.verify
+    original_output_close = admission._AdmissionOutputAuthority.close
+    original_pair_verify = admission.renderer._BoundPhaseKeyPair.verify
+    original_pair_close = admission.renderer._BoundPhaseKeyPair.close
+
+    def output_verify(self):
+        assert raw_close_started is False, "output verifier ran after raw close began"
+        return original_output_verify(self)
+
+    def output_close(self, *, verify=False):
+        nonlocal raw_close_started
+        assert verify is False
+        raw_close_started = True
+        return original_output_close(self, verify=verify)
+
+    def pair_verify(self):
+        nonlocal linked_between_passes
+        assert raw_close_started is False
+        result = original_pair_verify(self)
+        admission_set = output_root / "ADMISSION-SET.json"
+        if admission_set.exists() and not linked_between_passes:
+            os.link(admission_set, public_alias)
+            linked_between_passes = True
+        return result
+
+    def pair_close(self, *, verify):
+        assert raw_close_started is True
+        assert verify is False
+        return original_pair_close(self, verify=verify)
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: args)
+    monkeypatch.setattr(admission, "_load_private_json", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        admission,
+        "build_admissions",
+        lambda **_kwargs: (
+            {"status": "fixture_admission_authorized"},
+            {"social": {"status": "fixture_admission_authorized"}},
+        ),
+    )
+    monkeypatch.setattr(admission._AdmissionOutputAuthority, "verify", output_verify)
+    monkeypatch.setattr(admission._AdmissionOutputAuthority, "close", output_close)
+    monkeypatch.setattr(admission.renderer._BoundPhaseKeyPair, "verify", pair_verify)
+    monkeypatch.setattr(admission.renderer._BoundPhaseKeyPair, "close", pair_close)
+    with pytest.raises(admission.AdmissionError, match="changed before completion"):
+        admission.main([])
+    assert linked_between_passes is True
+    for path in (
+        output_root / "ADMISSION-SET.json",
+        output_root / "social.json",
+    ):
+        assert not path.exists() or path.read_bytes() == b""
+    assert public_alias.read_bytes() == b""
+
+
+@pytest.mark.parametrize("mutation", ("relocate-root", "hardlink-leaf"))
+def test_admission_output_authority_scrubs_exact_inodes_on_terminal_failure(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    public = tmp_path / "public" / "candidate"
+    public.mkdir(parents=True)
+    custodian = tmp_path / "custodian"
+    custodian.mkdir()
+    output = tmp_path / "admission-output"
+    authority = admission._AdmissionOutputAuthority.create(
+        output,
+        public_root=public,
+        custodian_root=custodian,
+    )
+    authority.write(
+        "ADMISSION-SET.json", {"status": "fixture_admission_authorized"}
+    )
+    live = output / "ADMISSION-SET.json"
+    displaced = live
+    if mutation == "relocate-root":
+        relocated = tmp_path / "relocated-admission-output"
+        output.rename(relocated)
+        output.mkdir()
+        displaced = relocated / live.name
+    else:
+        os.link(live, tmp_path / "published-admission-hardlink.json")
+    try:
+        with pytest.raises(
+            (admission.AdmissionError, admission.renderer.FixtureError)
+        ):
+            authority.verify()
+    finally:
+        authority.scrub()
+        authority.close()
+    assert displaced.read_bytes() == b""
+
+
+def test_admission_output_retain_failure_invalidates_unregistered_receipt(
+    tmp_path: Path,
+) -> None:
+    public = tmp_path / "public" / "candidate"
+    public.mkdir(parents=True)
+    custodian = tmp_path / "custodian"
+    custodian.mkdir()
+    output = tmp_path / "admission-output"
+    authority = admission._AdmissionOutputAuthority.create(
+        output,
+        public_root=public,
+        custodian_root=custodian,
+    )
+
+    class RejectingList(list):
+        def append(self, _value) -> None:
+            raise MemoryError("simulated receipt-retention failure")
+
+    authority._files = RejectingList()
+    receipt = output / "ADMISSION-SET.json"
+    try:
+        with pytest.raises(MemoryError, match="receipt-retention failure"):
+            authority.write(
+                "ADMISSION-SET.json",
+                {"status": "fixture_admission_authorized"},
+            )
+    finally:
+        authority.scrub()
+        authority.close()
+    assert receipt.exists()
+    assert receipt.read_bytes() == b""
 
 
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(

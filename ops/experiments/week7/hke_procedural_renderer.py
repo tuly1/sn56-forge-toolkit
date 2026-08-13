@@ -36,7 +36,7 @@ sys.dont_write_bytecode = True
 
 SCHEMA = 3
 KIND = "sn56-week7-hke-procedural-candidate"
-RENDERER_VERSION = "3.0.0"
+RENDERER_VERSION = "3.0.1"
 GENERATOR_REPOSITORY = "https://github.com/tuly1/sn56-forge-toolkit.git"
 GENERATOR_SOURCE_PATH = "ops/experiments/week7/hke_procedural_renderer.py"
 DECLARATIVE_CONTRACT_PATH = Path(__file__).with_name("hke_fixture_contract.json")
@@ -54,6 +54,7 @@ _DIRECTORY_OPEN_FLAGS = (
     | getattr(os, "O_DIRECTORY", 0)
 )
 _ACTIVE_CUSTODY_SESSIONS: list["_CustodySession"] | None = None
+_ACTIVE_PHASE_KEY_PAIR: "_BoundPhaseKeyPair | None" = None
 
 FIXTURE_CONTRACT: tuple[dict[str, Any], ...] = (
     {
@@ -1316,6 +1317,349 @@ def _validate_custody_boundary(
     return public_root, custodian_root, boundaries
 
 
+def _validate_phase_key_path(
+    path: Path,
+    *,
+    public_root: Path,
+    custodian_root: Path,
+    public_boundary_roots: Sequence[Path],
+    label: str,
+) -> Path:
+    """Require one phase key to remain outside every governed tree.
+
+    Key material is an input authority, not part of either candidate.  Its
+    location is therefore checked against the same live Git-worktree inventory
+    as private fixture output, plus both candidate roots and every declared
+    public boundary.  This function is deliberately rerunnable: a late
+    worktree registration must invalidate a previously acceptable location.
+    """
+
+    public_root, custodian_root, boundaries = _validate_custody_boundary(
+        public_root=public_root,
+        custodian_root=custodian_root,
+        public_boundary_roots=public_boundary_roots,
+    )
+    path = _absolute(path)
+    forbidden = (
+        EXECUTABLE_REPOSITORY_ROOT,
+        *_registered_worktree_roots(),
+        public_root,
+        custodian_root,
+        *boundaries,
+    )
+    if any(_paths_overlap(path, root) for root in forbidden):
+        raise FixtureError(
+            f"{label} must be outside public, candidate-custodian, repository, "
+            "and every registered-worktree tree"
+        )
+    _require_no_symlink_components(path, label)
+    _require_outside_git_repository(path, label)
+    return path
+
+
+def _require_outside_git_repository(path: Path, label: str) -> None:
+    """Reject a key below any live Git repository/worktree marker.
+
+    ``git worktree list`` inventories only the executable repository's linked
+    worktrees.  A key below an unrelated standalone repository (or unrelated
+    linked worktree) is equally commit-exposable, so every existing ancestor
+    is inspected through a no-symlink directory descriptor.  Re-running this
+    at terminal verification also catches a late ``git init``/``.git`` file.
+    """
+
+    current = _absolute(path).parent
+    while True:
+        descriptor = _open_directory_chain_no_symlinks(
+            current, f"{label} repository ancestry"
+        )
+        try:
+            try:
+                marker = os.stat(
+                    ".git", dir_fd=descriptor, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                marker = None
+            except OSError as exc:
+                raise FixtureError(
+                    f"cannot inspect {label} repository ancestry"
+                ) from exc
+            if marker is not None:
+                raise FixtureError(f"{label} must be outside every Git repository")
+        finally:
+            os.close(descriptor)
+        if current == Path(current.anchor):
+            break
+        current = current.parent
+
+
+def _read_bound_key_descriptor(descriptor: int, label: str) -> bytes:
+    """Read and validate one already-open phase-key descriptor."""
+
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise FixtureError(
+                f"{label} must be a single-link regular file with mode 0600"
+            )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(descriptor, min(4097 - total, 1024 * 1024))
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+            if total > 4096:
+                raise FixtureError(f"{label} must contain 32..4096 bytes")
+        after = os.fstat(descriptor)
+    except FixtureError:
+        raise
+    except OSError as exc:
+        raise FixtureError(f"cannot safely read {label}") from exc
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or stat.S_IMODE(after.st_mode) != 0o600
+        or (before.st_dev, before.st_ino, before.st_size)
+        != (after.st_dev, after.st_ino, after.st_size)
+    ):
+        raise FixtureError(f"{label} changed during descriptor-bound read")
+    return _validate_key(b"".join(chunks), label)
+
+
+class _BoundPhaseKey:
+    """Hold one phase-key inode, payload, ancestry, and custody policy."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        label: str,
+        parent: _BoundDirectory,
+        descriptor: int,
+        payload: bytes,
+        public_root: Path,
+        custodian_root: Path,
+        public_boundary_roots: Sequence[Path],
+    ) -> None:
+        self.path = _absolute(path)
+        self.label = label
+        self.parent = parent
+        self.descriptor = descriptor
+        self.payload = payload
+        self.public_root = _absolute(public_root)
+        self.custodian_root = _absolute(custodian_root)
+        self.public_boundary_roots = tuple(
+            _absolute(Path(item)) for item in public_boundary_roots
+        )
+        metadata = os.fstat(descriptor)
+        self.identity = (metadata.st_dev, metadata.st_ino)
+        self.size = metadata.st_size
+
+    @classmethod
+    def open(
+        cls,
+        path: Path,
+        *,
+        label: str,
+        public_root: Path,
+        custodian_root: Path,
+        public_boundary_roots: Sequence[Path],
+    ) -> "_BoundPhaseKey":
+        checked = _validate_phase_key_path(
+            path,
+            public_root=public_root,
+            custodian_root=custodian_root,
+            public_boundary_roots=public_boundary_roots,
+            label=label,
+        )
+        parent = _BoundDirectory.open_existing(checked.parent, f"{label} parent")
+        descriptor: int | None = None
+        try:
+            _validate_leaf_name(checked.name, label)
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            descriptor = os.open(checked.name, flags, dir_fd=parent.descriptor)
+            payload = _read_bound_key_descriptor(descriptor, label)
+            result = cls(
+                path=checked,
+                label=label,
+                parent=parent,
+                descriptor=descriptor,
+                payload=payload,
+                public_root=public_root,
+                custodian_root=custodian_root,
+                public_boundary_roots=public_boundary_roots,
+            )
+            result.verify()
+            return result
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            parent.close()
+            raise
+
+    def verify(self) -> None:
+        """Revalidate exact live path, inode, bytes, mode, links, and policy."""
+
+        self.parent.assert_live()
+        checked = _validate_phase_key_path(
+            self.path,
+            public_root=self.public_root,
+            custodian_root=self.custodian_root,
+            public_boundary_roots=self.public_boundary_roots,
+            label=self.label,
+        )
+        if checked != self.path:
+            raise FixtureError(f"{self.label} path changed")
+        try:
+            held = os.fstat(self.descriptor)
+            linked = os.stat(
+                self.path.name,
+                dir_fd=self.parent.descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise FixtureError(f"{self.label} binding is unavailable") from exc
+        expected = (self.identity[0], self.identity[1], self.size)
+        if (
+            not stat.S_ISREG(held.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or held.st_nlink != 1
+            or linked.st_nlink != 1
+            or stat.S_IMODE(held.st_mode) != 0o600
+            or stat.S_IMODE(linked.st_mode) != 0o600
+            or (held.st_dev, held.st_ino, held.st_size) != expected
+            or (linked.st_dev, linked.st_ino, linked.st_size) != expected
+        ):
+            raise FixtureError(
+                f"{self.label} inode, permissions, or link count changed"
+            )
+        held_payload = _read_bound_key_descriptor(self.descriptor, self.label)
+        live_payload = _read_regular_at(
+            self.parent.descriptor, self.path.name, self.label
+        )
+        if not hmac.compare_digest(held_payload, self.payload) or not hmac.compare_digest(
+            live_payload, self.payload
+        ):
+            raise FixtureError(f"{self.label} payload changed")
+        self.parent.assert_live()
+        _validate_phase_key_path(
+            self.path,
+            public_root=self.public_root,
+            custodian_root=self.custodian_root,
+            public_boundary_roots=self.public_boundary_roots,
+            label=self.label,
+        )
+        self.parent.assert_live()
+
+    def close(self, *, verify: bool = False) -> None:
+        verification_error: BaseException | None = None
+        if verify:
+            try:
+                self.verify()
+            except BaseException as exc:
+                verification_error = exc
+        try:
+            os.close(self.descriptor)
+        finally:
+            self.parent.close()
+        if verification_error is not None:
+            raise verification_error
+
+
+class _BoundPhaseKeyPair:
+    """Keep distinct discovery/confirmation key authorities until CLI exit."""
+
+    def __init__(self, discovery: _BoundPhaseKey, confirmation: _BoundPhaseKey) -> None:
+        self.discovery = discovery
+        self.confirmation = confirmation
+
+    @classmethod
+    def open(
+        cls,
+        *,
+        discovery_path: Path,
+        confirmation_path: Path,
+        public_root: Path,
+        custodian_root: Path,
+        public_boundary_roots: Sequence[Path],
+    ) -> "_BoundPhaseKeyPair":
+        if _paths_equivalent(_absolute(discovery_path), _absolute(confirmation_path)):
+            raise FixtureError("discovery and confirmation key paths must be distinct")
+        discovery: _BoundPhaseKey | None = None
+        confirmation: _BoundPhaseKey | None = None
+        try:
+            discovery = _BoundPhaseKey.open(
+                discovery_path,
+                label="discovery key",
+                public_root=public_root,
+                custodian_root=custodian_root,
+                public_boundary_roots=public_boundary_roots,
+            )
+            confirmation = _BoundPhaseKey.open(
+                confirmation_path,
+                label="confirmation key",
+                public_root=public_root,
+                custodian_root=custodian_root,
+                public_boundary_roots=public_boundary_roots,
+            )
+            result = cls(discovery, confirmation)
+            result.verify()
+            return result
+        except BaseException:
+            if confirmation is not None:
+                confirmation.close()
+            if discovery is not None:
+                discovery.close()
+            raise
+
+    def verify(self) -> None:
+        if _paths_equivalent(self.discovery.path, self.confirmation.path):
+            raise FixtureError("discovery and confirmation key paths must be distinct")
+        self.discovery.verify()
+        self.confirmation.verify()
+        if self.discovery.identity == self.confirmation.identity:
+            raise FixtureError("discovery and confirmation key inodes must be distinct")
+        _require_distinct_phase_keys(
+            self.discovery.payload, self.confirmation.payload
+        )
+        # Repeat after pair-level checks so neither phase can change while its
+        # peer is being validated.
+        self.discovery.verify()
+        self.confirmation.verify()
+
+    def close(self, *, verify: bool) -> None:
+        verification_error: BaseException | None = None
+        if verify:
+            try:
+                self.verify()
+            except BaseException as exc:
+                verification_error = exc
+        close_error: BaseException | None = None
+        for key in (self.confirmation, self.discovery):
+            try:
+                # Pair verification above is the joint semantic boundary.  Do
+                # not re-open a sequential check/close window between peers.
+                key.close(verify=False)
+            except BaseException as exc:
+                if close_error is None:
+                    close_error = exc
+        if verification_error is not None:
+            raise verification_error
+        if close_error is not None:
+            raise close_error
+
+
 class _CustodySession:
     """Hold and repeatedly revalidate every root governing private output."""
 
@@ -1482,6 +1826,44 @@ class _CustodySession:
         self.public.close()
         if verification_error is not None:
             raise verification_error
+
+    def duplicate_private_rollback_descriptors(self) -> list[int]:
+        """Retain scrub-only handles after custody authorities are released."""
+
+        self.verify()
+        descriptors: list[int] = []
+        try:
+            for _parent_descriptor, descriptor, _name in self._private_files:
+                duplicate = os.dup(descriptor)
+                try:
+                    descriptors.append(duplicate)
+                except BaseException:
+                    os.close(duplicate)
+                    raise
+        except BaseException:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            raise
+        return descriptors
+
+
+def _scrub_and_close_descriptors(
+    descriptors: Sequence[int], *, scrub: bool
+) -> None:
+    """Close rollback-only file handles, optionally zeroing exact inodes."""
+
+    for descriptor in descriptors:
+        try:
+            if scrub:
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _mkdir_open_at(parent_descriptor: int, name: str, label: str) -> int:
@@ -2165,37 +2547,83 @@ def build_candidate(
         except BaseException:
             session.close(scrub_private=True)
             raise
-        _ACTIVE_CUSTODY_SESSIONS.append(session)
+        try:
+            _ACTIVE_CUSTODY_SESSIONS.append(session)
+        except BaseException:
+            # Generation has already published private bytes, but the global
+            # finalizer cannot see this session until registration succeeds.
+            # Scrub the exact retained inodes here on any retention failure.
+            try:
+                session.close(scrub_private=True)
+            except BaseException:
+                pass
+            raise
     return result
 
 
-def _close_active_custody_sessions(*, verify: bool, scrub_private: bool) -> None:
-    """Final-check and release all CLI custody leases before success output."""
+def _close_active_custody_sessions(
+    *, verify: bool, scrub_private: bool
+) -> list[int]:
+    """Release governed leases and return scrub-only output rollback handles."""
 
     if _ACTIVE_CUSTODY_SESSIONS is None:
-        return
+        return []
     sessions = list(_ACTIVE_CUSTODY_SESSIONS)
     _ACTIVE_CUSTODY_SESSIONS.clear()
     verification_error: BaseException | None = None
+    rollback_descriptors: list[int] = []
     if verify:
         try:
             for session in sessions:
-                session.verify()
+                rollback_descriptors.extend(
+                    session.duplicate_private_rollback_descriptors()
+                )
+        except BaseException as exc:
+            scrub_private = True
+            verification_error = exc
+    # Joint terminal gate: every governed output and both phase-key authorities
+    # remain descriptor-bound throughout the entire sandwich.  Completion of
+    # this gate is the logical commit point.  No semantic/path check follows it.
+    if verify and verification_error is None:
+        try:
+            for _pass in range(2):
+                for session in sessions:
+                    session.verify()
+                if _ACTIVE_PHASE_KEY_PAIR is not None:
+                    _ACTIVE_PHASE_KEY_PAIR.verify()
         except BaseException as exc:
             scrub_private = True
             verification_error = exc
     close_error: BaseException | None = None
+    # After the joint gate these are raw releases only; verification is never
+    # re-entered for one authority after another authority has been released.
     for session in reversed(sessions):
         try:
-            session.close(scrub_private=scrub_private)
+            session.close(scrub_private=scrub_private, verify=False)
+        except BaseException as exc:
+            scrub_private = True
+            if close_error is None:
+                close_error = exc
+    if _ACTIVE_PHASE_KEY_PAIR is not None:
+        try:
+            _ACTIVE_PHASE_KEY_PAIR.close(verify=False)
         except BaseException as exc:
             scrub_private = True
             if close_error is None:
                 close_error = exc
     if verification_error is not None:
+        _scrub_and_close_descriptors(rollback_descriptors, scrub=True)
         raise verification_error
     if close_error is not None:
+        _scrub_and_close_descriptors(rollback_descriptors, scrub=True)
         raise close_error
+    if scrub_private:
+        _scrub_and_close_descriptors(rollback_descriptors, scrub=True)
+        return []
+    # Only raw fds survive the terminal key-authority close.  ``main`` retains
+    # them through success reporting so a BrokenPipe/reporting failure cannot
+    # leave private confirmation bytes from a failed authoritative command.
+    return rollback_descriptors
 
 
 def _decode_json(raw: bytes, label: str) -> dict[str, Any]:
@@ -2742,19 +3170,6 @@ def verify_replay(
     }
 
 
-def _read_key_file(path: Path, label: str) -> bytes:
-    path = Path(os.path.abspath(os.path.expanduser(path)))
-    _require_no_symlink_components(path, label)
-    metadata = path.lstat()
-    if (
-        path.is_symlink()
-        or not stat.S_ISREG(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-    ):
-        raise FixtureError(f"{label} must be a non-symlink regular file mode 0600")
-    return _validate_key(_read_regular(path, label), label)
-
-
 def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2783,22 +3198,29 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    global _ACTIVE_CUSTODY_SESSIONS
+    global _ACTIVE_CUSTODY_SESSIONS, _ACTIVE_PHASE_KEY_PAIR
 
     args = _parse(argv)
-    if _ACTIVE_CUSTODY_SESSIONS is not None:
-        raise FixtureError("custody session scope is already active")
+    if _ACTIVE_CUSTODY_SESSIONS is not None or _ACTIVE_PHASE_KEY_PAIR is not None:
+        raise FixtureError("CLI authority scope is already active")
     _ACTIVE_CUSTODY_SESSIONS = []
     succeeded = False
     rendered_result: str | None = None
+    rollback_descriptors: list[int] = []
+    finalization_error: BaseException | None = None
     try:
+        _ACTIVE_PHASE_KEY_PAIR = _BoundPhaseKeyPair.open(
+            discovery_path=args.discovery_key_file,
+            confirmation_path=args.confirmation_key_file,
+            public_root=args.public_output,
+            custodian_root=args.custodian_output,
+            public_boundary_roots=args.public_boundary_roots,
+        )
         common = {
             "public_output": args.public_output,
             "custodian_output": args.custodian_output,
-            "discovery_key": _read_key_file(args.discovery_key_file, "discovery key"),
-            "confirmation_key": _read_key_file(
-                args.confirmation_key_file, "confirmation key"
-            ),
+            "discovery_key": _ACTIVE_PHASE_KEY_PAIR.discovery.payload,
+            "confirmation_key": _ACTIVE_PHASE_KEY_PAIR.confirmation.payload,
             "public_boundary_roots": args.public_boundary_roots,
         }
         result = (
@@ -2817,14 +3239,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         succeeded = True
     finally:
         try:
-            _close_active_custody_sessions(
-                verify=succeeded, scrub_private=not succeeded
-            )
+            try:
+                rollback_descriptors = _close_active_custody_sessions(
+                    verify=succeeded, scrub_private=not succeeded
+                )
+            except BaseException as exc:
+                succeeded = False
+                if finalization_error is None:
+                    finalization_error = exc
         finally:
+            _ACTIVE_PHASE_KEY_PAIR = None
             _ACTIVE_CUSTODY_SESSIONS = None
+        if finalization_error is not None:
+            raise finalization_error
     if rendered_result is None:  # pragma: no cover - success sets the payload
+        _scrub_and_close_descriptors(rollback_descriptors, scrub=True)
         raise FixtureError("renderer completed without a result")
-    print(rendered_result)
+    try:
+        print(rendered_result)
+    except BaseException:
+        _scrub_and_close_descriptors(rollback_descriptors, scrub=True)
+        raise
+    _scrub_and_close_descriptors(rollback_descriptors, scrub=False)
     return 0
 
 

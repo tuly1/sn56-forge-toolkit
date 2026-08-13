@@ -3231,6 +3231,14 @@ def _validate_hashed_receipt(
     return {**body, digest_field: declared}
 
 
+def _require_non_boolean_integer(value: Any, label: str) -> int:
+    """Require an exact JSON-integer value without bool/float coercion."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HKEContractError(f"{label} must be a non-boolean integer")
+    return value
+
+
 def _validate_score_rows(
     rows: Any, *, fixture: Mapping[str, Any], label: str
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
@@ -3367,6 +3375,7 @@ def _validate_checkpoint_receipt(
         digest_field="checkpoint_receipt_sha256",
         required_fields=fields,
     )
+    _require_non_boolean_integer(receipt["checkpoint_step"], "checkpoint step")
     identity = _validate_cell_identity(plan_cell["cell_identity"], "checkpoint")
     _require_receipt_cell_binding(receipt, identity, "checkpoint")
     if (
@@ -3417,6 +3426,9 @@ def _validate_attachment_receipt(
         label="attachment",
         digest_field="attachment_receipt_sha256",
         required_fields=fields,
+    )
+    _require_non_boolean_integer(
+        receipt["checkpoint_step"], "attachment checkpoint step"
     )
     identity = _validate_cell_identity(plan_cell["cell_identity"], "attachment")
     _require_receipt_cell_binding(receipt, identity, "attachment")
@@ -3472,6 +3484,7 @@ def _validate_score_receipt(
         digest_field="score_receipt_sha256",
         required_fields=fields,
     )
+    _require_non_boolean_integer(receipt["checkpoint_step"], "score checkpoint step")
     identity = _validate_cell_identity(plan_cell["cell_identity"], "score")
     _require_receipt_cell_binding(receipt, identity, "score")
     if (

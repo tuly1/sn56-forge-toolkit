@@ -1986,6 +1986,110 @@ def test_training_receipt_rejects_artifact_not_bound_to_runtime_sidecar(base_con
         )
 
 
+@pytest.mark.parametrize("bad_step", [200.0, "200", True])
+def test_checkpoint_receipt_requires_exact_integer_step(base_config, bad_step):
+    plan = _plan(base_config)
+    cell = plan["cells"]["d1_core"]["A"]
+    curve = _curve(plan, "d1_core", "A", 0.9)
+    checkpoint = copy.deepcopy(curve["checkpoints"][0]["checkpoint_receipt"])
+    checkpoint["checkpoint_step"] = bad_step
+    _rehash(checkpoint, "checkpoint_receipt_sha256")
+
+    with pytest.raises(
+        H.HKEContractError, match="checkpoint step must be a non-boolean integer"
+    ):
+        H._validate_checkpoint_receipt(
+            checkpoint,
+            plan_sha256=plan["plan_sha256"],
+            plan_cell=cell,
+            training_receipt=curve["training_receipt"],
+        )
+
+
+@pytest.mark.parametrize("bad_step", [200.0, "200", True])
+def test_attachment_receipt_requires_exact_integer_step(base_config, bad_step):
+    plan = _plan(base_config)
+    cell = plan["cells"]["d1_core"]["A"]
+    curve = _curve(plan, "d1_core", "A", 0.9)
+    entry = curve["checkpoints"][0]
+    attachment = copy.deepcopy(entry["attachment_receipt"])
+    attachment["checkpoint_step"] = bad_step
+    _rehash(attachment, "attachment_receipt_sha256")
+
+    with pytest.raises(
+        H.HKEContractError,
+        match="attachment checkpoint step must be a non-boolean integer",
+    ):
+        H._validate_attachment_receipt(
+            attachment,
+            plan_sha256=plan["plan_sha256"],
+            plan_cell=cell,
+            checkpoint_receipt=entry["checkpoint_receipt"],
+        )
+
+
+@pytest.mark.parametrize("bad_step", [200.0, "200", True])
+def test_score_receipt_requires_exact_integer_step(base_config, bad_step):
+    plan = _plan(base_config)
+    cell = plan["cells"]["d1_core"]["A"]
+    curve = _curve(plan, "d1_core", "A", 0.9)
+    entry = curve["checkpoints"][0]
+    score = copy.deepcopy(entry["score_receipt"])
+    score["checkpoint_step"] = bad_step
+    _rehash(score, "score_receipt_sha256")
+
+    with pytest.raises(
+        H.HKEContractError,
+        match="score checkpoint step must be a non-boolean integer",
+    ):
+        H._validate_score_receipt(
+            score,
+            plan_sha256=plan["plan_sha256"],
+            plan_cell=cell,
+            fixture=plan["fixture"],
+            evaluator_sha256=plan["evaluator_sha256"],
+            checkpoint_receipt=entry["checkpoint_receipt"],
+            attachment_receipt=entry["attachment_receipt"],
+        )
+
+
+def test_rehashed_float_checkpoint_chain_is_rejected(base_config):
+    plan = _plan(base_config)
+    cell = plan["cells"]["d1_core"]["A"]
+    curve = copy.deepcopy(_curve(plan, "d1_core", "A", 0.9))
+    entry = curve["checkpoints"][0]
+    checkpoint = entry["checkpoint_receipt"]
+    attachment = entry["attachment_receipt"]
+    score = entry["score_receipt"]
+    assert checkpoint["checkpoint_step"] == 200
+
+    checkpoint["checkpoint_step"] = 200.0
+    _rehash(checkpoint, "checkpoint_receipt_sha256")
+    attachment["checkpoint_step"] = 200.0
+    attachment["checkpoint_receipt_sha256"] = checkpoint[
+        "checkpoint_receipt_sha256"
+    ]
+    _rehash(attachment, "attachment_receipt_sha256")
+    score["checkpoint_step"] = 200.0
+    score["checkpoint_receipt_sha256"] = checkpoint["checkpoint_receipt_sha256"]
+    score["attachment_receipt_sha256"] = attachment["attachment_receipt_sha256"]
+    _rehash(score, "score_receipt_sha256")
+    _rehash(entry, "entry_sha256")
+    _rehash(curve, "curve_sha256")
+
+    with pytest.raises(
+        H.HKEContractError, match="checkpoint step must be a non-boolean integer"
+    ):
+        H.validate_score_curve(
+            curve,
+            plan_sha256=plan["plan_sha256"],
+            plan_cell=cell,
+            fixture=plan["fixture"],
+            evaluator_sha256=plan["evaluator_sha256"],
+            expected_owner_identity="Atulya Shetty",
+        )
+
+
 def test_missing_or_foreign_execution_order_cannot_validate_curve(base_config):
     plan = _plan(base_config)
     cell = plan["cells"]["d1_core"]["A"]

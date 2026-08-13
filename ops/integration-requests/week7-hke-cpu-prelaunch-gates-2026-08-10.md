@@ -59,8 +59,19 @@ Only the following fresh first-party packs are in scope:
 | logo/UI | C1 | sealed confirmation guardrail | 10 | 8 |
 
 Every training/evaluation split is disjoint, and every pack is independent.
-Discovery and confirmation require distinct private phase-key files, each held
-at mode `0600`. Within each phase, row seeds are derived from that one phase
+Discovery and confirmation require distinct private phase-key files and
+inodes, each single-link, held at mode `0600`, and kept outside every public,
+candidate, repository, and registered-worktree boundary. Both key descriptors,
+their exact payloads, and their live ancestry remain bound through the
+authoritative CLI boundary. For renderer **build** and admission publication,
+a joint two-pass terminal verification keeps all candidate, private,
+admission, and key authorities open. Completion of that joint gate is the
+logical commit point. After it, those paths invoke no governed path or semantic
+authority; only raw authority and rollback descriptors may be closed or
+scrubbed, and renderer-build rollback handles remain live through success
+reporting. Renderer `verify` remains a point-in-time deterministic replay
+check; it does not claim continuous candidate-file custody after replay. Within
+each phase, row seeds are derived from that one phase
 key using domain-separated inputs that bind phase, fixture, pack, split role,
 and ordinal; there are no separate training/evaluation key files. Effective
 row seeds must be unequal across both axes and never reused across phases,
