@@ -176,3 +176,132 @@ python ops/experiments/week7/build_p0_package.py \
 Outputs are UTC-named, checksum-bound, and create-only. `PARTIAL` is an honest
 terminal result when a public surface is missing or lagging; it must not be
 silently promoted to COMPLETE by inference.
+
+## Schema-3 rights-clean HKE fixture candidates
+
+> **No legacy reuse:** every earlier candidate, review, admission, experiment
+> plan, timing record, training receipt, attachment receipt, score receipt, and
+> decision receipt is schema-invalid. Do not rehash, wrap, migrate, or reuse
+> any of it. Regenerate every schema-3 artifact in a fresh create-only root
+> after review of the exact pushed source SHA.
+
+`hke_procedural_renderer.py` is the CPU-only source for a new first-party Krea
+instrument. The schema-3 inventory is 144 rows:
+
+| Family | Packs | Per-pack training | Per-pack held-out evaluation |
+|---|---|---:|---:|
+| social / FutureBound | D1, D2, C1, C2 | 10 | 8 |
+| product | D1, C1 | 10 | 8 |
+| logo/UI | D1, C1 | 10 | 8 |
+
+D1 is discovery, D2 is independent discovery replication, C1 is sealed
+confirmation, and social C2 is a separately sealed reserve. Every pack's 10
+training rows and 8 evaluation rows are disjoint. Discovery and confirmation
+use distinct private phase-key files, each held at mode `0600`. Within a
+phase, training and evaluation rows are derived from that one phase key using
+domain-separated inputs that bind phase, fixture, pack, split role, and row
+ordinal. There are no separate training-key and evaluation-key files. All
+effective row seeds must be unequal across both separation axes and never
+reused for a different phase, pack, split role, or row. Public discovery and
+private confirmation outputs also live in disjoint create-only trees.
+
+The renderer uses integer geometry and a code-owned bitmap alphabet. It has no
+network, external font, reference-image, model-output, opponent, tournament,
+hidden/test-data, or validator-evaluation-row input. Confirmation identities,
+paths, captions, visible tokens, groups, and bytes remain unavailable from the
+public candidate; the public side exposes only counts and commitments.
+
+Fresh admission requires deterministic byte replay, exact generator
+commit/tree and source hashes, ownership/use records, cross-family,
+cross-phase, cross-pack, and train/evaluation deduplication, and named-human
+review of every image-caption row. The review record is
+`operator_attested`: its bindings establish internal consistency but do not
+cryptographically authenticate the named person. A PASS admits only that
+fixture revision after owner ratification. It grants no GPU, merge, release, or
+deployment authority.
+
+Confirmation stays sealed throughout D1 and D2. After D2, freeze the candidate
+recipe, checkpoint target, evaluator, inference settings, seed policy, and
+decision rule before any C1 identity or byte is revealed. C1 then supplies the
+single social confirmation and the product and logo/UI guardrails. Social C2
+may be opened only by a separate, predeclared borderline-C1 trigger; it must
+not be used routinely, to tune a threshold, or to rescue a failed C1 result.
+
+## Schema-3 calibration-only HKE factor screen
+
+`run_hke_factorial.py` describes a staged FutureBound-first screen. The D1 core
+is a matched 1,200-step loss (MAE versus MSE) × multires-noise factorial, with
+the exact retry reconstruction kept separate:
+
+| Cell | Loss | Multires noise | Terminal depth | Runtime |
+|---|---|---|---:|---|
+| R0 | retry recipe | retry setting | 1,166 exactly | incumbent |
+| A | MAE | off | 1,200 exactly | owned |
+| B | MSE | off | 1,200 exactly | owned |
+| C | MAE | 6 iterations, 0.3 discount | 1,200 exactly | owned |
+| D | MSE | 6 iterations, 0.3 discount | 1,200 exactly | owned |
+
+The 1,200-step depth is fixed by the reviewed contract, not inferred from a
+timing profile. Score each natural periodic checkpoint and the terminal
+checkpoint, but do not require a synthetic 1,166 checkpoint from A–D. R0 ends
+at exactly 1,166 steps.
+
+Before A–D, a no-multires incumbent-versus-owned runtime bridge must clear its
+predeclared equivalence tolerance. In the prelaunch plan, owned-runtime use is
+limited to that bridge and A–D; R0 remains on the incumbent runtime. This is an
+experiment boundary, not authority to swap the production runtime or change a
+non-Krea path.
+
+The stage order is fail-closed:
+
+1. Freeze the admitted D1 fixtures, evaluator, preprocessing, inference seeds,
+   prompted/blank weighting, runtime identities, and decision rules.
+2. Clear the runtime bridge, then run social D1 R0 and A–D against only D1's
+   held-out evaluation rows.
+3. Freeze one D1 recipe/checkpoint candidate, then compare it with the
+   incumbent on social D2 under the two predeclared finalist seeds.
+4. After D2, freeze the candidate, checkpoint target, evaluator, seed policy,
+   and decision rule before revealing C1.
+5. Run social C1 once, without reselection, then apply product C1 and logo/UI
+   C1 as guardrails.
+6. Keep social C2 sealed unless the separately predeclared borderline trigger
+   fires.
+
+The per-cell sequences recorded in these plans are an operator procedure, not
+machine-verified counterbalancing. The current receipts bind individual cells
+and inputs but do not prove ordinal execution, predecessor completion,
+non-overlap, or chronology across cells. Any analysis that relies on temporal
+counterbalancing must verify chronology from a separate run log; the plans
+alone do not establish it.
+
+Training directories and evaluation directories are independently inventoried
+and bound to their pack/split identities. Timing profiles and all execution,
+training, attachment, exact-score, freeze, and decision records are
+content-bound and `operator_attested`. They can demonstrate schema consistency
+and declared provenance; they are not independent proof that a human review,
+GPU run, attachment, or score event occurred.
+
+Every later-stage plan carries the complete prior-stage plan and evidence
+needed to reproduce it. Validation rebuilds the expected plan from that source
+chain and compares canonical bytes, so re-hashing an edited outer envelope
+cannot substitute a different generated config, optional-E cell, D2 finalist,
+confirmation candidate, or C2 input. D1's terminal record also preserves the
+predeclared MAE-versus-MSE and multires-noise factorial effects at the terminal
+checkpoint; these effects are descriptive experimental outputs, not execution
+or deployment authority.
+
+Private confirmation reveals bind the complete revealed row records to the
+family admission, phase commitment, physical training/evaluation inventories,
+and post-D2 freeze. Those records remain private after reveal and cannot be
+transplanted between families, packs, or an independently re-hashed authority
+envelope.
+
+The schema-3 contract and plan are CPU prelaunch artifacts only. They do not
+authorize a GPU rental or launch, fixture admission by themselves, checkpoint
+promotion, a semantic router, a merge, deployment, endpoint repoint, or any
+production mutation. Any later execution or release needs separate explicit
+owner authority.
+
+```bash
+python ops/experiments/week7/run_hke_factorial.py contract
+```

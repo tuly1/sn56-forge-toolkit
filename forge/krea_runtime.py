@@ -34,7 +34,6 @@ import yaml
 from forge import telemetry
 from forge.file_evidence import RegularFileError, read_regular_bytes
 
-
 BUNDLE_ENV = "FORGE_KREA_BUNDLE"
 TIMING_PROBE_ENV = "FORGE_KREA_TIMING_PROBE"
 INCUMBENT_RUNTIME_DIR_ENV = "AI_TOOLKIT_DIR"
@@ -43,12 +42,16 @@ INCUMBENT_BUNDLE = "incumbent-v1"
 LEADER_BUNDLE = "leader-v1"
 LEADER_COMFY_TE_BUNDLE = "leader-comfy-te-v1"
 MAE_BUNDLE = "mae-g3-v1"
+WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE = "week7-factorial-nomr-v1"
+WEEK7_FACTORIAL_MULTIRES_BUNDLE = "week7-factorial-mr-v1"
 KNOWN_BUNDLES = frozenset(
     {
         INCUMBENT_BUNDLE,
         LEADER_BUNDLE,
         LEADER_COMFY_TE_BUNDLE,
         MAE_BUNDLE,
+        WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+        WEEK7_FACTORIAL_MULTIRES_BUNDLE,
     }
 )
 
@@ -124,12 +127,30 @@ _BUNDLE_CLAIMS = {
         "source_config_sha256": PUBLIC_RANK3_CONFIG_SHA256,
         "byte_equivalent_to_source_config": False,
     },
+    WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE: {
+        "classification": "week7-dormant-factorial-owned-runtime-control",
+        "source_relationship": "reviewed-incumbent-config-on-owned-runtime",
+        "source_repository": None,
+        "source_revision": None,
+        "source_config_path": None,
+        "source_config_sha256": None,
+        "byte_equivalent_to_source_config": False,
+    },
+    WEEK7_FACTORIAL_MULTIRES_BUNDLE: {
+        "classification": "week7-dormant-factorial-multires-candidate",
+        "source_relationship": (
+            "reviewed-incumbent-config-plus-predeclared-multires-fields"
+        ),
+        "source_repository": None,
+        "source_revision": None,
+        "source_config_path": None,
+        "source_config_sha256": None,
+        "byte_equivalent_to_source_config": False,
+    },
 }
 
 # One named assertion per silent-runtime failure found in the Week-6 audit.
-COMPONENT_RECOVERY_CAPABILITY = (
-    "component_consistent_ema_optimizer_recovery"
-)
+COMPONENT_RECOVERY_CAPABILITY = "component_consistent_ema_optimizer_recovery"
 REQUIRED_CAPABILITIES = (
     "qwen3vl_text_encoder_lora",
     "optimizer_group_lr_split",
@@ -148,8 +169,7 @@ _RUNTIME_CAPABILITY_WIRE_ALIASES = {
     COMPONENT_RECOVERY_CAPABILITY: "ema_checkpoint_resume",
 }
 RUNTIME_MANIFEST_CAPABILITIES = tuple(
-    _RUNTIME_CAPABILITY_WIRE_ALIASES.get(name, name)
-    for name in REQUIRED_CAPABILITIES
+    _RUNTIME_CAPABILITY_WIRE_ALIASES.get(name, name) for name in REQUIRED_CAPABILITIES
 )
 
 _BUNDLE_CAPABILITIES = {
@@ -159,7 +179,17 @@ _BUNDLE_CAPABILITIES = {
         "ungated_differential_guidance",
         "strict_unknown_train_field_rejection",
     ),
+    WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE: ("strict_unknown_train_field_rejection",),
+    WEEK7_FACTORIAL_MULTIRES_BUNDLE: (
+        "multires_noise",
+        "strict_unknown_train_field_rejection",
+    ),
 }
+
+# These are experiment-contract values, duplicated here deliberately so the
+# runtime can reject an undeclared concrete seed before its timing projection
+# abstracts that factorial dimension.
+WEEK7_FACTORIAL_ALLOWED_TRAINING_SEEDS = frozenset({42_565_431, 42_565_432})
 
 
 class KreaRuntimeContractError(RuntimeError):
@@ -252,9 +282,8 @@ def runtime_directory(
     if resolved not in KNOWN_BUNDLES:
         raise KreaRuntimeContractError(f"unknown Krea bundle: {resolved!r}")
     is_experimental_krea = (
-        (model_type or "").strip().lower() == "krea2"
-        and resolved != INCUMBENT_BUNDLE
-    )
+        model_type or ""
+    ).strip().lower() == "krea2" and resolved != INCUMBENT_BUNDLE
     incumbent_dir, owned_dir = _isolated_runtime_directories(env)
     return owned_dir if is_experimental_krea else incumbent_dir
 
@@ -389,16 +418,58 @@ def apply(
             ] = True
     elif bundle == MAE_BUNDLE:
         _apply_mae(candidate)
+    elif bundle in {
+        WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+        WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+    }:
+        _apply_week7_factorial(candidate, bundle=bundle)
     else:  # guarded by requested_bundle; defense against future drift.
         raise KreaRuntimeContractError(f"unimplemented Krea bundle: {bundle}")
     _validate_effective_bundle(candidate, bundle)
-    if timing_contract_projection(candidate, bundle=bundle) != (
+    if bundle not in {
+        WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+        WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+    } and timing_contract_projection(candidate, bundle=bundle) != (
         _reference_bundle_projection(bundle)
     ):
         raise KreaRuntimeContractError(
             "Krea bundle normalized config projection drifted"
         )
     return candidate, manifest
+
+
+def materialize_week7_factorial_config(
+    cfg: dict[str, Any], *, multires_noise: bool
+) -> tuple[dict[str, Any], str]:
+    """Materialize a dormant Week-7 factorial cell without claiming launch.
+
+    Capability evidence is necessarily host/runtime specific and is verified by
+    :func:`apply` at launch.  This pure planner helper returns the exact config
+    and bundle ID that launch must select; it never loads the leader overlays.
+    """
+
+    bundle = (
+        WEEK7_FACTORIAL_MULTIRES_BUNDLE
+        if multires_noise
+        else WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE
+    )
+    candidate = copy.deepcopy(cfg)
+    _apply_week7_factorial(candidate, bundle=bundle)
+    _validate_effective_bundle(candidate, bundle)
+    return candidate, bundle
+
+
+def require_week7_factorial_capabilities(
+    manifest: dict[str, Any], *, multires_noise: bool
+) -> None:
+    """Fail closed if the selected owned runtime would make a factor inert."""
+
+    bundle = (
+        WEEK7_FACTORIAL_MULTIRES_BUNDLE
+        if multires_noise
+        else WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE
+    )
+    require_capabilities(manifest, _BUNDLE_CAPABILITIES[bundle])
 
 
 def load_capability_manifest(
@@ -487,9 +558,7 @@ def require_capabilities(manifest: dict[str, Any], required: tuple[str, ...]) ->
     missing = [
         name
         for name in required
-        if capabilities.get(
-            _RUNTIME_CAPABILITY_WIRE_ALIASES.get(name, name)
-        )
+        if capabilities.get(_RUNTIME_CAPABILITY_WIRE_ALIASES.get(name, name))
         is not True
     ]
     if missing:
@@ -505,8 +574,7 @@ def canonical_capabilities(manifest: dict[str, Any]) -> list[str]:
     return sorted(
         name
         for name in REQUIRED_CAPABILITIES
-        if capabilities.get(_RUNTIME_CAPABILITY_WIRE_ALIASES.get(name, name))
-        is True
+        if capabilities.get(_RUNTIME_CAPABILITY_WIRE_ALIASES.get(name, name)) is True
     )
 
 
@@ -537,9 +605,8 @@ def open_verified_runtime(
     env = os.environ if environ is None else environ
     runtime_dir = runtime_directory(model_type, bundle, environ=env)
     is_experimental_krea = (
-        (model_type or "").strip().lower() == "krea2"
-        and bundle != INCUMBENT_BUNDLE
-    )
+        model_type or ""
+    ).strip().lower() == "krea2" and bundle != INCUMBENT_BUNDLE
     manifest: dict[str, Any] | None = None
     if is_experimental_krea:
         manifest = load_capability_manifest(
@@ -552,9 +619,7 @@ def open_verified_runtime(
     expected_commit = (
         OWNED_RUNTIME_COMMIT if is_experimental_krea else PINNED_BASE_COMMIT
     )
-    expected_tree = (
-        OWNED_RUNTIME_TREE if is_experimental_krea else PINNED_BASE_TREE
-    )
+    expected_tree = OWNED_RUNTIME_TREE if is_experimental_krea else PINNED_BASE_TREE
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -697,9 +762,7 @@ def open_verified_runtime(
                     "materialized runtime identity is invalid"
                 ) from exc
             if copied_identity != expected_identity:
-                raise KreaRuntimeContractError(
-                    "materialized runtime identity mismatch"
-                )
+                raise KreaRuntimeContractError("materialized runtime identity mismatch")
         os.fchmod(materialized_fd, 0o500)
         os.close(root_fd)
         root_fd = -1
@@ -789,9 +852,7 @@ def _copy_runtime_tree_fd(source_fd: int, destination_fd: int, *, root: bool) ->
             try:
                 input_fd = os.open(name, read_flags, dir_fd=source_fd)
                 try:
-                    output_fd = os.open(
-                        name, write_flags, 0o600, dir_fd=destination_fd
-                    )
+                    output_fd = os.open(name, write_flags, 0o600, dir_fd=destination_fd)
                 except Exception:
                     os.close(input_fd)
                     input_fd = -1
@@ -839,9 +900,7 @@ def _copy_runtime_tree_fd(source_fd: int, destination_fd: int, *, root: bool) ->
                 os.mkdir(name, 0o700, dir_fd=destination_fd)
                 input_fd = os.open(name, directory_flags, dir_fd=source_fd)
                 try:
-                    output_fd = os.open(
-                        name, directory_flags, dir_fd=destination_fd
-                    )
+                    output_fd = os.open(name, directory_flags, dir_fd=destination_fd)
                 except Exception:
                     os.close(input_fd)
                     input_fd = -1
@@ -1006,9 +1065,7 @@ def _git_tree_digest(
             raise KreaRuntimeContractError(
                 "selected runtime contains a non-regular entry"
             )
-        entries.append(
-            (sort_key, mode + b" " + encoded_name + b"\0" + object_digest)
-        )
+        entries.append((sort_key, mode + b" " + encoded_name + b"\0" + object_digest))
 
     after = os.fstat(directory_fd)
     if _stable_stat_identity(after) != _stable_stat_identity(before):
@@ -1151,9 +1208,7 @@ def _read_fd_regular_bytes(
             chunks.append(chunk)
             observed += len(chunk)
             if observed > maximum_size:
-                raise KreaRuntimeContractError(
-                    "selected runtime identity is oversized"
-                )
+                raise KreaRuntimeContractError("selected runtime identity is oversized")
         if _stable_stat_identity(os.fstat(value_fd)) != _stable_stat_identity(before):
             raise KreaRuntimeContractError("selected runtime identity changed")
         return b"".join(chunks)
@@ -1214,9 +1269,7 @@ def should_emit_effective_runtime_record(
     """Keep the default incumbent execution path free of new I/O/events."""
 
     return bool(
-        bundle != INCUMBENT_BUNDLE
-        or throughput_profile is not None
-        or timing_probe
+        bundle != INCUMBENT_BUNDLE or throughput_profile is not None or timing_probe
     )
 
 
@@ -1253,10 +1306,9 @@ def emit_effective_runtime_record(
         or any(character not in "0123456789abcdef" for character in attempt_nonce)
     ):
         raise KreaRuntimeContractError("effective runtime source run id is invalid")
-    expected_projection = bundle_contract_document(bundle)[
-        "normalized_config_projection"
-    ]
-    if timing_contract_projection(cfg, bundle=bundle) != expected_projection:
+    if not projection_matches_bundle_contract(
+        timing_contract_projection(cfg, bundle=bundle), bundle=bundle
+    ):
         raise KreaRuntimeContractError(
             "effective config no longer matches the bundle timing contract"
         )
@@ -1267,12 +1319,15 @@ def emit_effective_runtime_record(
         )
     timing: dict[str, Any]
     if throughput_profile is not None:
-        from forge.adaptive_timing import ThroughputProfile, dataset_regime
+        from forge.adaptive_timing import (
+            ThroughputProfile,
+            canonical_sha256 as timing_canonical_sha256,
+            dataset_regime,
+            validate_accelerator_identity,
+        )
 
         if not isinstance(throughput_profile, ThroughputProfile):
-            raise KreaRuntimeContractError(
-                "invalid operator-attested timing profile"
-            )
+            raise KreaRuntimeContractError("invalid operator-attested timing profile")
         expected_digest = bundle_contract_sha256(bundle)
         expected_runtime_commit = runtime_commit_for_bundle(bundle)
         if (
@@ -1284,16 +1339,33 @@ def emit_effective_runtime_record(
             raise KreaRuntimeContractError(
                 "operator-attested timing profile binding drifted"
             )
+        current_projection = timing_contract_projection(cfg, bundle=bundle)
+        current_loss = _process(cfg)["train"].get("loss_type")
+        if (
+            throughput_profile.source_config_projection_sha256
+            != timing_canonical_sha256(current_projection)
+            or throughput_profile.source_loss_type != current_loss
+        ):
+            raise KreaRuntimeContractError(
+                "operator-attested timing profile source config drifted"
+            )
         if (
             isinstance(current_dataset_size, bool)
             or not isinstance(current_dataset_size, int)
             or current_dataset_size <= 0
-            or dataset_regime(current_dataset_size)
-            != throughput_profile.dataset_regime
+            or dataset_regime(current_dataset_size) != throughput_profile.dataset_regime
         ):
             raise KreaRuntimeContractError(
                 "operator-attested timing profile dataset regime drifted"
             )
+        try:
+            accelerator_identity = validate_accelerator_identity(
+                throughput_profile.accelerator_identity
+            )
+        except Exception as exc:
+            raise KreaRuntimeContractError(
+                "operator-attested timing profile accelerator identity is invalid"
+            ) from exc
         timing = {
             "mode": "operator_attested_profile",
             "profile_sha256": throughput_profile.profile_sha256,
@@ -1301,22 +1373,31 @@ def emit_effective_runtime_record(
             "measured_dataset_size": throughput_profile.measured_dataset_size,
             "current_dataset_size": current_dataset_size,
             "dataset_regime": throughput_profile.dataset_regime,
-            "accelerator_identity": throughput_profile.accelerator_identity,
+            "accelerator_identity": accelerator_identity,
         }
     elif timing_probe:
-        from forge.adaptive_timing import dataset_regime
+        from forge.adaptive_timing import (
+            dataset_regime,
+            validate_accelerator_identity,
+        )
 
         if (
             isinstance(current_dataset_size, bool)
             or not isinstance(current_dataset_size, int)
             or current_dataset_size <= 0
             or not isinstance(current_accelerator_identity, str)
-            or not current_accelerator_identity.strip()
-            or len(current_accelerator_identity) > 256
         ):
             raise KreaRuntimeContractError(
                 "bootstrap timing run identity is incomplete"
             )
+        try:
+            accelerator_identity = validate_accelerator_identity(
+                current_accelerator_identity
+            )
+        except Exception as exc:
+            raise KreaRuntimeContractError(
+                "bootstrap timing run accelerator identity is invalid"
+            ) from exc
         timing = {
             "mode": "bootstrap_probe_unmeasured",
             "profile_sha256": None,
@@ -1324,7 +1405,7 @@ def emit_effective_runtime_record(
             "measured_dataset_size": None,
             "current_dataset_size": current_dataset_size,
             "dataset_regime": dataset_regime(current_dataset_size),
-            "accelerator_identity": current_accelerator_identity.strip(),
+            "accelerator_identity": accelerator_identity,
         }
     else:
         timing = {
@@ -1365,9 +1446,7 @@ def emit_effective_runtime_record(
         "capability_manifest_file_sha256": manifest_file_sha,
         "capability_manifest_semantic_sha256": manifest_semantic_sha,
         "capabilities": (
-            canonical_capabilities(manifest)
-            if manifest is not None
-            else []
+            canonical_capabilities(manifest) if manifest is not None else []
         ),
         "runtime_manifest_capability_aliases": {
             name: wire
@@ -1493,13 +1572,45 @@ def _apply_mae(cfg: dict[str, Any]) -> None:
     }
 
 
+def _apply_week7_factorial(cfg: dict[str, Any], *, bundle: str) -> None:
+    """Apply only the dormant Week-7 factorial execution contract.
+
+    This deliberately does not call either public-recipe overlay.  The bridge
+    and A/B controls run the incumbent recipe bytes on the owned runtime, with
+    the strict-field sentinel as the sole governance field.  C/D add exactly
+    the two predeclared multires-noise fields on that same owned runtime.
+    """
+
+    if bundle not in {
+        WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+        WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+    }:
+        raise KreaRuntimeContractError("invalid Week-7 factorial bundle")
+    train = _process(cfg)["train"]
+    train["sn56_strict_krea_fields"] = True
+    if bundle == WEEK7_FACTORIAL_MULTIRES_BUNDLE:
+        train["multires_noise_iterations"] = 6
+        train["multires_noise_discount"] = 0.3
+    else:
+        train.pop("multires_noise_iterations", None)
+        train.pop("multires_noise_discount", None)
+
+
 def _validate_effective_bundle(cfg: dict[str, Any], bundle: str) -> None:
     p = _process(cfg)
     train = p["train"]
     if train.get("sn56_strict_krea_fields") is not True:
         raise KreaRuntimeContractError("strict Krea field validation is inactive")
-    if p.get("network") != {"type": "lora", "linear": 32, "linear_alpha": 32}:
+    if bundle not in {
+        WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+        WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+    } and p.get("network") != {
+        "type": "lora",
+        "linear": 32,
+        "linear_alpha": 32,
+    }:
         raise KreaRuntimeContractError("Krea bundle network topology drifted")
+    mismatched: list[str] = []
     if bundle in {LEADER_BUNDLE, LEADER_COMFY_TE_BUNDLE}:
         expected = {
             "train_text_encoder": True,
@@ -1510,14 +1621,36 @@ def _validate_effective_bundle(cfg: dict[str, Any], bundle: str) -> None:
             "multires_noise_iterations": 6,
             "multires_noise_discount": 0.3,
         }
-    else:
+    elif bundle == MAE_BUNDLE:
         expected = {
             "train_text_encoder": False,
             "loss_type": "mae",
             "timestep_type": "linear",
             "differential_guidance_scale": 3.0,
         }
-    mismatched = [key for key, value in expected.items() if train.get(key) != value]
+    elif bundle == WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE:
+        expected = {
+            "sn56_strict_krea_fields": True,
+        }
+        for forbidden in (
+            "multires_noise_iterations",
+            "multires_noise_discount",
+            "text_encoder_lr",
+        ):
+            if forbidden in train:
+                mismatched.append(forbidden)
+                break
+        if train.get("timestep_type") == "krea2_eval_sigmas":
+            mismatched.append("timestep_type")
+    elif bundle == WEEK7_FACTORIAL_MULTIRES_BUNDLE:
+        expected = {
+            "sn56_strict_krea_fields": True,
+            "multires_noise_iterations": 6,
+            "multires_noise_discount": 0.3,
+        }
+    else:  # pragma: no cover - guarded by bundle selection.
+        raise KreaRuntimeContractError(f"unknown Krea bundle: {bundle!r}")
+    mismatched.extend(key for key, value in expected.items() if train.get(key) != value)
     if bool(train.get("sn56_krea_comfy_text_encoder_export", False)) != (
         bundle == LEADER_COMFY_TE_BUNDLE
     ):
@@ -1541,18 +1674,16 @@ def _process(cfg: dict[str, Any]) -> dict[str, Any]:
         raise KreaRuntimeContractError("invalid Krea config shape") from exc
 
 
-def timing_contract_projection(
-    cfg: dict[str, Any], *, bundle: str
-) -> dict[str, Any]:
+def timing_contract_projection(cfg: dict[str, Any], *, bundle: str) -> dict[str, Any]:
     """Normalize one generated config for timing-profile compatibility.
 
     Only task identity, task-specific paths, trigger text, and the budgeted step
     count are abstracted. Every throughput- or optimizer-relevant value remains
     in the projection, including resolution, cache behavior, batch size,
     optimizer parameters, dtype, checkpointing, noise, guidance, EMA, scheduler,
-    and all untouched template fields. Experimental bundle save cadence remains
-    exact; incumbent cadence is explicitly normalized because it is derived
-    from the independently budgeted step count.
+    and all untouched template fields.  Incumbent and Week-7 save cadence are
+    normalized only after the concrete Week-7 seed and kill-safe cadence have
+    been validated against their declared experiment contract.
     """
 
     if bundle not in KNOWN_BUNDLES:
@@ -1569,8 +1700,50 @@ def timing_contract_projection(
         for key in ("text_encoder_path", "vae_path"):
             if key in model_kwargs:
                 model_kwargs[key] = "<model-path>"
+        concrete_steps = p["train"]["steps"]
+        if (
+            isinstance(concrete_steps, bool)
+            or not isinstance(concrete_steps, int)
+            or concrete_steps <= 0
+        ):
+            raise ValueError
+        if bundle in {
+            WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+            WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        }:
+            # Import lazily to avoid a module-cycle at package import time. The
+            # experiment must inherit the exact merged production Krea cadence,
+            # including PR #18's 200-step unsaved-window ceiling.
+            from forge import recipe
+
+            concrete_seed = p.get("training_seed")
+            concrete_cadence = p["save"].get("save_every")
+            expected_cadence = recipe.checkpoint_save_every(
+                "krea2", concrete_steps, 200
+            )
+            if (
+                isinstance(concrete_seed, bool)
+                or concrete_seed not in WEEK7_FACTORIAL_ALLOWED_TRAINING_SEEDS
+                or isinstance(concrete_cadence, bool)
+                or not isinstance(concrete_cadence, int)
+                or concrete_cadence != expected_cadence
+            ):
+                raise ValueError
         p["train"]["steps"] = "<budgeted-steps>"
         if bundle == INCUMBENT_BUNDLE:
+            p["save"]["save_every"] = "<kill-safe-derived-from-steps>"
+        elif bundle in {
+            WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+            WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        }:
+            # One Week-7 runtime bundle deliberately carries both loss cells,
+            # both predeclared seeds, and derived checkpoint cadences.  Those
+            # exact values remain bound by the generated-config SHA in the raw
+            # runtime record and by the outer experiment profile binding; the
+            # bundle-level projection abstracts only these declared factorial
+            # dimensions so the profile producer can consume the real C/D
+            # timing runs instead of requiring an impossible reference config.
+            p["training_seed"] = "<predeclared-cell-seed>"
             p["save"]["save_every"] = "<kill-safe-derived-from-steps>"
     except Exception as exc:
         raise KreaRuntimeContractError(
@@ -1598,14 +1771,37 @@ def _reference_bundle_projection(bundle: str) -> dict[str, Any]:
                 "vae_path": "/reference/model",
             }
         )
+        if bundle in {
+            WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+            WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        }:
+            p["training_seed"] = 42_565_431
         p["train"]["steps"] = 1234
-        p["save"]["save_every"] = 247
+        if bundle in {
+            WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+            WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        }:
+            # Keep the synthetic reference projection on the same production
+            # Krea checkpoint policy as real Week-7 cells.  PR #18 caps the
+            # durable unsaved window at 200 steps.
+            from forge import recipe
+
+            p["save"]["save_every"] = recipe.checkpoint_save_every(
+                "krea2", 1234, 247
+            )
+        else:
+            p["save"]["save_every"] = 247
         if bundle in {LEADER_BUNDLE, LEADER_COMFY_TE_BUNDLE}:
             _apply_source_derived_rank1(cfg)
             if bundle == LEADER_COMFY_TE_BUNDLE:
                 p["train"]["sn56_krea_comfy_text_encoder_export"] = True
         elif bundle == MAE_BUNDLE:
             _apply_mae(cfg)
+        elif bundle in {
+            WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+            WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+        }:
+            _apply_week7_factorial(cfg, bundle=bundle)
         elif bundle != INCUMBENT_BUNDLE:
             raise KreaRuntimeContractError(f"unknown Krea bundle: {bundle!r}")
         return timing_contract_projection(cfg, bundle=bundle)
@@ -1617,15 +1813,55 @@ def _reference_bundle_projection(bundle: str) -> dict[str, Any]:
         ) from exc
 
 
-def _effective_fields(
-    cfg: dict[str, Any], *, bundle: str
-) -> dict[str, Any]:
+def projection_matches_bundle_contract(projection: Any, *, bundle: str) -> bool:
+    """Check one effective projection against its bundle's declared shape.
+
+    Week-7 uses one owned runtime bundle for both predeclared loss cells.  The
+    projection retains the actual loss so downstream evidence can bind MAE and
+    MSE to their real source records; only this one declared factor is varied
+    for bundle-level compatibility.  Seed and save cadence are normalized by
+    :func:`timing_contract_projection`, while the exact config-file hash binds
+    their concrete values.  The incumbent bridge may add one of the same two
+    controlled seeds to an otherwise byte-derived incumbent config; that field
+    remains exact in evidence and is removed only for bundle compatibility.
+    """
+
+    if bundle not in KNOWN_BUNDLES or not isinstance(projection, dict):
+        return False
+    expected = _reference_bundle_projection(bundle)
+    candidate = copy.deepcopy(projection)
+    if bundle == INCUMBENT_BUNDLE:
+        try:
+            process = candidate["config"]["process"][0]
+        except Exception:
+            return False
+        if "training_seed" in process:
+            concrete_seed = process.pop("training_seed")
+            if (
+                isinstance(concrete_seed, bool)
+                or concrete_seed not in WEEK7_FACTORIAL_ALLOWED_TRAINING_SEEDS
+            ):
+                return False
+    elif bundle in {
+        WEEK7_FACTORIAL_NO_MULTIRES_BUNDLE,
+        WEEK7_FACTORIAL_MULTIRES_BUNDLE,
+    }:
+        try:
+            actual_loss = candidate["config"]["process"][0]["train"]["loss_type"]
+            expected_loss = expected["config"]["process"][0]["train"]["loss_type"]
+        except Exception:
+            return False
+        if actual_loss not in {"mae", "mse"}:
+            return False
+        candidate["config"]["process"][0]["train"]["loss_type"] = expected_loss
+    return candidate == expected
+
+
+def _effective_fields(cfg: dict[str, Any], *, bundle: str) -> dict[str, Any]:
     p = _process(cfg)
     return {
         "planned_steps": p["train"]["steps"],
-        "normalized_config_projection": timing_contract_projection(
-            cfg, bundle=bundle
-        ),
+        "normalized_config_projection": timing_contract_projection(cfg, bundle=bundle),
     }
 
 
@@ -1637,9 +1873,7 @@ def persist_first_checkpoint_observation(
     path = config_path + ".effective-runtime.json"
     try:
         record = json.loads(
-            _read_regular_attestation(
-                path, "effective runtime record"
-            ).decode("utf-8")
+            _read_regular_attestation(path, "effective runtime record").decode("utf-8")
         )
         if not isinstance(record, dict):
             raise ValueError("record is not an object")
@@ -1691,9 +1925,7 @@ def persist_training_completion_observation(
     path = config_path + ".effective-runtime.json"
     try:
         record = json.loads(
-            _read_regular_attestation(
-                path, "effective runtime record"
-            ).decode("utf-8")
+            _read_regular_attestation(path, "effective runtime record").decode("utf-8")
         )
         if not isinstance(record, dict):
             raise ValueError("record is not an object")
@@ -1741,9 +1973,7 @@ def persist_training_completion_observation(
             not isinstance(attempt_nonce, str)
             or len(attempt_nonce) != 32
             or any(character not in "0123456789abcdef" for character in attempt_nonce)
-            or not str(record.get("source_run_id") or "").endswith(
-                f":{attempt_nonce}"
-            )
+            or not str(record.get("source_run_id") or "").endswith(f":{attempt_nonce}")
         ):
             raise ValueError("terminal artifact scope identity mismatch")
         artifact = inspect_training_artifact(artifact_path)

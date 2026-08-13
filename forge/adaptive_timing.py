@@ -27,11 +27,10 @@ from typing import Any, Callable, Mapping
 
 from forge.file_evidence import RegularFileError, read_regular_bytes
 
-
 PROFILE_ENV = "FORGE_KREA_THROUGHPUT_PROFILE"
 SOURCE_RECORD_ENV = "FORGE_KREA_THROUGHPUT_SOURCE_RECORD"
 PROFILE_KIND = "forge-operator-attested-throughput-profile"
-PROFILE_SCHEMA = 3
+PROFILE_SCHEMA = 4
 FIRST_CHECKPOINT_EVENT = "first_checkpoint_timing_observed"
 _MAX_PROFILE_BYTES = 64 * 1024
 _MAX_SOURCE_RECORD_BYTES = 1024 * 1024
@@ -39,6 +38,18 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _BUNDLE_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _SOURCE_RUN_ID_RE = re.compile(r".+:[0-9a-f]{32}")
+_FIXED_NVIDIA_SMI = "/usr/bin/nvidia-smi"
+_ACCELERATOR_PROBE_ENVIRONMENT = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent-sn56-accelerator-identity",
+    "LANG": "C",
+    "LC_ALL": "C",
+}
+_ACCELERATOR_IDENTITY_RE = re.compile(
+    r"[^|\r\n]+\|[1-9][0-9]*-MiB\|"
+    r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 _PROFILE_FIELDS = {
     "schema",
@@ -63,6 +74,9 @@ _MEASUREMENT_FIELDS = {
 _PROVENANCE_FIELDS = {
     "source_run_id",
     "source_record_sha256",
+    "source_generated_config_sha256",
+    "source_config_projection_sha256",
+    "source_loss_type",
     "runtime_commit",
     "measured_at_utc",
     "accelerator_identity",
@@ -145,7 +159,7 @@ class ThroughputProfile:
     """An operator-attested timing claim for one experimental bundle.
 
     ``training_elapsed_seconds`` and ``first_checkpoint_elapsed_seconds`` are
-    declared relative to subprocess launch. Schema 3 conservatively includes
+    declared relative to subprocess launch. Schema 4 conservatively includes
     startup in the rate and therefore records ``startup_seconds`` as zero. The
     declared rate must equal
     ``(training_elapsed_seconds - startup_seconds) / completed_steps`` within
@@ -167,6 +181,9 @@ class ThroughputProfile:
     first_checkpoint_elapsed_seconds: float
     source_run_id: str
     source_record_sha256: str
+    source_generated_config_sha256: str
+    source_config_projection_sha256: str
+    source_loss_type: str
     runtime_commit: str
     measured_at_utc: str
     accelerator_identity: str
@@ -202,15 +219,9 @@ class FirstCheckpointCorrection:
             "timing_profile_sha256": self.profile_sha256,
             "checkpoint_step": self.checkpoint_step,
             "elapsed_since_launch_s": round(self.elapsed_since_launch_s, 3),
-            "profiled_seconds_per_step": round(
-                self.profiled_seconds_per_step, 6
-            ),
-            "observed_seconds_per_step": round(
-                self.observed_seconds_per_step, 6
-            ),
-            "observed_to_profile_ratio": round(
-                self.observed_to_profile_ratio, 6
-            ),
+            "profiled_seconds_per_step": round(self.profiled_seconds_per_step, 6),
+            "observed_seconds_per_step": round(self.observed_seconds_per_step, 6),
+            "observed_to_profile_ratio": round(self.observed_to_profile_ratio, 6),
             "correction": self.correction,
             "active_planned_steps": self.active_planned_steps,
             "active_plan_mutable": self.active_plan_mutable,
@@ -292,21 +303,27 @@ def current_accelerator_identity(
     environ: Mapping[str, str] | None = None,
     runner: Callable[..., Any] = subprocess.run,
 ) -> str:
-    """Return a portable GPU-class identity or fail before profile reuse.
+    """Return the live physical-GPU identity or fail before profile reuse.
 
-    Model name and total memory are read from the device while deliberately
-    omitting per-device UUID, allowing reuse on an equivalent card. Environment
-    variables are not an identity source and cannot override this observation.
+    Model name, total memory, and UUID come from one ``nvidia-smi`` observation.
+    Profiles are lab evidence for one measured device, so reuse on a merely
+    equivalent card is rejected. Environment variables are not an identity
+    source and cannot override this observation.
     """
 
+    # The caller's environment is deliberately not inherited.  Both the
+    # executable and its complete environment are fixed so an ambient PATH or
+    # shell configuration cannot manufacture hardware evidence.
     del environ
     try:
         completed = runner(
             [
-                "nvidia-smi",
-                "--query-gpu=name,memory.total",
+                _FIXED_NVIDIA_SMI,
+                "--query-gpu=name,uuid,memory.total",
                 "--format=csv,noheader,nounits",
             ],
+            cwd="/",
+            env=dict(_ACCELERATOR_PROBE_ENVIRONMENT),
             capture_output=True,
             text=True,
             timeout=10,
@@ -315,18 +332,49 @@ def current_accelerator_identity(
         rows = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
         if completed.returncode != 0 or len(rows) != 1:
             raise ValueError
-        name, memory = (part.strip() for part in rows[0].rsplit(",", 1))
+        parts = [part.strip() for part in rows[0].split(",")]
+        if len(parts) != 3:
+            raise ValueError
+        name, uuid, memory = parts
         if not name or not memory.isdigit():
             raise ValueError
-        return _text(
-            f"{name}|{int(memory)}-MiB",
-            "accelerator identity",
-            maximum=256,
+        return accelerator_identity(
+            name=name,
+            memory_total_mib=int(memory),
+            uuid=uuid,
         )
     except Exception as exc:
         raise TimingProfileError(
             "current accelerator identity could not be established"
         ) from exc
+
+
+def validate_accelerator_identity(value: Any) -> str:
+    """Validate the canonical physical-device identity carried end to end."""
+
+    identity = _text(value, "accelerator identity", maximum=256)
+    if _ACCELERATOR_IDENTITY_RE.fullmatch(identity) is None:
+        raise TimingProfileError("accelerator identity is malformed")
+    return identity
+
+
+def accelerator_identity(*, name: Any, memory_total_mib: Any, uuid: Any) -> str:
+    """Build the sole canonical accelerator identity used by timing evidence."""
+
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or name != name.strip()
+        or "|" in name
+        or isinstance(memory_total_mib, bool)
+        or not isinstance(memory_total_mib, int)
+        or memory_total_mib <= 0
+        or not isinstance(uuid, str)
+    ):
+        raise TimingProfileError("accelerator identity is malformed")
+    return validate_accelerator_identity(
+        f"{name}|{memory_total_mib}-MiB|{uuid}"
+    )
 
 
 def produce_profile_document(
@@ -358,18 +406,14 @@ def produce_profile_document(
     expected_size = _positive_int(measured_dataset_size, "measured dataset size")
     expected_regime = dataset_regime(expected_size)
     expected_bundle_sha = krea_runtime.bundle_contract_sha256(expected_bundle)
-    expected_runtime_commit = krea_runtime.runtime_commit_for_bundle(
-        expected_bundle
-    )
+    expected_runtime_commit = krea_runtime.runtime_commit_for_bundle(expected_bundle)
     expected_runtime_repository = krea_runtime.runtime_repository_for_bundle(
         expected_bundle
     )
     accelerator_identity = expected_accelerator_identity
     if accelerator_identity is None:
         accelerator_identity = current_accelerator_identity(runner=runner)
-    accelerator_identity = _text(
-        accelerator_identity, "accelerator identity", maximum=256
-    )
+    accelerator_identity = validate_accelerator_identity(accelerator_identity)
     raw, record = _read_source_record(source_record_path)
     document = _exact_object(record, _SOURCE_RECORD_FIELDS, "source runtime record")
     if document["schema"] != 4:
@@ -440,9 +484,8 @@ def produce_profile_document(
     effective = _exact_object(
         document["effective"], _SOURCE_EFFECTIVE_FIELDS, "source effective runtime"
     )
-    if (
-        effective["normalized_config_projection"]
-        != expected_contract["normalized_config_projection"]
+    if not krea_runtime.projection_matches_bundle_contract(
+        effective["normalized_config_projection"], bundle=expected_bundle
     ):
         raise TimingProfileError("source effective runtime projection mismatch")
     planned_steps = effective["planned_steps"]
@@ -488,9 +531,7 @@ def produce_profile_document(
     artifact_size = _positive_int(
         completion["artifact_size_bytes"], "terminal artifact size"
     )
-    artifact_sha = _sha256(
-        completion["artifact_sha256"], "terminal artifact sha256"
-    )
+    artifact_sha = _sha256(completion["artifact_sha256"], "terminal artifact sha256")
     artifact_step = _nonnegative_int(
         completion["artifact_checkpoint_step"], "terminal artifact checkpoint step"
     )
@@ -541,9 +582,7 @@ def produce_profile_document(
 
     measured_at = measured_at_utc
     if measured_at is None:
-        measured_at = datetime.now(timezone.utc).isoformat().replace(
-            "+00:00", "Z"
-        )
+        measured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     measured_at = _utc(measured_at)
     result = _seal_profile_document(
         {
@@ -566,6 +605,13 @@ def produce_profile_document(
             "provenance": {
                 "source_run_id": expected_run_id,
                 "source_record_sha256": hashlib.sha256(raw).hexdigest(),
+                "source_generated_config_sha256": document["generated_config_sha256"],
+                "source_config_projection_sha256": canonical_sha256(
+                    effective["normalized_config_projection"]
+                ),
+                "source_loss_type": effective["normalized_config_projection"]["config"][
+                    "process"
+                ][0]["train"]["loss_type"],
                 "runtime_commit": expected_runtime_commit,
                 "measured_at_utc": measured_at,
                 "accelerator_identity": accelerator_identity,
@@ -723,9 +769,10 @@ def validate_profile(
         raise TimingProfileError("timing profile bundle id mismatch")
     if bundle_sha256 != _sha256(expected_bundle_sha256, "expected bundle sha256"):
         raise TimingProfileError("timing profile bundle digest mismatch")
-    if model_type != _text(
-        expected_model_type, "expected model type", maximum=64
-    ).lower():
+    if (
+        model_type
+        != _text(expected_model_type, "expected model type", maximum=64).lower()
+    ):
         raise TimingProfileError("timing profile model type mismatch")
     current_size = _positive_int(current_dataset_size, "current dataset size")
     expected_regime = _text(
@@ -738,9 +785,7 @@ def validate_profile(
     if profile_dataset_regime != expected_regime:
         raise TimingProfileError("timing profile dataset regime mismatch")
 
-    declared_profile_sha = _sha256(
-        document["profile_sha256"], "profile sha256"
-    )
+    declared_profile_sha = _sha256(document["profile_sha256"], "profile sha256")
     body = dict(document)
     body.pop("profile_sha256")
     if canonical_sha256(body) != declared_profile_sha:
@@ -755,9 +800,7 @@ def validate_profile(
     measurement = _exact_object(
         document["measurement"], _MEASUREMENT_FIELDS, "timing measurement"
     )
-    completed_steps = _positive_int(
-        measurement["completed_steps"], "completed steps"
-    )
+    completed_steps = _positive_int(measurement["completed_steps"], "completed steps")
     training_elapsed_seconds = _finite_positive(
         measurement["training_elapsed_seconds"],
         "training elapsed seconds",
@@ -780,9 +823,9 @@ def validate_profile(
     effective_seconds_per_step = (
         training_elapsed_seconds - startup_seconds
     ) / completed_steps
-    relative_rate_error = abs(
-        effective_seconds_per_step - seconds_per_step
-    ) / seconds_per_step
+    relative_rate_error = (
+        abs(effective_seconds_per_step - seconds_per_step) / seconds_per_step
+    )
     if relative_rate_error > 0.02:
         raise TimingProfileError(
             "seconds per step does not match the operator-attested elapsed values"
@@ -795,17 +838,24 @@ def validate_profile(
     source_record_sha256 = _sha256(
         provenance["source_record_sha256"], "source record sha256"
     )
+    source_generated_config_sha256 = _sha256(
+        provenance["source_generated_config_sha256"],
+        "source generated config sha256",
+    )
+    source_config_projection_sha256 = _sha256(
+        provenance["source_config_projection_sha256"],
+        "source config projection sha256",
+    )
+    source_loss_type = _text(
+        provenance["source_loss_type"], "source loss type", maximum=32
+    )
     runtime_commit = _git_commit(provenance["runtime_commit"])
     measured_at_utc = _utc(provenance["measured_at_utc"])
-    accelerator_identity = _text(
-        provenance["accelerator_identity"],
-        "accelerator identity",
-        maximum=256,
+    accelerator_identity = validate_accelerator_identity(
+        provenance["accelerator_identity"]
     )
-    if accelerator_identity != _text(
-        expected_accelerator_identity,
-        "expected accelerator identity",
-        maximum=256,
+    if accelerator_identity != validate_accelerator_identity(
+        expected_accelerator_identity
     ):
         raise TimingProfileError("timing profile accelerator identity mismatch")
 
@@ -823,6 +873,9 @@ def validate_profile(
         first_checkpoint_elapsed_seconds=first_checkpoint_elapsed_seconds,
         source_run_id=source_run_id,
         source_record_sha256=source_record_sha256,
+        source_generated_config_sha256=source_generated_config_sha256,
+        source_config_projection_sha256=source_config_projection_sha256,
+        source_loss_type=source_loss_type,
         runtime_commit=runtime_commit,
         measured_at_utc=measured_at_utc,
         accelerator_identity=accelerator_identity,
@@ -862,9 +915,7 @@ def observe_first_checkpoint(
         maximum=604800.0,
     )
     budget = _finite_positive(total_budget_s, "total budget", maximum=604800.0)
-    reserve = _finite_nonnegative(
-        export_reserve_s, "export reserve", maximum=604800.0
-    )
+    reserve = _finite_nonnegative(export_reserve_s, "export reserve", maximum=604800.0)
     margin = _finite_positive(safety, "safety", maximum=1.0)
     if elapsed <= profile.startup_seconds:
         raise TimingProfileError("first checkpoint elapsed before profiled startup")
@@ -975,9 +1026,7 @@ def _read_source_record(path: str) -> tuple[bytes, Any]:
         )
         return raw, json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        raise TimingProfileError(
-            f"source runtime record unavailable: {path}"
-        ) from exc
+        raise TimingProfileError(f"source runtime record unavailable: {path}") from exc
 
 
 def _runtime_record_semantic_sha256(value: Any) -> str:
