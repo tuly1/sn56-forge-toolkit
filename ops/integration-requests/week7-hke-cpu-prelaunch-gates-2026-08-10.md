@@ -33,10 +33,15 @@ independent HOLD. PR #16 subsequently closed the prohibited-path-alias,
 explicit-`request_query`, and invalid-UTF-8 defects at exact head
 `0a6e61e813b9dcd80d067a4853d2425d4dbcf668`, tree
 `6e9143d06b711f4521f4244a26873b7cc55d73de`. An independent exact-SHA audit
-returned PASS-WITH-FOLLOWUPS with no P0--P2 findings and explicitly cleared
-that head as PR #17's base. PR #17 is now rebased directly onto that revision.
-Its new exact head must be pushed, read back, and independently audited before
-any fresh candidate is generated.
+returned PASS-WITH-FOLLOWUPS with no P0--P2 findings and cleared that historical
+head for integration. PR #18 was then squash-merged into the feature base at
+`8623743f530c72464d6fc918d10462d808b9f9f0`. PR #16 integrated that tree,
+passed its focused and full CPU gates, and was squash-merged into
+`claude/week6-real-fixture-experiment` at
+`5e5d09ae73222a2ef0baff77bcbd75310c3f7904`, tree
+`e50616ba237bd5a2f192777e3d909d9ff09dc41b`. PR #17 is rebased directly onto
+that merged revision. Its new exact head must be pushed, read back, fully
+tested, and independently audited before any fresh candidate is generated.
 
 ## Schema-3 fixture gate
 
@@ -84,8 +89,11 @@ multires-noise factorial:
 
 The factorial depth is fixed at 1,200; timing observations may establish
 feasibility but cannot redefine it. R0 must terminate at exactly 1,166. Score
-natural periodic and terminal checkpoints without inventing a 1,166 checkpoint
-for A–D.
+the production-shaped 200-step periodic grid plus the natural terminal:
+A--D expose steps 200, 400, 600, 800, 1,000, and 1,200; R0 exposes steps 200,
+400, 600, 800, 1,000, and terminal 1,166. Do not invent a 1,166 checkpoint for
+A--D. This grid is inherited from PR #18's Krea-only unsaved-window ceiling,
+not an independent experiment override.
 
 A no-multires incumbent-versus-owned bridge must clear its predeclared
 equivalence tolerance before A–D. In the prelaunch plan, the owned runtime is
