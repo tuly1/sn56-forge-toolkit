@@ -63,17 +63,31 @@ Discovery and confirmation require distinct private phase-key files and
 inodes, each single-link, held at mode `0600`, and kept outside every public,
 candidate, repository, and registered-worktree boundary. Both key descriptors,
 their exact payloads, and their live ancestry remain bound through the
-authoritative CLI boundary. For renderer **build** and admission publication,
-a joint two-pass terminal verification keeps all candidate, private,
-admission, and key authorities open. Completion of that joint gate is the
-logical commit point. After it, those paths invoke no governed path or semantic
-authority; only raw authority and rollback descriptors may be closed or
-scrubbed, and renderer-build rollback handles remain live through success
-reporting. Renderer `verify` remains a point-in-time deterministic replay
-check; it does not claim continuous candidate-file custody after replay. Within
-each phase, row seeds are derived from that one phase
-key using domain-separated inputs that bind phase, fixture, pack, split role,
-and ordinal; there are no separate training/evaluation key files. Effective
+authoritative CLI boundary. Renderer **build** keeps its generated candidate
+roots, private outputs, and key authorities open; authoritative admission
+publication keeps the existing public/custodian candidate roots and exact
+inventories, private records, admission receipts, and key authorities open.
+Each uses a joint two-pass terminal verification. Candidate inputs are never
+scrubbed; any terminal admission failure instead zeroes the exact retained
+receipt inodes. Admission parses and semantic-validates the candidate,
+discovery, and confirmation manifests through the retained root descriptors;
+their embedded file inventories must equal descriptor-derived inventories and
+the candidate must bind both phase-manifest file hashes. The real admission
+builder then requires its verified candidate/phase/dedup records to equal those
+retained records before replay. Replay candidate and dedup commitments must
+equal the verified records. Before writing any receipt, the admission-set root,
+replay evidence, and every family receipt must all carry that exact retained
+candidate semantic SHA. Thus a transient A-to-B-to-A path swap cannot publish
+B-bound results behind either a restored A inventory or a shared manifest SHA.
+Completion of the applicable joint gate is the logical commit point.
+After it, those paths invoke no governed path or semantic authority;
+only raw authority and rollback descriptors may be closed or scrubbed, and
+renderer-build rollback handles remain live through success reporting.
+Renderer `verify` and the programmatic `build_admissions` helper remain
+point-in-time checks; neither claims continuous candidate-file custody or
+publication authority. Within each phase, row seeds are derived from that one
+phase key using domain-separated inputs that bind phase, fixture, pack, split
+role, and ordinal; there are no separate training/evaluation key files. Effective
 row seeds must be unequal across both axes and never reused across phases,
 packs, split roles, or rows. Discovery and confirmation outputs must be
 separate create-only trees.

@@ -45,6 +45,7 @@ FACTOR_AUTHORITY_SOURCE_PATH = "ops/experiments/week7/run_hke_factorial.py"
 ADMISSION_SOURCE_PATH = "ops/experiments/week7/hke_fixture_admission.py"
 _ACTIVE_PRIVATE_AUTHORITIES: list["_PrivateAuthority"] | None = None
 _ACTIVE_ADMISSION_OUTPUTS: list["_AdmissionOutputAuthority"] | None = None
+_ACTIVE_CANDIDATE_AUTHORITIES: list["_CandidateCustodyAuthority"] | None = None
 _ACTIVE_PHASE_KEY_PAIR: Any | None = None
 
 
@@ -103,6 +104,283 @@ class _PrivateAuthority:
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+class _CandidateCustodyAuthority:
+    """Hold both candidate roots and their exact inventories through admit.
+
+    ``build_admissions`` is deliberately usable as a point-in-time pure
+    validator.  The authoritative ``admit`` CLI adds this lease so receipts
+    cannot outlive a relocated, rewritten, linked, or newly public candidate.
+    Candidate inputs are never scrubbed; only receipts are rollback outputs.
+    """
+
+    def __init__(
+        self,
+        *,
+        session: Any,
+        public_inventory: Mapping[str, Any],
+        custodian_inventory: Mapping[str, Any],
+        candidate_manifest: Mapping[str, Any],
+        discovery_manifest: Mapping[str, Any],
+        confirmation_manifest: Mapping[str, Any],
+    ) -> None:
+        self.session = session
+        self.public_inventory = dict(public_inventory)
+        self.custodian_inventory = dict(custodian_inventory)
+        self.candidate_manifest = dict(candidate_manifest)
+        self.discovery_manifest = dict(discovery_manifest)
+        self.confirmation_manifest = dict(confirmation_manifest)
+        candidate_semantic = self.candidate_manifest.get("semantic_sha256")
+        if not isinstance(candidate_semantic, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", candidate_semantic
+        ):
+            raise AdmissionError("bound candidate manifest lacks its semantic identity")
+        self.candidate_semantic_sha256 = candidate_semantic
+
+    @classmethod
+    def _inventory_with_manifests(
+        cls,
+        payload_inventory: Any,
+        manifests: Sequence[tuple[str, bytes]],
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(payload_inventory, Mapping)
+            or not isinstance(payload_inventory.get("files"), list)
+        ):
+            raise AdmissionError("candidate embedded inventory is malformed")
+        files = [dict(item) for item in payload_inventory["files"]]
+        payload_body = {"files": files, "file_count": len(files)}
+        if (
+            payload_inventory.get("file_count") != len(files)
+            or payload_inventory.get("semantic_sha256")
+            != renderer.semantic_sha256(payload_body)
+        ):
+            raise AdmissionError("candidate embedded inventory is invalid")
+        for name, raw in manifests:
+            files.append(
+                {
+                    "path": name,
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+        files.sort(key=lambda item: item["path"])
+        body = {"files": files, "file_count": len(files)}
+        return {**body, "semantic_sha256": renderer.semantic_sha256(body)}
+
+    @classmethod
+    def open(
+        cls,
+        *,
+        public_root: Path,
+        custodian_root: Path,
+        public_boundary_roots: Sequence[Path],
+    ) -> "_CandidateCustodyAuthority":
+        boundary_bindings: list[Any] = []
+        try:
+            public_root, custodian_root, boundaries = (
+                renderer._validate_custody_boundary(
+                    public_root=public_root,
+                    custodian_root=custodian_root,
+                    public_boundary_roots=public_boundary_roots,
+                )
+            )
+            for index, path in enumerate(boundaries):
+                boundary_bindings.append(
+                    renderer._BoundDirectory.open_existing(
+                        path, f"admission public boundary {index}"
+                    )
+                )
+        except BaseException as exc:
+            for boundary in reversed(boundary_bindings):
+                boundary.close()
+            if isinstance(exc, renderer.FixtureError):
+                raise AdmissionError(str(exc)) from exc
+            raise
+        public_binding = None
+        custodian_binding = None
+        session = None
+        try:
+            public_binding = renderer._BoundDirectory.open_existing(
+                public_root, "admission public candidate"
+            )
+            custodian_binding = renderer._BoundDirectory.open_existing(
+                custodian_root, "admission custodian candidate"
+            )
+            session = renderer._CustodySession(
+                public=public_binding,
+                custodian=custodian_binding,
+                boundaries=boundary_bindings,
+            )
+            session.assert_live()
+            public_inventory = renderer._tree_inventory_at(
+                session.public.descriptor, excluded=()
+            )
+            session.assert_live()
+            custodian_inventory = renderer._tree_inventory_at(
+                session.custodian.descriptor, excluded=()
+            )
+            session.assert_live()
+            candidate_raw = renderer._read_regular_at(
+                session.public.descriptor,
+                "CANDIDATE-MANIFEST.json",
+                "bound candidate manifest",
+            )
+            discovery_raw = renderer._read_regular_at(
+                session.public.descriptor,
+                "DISCOVERY-MANIFEST.json",
+                "bound discovery manifest",
+            )
+            confirmation_raw = renderer._read_regular_at(
+                session.custodian.descriptor,
+                "CONFIRMATION-MANIFEST.json",
+                "bound confirmation manifest",
+            )
+            candidate_manifest = renderer._decode_json(
+                candidate_raw, "bound candidate manifest"
+            )
+            discovery_manifest = renderer._decode_json(
+                discovery_raw, "bound discovery manifest"
+            )
+            confirmation_manifest = renderer._decode_json(
+                confirmation_raw, "bound confirmation manifest"
+            )
+            for label, record in (
+                ("bound candidate manifest", candidate_manifest),
+                ("bound discovery manifest", discovery_manifest),
+                ("bound confirmation manifest", confirmation_manifest),
+            ):
+                renderer._validate_semantic_record(record, label)
+            expected_public_inventory = cls._inventory_with_manifests(
+                discovery_manifest.get("file_inventory"),
+                (
+                    ("CANDIDATE-MANIFEST.json", candidate_raw),
+                    ("DISCOVERY-MANIFEST.json", discovery_raw),
+                ),
+            )
+            expected_custodian_inventory = cls._inventory_with_manifests(
+                confirmation_manifest.get("file_inventory"),
+                (("CONFIRMATION-MANIFEST.json", confirmation_raw),),
+            )
+            if (
+                public_inventory != expected_public_inventory
+                or custodian_inventory != expected_custodian_inventory
+                or candidate_manifest.get("discovery_manifest_file_sha256")
+                != hashlib.sha256(discovery_raw).hexdigest()
+                or not isinstance(candidate_manifest.get("confirmation"), Mapping)
+                or candidate_manifest["confirmation"].get(
+                    "custodian_manifest_sha256"
+                )
+                != hashlib.sha256(confirmation_raw).hexdigest()
+            ):
+                raise AdmissionError(
+                    "descriptor-bound candidate manifest or inventory binding failed"
+                )
+            # Re-inventory after reading the binding record so the manifest and
+            # both retained inventory snapshots describe one stable candidate.
+            if public_inventory != renderer._tree_inventory_at(
+                session.public.descriptor, excluded=()
+            ) or custodian_inventory != renderer._tree_inventory_at(
+                session.custodian.descriptor, excluded=()
+            ):
+                raise AdmissionError("candidate changed while custody was bound")
+            session.assert_live()
+            result = cls(
+                session=session,
+                public_inventory=public_inventory,
+                custodian_inventory=custodian_inventory,
+                candidate_manifest=candidate_manifest,
+                discovery_manifest=discovery_manifest,
+                confirmation_manifest=confirmation_manifest,
+            )
+            result.verify()
+            return result
+        except BaseException as exc:
+            if session is not None:
+                try:
+                    session.close(scrub_private=False, verify=False)
+                except BaseException:
+                    pass
+            else:
+                if custodian_binding is not None:
+                    custodian_binding.close()
+                if public_binding is not None:
+                    public_binding.close()
+                for boundary in reversed(boundary_bindings):
+                    boundary.close()
+            if isinstance(exc, renderer.FixtureError):
+                raise AdmissionError(str(exc)) from exc
+            raise
+
+    def verify(self) -> None:
+        try:
+            self.session.assert_live()
+            public_inventory = renderer._tree_inventory_at(
+                self.session.public.descriptor, excluded=()
+            )
+            self.session.assert_live()
+            custodian_inventory = renderer._tree_inventory_at(
+                self.session.custodian.descriptor, excluded=()
+            )
+            self.session.assert_live()
+        except renderer.FixtureError as exc:
+            raise AdmissionError(str(exc)) from exc
+        if (
+            public_inventory != self.public_inventory
+            or custodian_inventory != self.custodian_inventory
+        ):
+            raise AdmissionError(
+                "candidate inventory changed before admission publication completed"
+            )
+
+    def close(self) -> None:
+        # Candidate bytes are inputs.  A failed admission invalidates its exact
+        # receipt inodes but must never alter either candidate tree.
+        self.session.close(scrub_private=False, verify=False)
+
+    def assert_admission_result(
+        self,
+        root: Mapping[str, Any],
+        receipts: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Reject B-bound results even if live paths have already restored A."""
+
+        if not isinstance(root, Mapping) or not isinstance(receipts, Mapping):
+            raise AdmissionError("admission result candidate binding is malformed")
+        replay = root.get("replay_evidence")
+        if (
+            root.get("candidate_semantic_sha256")
+            != self.candidate_semantic_sha256
+            or not isinstance(replay, Mapping)
+            or replay.get("candidate_semantic_sha256")
+            != self.candidate_semantic_sha256
+            or not receipts
+            or any(
+                not isinstance(receipt, Mapping)
+                or receipt.get("candidate_semantic_sha256")
+                != self.candidate_semantic_sha256
+                for receipt in receipts.values()
+            )
+        ):
+            raise AdmissionError(
+                "admission result does not match descriptor-bound candidate"
+            )
+
+    def assert_verified_candidate(self, verified: Mapping[str, Any]) -> None:
+        """Require the records consumed by admission to be retained candidate A."""
+
+        if (
+            not isinstance(verified, Mapping)
+            or verified.get("candidate_manifest") != self.candidate_manifest
+            or verified.get("discovery_manifest") != self.discovery_manifest
+            or verified.get("confirmation_manifest") != self.confirmation_manifest
+            or verified.get("dedup_evidence")
+            != self.candidate_manifest.get("cross_candidate_evidence")
+        ):
+            raise AdmissionError(
+                "verified candidate does not match descriptor-bound candidate"
+            )
 
 
 class _AdmissionOutputAuthority:
@@ -829,6 +1107,9 @@ def _close_private_authorities(*, verify: bool, scrub_outputs: bool) -> None:
     admission_outputs = list(_ACTIVE_ADMISSION_OUTPUTS or ())
     if _ACTIVE_ADMISSION_OUTPUTS is not None:
         _ACTIVE_ADMISSION_OUTPUTS.clear()
+    candidate_authorities = list(_ACTIVE_CANDIDATE_AUTHORITIES or ())
+    if _ACTIVE_CANDIDATE_AUTHORITIES is not None:
+        _ACTIVE_CANDIDATE_AUTHORITIES.clear()
     verification_error: BaseException | None = None
     close_error: BaseException | None = None
     rollbacks: list[_AdmissionOutputRollback] = []
@@ -845,18 +1126,25 @@ def _close_private_authorities(*, verify: bool, scrub_outputs: bool) -> None:
             authority.scrub()
         for output in admission_outputs:
             output.scrub()
-    # Joint terminal gate: private inputs/outputs, public admission receipts,
-    # and both key authorities remain descriptor-bound throughout both passes.
+    # Joint terminal gate: candidate roots/inventories, private inputs/outputs,
+    # public admission receipts, and both key authorities remain descriptor-bound
+    # throughout both passes.
     # Its completion is the semantic commit point; no governed check follows.
     if verify and verification_error is None:
         try:
             for _pass in range(2):
+                for candidate_authority in candidate_authorities:
+                    candidate_authority.verify()
                 for authority in authorities:
                     authority.verify()
                 for output in admission_outputs:
                     output.verify()
                 if _ACTIVE_PHASE_KEY_PAIR is not None:
                     _ACTIVE_PHASE_KEY_PAIR.verify()
+                # Candidate custody is the publication premise, so close each
+                # pass by rebinding it after every other governed authority.
+                for candidate_authority in candidate_authorities:
+                    candidate_authority.verify()
         except BaseException as exc:
             scrub_outputs = True
             verification_error = (
@@ -881,6 +1169,13 @@ def _close_private_authorities(*, verify: bool, scrub_outputs: bool) -> None:
     for authority in reversed(authorities):
         try:
             authority.close()
+        except BaseException as exc:
+            scrub_outputs = True
+            if close_error is None:
+                close_error = exc
+    for candidate_authority in reversed(candidate_authorities):
+        try:
+            candidate_authority.close()
         except BaseException as exc:
             scrub_outputs = True
             if close_error is None:
@@ -1513,7 +1808,15 @@ def build_admissions(
     generator_identity_probe: Callable[
         [], Mapping[str, Any]
     ] = _current_generator_identity,
+    _candidate_authority: _CandidateCustodyAuthority | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Build a point-in-time admission decision without publication authority.
+
+    Callers that publish receipts must retain descriptor-bound candidate roots
+    and inventories through their own terminal gate.  The authoritative CLI
+    does so with :class:`_CandidateCustodyAuthority`.
+    """
+
     try:
         discovery_key = renderer._validate_key(discovery_key, "discovery key")
         confirmation_key = renderer._validate_key(confirmation_key, "confirmation key")
@@ -1529,6 +1832,8 @@ def build_admissions(
         ),
     }
     verified = _verify_candidate(public_root, custodian_root, public_boundary_roots)
+    if _candidate_authority is not None:
+        _candidate_authority.assert_verified_candidate(verified)
     if (
         verified["discovery_manifest"].get("phase_key_commitment_sha256")
         != phase_commitments["discovery"]
@@ -1606,7 +1911,11 @@ def build_admissions(
         "contract_source_sha256": replay.get("contract_source_sha256"),
     }
     if (
-        replay_evidence["discovery_key_commitment_sha256"]
+        replay_evidence["candidate_semantic_sha256"]
+        != candidate["semantic_sha256"]
+        or replay_evidence["dedup_semantic_sha256"]
+        != dedup["semantic_sha256"]
+        or replay_evidence["discovery_key_commitment_sha256"]
         != phase_commitments["discovery"]
         or replay_evidence["confirmation_key_commitment_sha256"]
         != phase_commitments["confirmation"]
@@ -2499,17 +2808,19 @@ def _parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     global _ACTIVE_PRIVATE_AUTHORITIES, _ACTIVE_ADMISSION_OUTPUTS
-    global _ACTIVE_PHASE_KEY_PAIR
+    global _ACTIVE_CANDIDATE_AUTHORITIES, _ACTIVE_PHASE_KEY_PAIR
 
     args = _parse(argv)
     if (
         _ACTIVE_PRIVATE_AUTHORITIES is not None
         or _ACTIVE_ADMISSION_OUTPUTS is not None
+        or _ACTIVE_CANDIDATE_AUTHORITIES is not None
         or _ACTIVE_PHASE_KEY_PAIR is not None
     ):
         raise AdmissionError("CLI authority scope is already active")
     _ACTIVE_PRIVATE_AUTHORITIES = []
     _ACTIVE_ADMISSION_OUTPUTS = []
+    _ACTIVE_CANDIDATE_AUTHORITIES = []
     succeeded = False
     finalization_error: BaseException | None = None
     try:
@@ -2528,6 +2839,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     finalization_error = exc
         finally:
             _ACTIVE_PHASE_KEY_PAIR = None
+            _ACTIVE_CANDIDATE_AUTHORITIES = None
             _ACTIVE_ADMISSION_OUTPUTS = None
             _ACTIVE_PRIVATE_AUTHORITIES = None
         if finalization_error is not None:
@@ -2535,7 +2847,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
-    """Keep private authority leases open through the CLI process boundary."""
+    """Keep private and candidate authority leases through the CLI boundary."""
 
     global _ACTIVE_PHASE_KEY_PAIR
 
@@ -2617,9 +2929,24 @@ def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
         return 0
     retained = _ACTIVE_PRIVATE_AUTHORITIES is not None
     pair = None
+    local_candidate: _CandidateCustodyAuthority | None = None
     local_output: _AdmissionOutputAuthority | None = None
     local_succeeded = False
     try:
+        candidate_authority = _CandidateCustodyAuthority.open(
+            public_root=args.public_root,
+            custodian_root=args.custodian_root,
+            public_boundary_roots=args.public_boundary_roots,
+        )
+        retained_candidate = _ACTIVE_CANDIDATE_AUTHORITIES is not None
+        if retained_candidate:
+            try:
+                _ACTIVE_CANDIDATE_AUTHORITIES.append(candidate_authority)
+            except BaseException:
+                candidate_authority.close()
+                raise
+        else:
+            local_candidate = candidate_authority
         try:
             pair = renderer._BoundPhaseKeyPair.open(
                 discovery_path=args.discovery_key_file,
@@ -2646,7 +2973,9 @@ def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
             confirmation_key=pair.confirmation.payload,
             public_boundary_roots=args.public_boundary_roots,
             sealed_review=sealed,
+            _candidate_authority=candidate_authority,
         )
+        candidate_authority.assert_admission_result(root, receipts)
         output_authority = _AdmissionOutputAuthority.create(
             args.output_root,
             public_root=args.public_root,
@@ -2680,10 +3009,14 @@ def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
         if local_succeeded and finalization_error is None:
             try:
                 for _pass in range(2):
+                    if local_candidate is not None:
+                        local_candidate.verify()
                     if local_output is not None:
                         local_output.verify()
                     if pair is not None:
                         pair.verify()
+                    if local_candidate is not None:
+                        local_candidate.verify()
             except BaseException as exc:
                 local_succeeded = False
                 finalization_error = (
@@ -2711,6 +3044,13 @@ def _main_with_held_private_descriptors(args: argparse.Namespace) -> int:
                         if isinstance(exc, renderer.FixtureError)
                         else exc
                     )
+        if local_candidate is not None:
+            try:
+                local_candidate.close()
+            except BaseException as exc:
+                local_succeeded = False
+                if finalization_error is None:
+                    finalization_error = exc
         if local_rollback is not None:
             if not local_succeeded or finalization_error is not None:
                 local_rollback.scrub()

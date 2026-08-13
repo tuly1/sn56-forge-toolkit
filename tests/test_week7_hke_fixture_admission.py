@@ -93,6 +93,107 @@ def _write_phase_key(path: Path, payload: bytes) -> Path:
     return path
 
 
+def _seed_stub_candidate(public: Path, custodian: Path, label: str) -> str:
+    discovery_body = {
+        "stub_phase": "discovery",
+        "file_inventory": renderer._tree_inventory(
+            public,
+            excluded={"CANDIDATE-MANIFEST.json", "DISCOVERY-MANIFEST.json"},
+        ),
+    }
+    discovery = {
+        **discovery_body,
+        "semantic_sha256": renderer.semantic_sha256(discovery_body),
+    }
+    discovery_raw = renderer.canonical_bytes(discovery) + b"\n"
+    (public / "DISCOVERY-MANIFEST.json").write_bytes(discovery_raw)
+    confirmation_body = {
+        "stub_phase": "confirmation",
+        "file_inventory": renderer._tree_inventory(
+            custodian, excluded={"CONFIRMATION-MANIFEST.json"}
+        ),
+    }
+    confirmation = {
+        **confirmation_body,
+        "semantic_sha256": renderer.semantic_sha256(confirmation_body),
+    }
+    confirmation_raw = renderer.canonical_bytes(confirmation) + b"\n"
+    (custodian / "CONFIRMATION-MANIFEST.json").write_bytes(confirmation_raw)
+    dedup_body = {"stub_dedup": label}
+    dedup = {
+        **dedup_body,
+        "semantic_sha256": renderer.semantic_sha256(dedup_body),
+    }
+    body = {
+        "stub_candidate": label,
+        "discovery_manifest_file_sha256": hashlib.sha256(
+            discovery_raw
+        ).hexdigest(),
+        "confirmation": {
+            "custodian_manifest_sha256": hashlib.sha256(
+                confirmation_raw
+            ).hexdigest()
+        },
+        "cross_candidate_evidence": dedup,
+    }
+    record = {**body, "semantic_sha256": renderer.semantic_sha256(body)}
+    (public / "CANDIDATE-MANIFEST.json").write_bytes(
+        renderer.canonical_bytes(record) + b"\n"
+    )
+    return record["semantic_sha256"]
+
+
+def _stub_admission_result(candidate_sha256: str, *families: str):
+    root = {
+        "status": "fixture_admission_authorized",
+        "candidate_semantic_sha256": candidate_sha256,
+        "replay_evidence": {"candidate_semantic_sha256": candidate_sha256},
+    }
+    receipts = {
+        family: {
+            "status": "fixture_admission_authorized",
+            "candidate_semantic_sha256": candidate_sha256,
+        }
+        for family in families
+    }
+    return root, receipts
+
+
+def _stub_admit_case(tmp_path: Path, prefix: str):
+    boundary = tmp_path / f"{prefix}-public-boundary"
+    public = boundary / "candidate"
+    public.mkdir(parents=True)
+    public_seed = public / "public.bin"
+    public_seed.write_bytes(b"public-candidate-bytes")
+    custodian = tmp_path / f"{prefix}-custodian"
+    custodian.mkdir()
+    custodian_seed = custodian / "private.bin"
+    custodian_seed.write_bytes(b"private-candidate-bytes")
+    candidate_sha256 = _seed_stub_candidate(public, custodian, prefix)
+    key_parent = tmp_path / f"{prefix}-keys"
+    discovery = _write_phase_key(key_parent / "discovery.key", DISCOVERY_KEY)
+    confirmation = _write_phase_key(
+        key_parent / "confirmation.key", CONFIRMATION_KEY
+    )
+    output_root = tmp_path / f"{prefix}-admission-output"
+    args = type(
+        "Args",
+        (),
+        {
+            "command": "admit",
+            "public_root": public,
+            "custodian_root": custodian,
+            "public_boundary_roots": (boundary,),
+            "sealed_review": tmp_path / f"{prefix}-review.json",
+            "discovery_key_file": discovery,
+            "confirmation_key_file": confirmation,
+            "output_root": output_root,
+            "candidate_semantic_sha256": candidate_sha256,
+        },
+    )()
+    return args, public_seed, custodian_seed
+
+
 def generator_probe():
     return {
         "repository": renderer.GENERATOR_REPOSITORY,
@@ -996,6 +1097,7 @@ def test_admit_cli_rejects_phase_key_inside_public_boundary(
     public.mkdir(parents=True)
     custodian = tmp_path / "admit-custodian"
     custodian.mkdir()
+    _seed_stub_candidate(public, custodian, "phase-key-public-boundary")
     discovery = _write_phase_key(boundary / "published.key", DISCOVERY_KEY)
     confirmation = _write_phase_key(
         tmp_path / "admit-keys" / "confirmation.key", CONFIRMATION_KEY
@@ -1039,6 +1141,7 @@ def test_admit_cli_revalidates_phase_keys_after_consumer_and_before_success(
     public.mkdir(parents=True)
     custodian = tmp_path / "admit-tail-custodian"
     custodian.mkdir()
+    candidate_sha256 = _seed_stub_candidate(public, custodian, "phase-key-tail")
     key_parent = tmp_path / "admit-tail-keys"
     discovery = _write_phase_key(key_parent / "discovery.key", DISCOVERY_KEY)
     confirmation = _write_phase_key(
@@ -1076,10 +1179,7 @@ def test_admit_cli_revalidates_phase_keys_after_consumer_and_before_success(
             discovery.write_bytes(b"z" * len(DISCOVERY_KEY))
         elif tail_mutation == "late-worktree":
             late_inventory = True
-        return (
-            {"status": "fixture_admission_authorized"},
-            {"social": {"status": "fixture_admission_authorized"}},
-        )
+        return _stub_admission_result(candidate_sha256, "social")
 
     def verify_with_between_pass_mutation(self):
         nonlocal between_pass_mutated
@@ -1127,6 +1227,7 @@ def test_admit_cli_keeps_receipt_rollback_live_through_private_and_key_close(
     public.mkdir(parents=True)
     custodian = tmp_path / "admit-close-custodian"
     custodian.mkdir()
+    candidate_sha256 = _seed_stub_candidate(public, custodian, "private-close-tail")
     key_parent = tmp_path / "admit-close-keys"
     discovery = _write_phase_key(key_parent / "discovery.key", DISCOVERY_KEY)
     confirmation = _write_phase_key(
@@ -1174,10 +1275,7 @@ def test_admit_cli_keeps_receipt_rollback_live_through_private_and_key_close(
     monkeypatch.setattr(
         admission,
         "build_admissions",
-        lambda **_kwargs: (
-            {"status": "fixture_admission_authorized"},
-            {"social": {"status": "fixture_admission_authorized"}},
-        ),
+        lambda **_kwargs: _stub_admission_result(candidate_sha256, "social"),
     )
     with pytest.raises(
         (admission.AdmissionError, admission.renderer.FixtureError),
@@ -1203,6 +1301,7 @@ def test_direct_admit_helper_scrubs_receipts_when_terminal_key_close_fails(
     public.mkdir(parents=True)
     custodian = tmp_path / "direct-admit-custodian"
     custodian.mkdir()
+    candidate_sha256 = _seed_stub_candidate(public, custodian, "direct-key-close")
     key_parent = tmp_path / "direct-admit-keys"
     discovery = _write_phase_key(key_parent / "discovery.key", DISCOVERY_KEY)
     confirmation = _write_phase_key(
@@ -1241,10 +1340,7 @@ def test_direct_admit_helper_scrubs_receipts_when_terminal_key_close_fails(
     monkeypatch.setattr(
         admission,
         "build_admissions",
-        lambda **_kwargs: (
-            {"status": "fixture_admission_authorized"},
-            {"social": {"status": "fixture_admission_authorized"}},
-        ),
+        lambda **_kwargs: _stub_admission_result(candidate_sha256, "social"),
     )
     monkeypatch.setattr(
         admission.renderer._BoundPhaseKeyPair, "verify", verify_after_output
@@ -1271,6 +1367,7 @@ def test_admit_cli_joint_gate_rejects_output_link_between_passes(
     public.mkdir(parents=True)
     custodian = tmp_path / "last-authority-custodian"
     custodian.mkdir()
+    candidate_sha256 = _seed_stub_candidate(public, custodian, "output-link-tail")
     key_parent = tmp_path / "last-authority-keys"
     discovery = _write_phase_key(key_parent / "discovery.key", DISCOVERY_KEY)
     confirmation = _write_phase_key(
@@ -1329,10 +1426,7 @@ def test_admit_cli_joint_gate_rejects_output_link_between_passes(
     monkeypatch.setattr(
         admission,
         "build_admissions",
-        lambda **_kwargs: (
-            {"status": "fixture_admission_authorized"},
-            {"social": {"status": "fixture_admission_authorized"}},
-        ),
+        lambda **_kwargs: _stub_admission_result(candidate_sha256, "social"),
     )
     monkeypatch.setattr(admission._AdmissionOutputAuthority, "verify", output_verify)
     monkeypatch.setattr(admission._AdmissionOutputAuthority, "close", output_close)
@@ -1418,6 +1512,420 @@ def test_admission_output_retain_failure_invalidates_unregistered_receipt(
         authority.close()
     assert receipt.exists()
     assert receipt.read_bytes() == b""
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "relocate-public",
+        "relocate-custodian",
+        "hardlink-public",
+        "new-custodian-file",
+        "rewrite-public",
+        "late-worktree",
+    ),
+)
+def test_admit_cli_candidate_custody_failure_invalidates_receipts_not_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    args, public_seed, custodian_seed = _stub_admit_case(
+        tmp_path, f"candidate-custody-{mutation}"
+    )
+    original_worktrees = admission.renderer._registered_worktree_roots
+    late_worktree = False
+    retained_public = public_seed
+    retained_custodian = custodian_seed
+
+    def worktrees():
+        roots = original_worktrees()
+        return roots + ((args.custodian_root,) if late_worktree else ())
+
+    def consume_then_mutate(**_kwargs):
+        nonlocal late_worktree, retained_public, retained_custodian
+        if mutation == "relocate-public":
+            moved = tmp_path / "relocated-public-candidate"
+            args.public_root.rename(moved)
+            args.public_root.mkdir()
+            retained_public = moved / public_seed.name
+        elif mutation == "relocate-custodian":
+            moved = tmp_path / "relocated-custodian-candidate"
+            args.custodian_root.rename(moved)
+            args.custodian_root.mkdir()
+            retained_custodian = moved / custodian_seed.name
+        elif mutation == "hardlink-public":
+            os.link(public_seed, tmp_path / "public-candidate-hardlink.bin")
+        elif mutation == "new-custodian-file":
+            (args.custodian_root / "new.bin").write_bytes(b"new candidate bytes")
+        elif mutation == "rewrite-public":
+            public_seed.write_bytes(b"PUBLIC-candidate-bytes")
+        elif mutation == "late-worktree":
+            late_worktree = True
+        return _stub_admission_result(args.candidate_semantic_sha256, "social")
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: args)
+    monkeypatch.setattr(admission, "_load_private_json", lambda *_a, **_k: {})
+    monkeypatch.setattr(admission.renderer, "_registered_worktree_roots", worktrees)
+    monkeypatch.setattr(admission, "build_admissions", consume_then_mutate)
+    with pytest.raises(
+        (admission.AdmissionError, admission.renderer.FixtureError),
+        match=(
+            "candidate|single-link|inventory|parent entry changed|"
+            "absolute path changed|custodian output"
+        ),
+    ):
+        admission.main([])
+    for path in (
+        args.output_root / "ADMISSION-SET.json",
+        args.output_root / "social.json",
+    ):
+        assert not path.exists() or path.read_bytes() == b""
+    assert retained_public.read_bytes() in {
+        b"public-candidate-bytes",
+        b"PUBLIC-candidate-bytes",
+    }
+    assert retained_custodian.read_bytes() == b"private-candidate-bytes"
+    assert admission._ACTIVE_CANDIDATE_AUTHORITIES is None
+
+
+def test_admit_cli_candidate_inventory_is_rechecked_between_terminal_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, public_seed, _custodian_seed = _stub_admit_case(
+        tmp_path, "candidate-between-pass"
+    )
+    original_verify = admission._CandidateCustodyAuthority.verify
+    mutated = False
+
+    def verify_then_mutate(self):
+        nonlocal mutated
+        result = original_verify(self)
+        if (
+            not mutated
+            and (args.output_root / "ADMISSION-SET.json").exists()
+        ):
+            public_seed.write_bytes(b"between-pass-rewrite")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: args)
+    monkeypatch.setattr(admission, "_load_private_json", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        admission,
+        "build_admissions",
+        lambda **_kwargs: _stub_admission_result(
+            args.candidate_semantic_sha256, "social"
+        ),
+    )
+    monkeypatch.setattr(
+        admission._CandidateCustodyAuthority, "verify", verify_then_mutate
+    )
+    with pytest.raises(admission.AdmissionError, match="candidate inventory changed"):
+        admission.main([])
+    assert mutated is True
+    assert public_seed.read_bytes() == b"between-pass-rewrite"
+    for path in (
+        args.output_root / "ADMISSION-SET.json",
+        args.output_root / "social.json",
+    ):
+        assert not path.exists() or path.read_bytes() == b""
+
+
+def test_admit_rejects_transient_a_to_b_to_a_candidate_consumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, public_seed, custodian_seed = _stub_admit_case(
+        tmp_path, "transient-candidate-a"
+    )
+    b_public = tmp_path / "transient-candidate-b-public"
+    b_public.mkdir()
+    (b_public / "public.bin").write_bytes(b"candidate-b-public")
+    b_custodian = tmp_path / "transient-candidate-b-custodian"
+    b_custodian.mkdir()
+    (b_custodian / "private.bin").write_bytes(b"candidate-b-private")
+    b_candidate_sha256 = _seed_stub_candidate(
+        b_public, b_custodian, "transient-candidate-b"
+    )
+    a_public_held = tmp_path / "transient-candidate-a-public-held"
+    a_custodian_held = tmp_path / "transient-candidate-a-custodian-held"
+    b_public_after = tmp_path / "transient-candidate-b-public-after"
+    b_custodian_after = tmp_path / "transient-candidate-b-custodian-after"
+    consumed_b = False
+
+    def consume_b_then_restore_a(**_kwargs):
+        nonlocal consumed_b
+        args.public_root.rename(a_public_held)
+        b_public.rename(args.public_root)
+        args.custodian_root.rename(a_custodian_held)
+        b_custodian.rename(args.custodian_root)
+        try:
+            consumed = json.loads(
+                (args.public_root / "CANDIDATE-MANIFEST.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            assert consumed["semantic_sha256"] == b_candidate_sha256
+            consumed_b = True
+        finally:
+            args.public_root.rename(b_public_after)
+            a_public_held.rename(args.public_root)
+            args.custodian_root.rename(b_custodian_after)
+            a_custodian_held.rename(args.custodian_root)
+        # This is the valid/stub B result that the inventory-only A->B->A
+        # terminal check accepted before the explicit consumption binding.
+        return _stub_admission_result(b_candidate_sha256, "social")
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: args)
+    monkeypatch.setattr(admission, "_load_private_json", lambda *_a, **_k: {})
+    monkeypatch.setattr(admission, "build_admissions", consume_b_then_restore_a)
+    with pytest.raises(
+        admission.AdmissionError,
+        match="admission result does not match descriptor-bound candidate",
+    ):
+        admission.main([])
+    assert consumed_b is True
+    assert public_seed.read_bytes() == b"public-candidate-bytes"
+    assert custodian_seed.read_bytes() == b"private-candidate-bytes"
+    assert json.loads(
+        (args.public_root / "CANDIDATE-MANIFEST.json").read_text(encoding="ascii")
+    )["semantic_sha256"] == args.candidate_semantic_sha256
+    for path in (
+        args.output_root / "ADMISSION-SET.json",
+        args.output_root / "social.json",
+    ):
+        assert not path.exists() or path.read_bytes() == b""
+    assert admission._ACTIVE_CANDIDATE_AUTHORITIES is None
+
+
+def test_candidate_authority_rejects_drifted_a_with_valid_b_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    boundary = tmp_path / "same-manifest-public-boundary"
+    b_public = boundary / "valid-b"
+    b_public.mkdir(parents=True)
+    (b_public / "public.bin").write_bytes(b"valid-b-public-bytes")
+    b_custodian = tmp_path / "same-manifest-valid-b-custodian"
+    b_custodian.mkdir()
+    (b_custodian / "private.bin").write_bytes(b"valid-b-private-bytes")
+    b_sha = _seed_stub_candidate(b_public, b_custodian, "same-manifest")
+    a_public = boundary / "drifted-a"
+    a_custodian = tmp_path / "same-manifest-drifted-a-custodian"
+    shutil.copytree(b_public, a_public)
+    shutil.copytree(b_custodian, a_custodian)
+    (a_public / "public.bin").write_bytes(b"DRIFTED-public-bytes")
+    assert len((a_public / "public.bin").read_bytes()) == len(
+        (b_public / "public.bin").read_bytes()
+    )
+    assert json.loads(
+        (a_public / "CANDIDATE-MANIFEST.json").read_text(encoding="ascii")
+    )["semantic_sha256"] == b_sha
+    assert json.loads(
+        (b_public / "CANDIDATE-MANIFEST.json").read_text(encoding="ascii")
+    )["semantic_sha256"] == b_sha
+    monkeypatch.setattr(
+        admission,
+        "build_admissions",
+        lambda **_kwargs: pytest.fail(
+            "drifted A reached admission before descriptor inventory binding"
+        ),
+    )
+    with pytest.raises(
+        admission.AdmissionError,
+        match="descriptor-bound candidate manifest or inventory binding failed",
+    ):
+        admission._CandidateCustodyAuthority.open(
+            public_root=a_public,
+            custodian_root=a_custodian,
+            public_boundary_roots=(boundary,),
+        )
+
+
+def test_real_builder_rejects_same_sha_verified_record_transplant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, _public_seed, _custodian_seed = _stub_admit_case(
+        tmp_path, "same-sha-verified-transplant"
+    )
+    authority = admission._CandidateCustodyAuthority.open(
+        public_root=args.public_root,
+        custodian_root=args.custodian_root,
+        public_boundary_roots=args.public_boundary_roots,
+    )
+    transplanted_discovery = copy.deepcopy(authority.discovery_manifest)
+    transplanted_discovery["stub_phase"] = "discovery-consumed-from-b"
+    transplanted_body = dict(transplanted_discovery)
+    transplanted_body.pop("semantic_sha256")
+    transplanted_discovery["semantic_sha256"] = renderer.semantic_sha256(
+        transplanted_body
+    )
+    verified_b = {
+        "candidate_manifest": copy.deepcopy(authority.candidate_manifest),
+        "discovery_manifest": transplanted_discovery,
+        "confirmation_manifest": copy.deepcopy(authority.confirmation_manifest),
+        "dedup_evidence": copy.deepcopy(
+            authority.candidate_manifest["cross_candidate_evidence"]
+        ),
+    }
+    monkeypatch.setattr(admission, "_verify_candidate", lambda *_a, **_k: verified_b)
+    monkeypatch.setattr(
+        admission.renderer,
+        "verify_replay",
+        lambda **_kwargs: pytest.fail(
+            "replay ran before the descriptor-bound consumed-record check"
+        ),
+    )
+    try:
+        with pytest.raises(
+            admission.AdmissionError,
+            match="verified candidate does not match descriptor-bound candidate",
+        ):
+            admission.build_admissions(
+                public_root=args.public_root,
+                custodian_root=args.custodian_root,
+                discovery_key=DISCOVERY_KEY,
+                confirmation_key=CONFIRMATION_KEY,
+                public_boundary_roots=args.public_boundary_roots,
+                sealed_review={},
+                generator_identity_probe=generator_probe,
+                _candidate_authority=authority,
+            )
+    finally:
+        authority.close()
+
+
+def test_direct_admit_helper_has_candidate_custody_and_receipt_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, _public_seed, custodian_seed = _stub_admit_case(
+        tmp_path, "direct-candidate-custody"
+    )
+    relocated = tmp_path / "direct-relocated-custodian"
+
+    def consume_then_relocate(**_kwargs):
+        args.custodian_root.rename(relocated)
+        args.custodian_root.mkdir()
+        return _stub_admission_result(args.candidate_semantic_sha256, "social")
+
+    monkeypatch.setattr(admission, "_load_private_json", lambda *_a, **_k: {})
+    monkeypatch.setattr(admission, "build_admissions", consume_then_relocate)
+    assert admission._ACTIVE_CANDIDATE_AUTHORITIES is None
+    with pytest.raises(
+        (admission.AdmissionError, admission.renderer.FixtureError),
+        match="parent entry changed|absolute path changed",
+    ):
+        admission._main_with_held_private_descriptors(args)
+    assert (relocated / custodian_seed.name).read_bytes() == b"private-candidate-bytes"
+    for path in (
+        args.output_root / "ADMISSION-SET.json",
+        args.output_root / "social.json",
+    ):
+        assert not path.exists() or path.read_bytes() == b""
+
+
+def test_admit_success_closes_candidate_only_after_joint_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, public_seed, custodian_seed = _stub_admit_case(
+        tmp_path, "candidate-success-order"
+    )
+    original_verify = admission._CandidateCustodyAuthority.verify
+    original_candidate_close = admission._CandidateCustodyAuthority.close
+    original_output_close = admission._AdmissionOutputAuthority.close
+    original_pair_close = admission.renderer._BoundPhaseKeyPair.close
+    terminal_candidate_checks = 0
+    gate_complete = False
+    close_order: list[str] = []
+
+    def candidate_verify(self):
+        nonlocal terminal_candidate_checks, gate_complete
+        result = original_verify(self)
+        if (args.output_root / "ADMISSION-SET.json").exists():
+            terminal_candidate_checks += 1
+            gate_complete = terminal_candidate_checks >= 4
+        return result
+
+    def output_close(self, *, verify=False):
+        assert verify is False
+        assert gate_complete is True
+        close_order.append("output")
+        return original_output_close(self, verify=verify)
+
+    def candidate_close(self):
+        assert gate_complete is True
+        close_order.append("candidate")
+        return original_candidate_close(self)
+
+    def pair_close(self, *, verify):
+        assert verify is False
+        assert gate_complete is True
+        close_order.append("keys")
+        return original_pair_close(self, verify=verify)
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: args)
+    monkeypatch.setattr(admission, "_load_private_json", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        admission,
+        "build_admissions",
+        lambda **_kwargs: _stub_admission_result(
+            args.candidate_semantic_sha256, "social"
+        ),
+    )
+    monkeypatch.setattr(
+        admission._CandidateCustodyAuthority, "verify", candidate_verify
+    )
+    monkeypatch.setattr(
+        admission._CandidateCustodyAuthority, "close", candidate_close
+    )
+    monkeypatch.setattr(admission._AdmissionOutputAuthority, "close", output_close)
+    monkeypatch.setattr(admission.renderer._BoundPhaseKeyPair, "close", pair_close)
+    assert admission.main([]) == 0
+    assert terminal_candidate_checks == 4
+    assert close_order == ["output", "candidate", "keys"]
+    assert public_seed.read_bytes() == b"public-candidate-bytes"
+    assert custodian_seed.read_bytes() == b"private-candidate-bytes"
+    assert json.loads(
+        (args.output_root / "ADMISSION-SET.json").read_text(encoding="ascii")
+    )["status"] == "fixture_admission_authorized"
+    assert admission._ACTIVE_CANDIDATE_AUTHORITIES is None
+
+
+def test_admit_candidate_raw_close_failure_still_invalidates_all_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, public_seed, custodian_seed = _stub_admit_case(
+        tmp_path, "candidate-close-failure"
+    )
+    original_close = admission._CandidateCustodyAuthority.close
+
+    def close_then_fail(self):
+        original_close(self)
+        raise admission.AdmissionError("candidate raw close failed")
+
+    monkeypatch.setattr(admission, "_parse", lambda _argv: args)
+    monkeypatch.setattr(admission, "_load_private_json", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        admission,
+        "build_admissions",
+        lambda **_kwargs: _stub_admission_result(
+            args.candidate_semantic_sha256, "social", "product"
+        ),
+    )
+    monkeypatch.setattr(
+        admission._CandidateCustodyAuthority, "close", close_then_fail
+    )
+    with pytest.raises(admission.AdmissionError, match="candidate raw close failed"):
+        admission.main([])
+    for path in (
+        args.output_root / "ADMISSION-SET.json",
+        args.output_root / "social.json",
+        args.output_root / "product.json",
+    ):
+        assert path.exists()
+        assert path.read_bytes() == b""
+    assert public_seed.read_bytes() == b"public-candidate-bytes"
+    assert custodian_seed.read_bytes() == b"private-candidate-bytes"
+    assert admission._ACTIVE_CANDIDATE_AUTHORITIES is None
 
 
 def test_admission_rejects_relocated_custodian_inside_evidence_boundary(
