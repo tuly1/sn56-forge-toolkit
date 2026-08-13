@@ -1,9 +1,12 @@
 # Validator-routed FLUX trainer. G.O.D deliberately selects this legacy-named
 # Dockerfile for model_type=flux. Its downloader emits one of two cache shapes:
 # an exact-one-root-file standalone checkpoint, or a full snapshot directory.
-# Keep both pinned runtime graphs in one image and select only from cache shape.
+# Keep the pinned incumbent ai-toolkit graph beside Kohya and select only from
+# cache shape. Experimental Krea code belongs exclusively to the toolkit image.
 
 FROM diagonalge/ai-toolkit:latest@sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8 AS aitoolkit-runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1
 
 COPY ops/docker/image-runtime-lock.txt /opt/sn56/image-runtime-lock.txt
 COPY ops/docker/image-runtime-phase1-constraints.txt /opt/sn56/image-runtime-phase1-constraints.txt
@@ -32,6 +35,7 @@ RUN retry_network() { \
     }; \
     retry_network git fetch origin 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
     git checkout 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+    test "$(git rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
     retry_network pip install --no-cache-dir \
         --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
         --requirement requirements.txt && \
@@ -79,7 +83,9 @@ RUN retry_network() { \
     python3 /opt/sn56/verify-image-runtime.py \
         --lock /opt/sn56/image-runtime-lock.txt \
         --constraints /opt/sn56/image-runtime-phase1-constraints.txt && \
-    test "$(git rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e
+    test "$(git -C /app/ai-toolkit rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+    find /app/ai-toolkit -xdev -type d -name __pycache__ \
+        -prune -exec rm -rf -- {} +
 
 
 FROM diagonalge/kohya_latest:latest@sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e
@@ -145,6 +151,7 @@ RUN set -eu; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONNOUSERSITE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     HF_HUB_OFFLINE=1 \

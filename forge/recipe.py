@@ -921,27 +921,68 @@ def field_demonstrated_steps(model_type, hours_to_complete):
         return None
 
 
-def size_scaled_steps(model_type, num_images, hours_to_complete, template_steps):
-    """Never raises → falls back to template_steps on any error (INV-1)."""
+def size_scaled_steps(
+    model_type,
+    num_images,
+    hours_to_complete,
+    template_steps,
+    *,
+    throughput_profile=None,
+):
+    """Materialize the size law under a static or operator-attested budget.
+
+    With no profile this retains the historical never-raise fallback and exact
+    incumbent outputs.  Supplying a profile is an experimental, fail-closed
+    operation: its model binding is checked before the legacy fallback block.
+    """
+    if throughput_profile is not None:
+        from forge.adaptive_timing import ThroughputProfile, TimingProfileError
+
+        if not isinstance(throughput_profile, ThroughputProfile):
+            raise TimingProfileError("recipe received an invalid timing profile")
+        expected_model = (model_type or "").strip().lower()
+        if throughput_profile.model_type != expected_model:
+            raise TimingProfileError("recipe timing profile model type mismatch")
     try:
         mt = (model_type or "").strip().lower()
-        row = STEP_TABLE.get(mt)
-        if row is None:
-            return int(template_steps)
-        n = max(1, int(num_images))
-        scaled = row["base"] * (n / row["n_ref"]) ** row["p"]
-        scaled = int(round(max(row["min"], min(row["max"], scaled))))
+        scaled = size_target_steps(mt, num_images, template_steps)
 
-        sit = SEC_PER_IT.get(mt, 3.0)
+        sit = (
+            throughput_profile.seconds_per_step
+            if throughput_profile is not None
+            else SEC_PER_IT.get(mt, 3.0)
+        )
+        startup_s = (
+            throughput_profile.startup_seconds
+            if throughput_profile is not None
+            else STARTUP_S
+        )
         budget_s = max(0.0, float(hours_to_complete) * 3600.0)
-        train_s = budget_s * margin_for(mt) - STARTUP_S - EXPORT_RESERVE_S
+        train_s = budget_s * margin_for(mt) - startup_s - EXPORT_RESERVE_S
         budget_cap = int(train_s / sit) if train_s > 0 else 1
         return max(1, min(scaled, budget_cap))  # cap may push below `min`
     except Exception:
+        # A supplied operator-attested claim is evidence-bearing experiment input.
+        # Never turn a malformed profiled invocation into a plausible-looking
+        # template run; only the historical no-profile path may degrade.
+        if throughput_profile is not None:
+            raise
         try:
             return int(template_steps)
         except Exception:
             return 1000
+
+
+def size_target_steps(model_type, num_images, template_steps):
+    """Return the size-law target before any wall-clock budget is applied."""
+
+    mt = (model_type or "").strip().lower()
+    row = STEP_TABLE.get(mt)
+    if row is None:
+        return int(template_steps)
+    n = max(1, int(num_images))
+    scaled = row["base"] * (n / row["n_ref"]) ** row["p"]
+    return int(round(max(row["min"], min(row["max"], scaled))))
 
 
 def projected_wall_s(model_type, steps):
