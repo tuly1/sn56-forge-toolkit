@@ -1738,6 +1738,119 @@ def test_clean_log_with_phantom_terminal_artifact_aborts(tmp_path, monkeypatch):
     assert record["training_completion_observation"] is None
 
 
+@pytest.mark.parametrize("timing_mode", ["profile", "bootstrap"])
+@pytest.mark.parametrize(
+    ("checkpoint_state", "expected_exit"),
+    [
+        ("absent", "toolkit_exit_nonzero_absent"),
+        ("truncated", "toolkit_exit_nonzero_present"),
+    ],
+)
+def test_nonzero_toolkit_failure_precedes_missing_checkpoint_observation(
+    tmp_path, monkeypatch, timing_mode, checkpoint_state, expected_exit
+):
+    spec = _spec()
+    _localize_spec(monkeypatch, tmp_path, spec)
+    toolkit_dir = tmp_path / "invalid-config-toolkit"
+    toolkit_dir.mkdir()
+    _activate(monkeypatch, toolkit_dir, krea_runtime.LEADER_BUNDLE)
+    monkeypatch.setattr(
+        krea_runtime,
+        "open_verified_runtime",
+        lambda *_args, **_kwargs: _verified_runtime_for_test(toolkit_dir),
+    )
+    Path(spec.save_root).mkdir(parents=True)
+    scope = checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+    scope = checkpoints.set_planned_steps(spec.save_root, scope, 1200)
+    if checkpoint_state == "truncated":
+        truncated = Path(spec.save_root) / (
+            f"{spec.expected_repo_name}_000000200.safetensors"
+        )
+        truncated.write_bytes(b"truncated-current-run-checkpoint")
+        assert checkpoints.current_loras(spec.save_root, scope) == [str(truncated)]
+        assert aitoolkit._first_durable_current_checkpoint(spec, scope) is None
+
+    class FailedConfigProcess:
+        returncode = 23
+
+        def poll(self):
+            return self.returncode
+
+    def fail_config(*_args, **kwargs):
+        kwargs["stdout"].write(
+            "Invalid config keys: diff_output_preservation, "
+            "switch_boundary_every\n"
+        )
+        kwargs["stdout"].flush()
+        return FailedConfigProcess()
+
+    monkeypatch.setattr(aitoolkit.subprocess, "Popen", fail_config)
+    monkeypatch.setattr(
+        aitoolkit.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="", stderr=""
+        ),
+    )
+    events = []
+    monkeypatch.setattr(
+        aitoolkit.telemetry,
+        "event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+    monkeypatch.setattr(
+        aitoolkit,
+        "_persist_training_completion_observation",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a failed subprocess cannot persist a completion observation"
+        ),
+    )
+
+    class Deadline:
+        def remaining(self):
+            return 10_000.0
+
+    timing_kwargs = {
+        "active_planned_steps": 1200,
+        "timing_record_required": True,
+        "timing_bundle": krea_runtime.LEADER_BUNDLE,
+        "toolkit_dir": str(toolkit_dir),
+    }
+    if timing_mode == "profile":
+        timing_kwargs.update(
+            throughput_profile=_timing_profile(
+                krea_runtime.LEADER_BUNDLE, startup_seconds=0.0
+            ),
+            future_target_steps=1200,
+            total_budget_s=2700.0,
+        )
+    else:
+        timing_kwargs["timing_probe"] = True
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"ai-toolkit failed \(rc=23\)",
+    ):
+        aitoolkit._run_toolkit(
+            spec.config_path,
+            Deadline(),
+            spec,
+            scope,
+            **timing_kwargs,
+        )
+
+    event_names = [name for name, _fields in events]
+    exit_names = [name for name in event_names if name.startswith("toolkit_exit_")]
+    assert exit_names == [expected_exit]
+    assert not any("salvaged" in name for name in event_names)
+    assert "toolkit_log_tail" in event_names
+    assert event_names.index(expected_exit) < event_names.index("toolkit_log_tail")
+    tail_fields = next(
+        fields for name, fields in events if name == "toolkit_log_tail"
+    )
+    assert "Invalid config keys" in tail_fields["tail"]
+
+
 def test_experimental_profile_requires_post_run_checkpoint_observation(
     tmp_path, monkeypatch
 ):
