@@ -132,6 +132,62 @@ def test_toolkit_log_parser_requires_terminal_save_after_last_progress(tmp_path)
     assert step == 999
 
 
+def test_gpu_sampler_pins_nvidia_smi_against_path_shadow(tmp_path, monkeypatch):
+    shadow_dir = tmp_path / "shadow-bin"
+    shadow_dir.mkdir()
+    shadow_marker = tmp_path / "shadow-executed"
+    shadow_binary = shadow_dir / "nvidia-smi"
+    shadow_binary.write_text(
+        f"#!/bin/sh\n: > {shadow_marker}\n",
+        encoding="utf-8",
+    )
+    shadow_binary.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{shadow_dir}:/usr/local/bin:/usr/bin:/bin")
+
+    calls = []
+
+    def capture_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return aitoolkit.subprocess.CompletedProcess(
+            argv,
+            returncode=0,
+            stdout="321\n",
+            stderr="",
+        )
+
+    class OneSample:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, timeout):
+            assert timeout == 5
+            self.stopped = True
+
+    monkeypatch.setattr(aitoolkit.subprocess, "run", capture_run)
+    gpu_peak = {"mb": 0}
+
+    # Exercise the real sampler target directly so the exact argv assertion
+    # cannot race the short-lived trainer subprocess used by higher-level tests.
+    stop = OneSample()
+    aitoolkit._sample_gpu(stop, gpu_peak)
+
+    assert aitoolkit._FIXED_NVIDIA_SMI == "/usr/bin/nvidia-smi"
+    assert calls == [
+        (
+            [
+                "/usr/bin/nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            {"capture_output": True, "text": True, "timeout": 5},
+        )
+    ]
+    assert gpu_peak == {"mb": 321}
+    assert not shadow_marker.exists()
+
+
 @pytest.mark.parametrize(
     ("returncode", "stopped", "checkpoint", "expected"),
     [

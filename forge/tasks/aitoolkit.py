@@ -37,12 +37,40 @@ from forge.data import dataset
 from forge.data.schema import ImageSpec
 
 _POLL_SECONDS = 5
+_FIXED_NVIDIA_SMI = "/usr/bin/nvidia-smi"
 # Extra cushion ON TOP OF the export reserve. We gate termination on
 # deadline.remaining() (the SOFT stop = hard_stop - export_reserve), so training
 # is stopped ~(reserve + _STOP_MARGIN_S) before the hard kill. That preserves the
 # full 180s export reserve for _terminate + _finalize (promote-to-last), instead
 # of squeezing finalize into a hand-picked 45s window off the hard stop.
 _STOP_MARGIN_S = holdout.boundary_margin_s()
+
+
+def _sample_gpu(gpu_stop, gpu_peak: dict[str, int]) -> None:
+    """Collect peak device memory without consulting caller-controlled PATH."""
+
+    while not gpu_stop.is_set():
+        try:
+            out = subprocess.run(
+                [
+                    _FIXED_NVIDIA_SMI,
+                    "--query-gpu=memory.used",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            values = [
+                int(value)
+                for value in out.stdout.split()
+                if value.strip().isdigit()
+            ]
+            if values:
+                gpu_peak["mb"] = max(gpu_peak["mb"], max(values))
+        except Exception:
+            pass
+        gpu_stop.wait(5)
 
 
 def run(spec: ImageSpec, deadline: Deadline) -> None:
@@ -331,21 +359,6 @@ def _run_toolkit(
     gpu_stop = threading.Event()
     gpu_peak = {"mb": 0}
 
-    def _sample_gpu():
-        while not gpu_stop.is_set():
-            try:
-                out = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=memory.used",
-                     "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                vals = [int(x) for x in out.stdout.split() if x.strip().isdigit()]
-                if vals:
-                    gpu_peak["mb"] = max(gpu_peak["mb"], max(vals))
-            except Exception:
-                pass
-            gpu_stop.wait(5)
-
     stopped_by_deadline = False
     scoring_decision: bool | None = None
     first_checkpoint_observed = False
@@ -375,7 +388,11 @@ def _run_toolkit(
             raise
 
         try:
-            gpu_thread = threading.Thread(target=_sample_gpu, daemon=True)
+            gpu_thread = threading.Thread(
+                target=_sample_gpu,
+                args=(gpu_stop, gpu_peak),
+                daemon=True,
+            )
             gpu_thread.start()
         except Exception:
             gpu_thread = None
