@@ -275,7 +275,7 @@ def _runtime_fingerprint() -> dict[str, Any]:
     try:
         gpu = _run_text(
             [
-                "nvidia-smi",
+                "/usr/bin/nvidia-smi",
                 "--query-gpu=name,uuid,driver_version",
                 "--format=csv,noheader,nounits",
             ]

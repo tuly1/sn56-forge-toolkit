@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -186,6 +188,20 @@ def test_gpu_sampler_pins_nvidia_smi_against_path_shadow(tmp_path, monkeypatch):
     ]
     assert gpu_peak == {"mb": 321}
     assert not shadow_marker.exists()
+
+
+def test_all_repository_gpu_processes_use_absolute_nvidia_smi():
+    root = Path(__file__).resolve().parents[1]
+    source_paths = sorted((root / "forge").rglob("*.py")) + sorted(
+        (root / "ops").rglob("*.py")
+    )
+    bare_argv = re.compile(r"(?m)^\s*[\"']nvidia-smi[\"']\s*,\s*$")
+    offenders = [
+        path.relative_to(root).as_posix()
+        for path in source_paths
+        if bare_argv.search(path.read_text(encoding="utf-8"))
+    ]
+    assert offenders == []
 
 
 @pytest.mark.parametrize(

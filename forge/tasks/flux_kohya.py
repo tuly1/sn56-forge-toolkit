@@ -403,7 +403,7 @@ def _start_gpu_sampler(
             try:
                 result = subprocess.run(
                     [
-                        "nvidia-smi",
+                        "/usr/bin/nvidia-smi",
                         "--query-gpu=memory.used",
                         "--format=csv,noheader,nounits",
                     ],
