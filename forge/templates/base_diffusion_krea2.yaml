@@ -208,7 +208,22 @@ config:
       # Effect sizes (8.4% and 3.0%, same sign, two tournaments) are the size of
       # a regularisation win, not of a bug fix — which is what this mechanism
       # predicts.  Guarded by tests/test_loss_and_ema_policy.py.
-      loss_type: mae
+      # REVERTED TO mse 2026-08-16 (week-8).  The Aug-10 tournament ran three
+      # krea2 R1 tasks; 5HKEAZxF SWEPT all three running mse and we placed
+      # 10th/5th/6th running mae, 10-20% behind.  On 797f3e7b we shipped 1752
+      # steps to its 1800 -- same epoch, same ai-toolkit 0.10.17, same UNet-only
+      # 512-tensor recipe, same data -- and lost by 10.50%.  That is the closest
+      # to a depth-matched mae-vs-mse read the field has produced, and mae is on
+      # the losing side of it.
+      # HONEST LIMITS (audit, 2026-08-12): the sweeper's config for 797f3e7b was
+      # NOT captured, so its mse is INFERRED from its other two tasks; runtime
+      # commit, seed and preprocessing are unobserved.  This does NOT prove mae
+      # caused the gap.  mse is reverted to because it is the ai-toolkit default
+      # (config_modules.py:502), the field standard, and what the sweeper ran --
+      # i.e. the conservative baseline.  mae remains a live hypothesis and is to
+      # be tested in a controlled same-runtime, same-data, multi-seed experiment,
+      # never again promoted from a single confounded pair.
+      loss_type: mse
       do_differential_guidance: true
       differential_guidance_scale: 2
     logging:
