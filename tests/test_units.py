@@ -359,16 +359,14 @@ def test_config_krea2():
     # effective residual differences (loss_type, caption_dropout_rate), not the
     # three a raw key-diff suggests.  Verified independently at the merge.
     assert p["train"]["do_differential_guidance"] is True
-    # WEEK-6: mse -> mae.  The decisive artifact is Aug-3 41025fb5, where
-    # 5FBmn1ax and 5FjDsFGA published configs that are byte-equal except
-    # loss_type / caption_dropout_rate / differential_guidance_scale (inert, see
-    # above) / save_every (inert to the exported weights — both completed 1432
-    # steps and shipped a `last.safetensors` whose LFS oid matches no rung of
-    # its own ladder).  mae ranked 4 at 0.048934, mse ranked 14 at 0.053039:
-    # +8.39%, against a same-recipe noise floor of 2.145% measured on 7421f056.
-    # See forge/templates/base_diffusion_krea2.yaml for the full citation and
-    # the honest count of the replication.
-    assert p["train"]["loss_type"] == "mae"
+    # WEEK-6: mse -> mae; WEEK-8 (75a0a20c, 2026-08-16): REVERTED to mse.  The
+    # Aug-10 tournament ran three krea2 R1 tasks; 5HKEAZxF swept all three
+    # running mse and we placed 10th/5th/6th running mae, 10-20% behind
+    # (AUG10-LOSS-FORENSICS.md #3).  The revert commit changed only the
+    # templates and left this pin stale (red at the served pin); reconciled
+    # 2026-08-18 (week-9).  The old mae citation (Aug-3 41025fb5 matched pair,
+    # +8.39%) remains in base_diffusion_krea2.yaml as history.
+    assert p["train"]["loss_type"] == "mse"
     assert p["network"]["lokr_full_rank"] is True
     mk = p["model"]["model_kwargs"]
     assert mk["text_encoder_path"] == "/cache/hf_cache/Qwen--Qwen3-VL-4B-Instruct"
