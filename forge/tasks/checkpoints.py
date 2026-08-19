@@ -50,12 +50,64 @@ _PROCESS_NONCE = uuid.uuid4().hex
 _ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
 # Only names whose values are produced by the validator's exact scoring code may
 # bypass proxy calibration. Unknown/self-declared metric names fail closed.
+# Week-9: this lane is additionally env-gated (krea2 lane REPORT §3.3 item 3b
+# flagged it as promotable by any stray complete manifest); without
+# FORGE_EXACT_HELDOUT_METRIC_TYPES naming the run's model type, an exact-named
+# manifest is telemetry-only like everything else.
 _EXACT_HELDOUT_METRICS = frozenset({"validator_exact_combined"})
+_EXACT_HELDOUT_ENV = "FORGE_EXACT_HELDOUT_METRIC_TYPES"
 # Frozen, consumer-owned promotion gates. A producer manifest cannot declare
 # its own safety threshold. Entries are added only after exact Comfy evaluator
 # calibration, keyed by (metric, model_type); an empty map is telemetry-only.
 _HELDOUT_PROXY_POLICIES: dict[tuple[str, str], dict[str, Any]] = {}
+# Week-9 reconstruction promotion (ship-the-argmin) is DORMANT until this env
+# names the type — the same merged-dormant pattern the producer allowlist uses.
+# The GPU-validation runbook's pass gates are the authorization to set it.
+_RECON_PROMOTION_ENV = "FORGE_RECON_PROMOTION_TYPES"
+# Greedy-soup promotion additionally requires this env (scout REPORT §Q3
+# F3.1); without it a manifest soup section is recorded evidence only.
+_RECON_SOUP_ENV = "FORGE_RECON_SOUP_TYPES"
+_RECON_METRIC = "heldout_reconstruction_mse_v1"
 _FROZEN_FRACTION_RULE = "nearest_current_candidate_ties_choose_earlier_step"
+
+
+def _env_allows(env_name: str, model_type: str) -> bool:
+    raw = os.environ.get(env_name, "")
+    allowed = {value.strip().lower() for value in raw.split(",") if value.strip()}
+    return "*" in allowed or (model_type or "").strip().lower() in allowed
+
+
+def _reconstruction_policy(metric: str, model_type: str) -> dict[str, Any] | None:
+    """Env-gated promotion policy for the week-9 reconstruction metric.
+
+    Constants are frozen HERE (consumer-owned), not read from the manifest.
+    required advantage = max(absolute_floor, relative_floor*|reference|):
+    the offline metric is deterministic (fixed prefix of the validator's own
+    seed list), so the gate protects only against bf16-diffusers vs
+    fp8-ComfyUI rank infidelity.  relative_floor=0.005 (0.5%) is INFERRED —
+    far under the 10-56% rung deltas observed in the ideogram4 field join and
+    under krea2's 3.7% clone-pair floor; GPU runbook gates Q3/Q4 calibrate it
+    before the env is ever set.
+    """
+    if metric != _RECON_METRIC:
+        return None
+    mt = (model_type or "").strip().lower()
+    if not _env_allows(_RECON_PROMOTION_ENV, mt):
+        return None
+    return {
+        "kind": "reconstruction",
+        "name": "recon_v1_relative_gate",
+        "calibration_id": f"week9-recon-uncalibrated-{mt}",
+        "direction": "min",
+        "captioned_weight": 0.25,
+        "blank_caption_weight": 0.75,
+        "absolute_floor": 0.0,
+        "relative_floor": 0.005,
+        "dispersion_multiplier": 0.0,
+        "min_holdout_pairs": 1,
+        "max_holdout_pairs": 4,
+        "reference_sources": ("exact_final", "highest_valid_periodic"),
+    }
 
 
 @dataclass(frozen=True)
@@ -678,7 +730,9 @@ def _select_from_holdout(
                 )
                 return None
             model_type = str(data.get("model_type") or "").strip().lower()
-            policy = _HELDOUT_PROXY_POLICIES.get((metric, model_type))
+            policy = _HELDOUT_PROXY_POLICIES.get(
+                (metric, model_type)
+            ) or _reconstruction_policy(metric, model_type)
             if policy is None:
                 _event(
                     "heldout_proxy_telemetry_only",
@@ -708,13 +762,29 @@ def _select_from_holdout(
                 )
                 return None
             try:
-                _validate_proxy_contract(policy, data, row_by_path)
+                if policy.get("kind") == "reconstruction":
+                    _validate_reconstruction_contract(policy, data, row_by_path)
+                else:
+                    _validate_proxy_contract(policy, data, row_by_path)
             except (KeyError, TypeError, ValueError) as exc:
                 _event(
                     "heldout_proxy_telemetry_only",
                     reason=f"proxy contract invalid: {exc}",
                 )
                 return None
+            if policy.get("kind") == "reconstruction":
+                soup = _soup_selection(
+                    data,
+                    save_root,
+                    state,
+                    default,
+                    default_score,
+                    scored,
+                    policy,
+                    metric,
+                )
+                if soup is not None:
+                    return soup
             if candidate == default.path:
                 return Selection(
                     path=default.path,
@@ -780,7 +850,21 @@ def _select_from_holdout(
                 calibration_id=str(policy.get("calibration_id") or ""),
             )
 
-        # Non-proxy held-out metrics retain the pre-Gate-B exact-score contract.
+        # Non-proxy held-out metrics retain the pre-Gate-B exact-score contract
+        # — but only when the deployment explicitly allowlists the run's model
+        # type.  Without the env, a stray complete manifest that self-declares
+        # the exact metric name is telemetry-only (week-9 hole closure).
+        scoped_model_type = str((state or {}).get("model_type") or "").strip().lower()
+        if not _env_allows(_EXACT_HELDOUT_ENV, scoped_model_type):
+            _event(
+                "heldout_exact_metric_telemetry_only",
+                reason=(
+                    "exact heldout metric promotion requires "
+                    f"{_EXACT_HELDOUT_ENV} to allowlist "
+                    f"{scoped_model_type or 'unknown'}"
+                ),
+            )
+            return None
         if candidate != default.path and advantage == 0.0:
             return Selection(
                 path=default.path,
@@ -838,6 +922,175 @@ def _guarded_proxy_default(
         margin_policy=(str(policy.get("name")) if policy else None),
         calibration_id=(str(policy.get("calibration_id")) if policy else None),
     )
+
+
+def _validate_reconstruction_contract(
+    policy: dict[str, Any],
+    manifest: dict[str, Any],
+    rows: dict[str, dict[str, Any]],
+) -> None:
+    """Frozen-contract checks for week-9 reconstruction manifests.
+
+    Everything checked here is consumer-owned: a producer manifest cannot
+    weaken its own promotion conditions.  The per-type sampler parameters are
+    revalidated against :mod:`forge.tasks.reconstruction`'s frozen table so a
+    manifest scored under drifted semantics can never promote.
+    """
+    from forge.tasks import reconstruction
+
+    direction = str(manifest.get("direction") or "").lower()
+    if direction != str(policy.get("direction") or "").lower():
+        raise ValueError("direction does not match frozen policy")
+    captioned_weight = float(manifest.get("captioned_weight"))
+    blank_weight = float(manifest.get("blank_caption_weight"))
+    if (
+        not math.isclose(
+            captioned_weight, float(policy.get("captioned_weight")),
+            rel_tol=0.0, abs_tol=1e-12,
+        )
+        or not math.isclose(
+            blank_weight, float(policy.get("blank_caption_weight")),
+            rel_tol=0.0, abs_tol=1e-12,
+        )
+        or not math.isclose(captioned_weight + blank_weight, 1.0, abs_tol=1e-12)
+        or manifest.get("strata_scored_separately") is not True
+    ):
+        raise ValueError("stratum weighting does not match frozen policy")
+    if int(manifest.get("master_seed")) != reconstruction.MASTER_SEED:
+        raise ValueError("master seed does not match the evaluator's")
+    model_type = str(manifest.get("model_type") or "").strip().lower()
+    params = reconstruction.EVAL_PARAMS.get(model_type)
+    if params is None:
+        raise ValueError("no frozen evaluator params for this model type")
+    declared = manifest.get("eval_params") or {}
+    for key in ("steps", "cfg", "denoise", "schedule_semantics", "guidance"):
+        if declared.get(key) != params[key]:
+            raise ValueError(f"eval param {key!r} does not match frozen table")
+    generations = int(manifest.get("generations"))
+    if generations != int(params["scorer_generations"]) or generations <= 0:
+        raise ValueError("generation count does not match frozen table")
+    seeds = manifest.get("seeds_used")
+    if list(seeds or []) != reconstruction.scorer_seeds(model_type):
+        raise ValueError("seed list is not the validator-seed prefix")
+    holdout_pairs = int(manifest.get("holdout_pairs"))
+    minimum_pairs = max(1, int(policy.get("min_holdout_pairs")))
+    maximum_pairs = int(policy.get("max_holdout_pairs"))
+    if not minimum_pairs <= holdout_pairs <= maximum_pairs:
+        raise ValueError("holdout pair count is outside frozen policy")
+    expected_points = holdout_pairs * generations
+    for row in rows.values():
+        captioned_score = float(row.get("captioned_score"))
+        blank_score = float(row.get("blank_caption_score"))
+        combined = float(row.get("score"))
+        if any(
+            not math.isfinite(value) or value < 0.0
+            for value in (captioned_score, blank_score, combined)
+        ):
+            raise ValueError("reconstruction component score is invalid")
+        recomputed = (
+            captioned_weight * captioned_score + blank_weight * blank_score
+        )
+        if not math.isclose(combined, recomputed, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError("combined score does not match its strata")
+        if (
+            int(row.get("captioned_points")) != expected_points
+            or int(row.get("blank_caption_points")) != expected_points
+            or int(row.get("points")) != expected_points * 2
+        ):
+            raise ValueError("point count does not match the holdout contract")
+        for key in ("captioned_stddev", "blank_caption_stddev"):
+            spread = float(row.get(key))
+            if not math.isfinite(spread) or spread < 0.0:
+                raise ValueError("dispersion field is invalid")
+
+
+def _soup_selection(
+    manifest: dict[str, Any],
+    save_root: str,
+    state: dict[str, Any] | None,
+    default: Selection,
+    default_score: float,
+    scored: list[tuple[float, str, int | None]],
+    policy: dict[str, Any],
+    metric: str,
+) -> Selection | None:
+    """Consider a manifest's greedy-soup artifact.  ANY defect degrades to
+    argmin (returns None) — never to a failed selection.
+
+    Ships only when every check holds: the env flag names the type, the soup
+    file is a current-run artifact whose bytes hash-match the manifest, every
+    member is a scored candidate, the soup strictly beats the best rung on the
+    offline metric, and it beats the conservative default by the same frozen
+    advantage gate the argmin must pass.
+    """
+    soup = manifest.get("soup")
+    if not isinstance(soup, dict) or str(soup.get("status") or "") != "improved":
+        return None
+    try:
+        model_type = str(manifest.get("model_type") or "").strip().lower()
+        if not _env_allows(_RECON_SOUP_ENV, model_type):
+            _event("heldout_soup_telemetry_only", reason="soup env gate is off")
+            return None
+        if str(manifest.get("direction") or "").lower() != "min":
+            raise ValueError("soup requires a min-direction metric")
+        file_name = str(soup.get("file") or "")
+        if not file_name or os.path.basename(file_name) != file_name:
+            raise ValueError("soup file must be one safe path component")
+        path = os.path.join(save_root, file_name)
+        if not _is_current(path, state) or not valid_safetensors(path):
+            raise ValueError("soup artifact is not a valid current-run file")
+        declared_sha = str(soup.get("sha256") or "").lower()
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", declared_sha)
+            or _sha256(path) != declared_sha
+        ):
+            raise ValueError("soup artifact bytes do not match the manifest")
+        members = [str(member) for member in (soup.get("members") or [])]
+        scored_names = {os.path.basename(row[1]) for row in scored}
+        if (
+            len(members) < 2
+            or len(set(members)) != len(members)
+            or not set(members) <= scored_names
+        ):
+            raise ValueError("soup members must be distinct scored candidates")
+        soup_score = float(soup.get("score"))
+        argmin_score = min(row[0] for row in scored)
+        if not math.isfinite(soup_score) or soup_score >= argmin_score:
+            raise ValueError("soup does not strictly beat the argmin rung")
+        required = max(
+            float(policy.get("absolute_floor")),
+            float(policy.get("relative_floor")) * abs(default_score),
+        )
+        advantage = default_score - soup_score
+        if advantage <= required:
+            _event(
+                "heldout_soup_telemetry_only",
+                reason="soup advantage did not exceed the calibrated gate",
+            )
+            return None
+        return Selection(
+            path=path,
+            source="heldout_soup",
+            reason=(
+                f"greedy soup of {len(members)} rungs beat the best single "
+                f"rung on {metric} ({soup_score:.8g} vs {argmin_score:.8g}) "
+                f"and exceeded the calibrated gate {required:.8g}"
+            ),
+            step=None,
+            score=soup_score,
+            metric=metric,
+            direction="min",
+            is_metric_proxy=True,
+            reference_file=os.path.basename(default.path),
+            reference_score=default_score,
+            score_advantage=advantage,
+            required_advantage=required,
+            margin_policy=str(policy.get("name") or "recon_soup"),
+            calibration_id=str(policy.get("calibration_id") or ""),
+        )
+    except Exception as exc:
+        _event("heldout_soup_ignored", error=f"{type(exc).__name__}: {exc}")
+        return None
 
 
 def _validate_proxy_contract(

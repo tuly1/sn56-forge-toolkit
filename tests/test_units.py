@@ -677,9 +677,13 @@ def test_failed_retry_explicitly_preserves_previous_last(tmp_path):
     assert "no valid checkpoint" in record["reason"]
 
 
-def test_heldout_manifest_selects_scored_checkpoint(tmp_path):
+def test_heldout_manifest_selects_scored_checkpoint(tmp_path, monkeypatch):
     import json
 
+    # Week-9: the exact-metric promotion lane is env-gated (hole closure —
+    # see tests/test_reconstruction.py::test_exact_metric_manifest_is_gated_by_env
+    # for the no-env telemetry-only behaviour).
+    monkeypatch.setenv("FORGE_EXACT_HELDOUT_METRIC_TYPES", "*")
     state = checkpoints.begin_run(str(tmp_path), "repo")
     best = _write_st(tmp_path / "repo_000000100.safetensors", tag="best")
     _write_st(tmp_path / "repo_000000200.safetensors", tag="worse")

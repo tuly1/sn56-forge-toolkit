@@ -2,6 +2,16 @@ FROM diagonalge/ai-toolkit:latest@sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783a
 
 ENV AI_TOOLKIT_DIR=/app/ai-toolkit
 ENV FORGE_TEMPLATES_DIR=/app/forge/templates
+# Week-9 checkpoint selection: produce reconstruction-scored holdout manifests
+# for these types (shadow-safe: with no promotion env the manifests are
+# telemetry-only and the exact final still ships).  z-image/qwen-image are not
+# in holdout._IMPLEMENTED_TYPES and cannot be enabled from here.
+ENV FORGE_HOLDOUT_SELECTION_TYPES=krea2,ideogram4,flux
+# PROMOTION (ship the argmin) and greedy soup stay OFF until the GPU
+# validation runbook's gates pass (evidence/week9-selection-impl-20260818/
+# GPU-VALIDATION-RUNBOOK.md).  Flip by uncommenting — one line, evidence-gated:
+# ENV FORGE_RECON_PROMOTION_TYPES=krea2,ideogram4,flux
+# ENV FORGE_RECON_SOUP_TYPES=krea2,ideogram4,flux
 
 # This is the exact 185-entry version/VCS metadata inventory observed in both
 # independently built H100 subjects. It does not attest downloaded wheel bytes.
