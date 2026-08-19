@@ -822,11 +822,6 @@ class _ToolkitBackend:
     """
 
     def __init__(self, order: dict[str, Any], arch: str):
-        import torch  # noqa: F401  (GPU-gated)
-
-        from toolkit.config_modules import ModelConfig
-        from toolkit.accelerator import get_accelerator  # noqa: F401
-
         self._order = order
         self._params = order["params"]
         self._arch = arch
@@ -856,33 +851,59 @@ class _ToolkitBackend:
         return model
 
     def attach_lora(self, path: str):
-        import safetensors.torch
+        """Attach adapter weights, mirroring the pin's own wiring.
 
-        self.attach_lora_state(safetensors.torch.load_file(path))
-
-    def attach_lora_state(self, state):
+        BaseSDTrainProcess.py:1767-1812 @ 99be3d96 is the authoritative
+        pattern: construct LoRASpecialNetwork(text_encoder, unet, lora_dim,
+        alpha, train_*, is_transformer, base_model), force_to fp32, hand it to
+        ``sd.network``, ``_update_torch_multiplier()``, then POSITIONAL
+        ``apply_to(text_encoder, unet, train_text_encoder, train_unet)``;
+        weights load via ``network.load_weights(path)`` (:866-868).
+        """
+        import torch
         from toolkit.lora_special import LoRASpecialNetwork
 
         if self._network is None:
             network_cfg = self._order.get("network") or {}
-            self._network = LoRASpecialNetwork(
+            unet = self._model.get_model_to_train()
+            network = LoRASpecialNetwork(
                 text_encoder=None,
-                unet=self._model.model,
+                unet=unet,
                 lora_dim=int(network_cfg.get("linear") or 32),
+                multiplier=1.0,
                 alpha=int(network_cfg.get("linear_alpha") or 32),
                 train_unet=False,
                 train_text_encoder=False,
-                is_transformer=True,
+                is_transformer=getattr(self._model, "is_transformer", True),
                 base_model=self._model,
             )
-            self._network.apply_to(None, self._model.model, apply_text_encoder=False, apply_unet=True)
-        weights = self._model.convert_lora_weights_before_load(state)
-        self._network.load_weights(weights)
-        self._network.is_active = True
+            network.force_to(self._model.device_torch, dtype=torch.float32)
+            self._model.network = network
+            network._update_torch_multiplier()
+            network.apply_to(None, unet, False, True)
+            network.eval()
+            self._network = network
+        self._network.load_weights(path)
+        self.set_adapter_active(True)
+
+    def attach_lora_state(self, state):
+        """Soup states arrive in memory; persist once and reuse the path loader
+        (``load_weights`` at the pin reads files, not dicts)."""
+        import safetensors.torch
+
+        temp = os.path.join(
+            tempfile.gettempdir(), f"recon-soup-state-{os.getpid()}.safetensors"
+        )
+        safetensors.torch.save_file(dict(state), temp)
+        self.attach_lora(temp)
 
     def set_adapter_active(self, active: bool):
+        # ToolkitNetworkMixin drives module multipliers off is_active; refresh
+        # them after every toggle.  GPU runbook gate E2 proves the toggle has a
+        # real effect (score must change when the negative branch is LoRA'd).
         if self._network is not None:
             self._network.is_active = bool(active)
+            self._network._update_torch_multiplier()
 
     # -- render ---------------------------------------------------------------
     def reconstruct(self, image, prompt: str, seed: int):
@@ -1015,28 +1036,43 @@ class _FluxBackend:
         self._network = None
 
     def attach_lora(self, path: str):
-        import safetensors.torch
-
-        self.attach_lora_state(safetensors.torch.load_file(path))
-
-    def attach_lora_state(self, state):
+        # Same pinned wiring as _ToolkitBackend.attach_lora, on the legacy
+        # class's unet handle with is_flux=True.
+        import torch
         from toolkit.lora_special import LoRASpecialNetwork
 
         if self._network is None:
             network_cfg = self._order.get("network") or {}
-            self._network = LoRASpecialNetwork(
+            unet = self._model.unet
+            network = LoRASpecialNetwork(
                 text_encoder=None,
-                unet=self._model.unet,
+                unet=unet,
                 lora_dim=int(network_cfg.get("linear") or 32),
+                multiplier=1.0,
                 alpha=int(network_cfg.get("linear_alpha") or 32),
                 train_unet=False,
                 train_text_encoder=False,
-                is_transformer=True,
+                is_flux=True,
                 base_model=self._model,
             )
-            self._network.apply_to(None, self._model.unet, apply_text_encoder=False, apply_unet=True)
-        self._network.load_weights(state)
+            network.force_to(self._model.device_torch, dtype=torch.float32)
+            self._model.network = network
+            network._update_torch_multiplier()
+            network.apply_to(None, unet, False, True)
+            network.eval()
+            self._network = network
+        self._network.load_weights(path)
         self._network.is_active = True
+        self._network._update_torch_multiplier()
+
+    def attach_lora_state(self, state):
+        import safetensors.torch
+
+        temp = os.path.join(
+            tempfile.gettempdir(), f"recon-soup-state-{os.getpid()}.safetensors"
+        )
+        safetensors.torch.save_file(dict(state), temp)
+        self.attach_lora(temp)
 
     def reconstruct(self, image, prompt: str, seed: int):
         import torch
