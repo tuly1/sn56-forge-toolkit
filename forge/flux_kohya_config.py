@@ -39,6 +39,36 @@ CLIP_L_PATH = "/app/flux/clip_l.safetensors"
 T5XXL_PATH = "/app/flux/t5xxl_fp16.safetensors"
 TOKENIZER_CACHE_DIR = "/app/flux/tokenizers"
 
+# The recipe's batch shape (also emitted into the config below).
+TRAIN_BATCH_SIZE = 4
+GRADIENT_ACCUMULATION_STEPS = 2
+
+# WEEK-9 field-parity depth law (evidence/week9-flux-family-port-20260819/CHANGES.md §5).
+#
+# The cross-n invariant in every archived flux winner is PRESENTATIONS
+# (epochs x n_train), not epochs: 754 @ n=13, 650 @ n=13, 540 @ n~=27
+# (flux lane REPORT §3.3; epochs vary 20-58 across those wins).  An
+# epochs-constant law would emit 1566 presentations at n=27 — 2.9x the observed
+# winner there and beyond the 960-presentation arm that LOST by 8.8%.
+#
+# Target 696 = the exact depth the beta Phase D field arm trained (58 ep x 12 =
+# 87 opt steps at batch4 x ga2) and scored 0.00581640 — 19.55% ahead of our
+# aitoolkit family — with the curve measured FLAT from 480 presentations (40 ep)
+# to 696 (+0.16%), so everything in [480, 754] is equivalent within tonight's
+# measurement.  696 sits inside the field winner band [540, 754].
+#
+# The 58-epoch cap binds only below n=12: for small datasets the constant-
+# presentations extrapolation is unevidenced (no field task below n=13), so we
+# never exceed the deepest epochs any field winner is known to have shipped.
+FIELD_PRESENTATIONS_TARGET = 696
+FIELD_EPOCH_CAP = 58
+# Floor = the shallow edge of the measured flat band (40 ep x 12 = 480
+# presentations; field selections also cluster at e40).  A kohya plan that
+# cannot reach the floor has no evidence of beating the aitoolkit route, so the
+# caller falls back instead.
+FIELD_PRESENTATIONS_FLOOR = 480
+FIELD_EPOCH_FLOOR = 40
+
 
 def build_config(
     *,
@@ -115,10 +145,12 @@ def build_config(
         "discrete_flow_shift": 3.1582,
         "model_prediction_type": "raw",
         "max_timestep": 1000,
-        # Operational optimization recipe.
+        # Operational optimization recipe.  Batch shape is bound to the module
+        # constants so the presentations-based depth law above cannot drift
+        # from the emitted config.
         "max_train_steps": steps,
-        "train_batch_size": 4,
-        "gradient_accumulation_steps": 2,
+        "train_batch_size": TRAIN_BATCH_SIZE,
+        "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
         "optimizer_type": "Lion",
         "optimizer_args": ["weight_decay=0.005", "betas=(0.9,0.99)"],
         "unet_lr": 5.0e-5,
@@ -179,6 +211,56 @@ def budgeted_train_steps(
         return max(1, min(ceiling, calibrated))
     except (TypeError, ValueError, OverflowError):
         return 1
+
+
+def _epochs_to_steps(epochs: int, num_images: int) -> int:
+    """Kohya optimizer steps for ``epochs`` over ``num_images``.
+
+    sd-scripts draws ceil(n / batch) batches per epoch and lets gradient
+    accumulation carry ACROSS epoch boundaries (no epoch-end sync): the beta
+    Phase D field arm's 87 max_train_steps completed exactly 58 epochs over 12
+    images at batch 4 x ga 2 — 58 * ceil(12/4) / 2 = 87 (OBSERVED, beta
+    REPORT §5).  A naive presentations/(batch*ga) division is wrong whenever
+    batch does not divide n.
+    """
+    batches_per_epoch = math.ceil(num_images / TRAIN_BATCH_SIZE)
+    return max(
+        1,
+        math.ceil(epochs * batches_per_epoch / GRADIENT_ACCUMULATION_STEPS),
+    )
+
+
+def field_epoch_steps(num_images: int) -> int:
+    """Optimizer steps for the field-parity depth law (WEEK-9, see constants).
+
+    epochs = min(FIELD_EPOCH_CAP, ceil(FIELD_PRESENTATIONS_TARGET / n)), then
+    converted with the true kohya step arithmetic.  n=12 -> 87 steps (the beta
+    field arm's exact depth); n=13 -> 108 (54 ep, 702 presentations); n=27 ->
+    91 (26 ep, 702 presentations) — all inside the field winner band
+    [540, 754] presentations.  Never raises; an invalid count degrades to the
+    n=12 anchor depth, never to zero (INV-1).
+    """
+    try:
+        n = max(1, int(num_images))
+        epochs = min(FIELD_EPOCH_CAP, math.ceil(FIELD_PRESENTATIONS_TARGET / n))
+        return _epochs_to_steps(epochs, n)
+    except (TypeError, ValueError, OverflowError):
+        return _epochs_to_steps(FIELD_EPOCH_CAP, 12)
+
+
+def field_floor_steps(num_images: int) -> int:
+    """Minimum useful field-family depth: the flat band's shallow edge (40 ep).
+
+    Below this the kohya family has no measured advantage over the aitoolkit
+    route, so callers should fall back rather than ship an under-evidenced
+    shallow kohya artifact.  Never raises (INV-1).
+    """
+    try:
+        n = max(1, int(num_images))
+        epochs = min(FIELD_EPOCH_FLOOR, math.ceil(FIELD_PRESENTATIONS_FLOOR / n))
+        return _epochs_to_steps(epochs, n)
+    except (TypeError, ValueError, OverflowError):
+        return _epochs_to_steps(FIELD_EPOCH_FLOOR, 12)
 
 
 def write_config(config: dict[str, Any], path: str) -> None:
