@@ -545,7 +545,11 @@ def test_ideogram4_law_is_flat_because_the_field_has_no_size_signal():
     """
     law = recipe.STEP_TABLE["ideogram4"]
     assert law["p"] <= 0.40
-    assert abs(law["p"] - recipe.STEP_TABLE["krea2"]["p"]) <= 0.05
+    # WEEK-9: krea2 went FULLY flat (p=0.00, AUG10-LOSS-FORENSICS §4.4), so the
+    # old "mirrors krea2's 0.35" coupling is gone.  The property that matters
+    # here is unchanged and asserted directly: ideogram4's exponent is
+    # near-flat because size is the wrong instrument for this type.
+    assert recipe.STEP_TABLE["krea2"]["p"] == 0.00
 
     # No power law through any two of the Aug-3 three lands near the third.
     winners = {14: 174, 46: 341, 40: 1100}

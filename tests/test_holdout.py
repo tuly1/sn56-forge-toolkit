@@ -740,14 +740,15 @@ def test_dormant_holdout_preserves_exact_recipe_budget_and_step_caps(monkeypatch
             return self.hard_remaining
 
     # Week-6 recalibration: ideogram4 9 imgs @0.25 h is clock-bound
-    # ((900*0.92 - 480)/4.2 = 82); krea2 24 imgs @0.5 h is clock-bound
-    # ((1800*0.92 - 480)/1.35 = 871, law 1500).  Was 86 / 477 under the Jul-16
-    # rows and MARGIN 0.85.  Both types keep the DEFAULT 0.92 margin — only
+    # ((900*0.92 - 480)/4.2 = 82); krea2 24 imgs @0.5 h is clock-bound.
+    # WEEK-9: the krea2 cap is now int((1800*0.92 - 400 - 180)/1.40) = 768
+    # (flat law 1850; §4.4 SEC 1.40 + per-type startup 400) — was 871 under
+    # SEC 1.35/startup 300.  Both types keep the DEFAULT 0.92 margin — only
     # qwen-image departs (recipe.MARGIN_BY_TYPE) — so `_recipe_hours`, which
     # reads the module-level recipe.MARGIN, stays exact for both holdout types.
     cases = (
         ("ideogram4", "black-forest-labs/FLUX.1-Krea-dev", 9, 0.25, 82),
-        ("krea2", "krea/Krea-2-Raw", 24, 0.5, 871),
+        ("krea2", "krea/Krea-2-Raw", 24, 0.5, 768),
     )
     for model_type, model, images, hours, expected_steps in cases:
         assert not holdout.enabled_for(model_type)

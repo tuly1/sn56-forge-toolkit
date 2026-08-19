@@ -265,7 +265,33 @@ STEP_TABLE = {
     # honest claim is: this removes a self-inflicted depth deficit and puts us at
     # a depth two operators demonstrably completed on this exact shape.  It does
     # NOT on its own predict a top-5 finish; the selection/recipe work does.
-    "krea2": dict(base=1584, n_ref=_N_REF, p=0.35, min=600, max=2200),
+    #
+    # WEEK-9 (2026-08-18): FLAT LAW, per AUG10-LOSS-FORENSICS §4.4 — p 0.35 ->
+    # 0.00, base 1584 -> 1850.  The Aug-10 loss forensics solved the field-best
+    # plan from two independent operators' own published step counts and NEITHER
+    # has a dataset-size term:
+    #     5HKEAZxF (swept all three R1 tasks): steps = (3600h - 300)/1.8
+    #     5D7iEJm5 (ranks 5/2/3):              steps = (3600h - 400)/1.8
+    # 5HKEAZxF's n_train moved 10 -> 28 across tasks and its planned depth did
+    # not move by one step beyond the clock (OBSERVED, forensics §4.2).  The old
+    # p=0.35 bent depth DOWN exactly where the field bent epochs UP: -12.5% at
+    # n=10, -8.8% at n=28, -4.4% at n=32 vs the winner's plans.  Small-N
+    # over-training was tested and REFUTED (§4.3: six published checkpoint
+    # ladders scored on the validator formula, not one turns over; the winner
+    # ran the deepest small-N run and won by the widest margin).
+    # With SEC_PER_IT 1.40 + STARTUP_S_BY_TYPE 400 (both below) this emits
+    #     1360 @0.75h (clock)   1850 @1.0h (law)   1850 @1.0h (law)
+    # on the real Aug-10 shapes (n=10/32/28) against the field plan
+    # 1333/1833/1833 (+2.0/+0.9/+0.9%) — replayed exactly, forensics §4.4.
+    # BOOKED SMALL, per the forensics: depth Spearman in-field is ~0 and a
+    # perfect law recovers ~9% of the Aug-10 gap; this is variance reduction +
+    # cadence repair (see FIXED_SAVE_EVERY), shipped because it is free and it
+    # is right, NOT as a win claim.  Week-9 krea2 lane REPORT §2.5 concurs:
+    # depth is not the krea2 gap; §4.4 is the free correction left unshipped.
+    # Per the forensics STOP list, no further depth refinement on this row.
+    # min/max unchanged: a flat 1850 sits inside [600, 2200]; they now do
+    # anti-extrapolation duty only.
+    "krea2": dict(base=1850, n_ref=_N_REF, p=0.00, min=600, max=2200),
     # ideogram4 — was base=140 p=0.50 min=48 max=400 (the discredited Jul-16
     # experiment), then base=240 p=0.57 min=120 max=1600, a two-point fit to the
     # champion's own published step counts (N=14 -> 174, N=46 -> 341).  BOTH are
@@ -714,7 +740,17 @@ SEC_PER_IT = {
     # is 287, so a stop anywhere in (1148, 1432) ships 1148 — still 1.4x the 823
     # we actually shipped on Aug-3, and the fit below puts 1148 at rank ~10, the
     # same band the 1336 that SEC=1.5 would have produced.  The bet is bounded.
-    "krea2": 1.35,
+    #
+    # WEEK-9 (2026-08-18): 1.35 -> 1.40, per AUG10-LOSS-FORENSICS §4.4/§5.3.
+    # Our own three Aug-10 forge_run blobs give a two-point fit of 1.3746
+    # s/step marginal + 373 s startup (the 1.259 above was one run, gross of
+    # startup).  1.35 sat BELOW our own measured marginal rate; 1.40 is a 1.8%
+    # pad over it.  With the flat-1850 law this pair emits the §4.4 plan
+    # exactly (1360/1850/1850) and keeps 233-459 s of cushion (87-91%
+    # utilisation) at the measured 1.3746 + 373.  The intent shifts with the
+    # flat law: at 0.75 h the CLOCK now binds (1360 < 1850) by design — that is
+    # the field's own plan shape (pure clock fill), not a truncation defect.
+    "krea2": 1.40,
     # ideogram4 3.0 -> 4.2.  NOTE THIS GOES UP, AND IT IS THE ONE PLACE THE TWO
     # WEEK-6 AUDITS DISAGREE.  The field bound of 2.05 s/step was measured on
     # field configs, which do NOT set `do_cfg`.  OUR config does:
@@ -765,6 +801,21 @@ STOP_MARGIN_S = 45.0
 # evaluator-geometry policy in `forge/geometry.py` collapses that to N when it
 # is enabled, which removes the under-model rather than papering over it.
 STARTUP_S = 300.0
+# WEEK-9 (2026-08-18): per-type startup override.  AUG10-LOSS-FORENSICS §5.3
+# measured OUR OWN krea2 startup at 373 s (two-point fit over the three Aug-10
+# forge_run blobs), i.e. STARTUP_S=300 was 20% optimistic and made the
+# wall-clock projection lie by ~70 s; §4.4 prescribes 400, independently
+# corroborated by 5D7iEJm5's solved law `(3600h - 400)/1.8`.  Implemented as a
+# PER-TYPE override rather than a global change, deliberately: the 373 s was
+# measured on krea2 runs only, and a global 300 -> 400 would shift the clock
+# caps of qwen/flux/ideogram4/z-image — types whose startup has never been
+# measured and whose week-9 lane arithmetic (e.g. the ideogram4 caps 1348/954)
+# was computed against the 300+180=480 fixed reserve.  Scope containment is a
+# week-9 decision recorded in evidence/week9-recipe-impl-20260818/CHANGES.md §3C.
+# `field_demonstrated_steps` stays on the GLOBAL constant: it models the
+# FIELD's window (W(h) = h*3600 - 525, a convention calibrated against field
+# artifacts), not our pipeline's startup.
+STARTUP_S_BY_TYPE = {"krea2": 400.0}
 EXPORT_RESERVE_S = 180.0  # mirrors cli._EXPORT_RESERVE_SECONDS
 # MARGIN 0.85 -> 0.92.  `size_scaled_steps` computes
 # `budget*MARGIN - STARTUP_S - EXPORT_RESERVE_S`, i.e. it took a 15% haircut ON
@@ -865,6 +916,21 @@ def margin_for(model_type):
         return MARGIN
 
 
+def startup_for(model_type):
+    """Per-type startup reserve, falling back to the global default.  Never raises.
+
+    WEEK-9: krea2 = 400 s (our measured 373 s + pad, AUG10-LOSS-FORENSICS
+    §4.4/§5.3); every other type keeps STARTUP_S = 300 unchanged — see the
+    STARTUP_S_BY_TYPE comment for why the override is per-type.
+    """
+    try:
+        return float(
+            STARTUP_S_BY_TYPE.get((model_type or "").strip().lower(), STARTUP_S)
+        )
+    except Exception:
+        return STARTUP_S
+
+
 def training_deadline_s(hours_to_complete):
     """Seconds from container start to the moment `_run_toolkit` terminates.
 
@@ -880,18 +946,20 @@ def training_deadline_s(hours_to_complete):
         return 0.0
 
 
-def completed_steps_at_rate(hours_to_complete, sec_per_it):
+def completed_steps_at_rate(hours_to_complete, sec_per_it, model_type=None):
     """Optimizer steps that land before the terminate trigger, at ``sec_per_it``.
 
     The inverse of the budget model, expressed against the REAL deadline rather
     than `budget*MARGIN`, so "does this plan actually finish at rate R?" is one
-    call instead of a hand-derivation.  Never raises (INV-1).
+    call instead of a hand-derivation.  ``model_type`` selects the per-type
+    startup reserve (WEEK-9: krea2 400 s); omitted, the global STARTUP_S holds,
+    so every pre-week-9 caller is unchanged.  Never raises (INV-1).
     """
     try:
         rate = float(sec_per_it)
         if rate <= 0:
             return 0
-        window = training_deadline_s(hours_to_complete) - STARTUP_S
+        window = training_deadline_s(hours_to_complete) - startup_for(model_type)
         return max(0, int(window / rate))
     except Exception:
         return 0
@@ -932,7 +1000,7 @@ def size_scaled_steps(model_type, num_images, hours_to_complete, template_steps)
 
         sit = SEC_PER_IT.get(mt, 3.0)
         budget_s = max(0.0, float(hours_to_complete) * 3600.0)
-        train_s = budget_s * margin_for(mt) - STARTUP_S - EXPORT_RESERVE_S
+        train_s = budget_s * margin_for(mt) - startup_for(mt) - EXPORT_RESERVE_S
         budget_cap = int(train_s / sit) if train_s > 0 else 1
         return max(1, min(scaled, budget_cap))  # cap may push below `min`
     except Exception:
@@ -950,8 +1018,9 @@ def projected_wall_s(model_type, steps):
     Never raises (INV-1).
     """
     try:
-        sit = SEC_PER_IT.get((model_type or "").strip().lower(), 3.0)
-        return STARTUP_S + max(0, int(steps)) * float(sit) + EXPORT_RESERVE_S
+        mt = (model_type or "").strip().lower()
+        sit = SEC_PER_IT.get(mt, 3.0)
+        return startup_for(mt) + max(0, int(steps)) * float(sit) + EXPORT_RESERVE_S
     except Exception:
         return STARTUP_S + EXPORT_RESERVE_S
 
@@ -965,25 +1034,44 @@ def first_save_wall_s(model_type, steps, save_every):
     the budget even when the box is slower than modelled.  Never raises.
     """
     try:
-        sit = SEC_PER_IT.get((model_type or "").strip().lower(), 3.0)
+        mt = (model_type or "").strip().lower()
+        sit = SEC_PER_IT.get(mt, 3.0)
         cadence = max(1, int(save_every))
         first = min(cadence, max(1, int(steps)))
-        return STARTUP_S + first * float(sit)
+        return startup_for(mt) + first * float(sit)
     except Exception:
         return STARTUP_S
 
 
-def kill_safe_save_every(steps, template_save_every):
-    """Budget about four useful periodic candidates plus the exact final.
+# WEEK-9 (2026-08-18): FIXED per-type checkpoint cadence.
+#   krea2 200:     AUG10-LOSS-FORENSICS §4.4 — the adaptive cadence gave only 4
+#                  coarse rungs (334+ steps apart on Aug-10: save_every
+#                  234/351/335) where the field ships 200-step / 6-9-rung
+#                  ladders; a fixed 200 caps a deadline haircut at 199 steps
+#                  instead of 334 and produces the rung grid checkpoint
+#                  selection needs.
+# Below 200 planned steps the adaptive kill-safe branch stands: a heavily
+# clock-capped run still needs a mid-run recovery point earlier than step 200.
+FIXED_SAVE_EVERY = {"krea2": 200}
+
+
+def kill_safe_save_every(steps, template_save_every, model_type=None):
+    """Budget periodic candidates plus the exact final.
 
     Saving is the only mid-run kill-safety, but each tournament save took tens of
-    seconds.  A fixed candidate budget is easier to reason about than ``steps//8``:
+    seconds.  Types with a FIXED_SAVE_EVERY entry get that fixed cadence (the
+    field's ladder shape; enables checkpoint selection) whenever the plan is at
+    least one interval deep.  Everything else keeps the week-6 adaptive rule:
     target four periodic saves and do not save more often than every 25 steps on
     short jobs.  The first ordinary candidate lands at about 20% of the planned
     run, while the very-short-run branch emits a recovery point near halfway.
+    ``model_type`` omitted -> adaptive rule, so pre-week-9 callers are unchanged.
     """
     try:
         s = max(1, int(steps))
+        fixed = FIXED_SAVE_EVERY.get((model_type or "").strip().lower())
+        if fixed is not None and s >= int(fixed):
+            return int(fixed)
         template = max(1, int(template_save_every))
         if s < 25:
             # A heavily time-capped run still needs one mid-run recovery point;

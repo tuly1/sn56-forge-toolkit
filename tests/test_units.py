@@ -249,11 +249,12 @@ def test_recipe_step_scaling():
     s10 = recipe.size_scaled_steps("flux", 10, 1000, 2000)
     s50 = recipe.size_scaled_steps("flux", 50, 1000, 2000)
     assert s10 < s50
-    # krea2 week-6 field recalibration: floor 600 (no 100-step krea2 was ever
-    # competitive; the one 200-step entrant in the R1 field ranked 13/14),
-    # ceiling 2200 (the champion clock-filled to 2012 on a 1.0 h task).
-    assert recipe.size_scaled_steps("krea2", 1, 1000, 2000) == 600  # min
-    assert recipe.size_scaled_steps("krea2", 500, 1000, 2000) == 2200  # max
+    # krea2 WEEK-9 flat law (AUG10-LOSS-FORENSICS §4.4): p=0, base=1850 — the
+    # law is size-independent, so n=1 and n=500 both emit 1850 with no clock
+    # pressure.  min=600/max=2200 are anti-typo backstops that a flat 1850 can
+    # never touch (pinned in test_week6_depth_geometry.py's crossover test).
+    assert recipe.size_scaled_steps("krea2", 1, 1000, 2000) == 1850
+    assert recipe.size_scaled_steps("krea2", 500, 1000, 2000) == 1850
     # z-image law re-derived from TWO independent rank-1 operators; 930 -> 984
     # when both are read at the n_train they trained on (43 and 35, not 48 and
     # 39).  984 reproduces BOTH shipped depths exactly, 1317 and 1188.
@@ -267,28 +268,30 @@ def test_recipe_step_scaling():
 
 
 def test_recipe_budget_cap_example():
-    # krea2 @ 24 imgs sits exactly on the week-6 base; at 1.0 h the clock cap is
-    # 2097, so the SIZE LAW binds — which is the point of the recalibration.
+    # WEEK-9 flat law: krea2 emits 1850 at any n when the clock allows; at
+    # 1.0 h the cap is int((3312 - 400 - 180)/1.40) = 1951 > 1850, so the flat
+    # law binds (AUG10-LOSS-FORENSICS §4.4).
     v = recipe.size_scaled_steps("krea2", 24, 1.0, 2000)
-    assert v == 1584
-    # the clock still binds on a tight budget
+    assert v == 1850
+    # the clock still binds on a tight budget:
+    # int((0.2*3600*0.92 - 580)/1.40) = int(82.4/1.4) = 58
     v = recipe.size_scaled_steps("krea2", 24, 0.2, 2000)
-    assert v == 135
+    assert v == 58
 
 
 @pytest.mark.parametrize(
     ("hours", "expected"),
     [
-        # cap @0.75 h = (0.75*3600*0.92 - 480)/1.35 = 1484
-        (0.75, (1166, 1484, 1484, 1484, 1484, 1484)),
-        # cap @1.0 h = (1.0*3600*0.92 - 480)/1.35 = 2097.  At the four REAL
-        # Aug-3 krea2 shapes the law binds and the clock does not -- and the
-        # sizes to quote are n_train 18/37/38/45, NOT the auditing record's
-        # 21/42/43/50, because the validator withholds ceil(0.10*N) before the
-        # zip is built (recipe.py, WEEK-6 ABSCISSA CORRECTION);
-        # these synthetic 100/200/500-image shapes are far outside the 10-50
-        # tournament range and are here to pin the clamp order, not a policy.
-        (1.0, (1166, 1584, 2048, 2097, 2097, 2097)),
+        # WEEK-9 flat law (AUG10-LOSS-FORENSICS §4.4): raw law = 1850 at every
+        # n.  cap @0.75 h = int((0.75*3600*0.92 - 400 - 180)/1.40) = 1360
+        # (krea2 startup is the per-type 400, recipe.STARTUP_S_BY_TYPE) -> the
+        # CLOCK binds at 0.75 h by design, matching the field's own pure
+        # clock-fill plans ((2700-300)/1.8 = 1333; ours +2.0%).
+        (0.75, (1360, 1360, 1360, 1360, 1360, 1360)),
+        # cap @1.0 h = int((3312 - 580)/1.40) = 1951 > 1850 -> flat law binds.
+        # Size-independence is the point: 5HKEAZxF's n_train moved 10 -> 28
+        # across Aug-10 tasks and its planned depth did not move a step.
+        (1.0, (1850, 1850, 1850, 1850, 1850, 1850)),
     ],
 )
 def test_krea_week6_materialization_table(hours, expected):
@@ -347,18 +350,19 @@ def test_config_krea2():
     cfg = config.build_config(s, num_images=24, hours_to_complete=1000)
     p = cfg["config"]["process"][0]
     assert cfg["config"]["name"] == "krepo"
-    # `do_differential_guidance` is pinned only so the template cannot change
-    # shape unnoticed.  IT IS A DEAD KEY AND MUST NOT BE READ AS LOAD-BEARING:
-    # at ai-toolkit pin 99be3d96 the branch that consumes it
+    # WEEK-9 (2026-08-18): `do_differential_guidance`/`differential_guidance_
+    # scale` DELETED from the krea2 template.  They were confirmed-dead at
+    # ai-toolkit pin 99be3d96 — the sole consuming branch
     # (extensions_built_in/sd_trainer/SDTrainer.py:734-737) is NESTED inside
     # `if self.train_config.do_guidance_loss:` at :692, and `do_guidance_loss`
-    # defaults False (toolkit/config_modules.py:568), is never assigned anywhere
-    # in the tree, is absent from all 45 published field configs, and is absent
-    # from all of our templates.  So `differential_guidance_scale` never runs —
-    # which is why the mae-vs-mse matched pair on Aug-3 41025fb5 has TWO
-    # effective residual differences (loss_type, caption_dropout_rate), not the
-    # three a raw key-diff suggests.  Verified independently at the merge.
-    assert p["train"]["do_differential_guidance"] is True
+    # defaults False (toolkit/config_modules.py:568) and is set nowhere in our
+    # tree — so they never executed in any run we shipped.  Deleted per the
+    # Aug-10 forensics STOP list ("delete the dead keys from our template so
+    # the next reader does not think they do something"); had anyone ever set
+    # do_guidance_loss true they would have silently activated at scale 2.
+    # Absence is now the pin.
+    assert "do_differential_guidance" not in p["train"]
+    assert "differential_guidance_scale" not in p["train"]
     # WEEK-6: mse -> mae; WEEK-8 (75a0a20c, 2026-08-16): REVERTED to mse.  The
     # Aug-10 tournament ran three krea2 R1 tasks; 5HKEAZxF swept all three
     # running mse and we placed 10th/5th/6th running mae, 10-20% behind
