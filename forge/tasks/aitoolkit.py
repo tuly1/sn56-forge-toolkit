@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 
-from forge import ideogram_release_policy, recipe, telemetry
+from forge import evalgrid_snap, ideogram_release_policy, recipe, telemetry
 from forge.clock import Deadline
 from forge.config import build_config, resolve_base_model, write_config
 from forge.tasks import checkpoints, holdout
@@ -97,11 +97,21 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     scoring_reserve_s = (
         holdout.scoring_reserve_s(spec.model_type) if holdout_pairs > 0 else 0.0
     )
+    # WEEK-9 eval-grid snap (flag-gated, default OFF, fail-open): build the
+    # snapped shadow base BEFORE the recipe hours are computed, so the wall
+    # time the snap consumes shrinks the planned step count instead of being
+    # collected by the deadline kill at the end of the run.
+    snapped_base = evalgrid_snap.prepare(spec, deadline)
     # The recipe's wall-clock cap must not plan optimizer steps inside time
     # explicitly reserved for checkpoint scoring. It already accounts for the
     # ordinary export reserve itself.
     hours = _recipe_hours(deadline, scoring_reserve_s)
-    cfg = build_config(spec, num_images=pairs, hours_to_complete=hours)
+    cfg = build_config(
+        spec,
+        num_images=pairs,
+        hours_to_complete=hours,
+        base_model_override=snapped_base,
+    )
     p = cfg["config"]["process"][0]
     steps = p["train"]["steps"]
     production_checkpoint = ideogram_release_policy.checkpoint_control(cfg)

@@ -78,10 +78,18 @@ def resolve_base_model(cached_model_dir: str) -> str:
     return cached_model_dir
 
 
-def build_config(spec, num_images, hours_to_complete) -> dict:
+def build_config(
+    spec, num_images, hours_to_complete, base_model_override=None
+) -> dict:
+    """``base_model_override``: an already-prepared eval-grid-snapped base dir
+    (forge/evalgrid_snap.py). Applied ONLY on the fully-successful override
+    path; the degraded (INV-1) path deliberately stays on the original staged
+    base — the known Week-4 behavior. None (the default) changes nothing."""
     cfg = load_template(spec.model_type)  # may raise → caller wraps
     try:
-        resolved = _apply_overrides(cfg, spec, num_images, hours_to_complete)
+        resolved = _apply_overrides(
+            cfg, spec, num_images, hours_to_complete, base_model_override
+        )
     except Exception:
         # Degrade to the template with only the load-bearing name/paths patched so
         # an override bug can't forfeit (INV-1). name==repo is non-negotiable.
@@ -140,7 +148,9 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
         return resolved
 
 
-def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
+def _apply_overrides(
+    cfg, spec, num_images, hours_to_complete, base_model_override=None
+) -> dict:
     cfg["config"]["name"] = spec.expected_repo_name  # MUST == repo_name
     p = cfg["config"]["process"][0]  # process is a LIST
     p["training_folder"] = spec.training_folder
@@ -185,6 +195,16 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
         # opponent's 0.0525 on template lr 1e-4 with a deep run + EARLY
         # selected checkpoint. Template LR stands; the real gap is checkpoint
         # SELECTION for image exports (see postmortem handoff).
+
+    # WEEK-9 eval-grid snap (flag-gated, default OFF; forge/evalgrid_snap.py):
+    # when forge/tasks/aitoolkit.py has already built a snapped shadow of the
+    # staged base, point the loader at it. LAST on purpose: the krea2
+    # model_kwargs above must keep vae_path/text_encoder_path on the ORIGINAL
+    # staged paths (only the transformer weights are snapped), and the
+    # ideogram release policy's projection reads only model["arch"], so this
+    # repoint cannot deactivate it.
+    if base_model_override:
+        model["name_or_path"] = base_model_override
     return cfg
 
 
