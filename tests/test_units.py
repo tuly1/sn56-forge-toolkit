@@ -258,7 +258,12 @@ def test_recipe_step_scaling():
     # z-image law re-derived from TWO independent rank-1 operators; 930 -> 984
     # when both are read at the n_train they trained on (43 and 35, not 48 and
     # 39).  984 reproduces BOTH shipped depths exactly, 1317 and 1188.
-    assert recipe.size_scaled_steps("z-image", 24, 1000, 2000) == 984
+    # WEEK-9: min 350 -> 1000 (the flat-1000 boss-winner floor; the current
+    # boss 5GU4Xkd3 shipped flat 1000 and won the last three z-image tasks
+    # while the raw law under-emitted 778-898).  At n=24 the raw law is 984,
+    # so the floor binds: emission is 1000.  The 1.0 h anchors are untouched
+    # (n=35 -> 1188, n=43 -> 1317, asserted in test_week9_recipe_pins.py).
+    assert recipe.size_scaled_steps("z-image", 24, 1000, 2000) == 1000
     # unknown type -> template
     assert recipe.size_scaled_steps("sd3", 24, 1000, 2000) == 2000
     # budget cap drives well below scaled, never < 1

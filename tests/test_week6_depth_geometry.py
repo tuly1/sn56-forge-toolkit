@@ -218,7 +218,13 @@ def test_step_table_is_the_week6_field_calibration():
         # imply base 983.9 / 983.8 at p=0.5 — agreement to 0.01%, TIGHTER than
         # the 0.11% the same two artifacts showed when fitted at N=48/39 (931 /
         # 932).  base 984 reproduces both winners EXACTLY.
-        "z-image": dict(base=984, n_ref=24, p=0.50, min=350, max=1800),
+        # WEEK-9: min 350 -> 1000 — the flat-1000 floor.  5GU4Xkd3 won the
+        # last three z-image boss tasks (0.75h, n_train 15-20) shipping flat
+        # 1000 where the raw law emitted 778/852/898; the floor makes those
+        # shapes emit exactly 1000 while the 1.0h anchors (1188/1317) are
+        # untouched.  Refit arithmetic + rejected power-fit alternative:
+        # evidence/week9-recipe-impl-20260818/CHANGES.md §3B.
+        "z-image": dict(base=984, n_ref=24, p=0.50, min=1000, max=1800),
         # 5FBmn1ax: 892*(n/24)^0.51 gives 947 and 1097 at n_train 27 and 36,
         # against his published 949 and 1095 (+-0.2%).  `p` held at 0.51; the
         # exponent re-recovered at the corrected abscissa is 0.497, worth <=0.4%

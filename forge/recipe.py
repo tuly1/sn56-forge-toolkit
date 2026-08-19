@@ -618,7 +618,28 @@ STEP_TABLE = {
     # field miner completed 2000 steps in the same 1.0 h.  `max` 1800 stays out
     # of the flat-2000-template regime, whose entrant lost by 7.9%; it first
     # binds at n_train 81 (N=90), the same real dataset as before.
-    "z-image": dict(base=984, n_ref=_N_REF, p=0.50, min=350, max=1800),
+    #
+    # WEEK-9 (2026-08-18): min 350 -> 1000.  The law under-emitted the current
+    # boss winner on every recent real shape: the last three z-image tasks
+    # (Aug-10 bd3a04d8, Aug-17 8ab17505/e62885b4) were 0.75h small-N boss
+    # shapes at n_train 15/18/20 where this row emitted 778/852/898 while
+    # 5GU4Xkd3 shipped flat 1000 and won ALL THREE (-22%/-15%/-10%;
+    # week9-zimage-lane REPORT §3.3).  REFIT ARITHMETIC (CHANGES.md §3B):
+    #   * floor min=1000: n in {8..20} @0.75h emits exactly 1000 (clock cap
+    #     int((2484-480)/1.8)=1113 clears it; the winner's own 1000 fits our
+    #     wall model: 300 + 1000*1.8 + 180 = 2280s < 2700s), and the 1.0h
+    #     anchors are UNTOUCHED: n=35 -> 1188, n=43 -> 1317 (0% movement —
+    #     base=984 p=0.50 still reproduces both Aug-3 rank-1s exactly).
+    #   * rejected alternative: power-refit through (15,1000),(43,1317) gives
+    #     p=0.261/base=1131, which moves the n=35 anchor +5.0% (1248) and
+    #     emits 1049/1078 (not the winner's flat 1000) at n=18/20.  The floor
+    #     is exact at every anchor, matches the field's observed flat-1000
+    #     behavior at small n, and is the minimal change (one constant).
+    #   * the floor binds for n < 25 (984*(n/24)^0.5 < 1000 up to n=24.8);
+    #     no z-image task below n_train 15 has ever been observed, and the
+    #     0.5h degenerate cap (653) still pushes below it safely ("cap may
+    #     push below min", size_scaled_steps).
+    "z-image": dict(base=984, n_ref=_N_REF, p=0.50, min=1000, max=1800),
     # qwen-image — base 840 -> 892, ABSCISSA REFIT.  The champion's law was
     # recovered from his two COMPLETED rank-1 runs, whose `steps:` are OBSERVED
     # absolute values; only the x-axis was wrong:

@@ -198,28 +198,31 @@ def test_shipped_caption_dropout_is_never_inert(generated_configs, model_type):
 
 
 # --------------------------------------------------------------------------- #
-# 2. z-image: no caption dropout, because the field ran none.
+# 2. z-image: caption dropout 0.05 — ADOPTED week-9 on new field evidence.
 # --------------------------------------------------------------------------- #
-def test_zimage_ships_no_caption_dropout(generated_configs):
-    """z-image trains on captions only — matching 2/2 Aug-3 z-image winners.
+def test_zimage_ships_effective_caption_dropout(generated_configs):
+    """WEEK-9 REVERSAL of `test_zimage_ships_no_caption_dropout`, exactly per
+    that test's own instruction ("If new evidence does, update ... in the same
+    commit").
 
-    Both rank-1 z-image configs (tasks b290d171 and b2582457) omit
-    `caption_dropout_rate` entirely, i.e. toolkit default 0.0
-    (toolkit/config_modules.py:919).  The metric being 75% blank-prompt is an
-    argument for dropout in the abstract; the two miners who actually won
-    z-image tasks under that metric did not use it, and we cannot measure the
-    alternative before the Monday tournament.  Absence here is a decision.
+    The Aug-3 refusal rested on both Aug-3 rank-1 z-image configs omitting the
+    key.  Since then (week9-zimage-lane REPORT §3.3, OBSERVED from archived HF
+    trees + audit records):
+      * 5GU4Xkd3 won the last THREE z-image boss tasks (Aug-10 bd3a04d8,
+        Aug-17 8ab17505, Aug-17 e62885b4) running our template + exactly two
+        deltas: `caption_dropout_rate: 0.05` and flat 1000 steps.
+      * 5FpdSckw — the ex-champion, previously dropout-free — now ships 0.05.
+      * 3/3 published z-image configs in the Aug-17 tournament carry 0.05.
+    Mechanism live at pin 99be3d96 (config_modules.py:919 ->
+    dataloader_mixins.py:387-392, gated `not cache_text_embeddings` -> False
+    here): a dropped caption trains the exact blank-prompt conditioning that
+    is 75% of the score.  Direction still INFERRED (dropout/depth confounded
+    in every field pair); adoption is field-parity under operating note 5.
     """
     dataset, train = _dataset_and_train(generated_configs["z-image"])
-    assert "caption_dropout_rate" not in dataset, (
-        "z-image gained a caption_dropout_rate. The Aug-3 field evidence "
-        "(b290d171, b2582457: both absent) does not support it. If new "
-        "evidence does, update AUG3_WINNER_CAPTION_DROPOUT and this docstring "
-        "in the same commit."
-    )
-    # The mechanism is live for z-image (unlike qwen) — nothing caches text
-    # embeddings away — so if this is ever revisited the change is a one-liner
-    # and costs no wall clock.  Pin the precondition so that stays true.
+    assert dataset.get("caption_dropout_rate") == 0.05
+    # The gate that makes it EFFECTIVE (not the qwen no-op): nothing caches
+    # text embeddings away.
     assert not bool(train.get("cache_text_embeddings", False))
     assert not bool(train.get("unload_text_encoder", False))
 
