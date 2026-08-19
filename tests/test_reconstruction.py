@@ -268,9 +268,12 @@ def test_reconstruction_routing_is_type_scoped():
 def test_selection_cadence_dormant_equivalence(monkeypatch):
     monkeypatch.delenv("FORGE_HOLDOUT_SELECTION_TYPES", raising=False)
     for steps in (24, 86, 367, 456, 944, 1432, 2000):
+        # MERGE COMPOSITE: dormant baseline is the RECIPE branch's cadence
+        # (kill_safe_save_every WITH model_type -> FIXED_SAVE_EVERY 200 for
+        # krea2 at steps >= 200), not the pre-week-9 adaptive rule.
         assert recipe.selection_save_every(
             "krea2", steps, 250
-        ) == recipe.kill_safe_save_every(steps, 250)
+        ) == recipe.kill_safe_save_every(steps, 250, "krea2")
 
 
 def test_selection_cadence_active_gives_dense_ladder(monkeypatch):
