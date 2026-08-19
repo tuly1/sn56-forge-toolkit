@@ -986,6 +986,13 @@ class _Ideogram4Backend(_ToolkitBackend):
     adapter active only on the cond branch — the ~8x amplification channel the
     onboarding describes.  Costs two forwards per step on both passes (priced
     into the raised 900 s ideogram4 reserve).
+
+    HONESTY NOTE (INFERRED): the workflow also sets ``CFG_override`` to
+    max(cfg-3,1)=5 (diffusion.py:236) whose consumption point inside the
+    ideogram4 ComfyUI graph is NOT in our evidence copies (only lora_flux.json
+    was captured).  This backend implements the primary dual-model mechanism
+    only; whether CFG_override modulates the negative branch is GPU runbook
+    gate E3.  Until C1/C2 pass for ideogram4, its promotion env stays unset.
     """
 
     def __init__(self, order: dict[str, Any]):
