@@ -224,8 +224,20 @@ config:
       # be tested in a controlled same-runtime, same-data, multi-seed experiment,
       # never again promoted from a single confounded pair.
       loss_type: mse
-      do_differential_guidance: true
-      differential_guidance_scale: 2
+      # WEEK-9 (2026-08-18): `do_differential_guidance: true` and
+      # `differential_guidance_scale: 2` DELETED.  Both were confirmed-inert at
+      # ai-toolkit pin 99be3d96: the sole consumption site
+      # (extensions_built_in/sd_trainer/SDTrainer.py:734-737) is nested inside
+      # `if self.train_config.do_guidance_loss:` at :692, and `do_guidance_loss`
+      # defaults False (toolkit/config_modules.py:568) and is set nowhere in our
+      # tree — re-verified for the week-9 krea2 lane (REPORT §1.2 rows 61-62)
+      # and independently by this change's author (git grep at the pin: one
+      # consumption site).  They never executed in any run we shipped.  Deleted
+      # per the Aug-10 forensics STOP list ("delete the dead keys from our
+      # template so the next reader does not think they do something") and
+      # because, had anyone ever set do_guidance_loss true, they would have
+      # silently activated at scale 2.  Any config-diff against archived field
+      # artifacts must treat the old keys as cosmetic.
     logging:
       log_every: 1
       use_ui_logger: true

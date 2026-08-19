@@ -6,8 +6,19 @@ tourn_c54bb970b5d0aa91_20260803): 75 published repos, 28 tasks, 42 config-bearin
 entrants on these three types.
 
 WHAT SHIPPED
-    loss_type: mae   on krea2 + z-image + qwen-image
+    loss_type: mae   on krea2 + z-image + qwen-image      [SUPERSEDED, see below]
     ema_config       ON (use_ema true, ema_decay 0.995) on qwen-image ONLY
+
+WEEK-8 SUPERSESSION (2026-08-16, commit 75a0a20c) — loss_type REVERTED TO mse on
+all three types.  The Aug-10 tournament ran three krea2 R1 tasks; 5HKEAZxF swept
+all three running mse and we placed 10th/5th/6th running mae, 10-20% behind
+(evidence/aug10-loss-forensics-20260812/AUG10-LOSS-FORENSICS.md #3: "match the
+champion, then earn deviations").  The revert commit changed ONLY the three
+templates and left this file's mae pins stale — the suite was red at the served
+pin (16 failures).  Reconciled 2026-08-18 (week-9): the pins below now assert
+the mse that actually ships.  The mae evidence narrative above is kept as
+history; mae remains a live hypothesis to be re-earned in a controlled
+same-runtime multi-seed experiment, never re-promoted from a confounded pair.
 
 WHAT WAS REFUSED, AND WHY THESE TESTS GO RED IF SOMEONE SHIPS IT ANYWAY
     EMA on krea2   — 5FBmn1ax ran EMA ON for qwen and z-image and OFF on all
@@ -78,7 +89,11 @@ TEMPLATE_FILE = {
 }
 
 # What ships, per type.  `None` for ema means "no ema_config block at all".
-SHIPPED_LOSS_TYPE = {"krea2": "mae", "z-image": "mae", "qwen-image": "mae"}
+# WEEK-8 mse revert (75a0a20c, 2026-08-16): all three templates carry the
+# explicit literal `mse` — written, not omitted, so a later edit that DROPS the
+# key (silently mse via config_modules.py:502) is still distinguishable from
+# the deliberate value.  Reconciled here 2026-08-18 (week-9 recipe impl).
+SHIPPED_LOSS_TYPE = {"krea2": "mse", "z-image": "mse", "qwen-image": "mse"}
 SHIPPED_EMA = {
     "krea2": {"use_ema": False, "ema_decay": 0.99},  # explicit off; decay inert
     "z-image": None,  # no block -> config_modules.py:527 -> use_ema False
@@ -111,11 +126,14 @@ FIELD_QWEN_EMA_DECAY = 0.995
 # "WEEK-6 ABSCISSA CORRECTION"); every krea2/z-image value moves +5.6..+5.8%
 # and qwen's two clock-bound shapes do not move at all.
 # --------------------------------------------------------------------------- #
+# WEEK-9 (2026-08-18): krea2 steps moved to the AUG10-LOSS-FORENSICS §4.4 flat
+# law (p=0, base=1850, SEC 1.40, krea2 startup 400): 0.75 h clock-fills to 1360,
+# 1.0 h emits the flat 1850.  See test_week6_depth_geometry.py for the full pin.
 REAL_SHAPES = [
-    ("41025fb5", "krea2", 18, 0.75, 1432),
-    ("db9f7244", "krea2", 38, 1.0, 1860),
-    ("3e0fdcde", "krea2", 37, 1.0, 1843),
-    ("f6725c2b", "krea2", 45, 1.0, 1974),
+    ("41025fb5", "krea2", 18, 0.75, 1360),
+    ("db9f7244", "krea2", 38, 1.0, 1850),
+    ("3e0fdcde", "krea2", 37, 1.0, 1850),
+    ("f6725c2b", "krea2", 45, 1.0, 1850),
     ("b290d171", "z-image", 35, 1.0, 1188),
     ("b2582457", "z-image", 43, 1.0, 1317),
     ("7421f056", "qwen-image", 25, 1.25, 836),
@@ -178,11 +196,13 @@ def _effective_ema(train: dict):
 # 1. loss_type — SHIPPED on all three types.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("model_type", OUR_TYPES)
-def test_template_writes_loss_type_mae(model_type):
-    """The raw template — reverting the key to mse or dropping it goes red.
+def test_template_writes_loss_type_mse(model_type):
+    """The raw template — moving the key off mse or dropping it goes red.
 
     Dropping it is the sneaky failure: `loss_type` absent is NOT "unset", it is
-    `mse` (toolkit/config_modules.py:502).  So absence must fail too.
+    `mse` (toolkit/config_modules.py:502).  Absence must still fail because the
+    week-8 revert (75a0a20c) deliberately writes the literal so the value is a
+    decision on the page, not a default someone can silently displace.
     """
     train = _template_train(model_type)
     assert "loss_type" in train, (
@@ -193,26 +213,31 @@ def test_template_writes_loss_type_mae(model_type):
 
 
 @pytest.mark.parametrize("task,model_type,pairs,hours,_steps", REAL_SHAPES)
-def test_emitted_config_runs_mae_on_every_real_shape(
+def test_emitted_config_runs_mse_on_every_real_shape(
     task, model_type, pairs, hours, _steps, images_dir
 ):
     """The EMITTED config, on the real task shapes — the override contract must
-    not eat the key on its way through `_apply_overrides`."""
+    not eat the key on its way through `_apply_overrides`.  mse per the week-8
+    revert (75a0a20c): the Aug-10 sweeper ran mse on all three krea2 tasks."""
     process = _build(model_type, pairs, hours, images_dir)
-    assert process["train"]["loss_type"] == "mae", task
-    assert _effective_loss_type(process["train"]) == "mae", task
+    assert process["train"]["loss_type"] == "mse", task
+    assert _effective_loss_type(process["train"]) == "mse", task
 
 
 @pytest.mark.parametrize("model_type", OUR_TYPES)
-def test_shipped_loss_literal_is_one_the_runtime_dispatches_on(model_type):
-    """The whole point of the string: SDTrainer.py:814-827 is an if/elif chain.
+def test_shipped_loss_literal_is_the_runtime_dispatch_default(model_type):
+    """SDTrainer.py:814-827 is an if/elif chain whose `else` at :827 is mse.
 
-    A near-miss spelling is not an error, it is a SILENT revert to mse.  This
-    asserts the value we ship is in the branch set, and that the obvious
-    near-misses are not — so the reader can see why the exact literal matters.
+    Since the week-8 revert the shipped literal IS the else-default, so a
+    near-miss spelling can no longer silently change the objective — but the
+    near-miss facts are kept pinned so the reader (and any future mae
+    re-promotion) still sees why the exact literal matters: "mae" is the one
+    four-letter branch (:818), and "MAE"/"l1"/"mae " all silently train mse.
     """
     written = _template_train(model_type)["loss_type"]
-    assert written in RUNTIME_LOSS_LITERALS
+    assert written == "mse"
+    assert written not in RUNTIME_LOSS_LITERALS  # mse is the else, not a branch
+    assert _effective_loss_type({"loss_type": written}) == "mse"
     for near_miss in ("MAE", "Mae", "l1", "l1_loss", "mae ", " mae"):
         assert near_miss not in RUNTIME_LOSS_LITERALS
         assert _effective_loss_type({"loss_type": near_miss}) == "mse"
@@ -391,14 +416,20 @@ def test_this_unit_did_not_move_anything_else(model_type):
     assert train["noise_scheduler"] == "flowmatch"
     assert train["dtype"] == "bf16"
     frozen = {
-        "krea2": {"timestep_type": "linear", "differential_guidance_scale": 2,
-                  "do_differential_guidance": True, "steps": 2000},
+        "krea2": {"timestep_type": "linear", "steps": 2000},
         "z-image": {"timestep_type": "weighted", "steps": 2000},
         "qwen-image": {"timestep_type": "weighted", "steps": 3000,
                        "cache_text_embeddings": True},
     }[model_type]
     for key, value in frozen.items():
         assert train[key] == value, (model_type, key)
+    # WEEK-9 (2026-08-18): the krea2 differential-guidance pair was DELETED —
+    # confirmed-dead at pin 99be3d96 (SDTrainer.py:734 unreachable under
+    # do_guidance_loss:692 default False) and removed per the Aug-10 forensics
+    # STOP list.  Absence is now the frozen shape.
+    if model_type == "krea2":
+        assert "do_differential_guidance" not in train
+        assert "differential_guidance_scale" not in train
 
 
 @pytest.mark.parametrize("model_type", OUR_TYPES)
