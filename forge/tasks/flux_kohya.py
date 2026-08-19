@@ -7,13 +7,26 @@ understands the former shape; ai-toolkit understands the latter. Forge chooses
 between them from the trusted, read-only cache shape while retaining the same
 run scope, telemetry, kill-safe checkpoint promotion, publication scrub, and
 never-forfeit fallback.
+
+WEEK-9 FIELD-FAMILY PORT (evidence/week9-flux-family-port-20260819/CHANGES.md):
+the beta Phase D A/B measured the field's kohya dim-128 TE-inclusive family
+19.55% ahead of our ai-toolkit flux family on the archived Aug-3 flux task
+(beta REPORT §5).  Snapshot-directory FLUX caches therefore now ATTEMPT the
+same Kohya recipe first — the full BFL checkpoint that Kohya consumes ships at
+the snapshot root (the evaluator's own >10 GiB rule finds it there) — and fall
+back to the unchanged ai-toolkit path on ANY failure: ineligible cache, missing
+Kohya runtime, a budget below the evidenced depth floor, config rejection, or
+a crash without a checkpoint.  The fallback re-plans on the remaining clock, so
+degrade-not-forfeit is preserved end to end.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -49,11 +62,23 @@ _DIFFUSERS_COMPONENT_DIRS = {
 }
 _WEIGHT_INDEX_SUFFIXES = (".bin.index.json", ".safetensors.index.json")
 _SHARDED_CHECKPOINT_PATTERN = re.compile(r"-\d{5}-of-\d{5}\.safetensors$")
+# WEEK-9 snapshot->kohya route.  Opt-out env for a no-rebuild A/B and a
+# one-line operational rollback: "aitoolkit" restores the pre-port behavior.
+_SNAPSHOT_BACKEND_ENV = "FORGE_FLUX_SNAPSHOT_BACKEND"
+# The evaluator's own flux base-file rule (is_safetensors_available @ G.O.D
+# f7caab6c: the largest .safetensors over 10 GiB).  A full BFL FLUX checkpoint
+# is the only snapshot member that big; adapters/VAE/TE shards are far smaller.
+_SNAPSHOT_MIN_CHECKPOINT_BYTES = 10 * 1024**3
+# safetensors headers are single-digit MB in practice; anything past this is
+# not a header we should trust enough to parse.
+_MAX_SAFETENSORS_HEADER_BYTES = 256 * 1024 * 1024
 
 
 def run(spec: ImageSpec, deadline: Deadline) -> None:
     layout, standalone_model = resolve_flux_cache_layout(spec.cached_model_dir)
     if layout == _SNAPSHOT_LAYOUT:
+        if _attempt_snapshot_kohya(spec, deadline):
+            return
         telemetry.set_meta(backend="aitoolkit", base_model_layout=layout)
         telemetry.event(
             "flux_backend_selected",
@@ -75,6 +100,125 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     _run_standalone_kohya(spec, deadline, standalone_model)
 
 
+def _attempt_snapshot_kohya(spec: ImageSpec, deadline: Deadline) -> bool:
+    """Try the week-9 field-family Kohya route on a snapshot cache.
+
+    Returns True only when Kohya finalized an artifact; every other outcome —
+    opt-out, ineligible checkpoint, missing runtime, budget below the depth
+    floor, or any exception — returns False so the caller runs the unchanged
+    ai-toolkit path.  This function must never raise (never-forfeit contract).
+    """
+    try:
+        if os.environ.get(_SNAPSHOT_BACKEND_ENV, "kohya").strip().lower() != "kohya":
+            telemetry.event(
+                "flux_snapshot_kohya_skipped", reason="env_opt_out"
+            )
+            return False
+        checkpoint = resolve_snapshot_kohya_checkpoint(spec.cached_model_dir)
+        if checkpoint is None:
+            telemetry.event(
+                "flux_snapshot_kohya_skipped", reason="no_eligible_checkpoint"
+            )
+            return False
+        ready, not_ready_reason = _kohya_runtime_ready()
+        if not ready:
+            telemetry.event(
+                "flux_snapshot_kohya_skipped", reason=not_ready_reason
+            )
+            return False
+        telemetry.event(
+            "flux_backend_selected",
+            backend="kohya",
+            cache_layout=_SNAPSHOT_LAYOUT,
+            checkpoint=os.path.basename(checkpoint),
+        )
+        if _train_with_kohya(spec, deadline, checkpoint, layout=_SNAPSHOT_LAYOUT):
+            return True
+        telemetry.event(
+            "flux_snapshot_kohya_fallback", reason="budget_below_field_floor"
+        )
+        return False
+    except BaseException as exc:  # noqa: BLE001 — any failure => aitoolkit
+        try:
+            telemetry.event(
+                "flux_snapshot_kohya_fallback",
+                reason="kohya_route_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            pass
+        return False
+
+
+def resolve_snapshot_kohya_checkpoint(cached_model_dir: str) -> str | None:
+    """Resolve the single Kohya-consumable full FLUX checkpoint in a snapshot.
+
+    Mirrors the evaluator's flux base-file selection (largest ``.safetensors``
+    over 10 GiB, is_safetensors_available @ f7caab6c) restricted to DIRECT
+    root regular files with non-shard names, then proves the file is a
+    BFL-format FLUX checkpoint (``double_blocks.*`` tensors) by reading the
+    safetensors header offline — the pinned Kohya flux loader consumes exactly
+    that format (tonight's beta field arm trained from the same root file of
+    the same snapshot shape, beta REPORT §5).  Returns None instead of raising:
+    an ineligible snapshot falls back to ai-toolkit.
+    """
+    try:
+        candidates: list[tuple[int, str]] = []
+        for entry in os.scandir(cached_model_dir):
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                continue
+            if not entry.name.endswith(".safetensors"):
+                continue
+            if _SHARDED_CHECKPOINT_PATTERN.search(entry.name):
+                continue
+            size = entry.stat(follow_symlinks=False).st_size
+            if size > _SNAPSHOT_MIN_CHECKPOINT_BYTES:
+                candidates.append((size, entry.path))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        checkpoint = candidates[0][1]
+        if not _is_bfl_flux_checkpoint(checkpoint):
+            return None
+        return checkpoint
+    except OSError:
+        return None
+
+
+def _is_bfl_flux_checkpoint(path: str) -> bool:
+    """Whether the safetensors header carries BFL FLUX transformer tensors."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(8)
+            if len(raw) != 8:
+                return False
+            (header_len,) = struct.unpack("<Q", raw)
+            if not 0 < header_len <= _MAX_SAFETENSORS_HEADER_BYTES:
+                return False
+            header = json.loads(fh.read(header_len).decode("utf-8"))
+        if not isinstance(header, dict):
+            return False
+        return any(key.startswith("double_blocks.") for key in header)
+    except (OSError, ValueError, UnicodeDecodeError, struct.error):
+        return False
+
+
+def _kohya_runtime_ready() -> tuple[bool, str]:
+    """Preflight the baked Kohya runtime surface before committing the clock."""
+    if not os.path.isfile(os.path.join(_SD_SCRIPTS_DIR, "flux_train_network.py")):
+        return False, "kohya_script_missing"
+    for asset in (
+        flux_kohya_config.AE_PATH,
+        flux_kohya_config.CLIP_L_PATH,
+        flux_kohya_config.T5XXL_PATH,
+    ):
+        if not os.path.isfile(asset):
+            return False, "kohya_flux_asset_missing"
+    if not os.path.isdir(flux_kohya_config.TOKENIZER_CACHE_DIR):
+        return False, "kohya_tokenizer_cache_missing"
+    return True, "ready"
+
+
 def _run_standalone_kohya(
     spec: ImageSpec,
     deadline: Deadline,
@@ -82,6 +226,16 @@ def _run_standalone_kohya(
 ) -> None:
     if base_model is None:  # defensive: the resolver binds this invariant
         raise RuntimeError("standalone FLUX layout resolved without a checkpoint")
+    _train_with_kohya(spec, deadline, base_model, layout=_STANDALONE_LAYOUT)
+
+
+def _train_with_kohya(
+    spec: ImageSpec,
+    deadline: Deadline,
+    base_model: str,
+    *,
+    layout: str,
+) -> bool:
     os.makedirs(spec.save_root, exist_ok=True)
     os.makedirs(spec.training_folder, exist_ok=True)
     scope = checkpoints.ensure_run(spec.save_root, spec.expected_repo_name)
@@ -92,14 +246,40 @@ def _run_standalone_kohya(
         trigger_word=spec.trigger_word,
     )
     remaining_soft_s = deadline.remaining()
-    steps = flux_kohya_config.budgeted_train_steps(
+    budget_steps = flux_kohya_config.budgeted_train_steps(
         remaining_soft_s,
         boundary_margin_s=_STOP_MARGIN_S,
     )
+    # WEEK-9 field depth law: plan the beta-validated field depth, never more
+    # than the R11 completion budget allows.  The law also CAPS the standalone
+    # path: every archived flux winner shipped 540-754 presentations, and the
+    # only deeper observed arm (~960) lost — the previous budget-fill plans
+    # (128/196 steps at 1.0/1.5 h = 1024/1568 presentations) overshot the whole
+    # winner band (CHANGES.md §5).
+    law_steps = flux_kohya_config.field_epoch_steps(pairs)
+    steps = min(budget_steps, law_steps)
+    if layout == _SNAPSHOT_LAYOUT:
+        floor_steps = flux_kohya_config.field_floor_steps(pairs)
+        if budget_steps < floor_steps:
+            # Not enough clock to reach the shallow edge of the measured flat
+            # band (40 epochs): the kohya family has no evidence of beating
+            # the aitoolkit route there, and the fallback can still re-plan
+            # its own clock-capped run on the remaining budget.
+            telemetry.event(
+                "kohya_snapshot_budget_below_floor",
+                budget_steps=budget_steps,
+                floor_steps=floor_steps,
+                pairs=pairs,
+                remaining_soft_s=round(remaining_soft_s, 1),
+            )
+            return False
     telemetry.event(
         "kohya_step_budgeted",
         max_steps=flux_kohya_config.MAX_TRAIN_STEPS,
         planned_steps=steps,
+        budget_steps=budget_steps,
+        field_law_steps=law_steps,
+        pairs=pairs,
         remaining_soft_s=round(remaining_soft_s, 1),
         boundary_margin_s=_STOP_MARGIN_S,
         last_durable_steps=flux_kohya_config.R11_LAST_DURABLE_STEPS,
@@ -133,7 +313,7 @@ def _run_standalone_kohya(
     telemetry.set_meta(
         model_type=spec.model_type,
         backend="kohya",
-        base_model_layout=_STANDALONE_LAYOUT,
+        base_model_layout=layout,
         pairs=pairs,
         base_model=os.path.basename(base_model),
         steps=steps,
@@ -157,6 +337,7 @@ def _run_standalone_kohya(
         source=record["source"],
         selected_step=record["selected_step"],
     )
+    return True
 
 
 def resolve_flux_cache_layout(cached_model_dir: str) -> tuple[str, str | None]:

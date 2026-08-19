@@ -345,10 +345,15 @@ def test_standalone_path_does_not_attest_the_parent_dependency_graph(
         str(tmp_path / "base.safetensors"),
     )
 
-    assert planned == [(59, {"model_type": "flux"})]
-    assert configs[0]["steps"] == 59
+    # WEEK-9: the R11 completion budget for 1620s is 59 steps, but the field
+    # depth law now caps the plan: pairs=1 -> 58 epochs x ceil(1/4)=1 batch
+    # / ga 2 = 29 optimizer steps (flux_kohya_config.field_epoch_steps).
+    assert planned == [(29, {"model_type": "flux"})]
+    assert configs[0]["steps"] == 29
     budget = next(values for name, values in events if name == "kohya_step_budgeted")
-    assert budget["planned_steps"] == 59
+    assert budget["planned_steps"] == 29
+    assert budget["budget_steps"] == 59
+    assert budget["field_law_steps"] == 29
     assert budget["remaining_soft_s"] == 1620.0
 
 
