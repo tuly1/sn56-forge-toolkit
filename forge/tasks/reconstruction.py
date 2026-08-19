@@ -466,9 +466,15 @@ def score_candidates(
         json.dump(order, fh, sort_keys=True)
 
     log_path = os.path.join(temp_root, "recon-worker.log")
+    # cwd = the directory containing the ``forge`` package, so the ``-m``
+    # import resolves identically no matter where the trainer was launched.
+    package_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.Popen(
             _worker_cmd(order_path),
+            cwd=package_root,
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
