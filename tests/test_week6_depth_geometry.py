@@ -82,7 +82,11 @@ REAL_TASKS = [
      887, (21, 21), {(1024, 768): 21}),
     ("7421f056", 2, "qwen-image", "design", 28, 25, 1.25, 850, 836, 836, 168,
      887, (28, 28), {(1024, 768): 28}),
-    ("84be9fcd", 2, "ideogram4", "style", 46, 41, 1.0, 341, 183, 614, 123,
+    # WEEK-9: ideogram4 depths moved to the no-do_cfg row (base 1250/max 1650,
+    # SEC 2.1) with fixed save_every 200 — clock-bound 1348 @1.0 h / 954
+    # @0.75 h.  See recipe.py's week-9 ideogram4 block + the ideogram lane
+    # REPORT §4.1.
+    ("84be9fcd", 2, "ideogram4", "style", 46, 41, 1.0, 341, 183, 1348, 200,
      None, None, {(1408, 768): 45, (768, 1376): 1}),
     ("b290d171", 2, "z-image", "design", 39, 35, 1.0, 1188, 860, 1188, 238,
      747, (37, 39), {(1408, 768): 37, (768, 1376): 2}),
@@ -99,7 +103,7 @@ REAL_TASKS = [
      758, (26, 43), {(768, 1376): 18, (1408, 768): 17, (1376, 768): 8}),
     ("ff643470", 4, "qwen-image", "social", 41, 36, 1.5, 1095, 1027, 1023, 205,
      887, (41, 41), {(1024, 768): 41}),
-    ("1365fa1c", 5, "ideogram4", "product", 14, 12, 0.75, 174, 99, 414, 83,
+    ("1365fa1c", 5, "ideogram4", "product", 14, 12, 0.75, 174, 99, 954, 200,
      None, None, {(1195, 896): 13, (1376, 768): 1}),
     ("3e0fdcde", 5, "krea2", "design", 42, 37, 1.0, 2012, 1172, 1850, 200,
      887, (42, 42), {(1024, 768): 42}),
@@ -113,7 +117,7 @@ REAL_TASKS = [
     # SELECTED and shipped the 1100 rung.  Neither 1300 nor ">=1200" is what any
     # artifact contains.  ideogram4 is excluded from the winner-ratio assertions
     # below, so this column is documentation for this row — but it was wrong.
-    ("b72da8c6", 5, "ideogram4", "style", 40, 36, 1.0, 1100, 171, 589, 118,
+    ("b72da8c6", 5, "ideogram4", "style", 40, 36, 1.0, 1100, 171, 1348, 200,
      None, None, {(1024, 768): 40}),
     ("f6725c2b", 5, "krea2", "design", 50, 45, 1.0, 2012, 1172, 1850, 200,
      887, (50, 50), {(1024, 768): 50}),
@@ -202,13 +206,14 @@ def test_step_table_is_the_week6_field_calibration():
         # with SEC 1.40 + krea2 startup 400 this emits 1360/1850/1850 on the
         # real Aug-10 shapes vs the field plan 1333/1833/1833 (+0.9..2.0%).
         "krea2": dict(base=1850, n_ref=24, p=0.00, min=600, max=2200),
-        # NOT a fit to the field: the champion runs lr 4e-4 constant and we run
-        # 2.5e-5 cosine, so his step counts are not transferable (28.5x less lr
-        # integral at matched steps).  Set instead from our own EMA attenuation
-        # and our own do_cfg clock ceiling, and normalised to the ONE in-family
-        # field winner.  500 -> 517 = 378/(9/24)^0.32 — an abscissa correction
-        # only; p/min/max are untouched and the HELD adjudication is unchanged.
-        "ideogram4": dict(base=517, n_ref=24, p=0.32, min=350, max=620),
+        # WEEK-9 (2026-08-18): base 517 -> 1250, max 620 -> 1650, conditional
+        # on the do_cfg removal (release policy WEEK9_DO_CFG_AMENDMENT; the
+        # Aug-17 last-place-x3).  base plans ~1.2x the field's 1h rank-1..9
+        # geometric-mean ship (923.6); max = deepest observed ship (1650,
+        # 5D7iEJm5).  The clock (1348 @1.0 h at SEC 2.1) is the live ceiling
+        # inside the observed range; p/min untouched (still no size signal).
+        # Full arithmetic: evidence/week9-recipe-impl-20260818/CHANGES.md §3A.
+        "ideogram4": dict(base=1250, n_ref=24, p=0.32, min=350, max=1650),
         # Two INDEPENDENT rank-1 operators: 1317 and 1188 at n_train 43 and 35
         # imply base 983.9 / 983.8 at p=0.5 — agreement to 0.01%, TIGHTER than
         # the 0.11% the same two artifacts showed when fitted at N=48/39 (931 /
@@ -282,9 +287,10 @@ def test_step_table_max_binding_sizes():
         )
         crossover[model_type] = first
     assert crossover == {
-        # The one row whose `max` is ACTIVE at the top of the observed range
-        # (n_train 43 == the N=48 task).
-        "ideogram4": 43,
+        # WEEK-9: 43 -> 58.  max 1650 (deepest observed ship) first binds
+        # ABOVE the observed n_train 8..45 — anti-extrapolation; the clock cap
+        # (1348 @1.0 h) is the live ceiling inside the range.
+        "ideogram4": 58,
         # WEEK-9: krea2 went FLAT (p=0.00, base=1850 per AUG10-LOSS-FORENSICS
         # §4.4), so its law is size-independent by construction and can never
         # reach max=2200 at any n.  `None` here is the flat law working, not an
@@ -366,8 +372,10 @@ def test_discredited_jul16_premises_are_not_reintroduced():
          "5D2Qee4V completed 2000 steps in the same 1.0 h"),
         ("flux", 2175 / 870, "BOUND",
          "rank-1 5FW2Eaae, 58 kohya epochs x N=15, INFERRED"),
-        ("ideogram4", 2 * 3075 / 1523, "BOUND",
-         "5FBmn1ax completed 1523 in 1.0 h; DOUBLED for our do_cfg batch-2 step"),
+        # WEEK-9: the do_cfg doubling is GONE (poison removed); the field bound
+        # applies to our batch-1 step at face value.
+        ("ideogram4", 3075 / 1523, "BOUND",
+         "5FBmn1ax completed 1523 in 1.0 h; week-9 un-doubled, do_cfg removed"),
     ],
 )
 def test_sec_per_it_is_never_faster_than_its_own_evidence(
@@ -459,24 +467,32 @@ def test_krea2_flat_law_binding_structure():
     assert abs(1850 / ((3600 - 300) / 1.8) - 1.0) < 0.01
 
 
-def test_ideogram4_sec_per_it_is_deliberately_above_the_field_bound():
-    """The field's 2.05 s/step bound does NOT apply to our ideogram4 config.
+def test_ideogram4_sec_per_it_is_the_unhalved_field_bound_plus_pad():
+    """WEEK-9: the do_cfg batch-2 doubling is gone with the poison.
 
-    `forge.ideogram_release_policy` sets `do_cfg: true`, which runs the
-    transformer at batch 2 every step and adds a second grad-enabled forward
-    through the 8B text encoder (PIPELINE-MATERIALIZATION-AUDIT D6) — roughly
-    2x the field's per-step cost. Being honest about that costs nothing: the
-    size law binds on all three real ideogram4 shapes either way.
+    Week 6 priced our ideogram4 step at 2x the field's 2.019 bound because
+    `do_cfg: true` ran the transformer at batch 2 with a second grad-enabled
+    TE forward.  The week-9 release policy REMOVES do_cfg (the Aug-17
+    last-place-x3 mechanism; WEEK9_DO_CFG_AMENDMENT), so the honest constant
+    is the field bound with the same ~4% pad: 2.019 * 1.04 ~= 2.1.  The
+    week-9 row deliberately plans INTO this clock at the big Aug-3 shapes
+    (deep-plan + 200-rung ladder for selection), so the cap is now load-
+    bearing and its arithmetic is pinned here and in
+    tests/test_week9_recipe_pins.py.
     """
-    assert recipe.SEC_PER_IT["ideogram4"] == pytest.approx(2.05 * 2, abs=0.15)
+    field_bound = 3075 / 1523  # 5FBmn1ax completed 1523 in W(1.0h)
+    assert recipe.SEC_PER_IT["ideogram4"] == 2.1
+    assert recipe.SEC_PER_IT["ideogram4"] / field_bound == pytest.approx(
+        1.04, abs=0.01
+    )
     for row in REAL_TASKS:
         if row[2] != "ideogram4":
             continue
         n_train, hours, after = row[5], row[6], row[9]
         law = _pure_law("ideogram4", n_train)
         cap = _clock_cap("ideogram4", hours)
-        assert law < cap, "ideogram4 must be size-bound, not clock-bound"
-        assert after == law
+        assert law > cap, "week-9: the Aug-3 shapes are clock-bound by design"
+        assert after == cap
 
 
 def test_margin_stops_double_counting_the_fixed_reserve():
@@ -1105,7 +1121,9 @@ def test_ideogram4_release_policy_survives_the_geometry_switch(
     # The policy fired and its checkpoint binding still validates.
     assert cfg["meta"]["forge_ideogram_production_policy"]["policy_id"]
     assert process["train"]["lr"] == 0.000025
-    assert process["train"]["do_cfg"] is True
+    # WEEK-9: do_cfg removed — absence is the policy (WEEK9_DO_CFG_AMENDMENT).
+    assert "do_cfg" not in process["train"]
+    assert "cfg_scale" not in process["train"]
     control, selected = ideogram_release_policy.checkpoint_control(cfg)
     assert control["fraction_numerator"] == 1
     assert selected == process["train"]["steps"]

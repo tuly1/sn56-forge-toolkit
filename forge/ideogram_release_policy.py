@@ -15,6 +15,15 @@ shows the field moved and moved back.  See the block above ``EMA_DECAY`` for the
 evaluator mechanism, the in-family matched pair that decided it, and the
 arithmetic.  ``deployment_authorized`` remains False in the activation record;
 promotion past this branch still requires a separate, explicit owner step.
+
+WEEK-9 AMENDMENT (2026-08-18): ``do_cfg``/``cfg_scale`` REMOVED from the
+recipe this module writes.  The Aug-17 tournament drew three ideogram4 tasks
+and we finished LAST on all three (0.0765/0.2013/0.1212 vs field best
+0.0185/0.0271/0.0298 — 4.1x/7.4x/4.1x worse), with a structurally valid
+adapter, i.e. the adapter was ACTIVELY DAMAGING the model.  The verified
+mechanism and field join live in ``WEEK9_DO_CFG_AMENDMENT`` below and in
+evidence/week9-ideogram4-lane-20260818/REPORT.md §1-§4.  This is the third
+re-signature of the activation record; ``deployment_authorized`` remains False.
 """
 
 from __future__ import annotations
@@ -32,8 +41,10 @@ from forge import telemetry
 # v2 = the v1 EMA-horizon amendment VACATED.  A new id (rather than an in-place
 # edit of v1) so the activation record cannot be reused across the change and
 # the supersession chain records that the field moved and moved back.
-POLICY_ID = "week6-ideogram-exact-final-ema-horizon-vacated-v2"
-SUPERSEDED_POLICY_ID = "week6-ideogram-exact-final-ema-horizon-v1"
+# v3 (2026-08-18) = do_cfg/cfg_scale REMOVED from the projection.  Same rule:
+# a new id so the v2 activation record cannot validate this projection.
+POLICY_ID = "week9-ideogram-exact-final-do-cfg-removed-v3"
+SUPERSEDED_POLICY_ID = "week6-ideogram-exact-final-ema-horizon-vacated-v2"
 POLICY_KIND = "forge-ideogram-week5-production-policy"
 ACTIVATION_KIND = "forge-ideogram-week5-production-activation"
 CHECKPOINT_MAPPING_RULE = "nearest_current_candidate_ties_choose_earlier_step"
@@ -270,7 +281,84 @@ WEEK6_EMA_AMENDMENT: Mapping[str, Any] = {
     ),
     "vacated_on": "2026-08-06",
 }
-AMENDMENT_SHA256 = hashlib.sha256(_canonical_bytes(WEEK6_EMA_AMENDMENT)).hexdigest()
+WEEK6_AMENDMENT_SHA256 = hashlib.sha256(
+    _canonical_bytes(WEEK6_EMA_AMENDMENT)
+).hexdigest()
+
+# --- Week-9: do_cfg / cfg_scale removed from the projection -----------------
+#
+# WHAT THE PINNED RUNTIME DOES WITH do_cfg (all line numbers at ai-toolkit pin
+# 99be3d96, VERIFIED by reading the pinned tree for this amendment, not
+# inferred):
+#   1. toolkit/config_modules.py:489/:491 parse `do_cfg` (default False) and
+#      `cfg_scale` (default 1.0).
+#   2. extensions_built_in/sd_trainer/SDTrainer.py:1300 gates on do_cfg and
+#      :1311 sets the batch negative prompt to '' (we configure no
+#      negative_prompt pool), so the unconditional branch IS the blank prompt.
+#   3. The main-loss path passes unconditional embeds into predict_noise
+#      (SDTrainer.py:2029-2037), which forwards guidance_scale=cfg_scale
+#      (:1269) and detach_unconditional=False (:1271).
+#   4. toolkit/models/base_model.py doubles the batch (:891-893, inside a
+#      no_grad that covers ONLY input prep), runs the model forward OUTSIDE
+#      that no_grad (:932-937), chunks (:943) and combines (:947-949):
+#          pred = uncond + cfg_scale * (cond - uncond)
+#      with gradient flowing through BOTH branches (detach gate :945 is False).
+#   5. The loss is MSE(pred, velocity_target).  d(loss)/d(cond) = +cfg_scale;
+#      d(loss)/d(uncond) = (1 - cfg_scale) = -9 at cfg_scale 10: every step
+#      pushes the BLANK-PROMPT prediction AWAY from the true velocity target
+#      with ~9/10 the force it pushes the caption prediction toward it.
+#   6. The validator's score is 0.25*caption + 0.75*BLANK-PROMPT img2img
+#      reconstruction, and ideogram4's DualModelGuider amplifies the adapter's
+#      delta ~6.8-8x against an un-LoRA'd negative branch (see the EMA block
+#      above).  do_cfg anti-trains exactly the conditioning that carries 75%
+#      of the score, and the evaluator amplifies whatever damage it does.
+WEEK9_DO_CFG_AMENDMENT: Mapping[str, Any] = {
+    "schema": 1,
+    "amendment_id": "week9-ideogram-do-cfg-removal",
+    "fields": [
+        "config.process[0].train.do_cfg",
+        "config.process[0].train.cfg_scale",
+    ],
+    "validated_value": {"do_cfg": True, "cfg_scale": 10.0},
+    "amended_value": None,  # keys removed entirely; toolkit defaults False/1.0
+    "status": "active",
+    # HONEST: the I-J20-D2 cell RAN do_cfg true / cfg_scale 10, so the shipped
+    # recipe now deliberately diverges from its source validation cell on
+    # exactly these two fields.
+    "covered_by_source_validation_cell": False,
+    "basis": "aug17_last_place_x3_mechanism_and_field_join",
+    "evidence": (
+        "(a) MECHANISM at ai-toolkit pin 99be3d96 (traced, see the comment "
+        "block above): pred = uncond + 10*(cond - uncond) with "
+        "detach_unconditional=False (SDTrainer.py:1269-1271, "
+        "base_model.py:947-949) -> -9x gradient anti-trains the blank-prompt "
+        "branch that is 75% of the validator score, and ideogram4's "
+        "DualModelGuider amplifies the adapter delta ~8x against an un-LoRA'd "
+        "negative branch.  (b) RESULT: Aug-17 tournament, three ideogram4 "
+        "tasks, we finished LAST on all three at 4.1x/7.4x/4.1x the field "
+        "best.  (c) FIELD JOIN (week9-ideogram4-lane REPORT §2-3): all seven "
+        "published survivor configs OMIT do_cfg (ranks 1-11); the only two "
+        "published do_cfg:10 entries (us, 5HKEAZxF) are the catastrophic tail "
+        "on the one task where both are visible (0.052/0.077 vs 0.017-0.024). "
+        "(d) ORIGINATOR ABANDONMENT: the Jul-20 winner whose config this "
+        "recipe ports (5FNLSgh8, do_cfg:10 at 0.0502341) no longer runs it — "
+        "its own Aug-17 config has no do_cfg — and 0.0502 IS the Aug-17 "
+        "catastrophic tail: the tier do_cfg wins moved from rank 1 to rank 12. "
+        "(e) CLOCK: removal halves s/step (4.038 -> 2.019 field-bound), "
+        "doubling reachable depth (recipe.py SEC_PER_IT).  Counter-evidence "
+        "stated: six of twelve competitors publish no config, so the winners' "
+        "do_cfg state is unobserved; the drop matches every VISIBLE survivor "
+        "config, which under operating note 5 is a faithful reproduction of a "
+        "proven field family."
+    ),
+    "amended_on": "2026-08-18",
+}
+# The activation record binds the LIVE amendment; the vacated week-6 record
+# stays embedded in the policy body (and therefore in POLICY_SHA256) but is no
+# longer the record `amendment_sha256` scopes to.
+AMENDMENT_SHA256 = hashlib.sha256(
+    _canonical_bytes(WEEK9_DO_CFG_AMENDMENT)
+).hexdigest()
 
 
 _EXPECTED_RECIPE = {
@@ -309,8 +397,15 @@ _EXPECTED_RECIPE = {
         # use_ema True, decay EMA_DECAY (0.995) — the source cell's own values.
         # See the vacated-amendment block above for why 0.99 was rejected.
         "ema_config": {"use_ema": True, "ema_decay": EMA_DECAY},
-        "do_cfg": True,
-        "cfg_scale": 10.0,
+        # WEEK-9: do_cfg/cfg_scale REMOVED (WEEK9_DO_CFG_AMENDMENT above).
+        # `None` here means ABSENT: `_recipe_projection` reads these with
+        # train.get(), so a config that carries either key in any form fails
+        # the projection match and the post-apply verification.  Absent keys
+        # fall to the toolkit defaults False/1.0 (config_modules.py:489/:491)
+        # = single-branch training, no CFG objective — the configuration every
+        # published Aug-17 survivor config runs.
+        "do_cfg": None,
+        "cfg_scale": None,
         "disable_sampling": True,
         "dtype": "bf16",
     },
@@ -344,9 +439,11 @@ _POLICY_BODY = {
     "supersedes_policy_id": SUPERSEDED_POLICY_ID,
     "source_recipe_projection": _SOURCE_RECIPE,
     "recipe_projection": _EXPECTED_RECIPE,
-    # EMPTY: the shipped recipe has no live divergence from the source cell.
-    # The withdrawn one is kept alongside, hashed, for the audit trail.
-    "amendments": [],
+    # WEEK-9: ONE live amendment — the do_cfg/cfg_scale removal.  The shipped
+    # recipe now deliberately diverges from the I-J20-D2 source cell on those
+    # two fields and nowhere else.  The withdrawn week-6 EMA record is kept
+    # alongside, hashed, for the audit trail.
+    "amendments": [WEEK9_DO_CFG_AMENDMENT],
     "vacated_amendments": [WEEK6_EMA_AMENDMENT],
     "calibration_provenance": {
         "cell": SOURCE_VALIDATION_CELL,
@@ -357,13 +454,15 @@ _POLICY_BODY = {
             "production-compatible effective-U-Net schedule; the frozen stack "
             "created no trainable text-encoder LoRA modules"
         ),
-        # True again with the EMA amendment vacated: every field of the
-        # projection below is a field the I-J20-D2 cell actually ran.  (The
-        # `lr_scheduler: cosine` + `eta_min` spelling versus the field
+        # WEEK-9: False.  The projection now diverges from the I-J20-D2 cell
+        # on exactly two fields — do_cfg/cfg_scale, which the cell ran at
+        # true/10.0 and the projection requires ABSENT — recorded as the live
+        # WEEK9_DO_CFG_AMENDMENT.  Every other field is one the cell ran.
+        # (The `lr_scheduler: cosine` + `eta_min` spelling versus the field
         # artifact's `cosine_by_group` + `min_lr_by_initial_lr` is the
         # documented effective-schedule port, not a divergence in value: both
         # anneal 2.5e-5 -> 2.5e-6.)
-        "covers_recipe_projection_exactly": True,
+        "covers_recipe_projection_exactly": False,
     },
     "checkpoint_policy": {
         "target_fraction": {"numerator": 1, "denominator": 1},
@@ -380,20 +479,24 @@ POLICY_SHA256 = hashlib.sha256(_canonical_bytes(_POLICY_BODY)).hexdigest()
 # owner explicitly authorized the I-J20 port on the documented null-result
 # override branch.  There is intentionally no environment-variable path.
 #
-# RE-SIGNED TWICE IN WEEK 6.  Any change to the recipe projection necessarily
-# changes POLICY_SHA256 and so requires this record to be regenerated — that is
-# the mechanism working, not a bypass of it.  The first re-signature carried the
-# EMA-horizon amendment (0.995 -> 0.99); THIS one carries its VACATION, so the
-# projection is back to the bare I-J20-D2 port.  `amendment_sha256` keeps the
-# signature SCOPED: it binds this activation to exactly one named record — now a
-# vacation rather than a live divergence — and stops validating if that record
-# is edited.  `deployment_authorized` stays False; promoting this off the
-# integration branch remains a separate step.
+# RE-SIGNED TWICE IN WEEK 6, AND A THIRD TIME IN WEEK 9.  Any change to the
+# recipe projection necessarily changes POLICY_SHA256 and so requires this
+# record to be regenerated — that is the mechanism working, not a bypass of it.
+# The first re-signature carried the EMA-horizon amendment (0.995 -> 0.99); the
+# second carried its VACATION; THIS one carries the WEEK-9 do_cfg/cfg_scale
+# REMOVAL (the Aug-17 last-place-x3 poison; see WEEK9_DO_CFG_AMENDMENT for the
+# traced mechanism and field join).  `amendment_sha256` keeps the signature
+# SCOPED: it binds this activation to exactly the week-9 removal record and
+# stops validating if that record is edited.  Regenerated on the week9-recipe
+# branch under the owner's standing campaign authorization (operating notes
+# 15/19); `deployment_authorized` stays False, so promoting this off the
+# integration branch — repointing the served pin — remains a separate, explicit
+# owner step, exactly as before.
 PRODUCTION_ACTIVATION: Mapping[str, Any] | None = {
     "schema": 1,
     "kind": "forge-ideogram-week5-production-activation",
-    "policy_sha256": "aff7ce75bac9f28e40a0e7c8e1991d5a0482107b16b7be5c9699bd3b2189ea51",
-    "amendment_sha256": "501311769658b813e61a6bd6a9a2b59d2dc8ca664d70a804c9755216d4267675",
+    "policy_sha256": "93f076f0203ad43b78a61c4917cad554ced65dd7211241de5c25f0c221ce9cb4",
+    "amendment_sha256": "8236bfc751b11f7223d9e7e94466e45eaa9baae00f06a94f9b14b159f4136c8d",
     "formal_ideogram_decision_sha256": (
         "deb5bc3dc6590aa4a9ef0a234a5efc5bc25c40c04327810eb3c997c32dc30af4"
     ),
@@ -406,7 +509,7 @@ PRODUCTION_ACTIVATION: Mapping[str, Any] | None = {
     "production_mutation_authorized": True,
     "release_authorized": True,
     "deployment_authorized": False,
-    "activation_sha256": "04261257fadfc780fe70f557b1f5b6c6672e09631b804d51d9d28863f0ba348c",
+    "activation_sha256": "dda89490a1bdd885cb528c7c1661427a06b1560496f9b153e74b280c4237dc1e",
 }
 
 
@@ -561,13 +664,16 @@ def apply(
             "text_encoder_lr": 0.0000001,
             "lr_scheduler": "cosine",
             "lr_scheduler_params": {"eta_min": 0.0000025},
-            # The single field this module writes that the I-J20-D2 cell did
-            # not run.  ai-toolkit pin 99be3d96 consumes it at
+            # ai-toolkit pin 99be3d96 consumes ema_config at
             # config_modules.py:521-529,796 -> BaseSDTrainProcess.py:769-781
-            # (`decay=`) -> ema.py:55,117.  Nothing else on this dict changed.
+            # (`decay=`) -> ema.py:55,117.
             "ema_config": {"use_ema": True, "ema_decay": EMA_DECAY},
-            "do_cfg": True,
-            "cfg_scale": 10.0,
+            # WEEK-9: do_cfg/cfg_scale are NO LONGER WRITTEN (they used to be
+            # set true/10.0 right here).  The incoming template carries
+            # neither key, and the post-apply `_recipe_projection(resolved) !=
+            # _EXPECTED_RECIPE` check now FAILS the application if either key
+            # is present from any source — absence is enforced, not assumed.
+            # Mechanism + evidence: WEEK9_DO_CFG_AMENDMENT above.
         }
     )
     if _recipe_projection(resolved) != _EXPECTED_RECIPE:
