@@ -40,7 +40,7 @@ import yaml
 from forge import recipe, telemetry
 from forge.clock import Deadline
 from forge.data.schema import ImageSpec
-from forge.tasks import checkpoints
+from forge.tasks import checkpoints, reconstruction
 from forge.tasks.integrity import valid_safetensors
 
 _AI_TOOLKIT_DIR = os.environ.get("AI_TOOLKIT_DIR", "/app/ai-toolkit")
@@ -53,9 +53,24 @@ _BLANK_WEIGHT = 0.75
 _POLL_SECONDS = 2.0
 _FINALIZE_MARGIN_S = 30.0
 _MIN_CANDIDATE_START_S = 120.0
-_IMPLEMENTED_TYPES = frozenset({"krea2", "ideogram4"})
-_SCORING_RESERVE_S = {"krea2": 900.0, "ideogram4": 750.0}
-_MIN_TRAINING_WINDOW_S = {"krea2": 600.0, "ideogram4": 600.0}
+# Week-9: flux joins via the reconstruction scorer (aitoolkit route only; the
+# kohya route has no holdout machinery — see forge/tasks/dispatch.py).
+# z-image and qwen-image are deliberately ABSENT: no validated time-budget
+# analysis exists for them, so even FORGE_HOLDOUT_SELECTION_TYPES="*" cannot
+# enable them (enabled_for checks this set first).
+_IMPLEMENTED_TYPES = frozenset({"krea2", "ideogram4", "flux"})
+# Reserves (seconds carved from training when the env gate is on):
+# * krea2 900: measured design point — full 0.25/0.75 at 2 seeds over a 5-8
+#   rung ladder ~600-840 s (krea2 lane REPORT §3.4).  INFERRED, GPU gate Q1.
+# * ideogram4 750->900 (week-9): its evaluator's DualModelGuider needs an
+#   un-LoRA'd negative forward per step on BOTH passes, doubling per-step cost
+#   versus krea2's blank pass; the 750 s reserve is underwater in the same
+#   cost model.  INFERRED, GPU gate Q1.
+# * flux 900 (new): 1 generation per image per pass (its evaluator seed is
+#   dead — flux lane REPORT §2.2), 35 executed steps, single-branch guidance;
+#   ~550-1000 s for a 4-6 rung ladder incl. one model load.  INFERRED, Q1.
+_SCORING_RESERVE_S = {"krea2": 900.0, "ideogram4": 900.0, "flux": 900.0}
+_MIN_TRAINING_WINDOW_S = {"krea2": 600.0, "ideogram4": 600.0, "flux": 600.0}
 _BOUNDARY_MARGIN_S = 45.0
 
 
@@ -122,11 +137,20 @@ def produce(
     *,
     holdout_pairs: int,
     scorer: Callable[..., dict[str, Any]] | None = None,
+    recon_scorer: Callable[..., dict[str, Any]] | None = None,
 ) -> bool:
     """Score every valid current-run candidate and atomically publish a manifest.
 
     Returns ``True`` only when a complete authoritative manifest was written.
     It never raises into finalization.
+
+    Routing: architectures in ``reconstruction.EVAL_PARAMS`` are scored by the
+    week-9 reconstruction scorer (one worker process, real evaluator
+    semantics); an explicitly injected legacy ``scorer`` keeps the original
+    per-candidate zero-LR proxy path (also the path any future non-implemented
+    type would take).  Both share this function's fail-closed frame: any
+    exception, timeout, coverage gap, or candidate drift leaves NO manifest,
+    and finalization ships the true final checkpoint unchanged.
     """
     manifest_path = os.path.join(spec.save_root, _MANIFEST_NAME)
     started = time.monotonic()
@@ -153,6 +177,62 @@ def produce(
             )
             return False
         before_hashes = {os.path.basename(path): _sha256(path) for path in before}
+
+        use_reconstruction = scorer is None and reconstruction.uses_reconstruction(
+            spec.model_type
+        )
+        if use_reconstruction:
+            temp_root = tempfile.mkdtemp(prefix="forge-holdout-recon-")
+            rows, manifest_fields, soup_section = _reconstruction_rows(
+                spec,
+                cfg,
+                before,
+                before_hashes,
+                scope,
+                deadline,
+                holdout_pairs=holdout_pairs,
+                temp_root=temp_root,
+                recon_scorer=recon_scorer,
+            )
+            after = _valid_candidates(spec.save_root, scope)
+            after_hashes = {os.path.basename(path): _sha256(path) for path in after}
+            if (
+                list(before_hashes) != list(after_hashes)
+                or before_hashes != after_hashes
+            ):
+                raise RuntimeError("candidate set or bytes changed while scoring")
+            manifest = {
+                "schema": 1,
+                "source": "heldout",
+                "complete": True,
+                "task_id": spec.task_id,
+                "expected_repo_name": spec.expected_repo_name,
+                "attempt_nonce": scope.get("attempt_nonce"),
+                "scope_started_unix": scope.get("started_unix"),
+                "direction": "min",
+                "metric": reconstruction.METRIC,
+                "proxy_not_validator_metric": True,
+                "model_type": spec.model_type,
+                "holdout_pairs": holdout_pairs,
+                "captioned_weight": reconstruction.CAPTIONED_WEIGHT,
+                "blank_caption_weight": reconstruction.BLANK_WEIGHT,
+                "strata_scored_separately": True,
+                "scores": rows,
+                "elapsed_s": round(time.monotonic() - started, 3),
+                "created_unix": int(time.time()),
+            }
+            manifest.update(manifest_fields)
+            if soup_section is not None:
+                manifest["soup"] = soup_section
+            _atomic_json(manifest_path, manifest)
+            telemetry.event(
+                "holdout_manifest_complete",
+                metric=reconstruction.METRIC,
+                candidates=len(rows),
+                holdout_pairs=holdout_pairs,
+                elapsed_s=manifest["elapsed_s"],
+            )
+            return True
 
         temp_root = tempfile.mkdtemp(prefix="forge-holdout-proxy-")
         probe_root = os.path.join(temp_root, "datasets")
@@ -289,6 +369,157 @@ def produce(
     finally:
         if temp_root:
             shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def _reconstruction_rows(
+    spec: ImageSpec,
+    cfg: dict[str, Any],
+    before: list[str],
+    before_hashes: dict[str, str],
+    scope: dict[str, Any],
+    deadline: Deadline,
+    *,
+    holdout_pairs: int,
+    temp_root: str,
+    recon_scorer: Callable[..., dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
+    """Run the batch reconstruction scorer; raise on any defect (fail-closed).
+
+    Returns (manifest rows, reconstruction manifest fields, soup section or
+    None).  The optional greedy-soup artifact is only placed into
+    ``save_root`` after the worker payload validated; a soup placement failure
+    degrades to argmin (rows survive), never to a lost manifest.
+    """
+    pairs = reconstruction.holdout_pairs_list(spec.dataset_holdout_dir)
+    if len(pairs) != holdout_pairs:
+        raise RuntimeError(
+            f"holdout dir has {len(pairs)} pairs; expected {holdout_pairs}"
+        )
+    soup_output_path = os.path.join(temp_root, "soup-candidate.safetensors")
+    score = recon_scorer or reconstruction.score_candidates
+    payload = score(
+        model_type=spec.model_type,
+        candidates=list(before),
+        holdout_dir=spec.dataset_holdout_dir,
+        cfg=cfg,
+        temp_root=temp_root,
+        deadline=deadline,
+        soup_output_path=soup_output_path,
+    )
+    params = reconstruction.EVAL_PARAMS[(spec.model_type or "").strip().lower()]
+    scored_names = [str(raw.get("checkpoint")) for raw in payload["rows"]]
+    if sorted(scored_names) != sorted(before_hashes) or len(set(scored_names)) != len(
+        scored_names
+    ):
+        raise RuntimeError(
+            "reconstruction rows must cover every valid candidate exactly once"
+        )
+    rows: list[dict[str, Any]] = []
+    for raw in payload["rows"]:
+        name = str(raw["checkpoint"])
+        if name not in before_hashes:
+            raise RuntimeError(f"scored unknown candidate {name!r}")
+        path = next(p for p in before if os.path.basename(p) == name)
+        values = (
+            float(raw["score"]),
+            float(raw["captioned_score"]),
+            float(raw["blank_caption_score"]),
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in values):
+            raise RuntimeError(f"non-finite/negative reconstruction score for {name!r}")
+        row = {
+            "checkpoint": name,
+            "sha256": before_hashes[name],
+            "step": _step_of(path, scope),
+            "score": float(raw["score"]),
+            "captioned_score": float(raw["captioned_score"]),
+            "blank_caption_score": float(raw["blank_caption_score"]),
+            "captioned_points": int(raw["captioned_points"]),
+            "blank_caption_points": int(raw["blank_caption_points"]),
+            "points": int(raw["points"]),
+            "captioned_stddev": float(raw["captioned_stddev"]),
+            "blank_caption_stddev": float(raw["blank_stddev"]),
+        }
+        rows.append(row)
+        telemetry.event(
+            "holdout_candidate_scored",
+            checkpoint=name,
+            score=row["score"],
+            points=row["points"],
+        )
+    manifest_fields = {
+        "master_seed": reconstruction.MASTER_SEED,
+        "seeds_used": reconstruction.scorer_seeds(spec.model_type),
+        "generations": int(params["scorer_generations"]),
+        "validator_generations": int(params["validator_generations"]),
+        "eval_params": {
+            "steps": params["steps"],
+            "cfg": params["cfg"],
+            "denoise": params["denoise"],
+            "sampler": params["sampler"],
+            "scheduler": params["scheduler"],
+            "schedule_semantics": params["schedule_semantics"],
+            "guidance": params["guidance"],
+        },
+        "eval_geometry": [
+            list(reconstruction.evaluator_size(*_image_size(image)))
+            for image, _caption in pairs
+        ],
+        "scorer": payload.get("scorer") or {},
+    }
+    soup_section = _place_soup(spec, payload.get("soup"), rows)
+    return rows, manifest_fields, soup_section
+
+
+def _place_soup(
+    spec: ImageSpec,
+    soup: dict[str, Any] | None,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Move a winning soup artifact into save_root; degrade to argmin on error.
+
+    The scored rungs are already complete here, so ANY defect in this step
+    only drops the soup section (consumer then promotes the argmin as usual).
+    """
+    if not soup:
+        return None
+    try:
+        status = str(soup.get("status") or "")
+        if status != "improved" or not soup.get("output_path"):
+            return {
+                "status": status or "unknown",
+                "members": list(soup.get("members") or []),
+                "trials": int(soup.get("trials") or 0),
+            }
+        file_name = f"{spec.expected_repo_name}.soup.safetensors"
+        destination = os.path.join(spec.save_root, file_name)
+        digest = checkpoints._atomic_copy(str(soup["output_path"]), destination)
+        section = {
+            "status": "improved",
+            "file": file_name,
+            "sha256": digest,
+            "score": float(soup["score"]),
+            "members": [str(member) for member in soup["members"]],
+            "trials": int(soup.get("trials") or 0),
+        }
+        telemetry.event(
+            "holdout_soup_candidate",
+            score=section["score"],
+            members=len(section["members"]),
+        )
+        return section
+    except BaseException as exc:
+        telemetry.event(
+            "holdout_soup_dropped", error=f"{type(exc).__name__}: {exc}"
+        )
+        return None
+
+
+def _image_size(path: str) -> tuple[int, int]:
+    from PIL import Image
+
+    with Image.open(path) as image:
+        return image.size
 
 
 def _score_candidate(

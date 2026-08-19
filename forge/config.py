@@ -108,12 +108,17 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
             pass
         # Apply the same fixed candidate/I/O budget even on the degraded path;
         # the raw template's 200-250 cadence would miss most short jobs.
+        # (selection_save_every falls through to kill_safe_save_every whenever
+        # holdout selection is not enabled for the type.)
         try:
             p = cfg["config"]["process"][0]
-            p["save"]["save_every"] = recipe.kill_safe_save_every(
+            # MERGE RESOLUTION (trial): selection_save_every routes; its
+            # fallthrough passes model_type so recipe's FIXED_SAVE_EVERY holds
+            # when selection is dormant.
+            p["save"]["save_every"] = recipe.selection_save_every(
+                getattr(spec, "model_type", None),
                 p["train"]["steps"],
                 p["save"].get("save_every", 250),
-                getattr(spec, "model_type", None),
             )
         except Exception:
             pass
@@ -150,10 +155,11 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
         spec.model_type, num_images, hours_to_complete, template_steps
     )
     p["train"]["steps"] = steps
-    # WEEK-9: model_type routes krea2/ideogram4 to the fixed 200-step field
-    # cadence (recipe.FIXED_SAVE_EVERY); other types keep the adaptive rule.
-    p["save"]["save_every"] = recipe.kill_safe_save_every(
-        steps, p["save"].get("save_every", 250), spec.model_type
+    # WEEK-9 MERGE: selection_save_every when selection enabled; falls
+    # through to kill_safe_save_every WITH model_type (recipe FIXED_SAVE_EVERY
+    # for krea2/ideogram4) when dormant.
+    p["save"]["save_every"] = recipe.selection_save_every(
+        spec.model_type, steps, p["save"].get("save_every", 250)
     )
 
     _apply_eval_geometry(p, spec)

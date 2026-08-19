@@ -1170,3 +1170,38 @@ def kill_safe_save_every(steps, template_save_every, model_type=None):
             return int(template_save_every)
         except Exception:
             return 100
+
+
+# Fixed ladder cadence used only when holdout checkpoint selection is active
+# for the architecture.  The field's selection ladders run ~200-step cadences
+# (krea2 lane REPORT §2.5(i)/§3.3 item 4: live kill_safe cadence yields only 4
+# coarse rungs vs the field's 6-9); a denser fixed grid is what the
+# reconstruction scorer ranks.  Value INFERRED from field artifacts; the
+# per-type scoring reserve in forge.tasks.holdout prices the resulting 4-8
+# candidates.
+SELECTION_SAVE_EVERY = 200
+
+
+def selection_save_every(model_type, steps, template_save_every):
+    """Ladder cadence for selection-enabled runs; legacy cadence otherwise.
+
+    Dormant-equivalence contract: when ``FORGE_HOLDOUT_SELECTION_TYPES`` does
+    not name the type (production today), this is byte-for-byte
+    ``kill_safe_save_every`` — configs cannot change under a disabled feature.
+    Never raises (INV-1).
+    """
+    try:
+        from forge.tasks import holdout
+
+        if not holdout.enabled_for(model_type):
+            # MERGE RESOLUTION: pass model_type so recipe's FIXED_SAVE_EVERY
+            # (krea2/ideogram4 fixed 200) survives when selection is dormant.
+            return kill_safe_save_every(steps, template_save_every, model_type)
+        s = max(1, int(steps))
+        if s < 25:
+            return kill_safe_save_every(steps, template_save_every, model_type)
+        # Keep at least one mid-run rung on short plans; never save more often
+        # than every 25 steps (same floor as the legacy cadence).
+        return max(25, min(SELECTION_SAVE_EVERY, s // 2 + 1))
+    except Exception:
+        return kill_safe_save_every(steps, template_save_every, model_type)

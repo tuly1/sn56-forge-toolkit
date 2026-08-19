@@ -153,6 +153,7 @@ ENV PYTHONUNBUFFERED=1 \
     FORGE_FLUX_BACKEND=kohya \
     AI_TOOLKIT_DIR=/app/ai-toolkit \
     FORGE_TEMPLATES_DIR=/app/forge/templates \
+    FORGE_HOLDOUT_SELECTION_TYPES=flux \
     FORGE_KOHYA_PYTHONPATH=/home/.local/lib/python3.10/site-packages \
     FORGE_KOHYA_LD_LIBRARY_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64 \
     FORGE_KOHYA_LD_PRELOAD=libtcmalloc.so \
