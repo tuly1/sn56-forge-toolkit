@@ -144,6 +144,8 @@ RUN set -eu; \
       >/opt/sn56/legacy-os-package-inventory.sha256; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
+# WEEK-9: FORGE_HOLDOUT_SELECTION_TYPES removed (promotion blocked by gates;
+# see evidence/week9-gpu-campaign-20260819/alpha). No shadow tax.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONNOUSERSITE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
@@ -153,7 +155,6 @@ ENV PYTHONUNBUFFERED=1 \
     FORGE_FLUX_BACKEND=kohya \
     AI_TOOLKIT_DIR=/app/ai-toolkit \
     FORGE_TEMPLATES_DIR=/app/forge/templates \
-    FORGE_HOLDOUT_SELECTION_TYPES=flux \
     FORGE_KOHYA_PYTHONPATH=/home/.local/lib/python3.10/site-packages \
     FORGE_KOHYA_LD_LIBRARY_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64 \
     FORGE_KOHYA_LD_PRELOAD=libtcmalloc.so \

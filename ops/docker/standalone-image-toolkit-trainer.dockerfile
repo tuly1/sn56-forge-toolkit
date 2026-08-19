@@ -6,7 +6,11 @@ ENV FORGE_TEMPLATES_DIR=/app/forge/templates
 # for these types (shadow-safe: with no promotion env the manifests are
 # telemetry-only and the exact final still ships).  z-image/qwen-image are not
 # in holdout._IMPLEMENTED_TYPES and cannot be enabled from here.
-ENV FORGE_HOLDOUT_SELECTION_TYPES=krea2,ideogram4,flux
+# WEEK-9 GATES: promotion blocked (A2+B1 FAIL, 4 scorer defects; see
+# evidence/week9-gpu-campaign-20260819/alpha) -> shadow UNSET: no 900s depth
+# tax for a scorer that cannot promote. Re-enable only after the week-10 fix
+# passes the full gate battery.
+# ENV FORGE_HOLDOUT_SELECTION_TYPES=krea2,ideogram4,flux
 # PROMOTION (ship the argmin) and greedy soup stay OFF until the GPU
 # validation runbook's gates pass (evidence/week9-selection-impl-20260818/
 # GPU-VALIDATION-RUNBOOK.md).  Flip by uncommenting — one line, evidence-gated:
