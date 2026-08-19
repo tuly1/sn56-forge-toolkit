@@ -493,3 +493,6 @@ KREA2_FP8_TENSORS = {
     'txtfusion.refiner_blocks.1.mlp.gate.weight': (0.002162388525903225, (6912, 2560)),
     'txtfusion.refiner_blocks.1.mlp.up.weight': (0.0014822824159637094, (6912, 2560)),
 }
+
+# D-M1 provenance: source identity of every baked input (see gen_constants.py --verify)
+EVAL_SOURCE = {'ideogram4_eval': {'repo': 'Comfy-Org/Ideogram-4', 'file': 'diffusion_models/ideogram4_fp8_scaled.safetensors', 'size': 9280741285, 'lfs_oid': '49a946f1b0f8bcf5eab7d3b1ecc7b453c104e034cb1b592032745692724bd306', 'captured': '2026-08-18'}, 'krea2_eval': {'repo': 'Comfy-Org/Krea-2', 'file': 'diffusion_models/krea2_raw_fp8_scaled.safetensors', 'size': 13141730784, 'lfs_oid': '48cd5d6c100297968349b41a8e77c6591d1dac18a215807f5f25f59e5c54cd61', 'captured': '2026-08-18'}, 'ideogram4_trainer': {'repo': 'gradients-io-tournaments/ideogram-4-fp8', 'file': 'transformer/diffusion_pytorch_model.safetensors', 'size': 9289792888, 'lfs_oid': '19e12b4d5bdfcf35e17e5f4d292f5301a69a30e02336a9f8645e4b82f8319a1b', 'captured': '2026-08-18'}, 'krea2_trainer': {'repo': 'krea/Krea-2-Raw', 'file': 'raw.safetensors', 'size': 26283332608, 'lfs_oid': None, 'header_capture_sha256': 'b059dde0c1b1197bf07a3dbc77b9ff3e0557994b4813f8468c01a43fbce3554f', 'captured': '2026-08-18'}}

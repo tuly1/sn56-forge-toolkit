@@ -339,6 +339,10 @@ def public_record(private_sha256: str) -> dict[str, Any]:
         if not isinstance(raw, dict):
             continue
         name = _public_event_name(raw.get("name"))
+        # D-m2 (week-9 refutation review): evalgrid_* event NAMES alone would
+        # reveal the base-snap edge in the public recorder. Private record keeps them.
+        if name is not None and name.startswith("evalgrid_"):
+            continue
         timing = raw.get("t")
         if name is None or isinstance(timing, bool) or not isinstance(
             timing, (int, float)

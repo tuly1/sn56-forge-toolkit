@@ -643,3 +643,26 @@ def test_constants_provenance_pins():
     for name, (scale, sh) in krea.items():
         assert 0.0 < scale < 1.0, name
         assert len(sh) == 2, name
+
+
+def test_eval_source_provenance_is_baked_and_pinned():
+    # D-M1 (week-9 refutation review): a silent re-upload of an eval artifact
+    # must be detectable — the baked scales carry their source LFS oids.
+    from forge import evalgrid_constants as c
+
+    src = c.EVAL_SOURCE
+    assert set(src) == {"ideogram4_eval", "krea2_eval", "ideogram4_trainer", "krea2_trainer"}
+    # the two artifacts the scales were baked FROM are pinned by exact oid
+    assert src["ideogram4_eval"]["lfs_oid"] == (
+        "49a946f1b0f8bcf5eab7d3b1ecc7b453c104e034cb1b592032745692724bd306"
+    )
+    assert src["krea2_eval"]["lfs_oid"] == (
+        "48cd5d6c100297968349b41a8e77c6591d1dac18a215807f5f25f59e5c54cd61"
+    )
+    for entry in src.values():
+        assert entry["captured"] == "2026-08-18"
+        oid = entry.get("lfs_oid")
+        assert oid is None or (len(oid) == 64 and set(oid) <= set("0123456789abcdef"))
+    # HF redacts the krea2 trainer repo's oids at source; header capture is the anchor
+    assert src["krea2_trainer"]["lfs_oid"] is None
+    assert len(src["krea2_trainer"]["header_capture_sha256"]) == 64
