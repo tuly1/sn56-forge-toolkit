@@ -665,4 +665,6 @@ def test_eval_source_provenance_is_baked_and_pinned():
         assert oid is None or (len(oid) == 64 and set(oid) <= set("0123456789abcdef"))
     # HF redacts the krea2 trainer repo's oids at source; header capture is the anchor
     assert src["krea2_trainer"]["lfs_oid"] is None
-    assert len(src["krea2_trainer"]["header_capture_sha256"]) == 64
+    assert src["krea2_trainer"]["header_capture_sha256"] == (
+        "b059dde0c1b1197bf07a3dbc77b9ff3e0557994b4813f8468c01a43fbce3554f"
+    )
