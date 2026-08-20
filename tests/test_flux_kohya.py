@@ -592,16 +592,30 @@ def test_terminate_signals_the_process_group(monkeypatch):
 
     class Process:
         pid = 123
+        returncode = None
+
+        def poll(self):
+            return self.returncode
 
         def wait(self, timeout):
             calls.append(("wait", timeout))
             if timeout == 5:
                 raise flux_kohya.subprocess.TimeoutExpired("kohya", timeout)
+            self.returncode = -signal.SIGKILL
 
-        def send_signal(self, sig):
-            calls.append(("direct", sig))
-
-    monkeypatch.setattr(flux_kohya.os, "getpgid", lambda pid: 456)
+    identity = flux_kohya._ProcessIdentity(123, "proc:test-start")
+    info = flux_kohya._ProcessInfo(
+        identity=identity,
+        ppid=1,
+        pgid=123,
+        state="S",
+    )
+    monkeypatch.setattr(
+        flux_kohya,
+        "_process_table",
+        lambda: {123: info},
+    )
+    monkeypatch.setattr(flux_kohya, "_process_info", lambda pid: info)
     monkeypatch.setattr(
         flux_kohya.os,
         "killpg",
@@ -611,9 +625,9 @@ def test_terminate_signals_the_process_group(monkeypatch):
     flux_kohya._terminate(Process())
 
     assert calls == [
-        ("group", 456, signal.SIGTERM),
+        ("group", 123, signal.SIGTERM),
         ("wait", 5),
-        ("group", 456, signal.SIGKILL),
+        ("group", 123, signal.SIGKILL),
         ("wait", 10),
     ]
 

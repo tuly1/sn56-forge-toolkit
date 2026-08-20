@@ -1,8 +1,10 @@
 """Week-9 HAZARD 2: no Kohya child may outlive the FLUX fallback.
 
-``flux_kohya.run`` falls back to ``aitoolkit.run`` on any Kohya failure.  Both
-trainers use the whole GPU, so a Kohya child that survives the transition means
-VRAM exhaustion or a corrupted artifact — a forfeit for the task either way.
+``flux_kohya.run`` may fall back to ``aitoolkit.run`` after an ordinary Kohya
+failure only when shutdown is positively verified.  Both trainers use the
+whole GPU, so an unverified child must instead surface a containment error to
+the outer non-trainer fallback; concurrent trainers mean VRAM exhaustion or a
+corrupted artifact — a forfeit for the task either way.
 
 week9-rc only terminated the child on the clean deadline path: an exception
 anywhere in the poll loop, or a ``_terminate`` whose final ``wait`` timed out,
@@ -49,18 +51,27 @@ def _spec() -> ImageSpec:
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    """No test may leak a registered child into the next one.
-
-    getattr, not a direct call: the behavioural tests below must be runnable
-    against the week9-rc module (which has no registry) and fail there on their
-    own assertions rather than on a missing attribute.
-    """
-    reap = getattr(flux_kohya, "reap_kohya_children", None)
-    if reap is not None:
-        reap("test_setup")
+    """No failed-containment double may leak into the next test."""
+    flux_kohya.reap_kohya_children("test_setup")
     yield
-    if reap is not None:
-        reap("test_teardown")
+    flux_kohya.reap_kohya_children("test_teardown")
+    # Stubborn/throwing doubles intentionally remain owned.  Product code must
+    # retain them; the test harness alone may discard them after its assertion.
+    with flux_kohya._ACTIVE_CHILDREN_LOCK:
+        leftovers = list(flux_kohya._ACTIVE_KOHYA_CHILDREN)
+        flux_kohya._ACTIVE_KOHYA_CHILDREN.clear()
+    for child in leftovers:
+        for identity in child.descendants.values():
+            try:
+                flux_kohya._signal_process_identity(identity, signal.SIGKILL)
+            except Exception:
+                pass
+        try:
+            if child.proc.poll() is None:
+                child.proc.kill()
+                child.proc.wait(timeout=10)
+        except Exception:
+            pass
 
 
 class _Deadline:
@@ -107,15 +118,15 @@ def _install_fake_aitoolkit(monkeypatch, module) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_surviving_kohya_child_is_reaped_before_the_aitoolkit_fallback(
+def test_started_leader_and_escaped_descendant_are_gone_before_fallback(
     monkeypatch, tmp_path
 ):
-    """The decisive test: a crash mid-Kohya must not hand ai-toolkit a live GPU.
+    """Popen -> live setsid descendant -> exception -> reap -> fallback.
 
-    Fully end-to-end over surface that exists on week9-rc too — real Popen, the
-    real ``_run_kohya`` poll loop, the real ``_attempt_snapshot_kohya`` failure
-    handler, the real ``run`` fallback — so it fails on the RC bytes by finding
-    the trainer still alive, not by finding a missing helper.
+    This exercises the transition the empty-runtime smoke missed: the real
+    poll loop has started a leader and an escaped descendant before the
+    injected failure.  The real snapshot failure handler may reach ai-toolkit
+    only after both identities are positively gone.
     """
     script_root = tmp_path / "sd-scripts"
     script_root.mkdir()
@@ -123,6 +134,8 @@ def test_surviving_kohya_child_is_reaped_before_the_aitoolkit_fallback(
     spawned: list[subprocess.Popen] = []
     events: list[tuple[str, dict]] = []
     observations: list = []
+    marker = tmp_path / "descendant.pid"
+    saw_live_pair = []
     real_popen = subprocess.Popen
 
     def recording_popen(*args, **kwargs):
@@ -130,8 +143,13 @@ def test_surviving_kohya_child_is_reaped_before_the_aitoolkit_fallback(
         spawned.append(proc)
         return proc
 
-    fake = _fake_aitoolkit(observations)
-    fake.run.watched = spawned
+    fake = types.ModuleType("forge.tasks.aitoolkit")
+
+    def fallback_run(spec, deadline):  # noqa: ANN001
+        descendant_pid = int(marker.read_text().strip())
+        observations.append((spawned[0].poll(), _alive(descendant_pid)))
+
+    fake.run = fallback_run
 
     _install_fake_aitoolkit(monkeypatch, fake)
     monkeypatch.setattr(flux_kohya.subprocess, "Popen", recording_popen)
@@ -145,7 +163,15 @@ def test_surviving_kohya_child_is_reaped_before_the_aitoolkit_fallback(
         lambda config_path, script=None: [
             sys.executable,
             "-c",
-            "import time; time.sleep(300)",
+            (
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen(\n"
+                "    [sys.executable, '-c', 'import time; time.sleep(300)'],\n"
+                "    start_new_session=True,\n"
+                ")\n"
+                f"open({str(marker)!r}, 'w').write(str(child.pid))\n"
+                "time.sleep(300)\n"
+            ),
         ],
     )
     monkeypatch.setattr(
@@ -176,16 +202,41 @@ def test_surviving_kohya_child_is_reaped_before_the_aitoolkit_fallback(
         lambda name, **values: events.append((name, values)),
     )
 
-    flux_kohya.run(_spec(), _Deadline(raise_after=1))
+    def register_then_inject(proc, *, token=None):
+        # Fail before registration appends anything or the assignment to
+        # _run_kohya's local `child` completes.  Finally must recover from the
+        # raw Popen descriptor and inherited token; an empty registry cannot
+        # be mistaken for proof that the GPU is free.
+        wait_until = time.monotonic() + 10
+        while time.monotonic() < wait_until:
+            if marker.exists() and marker.read_text().strip():
+                descendant_pid = int(marker.read_text().strip())
+                if proc.poll() is None and _alive(descendant_pid):
+                    saw_live_pair.append((proc.pid, descendant_pid))
+                    raise RuntimeError("injected failure after Popen before return")
+            time.sleep(0.02)
+        pytest.fail("leader/escaped descendant never became live")
 
-    assert spawned, "the Kohya route never started a child"
-    assert observations, "the fallback never reached ai-toolkit"
-    assert observations[0][0][1] is not None, (
-        "a Kohya child was still training when ai-toolkit started on the same GPU"
-    )
-    # Reaped, not merely signalled: no zombie holding the device handle.
-    assert spawned[0].returncode is not None
-    assert [name for name, _ in events if name == "flux_snapshot_kohya_fallback"]
+    monkeypatch.setattr(flux_kohya, "_register_kohya_child", register_then_inject)
+
+    try:
+        flux_kohya.run(_spec(), _Deadline())
+
+        assert saw_live_pair, "failure was not injected after both processes started"
+        assert observations == [(spawned[0].returncode, False)]
+        assert spawned[0].returncode is not None, "leader descriptor was not reaped"
+        assert [name for name, _ in events if name == "flux_snapshot_kohya_fallback"]
+        assert flux_kohya._ACTIVE_KOHYA_CHILDREN == []
+    finally:
+        if marker.exists() and marker.read_text().strip():
+            try:
+                os.kill(int(marker.read_text().strip()), signal.SIGKILL)
+            except OSError:
+                pass
+        for proc in spawned:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
 
 
 def test_the_barrier_is_silent_when_no_child_was_left_behind(monkeypatch):
@@ -274,6 +325,56 @@ def test_an_exception_in_the_poll_loop_still_reaps_the_child(monkeypatch, tmp_pa
     assert getattr(flux_kohya, "_ACTIVE_KOHYA_CHILDREN", []) == []
 
 
+def test_deadline_path_reaps_the_started_child(monkeypatch, tmp_path):
+    script_root = tmp_path / "sd-scripts"
+    script_root.mkdir()
+    (script_root / "flux_train_network.py").write_text("# test", encoding="utf-8")
+    spawned: list[subprocess.Popen] = []
+    events: list[tuple[str, dict]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    class DeadlineStop:
+        calls = 0
+
+        def remaining(self):
+            self.calls += 1
+            return 3600.0 if self.calls == 1 else 0.0
+
+    monkeypatch.setattr(flux_kohya, "_SD_SCRIPTS_DIR", str(script_root))
+    monkeypatch.setattr(flux_kohya, "_log_path", lambda spec: str(tmp_path / "k.log"))
+    monkeypatch.setattr(flux_kohya, "_start_gpu_sampler", lambda *args: None)
+    monkeypatch.setattr(flux_kohya.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(
+        flux_kohya,
+        "_command",
+        lambda config_path, script=None: [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(300)",
+        ],
+    )
+    monkeypatch.setattr(
+        flux_kohya.telemetry,
+        "event",
+        lambda name, **values: events.append((name, values)),
+    )
+    monkeypatch.setattr(flux_kohya.telemetry, "sample", lambda *args: None)
+
+    flux_kohya._run_kohya(
+        str(tmp_path / "config.toml"), DeadlineStop(), _spec(), {}
+    )
+
+    assert spawned and spawned[0].returncode is not None
+    assert flux_kohya._ACTIVE_KOHYA_CHILDREN == []
+    end = next(values for name, values in events if name == "kohya_end")
+    assert end["stopped_by_deadline"] is True
+
+
 def test_terminate_reaps_a_real_child_and_reports_success():
     child = _spawn_sleeper()
     started = time.monotonic()
@@ -284,24 +385,214 @@ def test_terminate_reaps_a_real_child_and_reports_success():
 
 def test_terminate_never_raises_when_the_child_cannot_be_confirmed_dead(monkeypatch):
     """week9-rc let this TimeoutExpired escape and skip every cleanup path."""
+    signals: list[int] = []
 
     class Unkillable:
         pid = 4242
+        returncode = None
+
+        def poll(self):
+            return None
 
         def wait(self, timeout):
             raise subprocess.TimeoutExpired("kohya", timeout)
 
-        def send_signal(self, sig):
-            pass
-
-    monkeypatch.setattr(flux_kohya.os, "getpgid", lambda pid: pid)
-    monkeypatch.setattr(flux_kohya.os, "killpg", lambda pgid, sig: None)
+    identity = flux_kohya._ProcessIdentity(4242, "proc:stubborn")
+    info = flux_kohya._ProcessInfo(
+        identity=identity,
+        ppid=1,
+        pgid=4242,
+        state="D",
+    )
+    monkeypatch.setattr(
+        flux_kohya,
+        "_process_table",
+        lambda: {4242: info},
+    )
+    monkeypatch.setattr(flux_kohya, "_process_info", lambda pid: info)
+    monkeypatch.setattr(
+        flux_kohya.os,
+        "killpg",
+        lambda pgid, sig: signals.append(sig),
+    )
 
     assert flux_kohya._terminate(Unkillable()) is False
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_reused_descendant_pid_is_never_signalled(monkeypatch):
+    old = flux_kohya._ProcessIdentity(4242, "proc:old-start")
+    replacement = flux_kohya._ProcessInfo(
+        identity=flux_kohya._ProcessIdentity(4242, "proc:new-start"),
+        ppid=1,
+        pgid=4242,
+        state="S",
+    )
+    opened: list[int] = []
+    sent: list[tuple[int, int]] = []
+    closed: list[int] = []
+    monkeypatch.setattr(flux_kohya.sys, "platform", "linux")
+    monkeypatch.setattr(flux_kohya, "_process_info", lambda pid: replacement)
+    monkeypatch.setattr(
+        flux_kohya.os, "pidfd_open", lambda pid: opened.append(pid) or 77, raising=False
+    )
+    monkeypatch.setattr(
+        flux_kohya.signal,
+        "pidfd_send_signal",
+        lambda fd, sig, info, flags: sent.append((fd, sig)),
+        raising=False,
+    )
+    monkeypatch.setattr(flux_kohya.os, "close", lambda fd: closed.append(fd))
+    monkeypatch.setattr(
+        flux_kohya.os,
+        "kill",
+        lambda *args: pytest.fail("numeric os.kill used on Linux"),
+    )
+
+    assert flux_kohya._signal_process_identity(old, signal.SIGKILL) is True
+    assert opened == [4242]
+    assert sent == [], "PID-reused replacement was mistaken for Kohya"
+    assert closed == [77]
+
+
+def test_linux_descendant_signal_uses_identity_bound_pidfd(monkeypatch):
+    identity = flux_kohya._ProcessIdentity(4545, "proc:owned")
+    info = flux_kohya._ProcessInfo(
+        identity=identity,
+        ppid=1,
+        pgid=4545,
+        state="S",
+    )
+    sent: list[tuple[int, int, object, int]] = []
+    monkeypatch.setattr(flux_kohya.sys, "platform", "linux")
+    monkeypatch.setattr(flux_kohya, "_process_info", lambda pid: info)
+    monkeypatch.setattr(flux_kohya.os, "pidfd_open", lambda pid: 88, raising=False)
+    monkeypatch.setattr(
+        flux_kohya.signal,
+        "pidfd_send_signal",
+        lambda fd, sig, siginfo, flags: sent.append((fd, sig, siginfo, flags)),
+        raising=False,
+    )
+    monkeypatch.setattr(flux_kohya.os, "close", lambda fd: None)
+    monkeypatch.setattr(
+        flux_kohya.os,
+        "kill",
+        lambda *args: pytest.fail("numeric os.kill used on Linux"),
+    )
+
+    assert flux_kohya._signal_process_identity(identity, signal.SIGTERM) is True
+    assert sent == [(88, signal.SIGTERM, None, 0)]
+
+
+def test_reused_leader_pid_blocks_handoff_without_signalling_group(monkeypatch):
+    old = flux_kohya._ProcessIdentity(4343, "proc:original-leader")
+    replacement = flux_kohya._ProcessInfo(
+        identity=flux_kohya._ProcessIdentity(4343, "proc:replacement"),
+        ppid=1,
+        pgid=4343,
+        state="S",
+    )
+
+    class ClaimsLive:
+        pid = 4343
+
+        def poll(self):
+            return None
+
+    child = flux_kohya._KohyaChild(
+        proc=ClaimsLive(),
+        pid=4343,
+        token=None,
+        leader_identity=old,
+        pgid=4343,
+    )
+    group_signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(flux_kohya, "_process_table", lambda: {4343: replacement})
+    monkeypatch.setattr(flux_kohya, "_process_info", lambda pid: replacement)
+    monkeypatch.setattr(
+        flux_kohya.os,
+        "killpg",
+        lambda pgid, sig: group_signals.append((pgid, sig)),
+    )
+    with flux_kohya._ACTIVE_CHILDREN_LOCK:
+        flux_kohya._ACTIVE_KOHYA_CHILDREN.append(child)
+
+    with pytest.raises(flux_kohya.KohyaContainmentError, match="leader_pids=\\[4343\\]"):
+        flux_kohya._require_kohya_quiescent("pid_reuse_probe")
+
+    assert group_signals == [], "PID-reused process group was signalled"
+    assert flux_kohya._ACTIVE_KOHYA_CHILDREN == [child]
+
+
+def test_descendant_verification_uncertainty_is_not_success(monkeypatch):
+    identity = flux_kohya._ProcessIdentity(5151, "proc:owned")
+
+    class ReapedLeader:
+        pid = 4141
+
+        def poll(self):
+            return 0
+
+    child = flux_kohya._KohyaChild(
+        proc=ReapedLeader(),
+        pid=4141,
+        token="owned-token",
+        descendants={identity.pid: identity},
+    )
+    monkeypatch.setattr(
+        flux_kohya,
+        "_refresh_kohya_identities",
+        lambda record: (_ for _ in ()).throw(
+            flux_kohya._ProcessInspectionError("injected unreadable identity")
+        ),
+    )
+
+    assert flux_kohya._terminate(child, sweep_descendants=True) is False
+    assert "injected unreadable identity" in child.last_error
+
+
+def test_descendant_barrier_requires_two_consecutive_quiet_scans(monkeypatch):
+    late = flux_kohya._ProcessIdentity(5252, "proc:late-fork")
+    late_info = flux_kohya._ProcessInfo(
+        identity=late,
+        ppid=1,
+        pgid=5252,
+        state="S",
+    )
+
+    class ReapedLeader:
+        pid = 5151
+
+        def poll(self):
+            return 0
+
+    child = flux_kohya._KohyaChild(
+        proc=ReapedLeader(), pid=5151, token="quiet-scan-token"
+    )
+    scans = []
+    signals = []
+
+    def refresh(record):
+        scans.append(len(scans) + 1)
+        if len(scans) == 2:
+            record.descendants[late.pid] = late
+            return {late.pid: late_info}
+        return {}
+
+    monkeypatch.setattr(flux_kohya, "_refresh_kohya_identities", refresh)
+    monkeypatch.setattr(
+        flux_kohya,
+        "_signal_process_identity",
+        lambda identity, sig: signals.append((identity.pid, sig)) or True,
+    )
+
+    assert flux_kohya._wait_for_descendants(child, timeout=1.0) is True
+    assert len(scans) >= 4
+    assert signals == [(late.pid, signal.SIGKILL)]
 
 
 def test_an_unconfirmed_child_stays_registered_for_the_fallback_barrier(monkeypatch):
-    """A child we could not kill must not be silently forgotten."""
+    """False termination retains descriptor ownership and blocks handoff."""
     calls: list[str] = []
 
     class Zombie:
@@ -322,12 +613,104 @@ def test_an_unconfirmed_child_stays_registered_for_the_fallback_barrier(monkeypa
 
     assert flux_kohya.reap_kohya_children("probe") == 0
     assert calls == ["terminate"]
-    # The registry is drained by the barrier itself, so a second barrier is a
-    # no-op rather than an unbounded retry loop.
-    assert flux_kohya._ACTIVE_KOHYA_CHILDREN == []
+    assert len(flux_kohya._ACTIVE_KOHYA_CHILDREN) == 1
+    assert flux_kohya._ACTIVE_KOHYA_CHILDREN[0].proc is zombie
+    with pytest.raises(
+        flux_kohya.KohyaContainmentError,
+        match="refusing ai-toolkit handoff.*leader_pids=\\[99\\]",
+    ):
+        flux_kohya._require_kohya_quiescent("fallback_probe")
+    assert calls == ["terminate", "terminate"]
+    assert flux_kohya._ACTIVE_KOHYA_CHILDREN[0].proc is zombie
 
 
-def test_reap_is_a_no_op_for_children_that_already_exited(monkeypatch):
+def test_failed_reap_blocks_aitoolkit_on_the_same_gpu(monkeypatch):
+    child = _spawn_sleeper()
+    observations: list = []
+    _install_fake_aitoolkit(monkeypatch, _fake_aitoolkit(observations))
+    monkeypatch.setattr(
+        flux_kohya,
+        "resolve_flux_cache_layout",
+        lambda cached_model_dir: (flux_kohya._SNAPSHOT_LAYOUT, None),
+    )
+
+    def fail_after_launch(spec, deadline):
+        flux_kohya._register_kohya_child(child)
+        return False
+
+    monkeypatch.setattr(flux_kohya, "_attempt_snapshot_kohya", fail_after_launch)
+    monkeypatch.setattr(flux_kohya, "_terminate", lambda *args, **kwargs: False)
+    monkeypatch.setattr(flux_kohya.telemetry, "event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(flux_kohya.telemetry, "set_meta", lambda **kwargs: None)
+
+    with pytest.raises(
+        flux_kohya.KohyaContainmentError,
+        match="outer no-artifact fallback required",
+    ):
+        flux_kohya.run(_spec(), _Deadline())
+
+    assert observations == [], "ai-toolkit started despite unverified Kohya shutdown"
+    assert len(flux_kohya._ACTIVE_KOHYA_CHILDREN) == 1
+    assert flux_kohya._ACTIVE_KOHYA_CHILDREN[0].proc is child
+
+
+def test_termination_helper_exception_is_fail_closed(monkeypatch):
+    child = _spawn_sleeper()
+    observations: list = []
+    _install_fake_aitoolkit(monkeypatch, _fake_aitoolkit(observations))
+    monkeypatch.setattr(
+        flux_kohya,
+        "resolve_flux_cache_layout",
+        lambda cached_model_dir: (flux_kohya._SNAPSHOT_LAYOUT, None),
+    )
+
+    def fail_after_launch(spec, deadline):
+        flux_kohya._register_kohya_child(child)
+        return False
+
+    def broken_helper(*args, **kwargs):
+        raise RuntimeError("injected termination helper failure")
+
+    monkeypatch.setattr(flux_kohya, "_attempt_snapshot_kohya", fail_after_launch)
+    monkeypatch.setattr(flux_kohya, "_terminate", broken_helper)
+    monkeypatch.setattr(flux_kohya.telemetry, "event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(flux_kohya.telemetry, "set_meta", lambda **kwargs: None)
+
+    with pytest.raises(
+        flux_kohya.KohyaContainmentError,
+        match="termination helper failed: RuntimeError: injected termination helper",
+    ):
+        flux_kohya.run(_spec(), _Deadline())
+
+    assert observations == []
+    assert flux_kohya._ACTIVE_KOHYA_CHILDREN[0].proc is child
+
+
+def test_containment_error_is_not_downgraded_to_trainer_fallback(monkeypatch):
+    monkeypatch.delenv("FORGE_FLUX_SNAPSHOT_BACKEND", raising=False)
+    monkeypatch.setattr(
+        flux_kohya,
+        "resolve_snapshot_kohya_checkpoint",
+        lambda cached_model_dir: "/cache/flux1-dev.safetensors",
+    )
+    monkeypatch.setattr(flux_kohya, "_kohya_runtime_ready", lambda: (True, "ready"))
+    monkeypatch.setattr(
+        flux_kohya,
+        "_train_with_kohya",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            flux_kohya.KohyaContainmentError("injected containment failure")
+        ),
+    )
+    monkeypatch.setattr(flux_kohya.telemetry, "event", lambda *args, **kwargs: None)
+
+    with pytest.raises(
+        flux_kohya.KohyaContainmentError,
+        match="injected containment failure",
+    ):
+        flux_kohya._attempt_snapshot_kohya(_spec(), _Deadline())
+
+
+def test_reap_releases_an_already_reaped_leader_record(monkeypatch):
     child = _spawn_sleeper()
     child.kill()
     child.wait(timeout=10)
@@ -337,18 +720,28 @@ def test_reap_is_a_no_op_for_children_that_already_exited(monkeypatch):
         flux_kohya.telemetry, "event", lambda name, **values: events.append(name)
     )
 
-    assert flux_kohya.reap_kohya_children("probe") == 0
-    assert events == []
+    assert flux_kohya.reap_kohya_children("probe") == 1
+    assert events == ["kohya_child_reaped"]
+    assert flux_kohya._ACTIVE_KOHYA_CHILDREN == []
 
 
 def test_no_kohya_child_registry_leak_after_a_clean_run(monkeypatch, tmp_path):
     script_root = tmp_path / "sd-scripts"
     script_root.mkdir()
     (script_root / "flux_train_network.py").write_text("# test", encoding="utf-8")
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
     monkeypatch.setattr(flux_kohya, "_SD_SCRIPTS_DIR", str(script_root))
     monkeypatch.setattr(flux_kohya, "_log_path", lambda spec: str(tmp_path / "k.log"))
     monkeypatch.setattr(flux_kohya, "_start_gpu_sampler", lambda *args: None)
     monkeypatch.setattr(flux_kohya, "_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(flux_kohya.subprocess, "Popen", recording_popen)
     monkeypatch.setattr(
         flux_kohya,
         "_command",
@@ -364,6 +757,7 @@ def test_no_kohya_child_registry_leak_after_a_clean_run(monkeypatch, tmp_path):
         str(tmp_path / "config.toml"), _Deadline(), _spec(), {}
     )
 
+    assert spawned and spawned[0].returncode == 0
     assert flux_kohya._ACTIVE_KOHYA_CHILDREN == []
 
 
@@ -456,7 +850,8 @@ def test_descendant_discovery_finds_a_re_sessioned_grandchild(tmp_path):
     """The snapshot itself must see through setsid, or the sweep is empty."""
     parent, grandchild_pid = _spawn_setsid_grandchild(tmp_path)
     try:
-        assert grandchild_pid in flux_kohya._descendant_pids(parent.pid)
+        table = flux_kohya._process_table()
+        assert grandchild_pid in flux_kohya._descendant_identities(parent.pid, table)
     finally:
         for pid in (grandchild_pid,):
             try:
@@ -469,24 +864,20 @@ def test_descendant_discovery_finds_a_re_sessioned_grandchild(tmp_path):
 
 def test_descendant_sweep_is_opt_in_only(monkeypatch):
     """A pid we did not spawn must never make us signal unrelated processes."""
+    child = _spawn_sleeper()
     monkeypatch.setattr(
-        flux_kohya, "_descendant_pids", lambda pid: pytest.fail("discovery ran")
+        flux_kohya,
+        "_signal_owned_descendants",
+        lambda record, sig: pytest.fail("descendant signalling ran without opt-in"),
     )
-    swept: list[list[int]] = []
     monkeypatch.setattr(
-        flux_kohya, "_sweep_descendants", lambda pids: swept.append(pids) or 0
+        flux_kohya,
+        "_wait_for_descendants",
+        lambda record: pytest.fail("descendant verification ran without opt-in"),
     )
-    monkeypatch.setattr(flux_kohya.os, "getpgid", lambda pid: pid)
-    monkeypatch.setattr(flux_kohya.os, "killpg", lambda pgid, sig: None)
 
-    class Double:
-        pid = 1
-
-        def wait(self, timeout):
-            return 0
-
-    assert flux_kohya._terminate(Double()) is True
-    assert swept == [[]], "nothing was discovered, so nothing may be signalled"
+    assert flux_kohya._terminate(child) is True
+    assert child.returncode is not None
 
 
 def test_the_success_path_also_reaps_an_unconfirmed_child(monkeypatch, tmp_path):

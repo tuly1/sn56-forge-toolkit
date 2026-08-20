@@ -14,10 +14,12 @@ the beta Phase D A/B measured the field's kohya dim-128 TE-inclusive family
 (beta REPORT §5).  Snapshot-directory FLUX caches therefore now ATTEMPT the
 same Kohya recipe first — the full BFL checkpoint that Kohya consumes ships at
 the snapshot root (the evaluator's own >10 GiB rule finds it there) — and fall
-back to the unchanged ai-toolkit path on ANY failure: ineligible cache, missing
-Kohya runtime, a budget below the evidenced depth floor, config rejection, or
-a crash without a checkpoint.  The fallback re-plans on the remaining clock, so
-degrade-not-forfeit is preserved end to end.
+back to the unchanged ai-toolkit path after ordinary failures such as an
+ineligible cache, missing runtime, insufficient budget, config rejection, or a
+crash without a checkpoint, but only after Kohya shutdown is verified.  An
+unverified trainer fails closed to the CLI's non-trainer fallback instead of
+starting ai-toolkit on the same GPU.  A safe fallback re-plans on the remaining
+clock, so degrade-not-forfeit is preserved whenever containment is proven.
 """
 
 from __future__ import annotations
@@ -25,12 +27,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import signal
 import struct
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 
 from forge import flux_kohya_config, telemetry
 from forge.clock import Deadline
@@ -72,27 +76,104 @@ _SNAPSHOT_MIN_CHECKPOINT_BYTES = 10 * 1024**3
 # safetensors headers are single-digit MB in practice; anything past this is
 # not a header we should trust enough to parse.
 _MAX_SAFETENSORS_HEADER_BYTES = 256 * 1024 * 1024
+_KOHYA_RUN_TOKEN_ENV = "FORGE_KOHYA_RUN_TOKEN"
 
 
 # WEEK-9 HAZARD 2 (evidence/week9-hazards-20260819/CHANGES.md).  The snapshot
-# route falls back to ai-toolkit on ANY Kohya failure.  A Kohya child that
-# outlives that transition would train on the same GPU as ai-toolkit: VRAM
+# route may fall back to ai-toolkit only after verified Kohya shutdown.  A
+# child that outlives that transition would share the GPU with ai-toolkit: VRAM
 # exhaustion, or a truncated/interleaved artifact.  Every child this process
 # spawns is registered here so the fallback can prove none is left alive,
 # including on the paths that never reach _run_kohya's own cleanup.
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    """A PID bound to one kernel process lifetime, not just a reusable number."""
+
+    pid: int
+    started: str
+
+
+@dataclass(frozen=True)
+class _ProcessInfo:
+    identity: _ProcessIdentity
+    ppid: int
+    pgid: int
+    state: str
+
+
+@dataclass
+class _KohyaChild:
+    """Lifecycle ownership retained until the whole trainer tree is gone."""
+
+    proc: subprocess.Popen
+    pid: int
+    token: str | None
+    leader_identity: _ProcessIdentity | None = None
+    pgid: int | None = None
+    descendants: dict[int, _ProcessIdentity] = field(default_factory=dict)
+    last_error: str | None = None
+
+
+class KohyaContainmentError(RuntimeError):
+    """Kohya may still own the GPU, so another trainer must not be launched."""
+
+
+class _ProcessInspectionError(RuntimeError):
+    pass
+
+
 _ACTIVE_CHILDREN_LOCK = threading.Lock()
-_ACTIVE_KOHYA_CHILDREN: list[subprocess.Popen] = []
+_ACTIVE_KOHYA_CHILDREN: list[_KohyaChild] = []
 
 
-def _register_kohya_child(proc: subprocess.Popen) -> None:
+def _register_kohya_child(
+    proc: subprocess.Popen,
+    *,
+    token: str | None = None,
+) -> _KohyaChild | None:
+    child = _ensure_kohya_child_registered(proc, token=token)
+    if child is None:
+        return None
+    try:
+        _refresh_kohya_identities(child)
+    except BaseException as exc:  # noqa: BLE001 — retain ownership on uncertainty
+        child.last_error = f"identity registration failed: {type(exc).__name__}: {exc}"
+    return child
+
+
+def _ensure_kohya_child_registered(
+    proc: subprocess.Popen,
+    *,
+    token: str | None,
+) -> _KohyaChild | None:
+    """Append-only ownership primitive used in the post-Popen recovery gap."""
+    # Test doubles for an already-complete Popen may omit pid.  A real Popen
+    # always has one; a live pid-less object cannot be owned safely.
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        try:
+            if proc.poll() is not None:
+                return None
+        except Exception:
+            pass
+        raise KohyaContainmentError("live Kohya child has no usable pid")
+    # Append BEFORE process inspection.  /proc, ps, or even a test injection
+    # may fail after Popen; the descriptor must already be recoverable then.
     with _ACTIVE_CHILDREN_LOCK:
-        _ACTIVE_KOHYA_CHILDREN.append(proc)
+        for child in _ACTIVE_KOHYA_CHILDREN:
+            if child.proc is proc:
+                if child.token is None:
+                    child.token = token
+                return child
+        child = _KohyaChild(proc=proc, pid=pid, token=token)
+        _ACTIVE_KOHYA_CHILDREN.append(child)
+    return child
 
 
-def _forget_kohya_child(proc: subprocess.Popen) -> None:
+def _forget_kohya_child(child: _KohyaChild) -> None:
     with _ACTIVE_CHILDREN_LOCK:
         try:
-            _ACTIVE_KOHYA_CHILDREN.remove(proc)
+            _ACTIVE_KOHYA_CHILDREN.remove(child)
         except ValueError:
             pass
 
@@ -100,23 +181,25 @@ def _forget_kohya_child(proc: subprocess.Popen) -> None:
 def reap_kohya_children(reason: str) -> int:
     """Terminate AND reap every Kohya child this process still owns.
 
-    Returns the number confirmed dead.  Never raises and never blocks longer
-    than ``_terminate``'s own 15 s escalation per child: a forfeit is worse
-    than an unclean handoff, so a child we cannot kill is reported through
-    telemetry and the fallback proceeds anyway.
+    Returns the number of lifecycle records completely released.  A failed
+    record remains registered, with its Popen descriptor and identity-bound
+    descendants intact, so a later barrier can retry.  Helper failures are
+    reported but never converted into permission to start a second trainer.
     """
     with _ACTIVE_CHILDREN_LOCK:
         pending = list(_ACTIVE_KOHYA_CHILDREN)
-        _ACTIVE_KOHYA_CHILDREN.clear()
     reaped = 0
     survived = 0
-    for proc in pending:
+    for child in pending:
         try:
-            if proc.poll() is not None:
-                continue
-        except Exception:  # noqa: BLE001 — unknown state: try to kill it
-            pass
-        if _terminate(proc, sweep_descendants=True):
+            confirmed = _terminate(child, sweep_descendants=True)
+        except BaseException as exc:  # noqa: BLE001 — fail closed, retain handle
+            child.last_error = (
+                f"termination helper failed: {type(exc).__name__}: {exc}"
+            )
+            confirmed = False
+        if confirmed:
+            _forget_kohya_child(child)
             reaped += 1
         else:
             survived += 1
@@ -131,6 +214,25 @@ def reap_kohya_children(reason: str) -> int:
         except Exception:  # noqa: BLE001 — telemetry must never forfeit
             pass
     return reaped
+
+
+def _require_kohya_quiescent(reason: str) -> None:
+    """Positive barrier required before handing the GPU to another trainer."""
+    reap_kohya_children(reason)
+    with _ACTIVE_CHILDREN_LOCK:
+        pending = list(_ACTIVE_KOHYA_CHILDREN)
+    if not pending:
+        return
+    leaders = ",".join(str(child.pid) for child in pending)
+    failures = "; ".join(
+        f"pid={child.pid}: {child.last_error or 'shutdown unverified'}"
+        for child in pending
+    )
+    raise KohyaContainmentError(
+        "refusing ai-toolkit handoff because Kohya shutdown is unverified "
+        f"(reason={reason}; leader_pids=[{leaders}]; {failures}); "
+        "outer no-artifact fallback required"
+    )
 
 
 def run(spec: ImageSpec, deadline: Deadline) -> None:
@@ -150,7 +252,7 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
             # is the only place that can prove the GPU is free BEFORE
             # ai-toolkit starts.  It emits nothing when no child was left
             # behind, so the byte-identical fallback contract is untouched.
-            reap_kohya_children("flux_snapshot_fallback")
+            _require_kohya_quiescent("flux_snapshot_fallback")
             telemetry.set_meta(backend="aitoolkit", base_model_layout=layout)
             telemetry.event(
                 "flux_backend_selected",
@@ -172,16 +274,17 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         )
         _run_standalone_kohya(spec, deadline, standalone_model)
     finally:
-        reap_kohya_children("flux_run_exit")
+        _require_kohya_quiescent("flux_run_exit")
 
 
 def _attempt_snapshot_kohya(spec: ImageSpec, deadline: Deadline) -> bool:
     """Try the week-9 field-family Kohya route on a snapshot cache.
 
-    Returns True only when Kohya finalized an artifact; every other outcome —
+    Returns True only when Kohya finalized an artifact.  Ordinary failures —
     opt-out, ineligible checkpoint, missing runtime, budget below the depth
-    floor, or any exception — returns False so the caller runs the unchanged
-    ai-toolkit path.  This function must never raise (never-forfeit contract).
+    floor, or training errors — return False so the caller can run ai-toolkit
+    after its positive shutdown barrier.  A ``KohyaContainmentError`` is
+    deliberately re-raised so the CLI uses only its non-trainer fallback.
     """
     try:
         if os.environ.get(_SNAPSHOT_BACKEND_ENV, "kohya").strip().lower() != "kohya":
@@ -213,7 +316,11 @@ def _attempt_snapshot_kohya(spec: ImageSpec, deadline: Deadline) -> bool:
             "flux_snapshot_kohya_fallback", reason="budget_below_field_floor"
         )
         return False
-    except BaseException as exc:  # noqa: BLE001 — any failure => aitoolkit
+    except KohyaContainmentError:
+        # This is not an ordinary Kohya failure: another trainer is forbidden.
+        # Let forge.cli choose its non-trainer, no-artifact fallback.
+        raise
+    except BaseException as exc:  # noqa: BLE001 — ordinary failure => aitoolkit
         try:
             telemetry.event(
                 "flux_snapshot_kohya_fallback",
@@ -574,59 +681,88 @@ def _run_kohya(
     gpu_thread = _start_gpu_sampler(gpu_stop, gpu_peak)
     stopped_by_deadline = False
     proc: subprocess.Popen | None = None
+    child: _KohyaChild | None = None
+    run_token: str | None = None
+    registration_error: BaseException | None = None
 
     try:
         with open(log_path, "w", encoding="utf-8") as log:
+            child_env = _kohya_subprocess_env()
+            run_token = (
+                f"{os.getpid()}-{time.time_ns()}-{secrets.token_hex(12)}"
+            )
+            child_env[_KOHYA_RUN_TOKEN_ENV] = run_token
             proc = subprocess.Popen(
                 cmd,
                 cwd=_SD_SCRIPTS_DIR,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                env=_kohya_subprocess_env(),
+                env=child_env,
             )
-            _register_kohya_child(proc)
+            child = _register_kohya_child(proc, token=run_token)
             while proc.poll() is None:
+                if child is not None:
+                    try:
+                        _refresh_kohya_identities(child)
+                    except BaseException as exc:  # noqa: BLE001 — barrier retries
+                        child.last_error = (
+                            "identity refresh failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
                 # Deadline.remaining() already excludes the CLI's 180-second
                 # export reserve. Stop one additional boundary margin early so
                 # process-group termination and atomic promotion cannot race it.
                 if deadline.remaining() <= _STOP_MARGIN_S:
                     stopped_by_deadline = True
-                    _terminate(proc, sweep_descendants=True)
                     break
                 time.sleep(_POLL_SECONDS)
     finally:
-        gpu_stop.set()
-        if gpu_thread is not None:
-            gpu_thread.join(timeout=6)
-        if gpu_peak["mb"] > 0:
-            telemetry.sample("gpu_peak_mb", gpu_peak["mb"])
-        # WEEK-9 HAZARD 2: the poll loop is not the only way out of this
-        # frame.  Anything raising inside it (a clock error, a telemetry
-        # failure, KeyboardInterrupt) previously left the trainer running
-        # while the caller fell back to ai-toolkit on the same GPU.  Reap
-        # here on EVERY exit; keep the child registered if we could not
-        # confirm its death so the fallback barrier tries again.
+        # Containment comes first.  Sampler joins and telemetry are advisory
+        # and must never be able to bypass ownership/reaping after Popen.
         if proc is not None:
-            still_running = True
+            # Covers an injected/asynchronous BaseException after Popen
+            # returned but before _register_kohya_child returned to this frame.
+            # The ensure primitive also recovers a record already appended by
+            # a partially completed registration, without duplicating it.
             try:
-                still_running = proc.poll() is None
-            except Exception:  # noqa: BLE001 — unknown state: assume alive
-                pass
-            confirmed = True
-            if still_running:
-                confirmed = _terminate(proc, sweep_descendants=True)
-                try:
-                    telemetry.event(
-                        "kohya_child_reaped",
-                        reason="run_kohya_exit",
-                        reaped=1 if confirmed else 0,
-                        survived=0 if confirmed else 1,
-                    )
-                except Exception:  # noqa: BLE001 — telemetry must not forfeit
-                    pass
+                ensured = _ensure_kohya_child_registered(proc, token=run_token)
+                if ensured is not None:
+                    child = ensured
+            except BaseException as exc:  # noqa: BLE001
+                registration_error = exc
+        if child is not None:
+            try:
+                confirmed = _terminate(child, sweep_descendants=True)
+            except BaseException as exc:  # noqa: BLE001 — retain for outer barrier
+                child.last_error = (
+                    f"termination helper failed: {type(exc).__name__}: {exc}"
+                )
+                confirmed = False
             if confirmed:
-                _forget_kohya_child(proc)
+                _forget_kohya_child(child)
+            try:
+                telemetry.event(
+                    "kohya_child_reaped",
+                    reason="run_kohya_exit",
+                    reaped=1 if confirmed else 0,
+                    survived=0 if confirmed else 1,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not forfeit
+                pass
+        try:
+            gpu_stop.set()
+            if gpu_thread is not None:
+                gpu_thread.join(timeout=6)
+            if gpu_peak["mb"] > 0:
+                telemetry.sample("gpu_peak_mb", gpu_peak["mb"])
+        finally:
+            if registration_error is not None:
+                raise KohyaContainmentError(
+                    "post-Popen Kohya registration could not be retained; "
+                    "refusing ai-toolkit handoff; outer no-artifact fallback "
+                    "required"
+                ) from registration_error
 
     rc = None if proc is None else proc.returncode
     telemetry.event(
@@ -765,149 +901,511 @@ def _kohya_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _parent_map() -> dict[int, int]:
-    """pid -> ppid for every visible process.  Best effort; {} on failure."""
-    mapping: dict[int, int] = {}
+def _process_table() -> dict[int, _ProcessInfo]:
+    """Return a complete visible process snapshot or raise uncertainty.
+
+    Linux's start-time clock tick is an immutable production process identity.
+    The second-resolution ps fallback is best-effort support for CPU tests on
+    macOS, never the release proof.  An empty/failed snapshot is not interpreted
+    as proof that Kohya is gone.
+    """
+    table: dict[int, _ProcessInfo] = {}
+    if os.path.isdir("/proc"):
+        try:
+            entries = os.listdir("/proc")
+        except OSError as exc:
+            raise _ProcessInspectionError(f"cannot list /proc: {exc}") from exc
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                info = _process_info(int(entry))
+            except ValueError:
+                continue
+            if info is not None:
+                table[info.identity.pid] = info
+    else:
+        try:
+            result = subprocess.run(
+                ["ps", "-Ao", "pid=,ppid=,pgid=,stat=,lstart="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise _ProcessInspectionError(f"ps process snapshot failed: {exc}") from exc
+        if result.returncode != 0:
+            raise _ProcessInspectionError(
+                f"ps process snapshot returned {result.returncode}: "
+                f"{result.stderr.strip()[-200:]}"
+            )
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 4)
+            if len(parts) != 5:
+                continue
+            try:
+                pid, ppid, pgid = (int(value) for value in parts[:3])
+            except ValueError:
+                continue
+            table[pid] = _ProcessInfo(
+                identity=_ProcessIdentity(pid, f"ps:{parts[4].strip()}"),
+                ppid=ppid,
+                pgid=pgid,
+                state=parts[3],
+            )
+    if not table:
+        raise _ProcessInspectionError("process snapshot was empty")
+    return table
+
+
+def _process_info(pid: int) -> _ProcessInfo | None:
+    """One identity snapshot; Linux is production, ps is test-only fallback."""
+    if os.path.isdir("/proc"):
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                raw = handle.read()
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except OSError as exc:
+            raise _ProcessInspectionError(
+                f"cannot read /proc/{pid}/stat: {exc}"
+            ) from exc
+        # stat field 2 (comm) may contain spaces and parentheses.  Fields after
+        # its final ')' are state, ppid, pgrp, session, ..., starttime at 19.
+        close = raw.rfind(b")")
+        tail = raw[close + 1 :].split() if close >= 0 else []
+        if len(tail) < 20:
+            raise _ProcessInspectionError(f"malformed /proc/{pid}/stat")
+        try:
+            return _ProcessInfo(
+                identity=_ProcessIdentity(
+                    pid, f"proc:{tail[19].decode('ascii')}"
+                ),
+                ppid=int(tail[1]),
+                pgid=int(tail[2]),
+                state=tail[0].decode("ascii", errors="replace"),
+            )
+        except (ValueError, IndexError) as exc:
+            raise _ProcessInspectionError(
+                f"malformed numeric fields in /proc/{pid}/stat"
+            ) from exc
+
     try:
-        if os.path.isdir("/proc"):
-            for entry in os.listdir("/proc"):
-                if not entry.isdigit():
-                    continue
-                try:
-                    with open(f"/proc/{entry}/stat", "rb") as handle:
-                        raw = handle.read()
-                except OSError:
-                    continue
-                # The comm field may contain spaces and parentheses; every
-                # field after the final ')' is safe to split on whitespace.
-                tail = raw[raw.rfind(b")") + 1 :].split()
-                if len(tail) >= 2:
-                    try:
-                        mapping[int(entry)] = int(tail[1])
-                    except ValueError:
-                        continue
-            return mapping
         result = subprocess.run(
-            ["ps", "-Ao", "pid=,ppid="],
+            ["ps", "-p", str(pid), "-o", "pid=,ppid=,pgid=,stat=,lstart="],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-                mapping[int(parts[0])] = int(parts[1])
-    except Exception:  # noqa: BLE001 — discovery is best effort
-        return {}
-    return mapping
+    except Exception as exc:  # noqa: BLE001
+        raise _ProcessInspectionError(f"ps process lookup failed: {exc}") from exc
+    if result.returncode not in (0, 1):
+        raise _ProcessInspectionError(
+            f"ps process lookup returned {result.returncode}: "
+            f"{result.stderr.strip()[-200:]}"
+        )
+    line = result.stdout.strip()
+    if not line:
+        return None
+    parts = line.split(None, 4)
+    if len(parts) != 5:
+        raise _ProcessInspectionError(f"malformed ps identity for pid {pid}")
+    try:
+        found_pid, ppid, pgid = (int(value) for value in parts[:3])
+    except ValueError as exc:
+        raise _ProcessInspectionError(f"malformed ps identity for pid {pid}") from exc
+    if found_pid != pid:
+        raise _ProcessInspectionError(
+            f"ps identity lookup returned pid {found_pid} for requested {pid}"
+        )
+    return _ProcessInfo(
+        identity=_ProcessIdentity(pid, f"ps:{parts[4].strip()}"),
+        ppid=ppid,
+        pgid=pgid,
+        state=parts[3],
+    )
 
 
-def _descendant_pids(root_pid: int) -> list[int]:
-    """Live descendants of ``root_pid``, deepest first.  Never raises.
+def _token_process_identities(
+    token: str,
+    table: dict[int, _ProcessInfo],
+) -> dict[int, _ProcessIdentity]:
+    """Find every process inheriting one Kohya launch token.
 
-    WEEK-9 HAZARD 2(a): a grandchild that calls ``setsid()`` leaves the
-    child's process group, so ``os.killpg`` cannot reach it.  Snapshot the
-    tree BEFORE signalling and sweep any survivor afterwards.
+    The environment marker survives fork, exec, setsid, and reparenting.  It
+    closes the race where a descendant leaves both the leader's ancestry and
+    process group before teardown takes its snapshot.
     """
+    marker = f"{_KOHYA_RUN_TOKEN_ENV}={token}"
+    found: dict[int, _ProcessIdentity] = {}
+    if os.path.isdir("/proc"):
+        encoded = marker.encode()
+        for pid, info in table.items():
+            path = f"/proc/{pid}/environ"
+            try:
+                with open(path, "rb") as handle:
+                    environment = handle.read().split(b"\0")
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except PermissionError as exc:
+                # A descendant can change uid without losing its inherited
+                # token.  Any opaque environment makes the scan incomplete.
+                raise _ProcessInspectionError(
+                    f"cannot inspect process {pid} environment"
+                ) from exc
+            except OSError as exc:
+                raise _ProcessInspectionError(
+                    f"cannot inspect process {pid} environment: {exc}"
+                ) from exc
+            if encoded in environment:
+                found[pid] = info.identity
+        return found
+
+    try:
+        result = subprocess.run(
+            ["ps", "eww", "-Ao", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _ProcessInspectionError(f"ps environment scan failed: {exc}") from exc
+    if result.returncode != 0:
+        raise _ProcessInspectionError(
+            f"ps environment scan returned {result.returncode}: "
+            f"{result.stderr.strip()[-200:]}"
+        )
+    for line in result.stdout.splitlines():
+        stripped = line.lstrip()
+        pid_text, separator, command = stripped.partition(" ")
+        if not separator or not pid_text.isdigit() or marker not in command:
+            continue
+        pid = int(pid_text)
+        info = table.get(pid)
+        if info is not None:
+            found[pid] = info.identity
+    return found
+
+
+def _descendant_identities(
+    root_pid: int,
+    table: dict[int, _ProcessInfo],
+) -> dict[int, _ProcessIdentity]:
     children: dict[int, list[int]] = {}
-    for pid, ppid in _parent_map().items():
-        children.setdefault(ppid, []).append(pid)
-    ordered: list[int] = []
+    for pid, info in table.items():
+        children.setdefault(info.ppid, []).append(pid)
+    found: dict[int, _ProcessIdentity] = {}
     frontier = list(children.get(root_pid, ()))
-    seen = {root_pid}
     while frontier:
         pid = frontier.pop()
-        if pid in seen:
+        if pid == root_pid or pid in found:
             continue
-        seen.add(pid)
-        ordered.append(pid)
+        info = table.get(pid)
+        if info is None:
+            continue
+        found[pid] = info.identity
         frontier.extend(children.get(pid, ()))
-    ordered.reverse()  # deepest first
-    return ordered
+    return found
 
 
-def _sweep_descendants(pids: list[int]) -> int:
-    """SIGKILL any listed pid still alive.  Returns the survivor count.
+def _refresh_kohya_identities(
+    child: _KohyaChild,
+) -> dict[int, _ProcessInfo]:
+    """Refresh every identity owned by a launch; uncertainty raises."""
+    table = _process_table()
+    leader = table.get(child.pid)
+    if child.leader_identity is None and leader is not None:
+        if leader.pgid != child.pid:
+            raise _ProcessInspectionError(
+                f"leader {child.pid} is not its private process-group leader"
+            )
+        child.leader_identity = leader.identity
+        child.pgid = leader.pgid
 
-    These are orphans once their parent is reaped, so ``waitpid`` is not ours
-    to call — killing them is what frees the GPU.  Only pids observed as
-    descendants of our own child before we signalled it are touched.
+    leader_matches = (
+        leader is not None
+        and child.leader_identity is not None
+        and leader.identity == child.leader_identity
+    )
+    if leader_matches:
+        child.descendants.update(_descendant_identities(child.pid, table))
+        # A descendant may already be reparented but remain in the private
+        # session's process group.  Capture it while the leader identity still
+        # proves that this group cannot have been recycled.
+        if child.pgid is not None:
+            child.descendants.update(
+                {
+                    pid: info.identity
+                    for pid, info in table.items()
+                    if pid != child.pid and info.pgid == child.pgid
+                }
+            )
+    elif leader is not None and child.leader_identity is not None:
+        try:
+            leader_reported_live = child.proc.poll() is None
+        except Exception as exc:
+            raise _ProcessInspectionError(
+                f"leader {child.pid} state unavailable after identity mismatch"
+            ) from exc
+        if leader_reported_live:
+            raise _ProcessInspectionError(
+                f"leader pid {child.pid} identity changed while Popen reports it live"
+            )
+
+    if child.token is not None:
+        token_identities = _token_process_identities(child.token, table)
+        child.descendants.update(
+            {
+                pid: identity
+                for pid, identity in token_identities.items()
+                if pid != child.pid
+            }
+        )
+    elif child.leader_identity is None:
+        try:
+            leader_reported_live = child.proc.poll() is None
+        except Exception as exc:
+            raise _ProcessInspectionError(
+                f"leader {child.pid} state unavailable"
+            ) from exc
+        if leader_reported_live:
+            raise _ProcessInspectionError(
+                f"leader {child.pid} identity unavailable"
+            )
+    return table
+
+
+def _signal_process_identity(identity: _ProcessIdentity, sig: int) -> bool:
+    """Signal only the exact process lifetime captured earlier.
+
+    False means inspection/signalling uncertainty.  Absence or a different
+    start identity is success for the old process and MUST NOT signal the
+    replacement PID.
     """
-    survivors = 0
-    for pid in pids:
+    if sys.platform.startswith("linux"):
+        pidfd_open = getattr(os, "pidfd_open", None)
+        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        if pidfd_open is None or pidfd_send_signal is None:
+            raise _ProcessInspectionError(
+                "Linux pidfd signalling is unavailable; refusing numeric-pid signal"
+            )
         try:
-            os.kill(pid, 0)
+            pidfd = pidfd_open(identity.pid)
+        except ProcessLookupError:
+            return True
         except OSError:
-            continue  # already gone
+            return False
         try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-        # SIGKILL is immediate, but the pid stays visible until whoever
-        # inherited it reaps the zombie.  Give that a bounded moment before
-        # calling it a survivor.
-        deadline = time.monotonic() + 5.0
-        alive = True
-        while time.monotonic() < deadline:
+            # Open first, then validate.  If the PID is reused on either side
+            # of this check, the pidfd still names only the process opened by
+            # the kernel and can never signal the numeric-PID replacement.
+            current = _process_info(identity.pid)
+            if current is None or current.identity != identity:
+                return True
+            if current.state.startswith("Z"):
+                return True
             try:
-                os.kill(pid, 0)
+                pidfd_send_signal(pidfd, sig, None, 0)
+            except ProcessLookupError:
+                return True
             except OSError:
-                alive = False
-                break
-            time.sleep(0.05)
-        if alive:
-            survivors += 1
-    return survivors
+                return False
+            return True
+        finally:
+            os.close(pidfd)
 
-
-def _terminate(proc: subprocess.Popen, *, sweep_descendants: bool = False) -> bool:
-    """Signal the child's process group, then REAP it.  Never raises.
-
-    Returns True only when the child is known to be gone (waited on, so no
-    zombie is left holding the GPU handle) AND, when ``sweep_descendants`` is
-    set, no ``setsid`` grandchild survived the sweep.  week9-rc let the final
-    ``wait(timeout=10)`` raise ``TimeoutExpired``, which propagated out of
-    ``_run_kohya`` and skipped the FLUX fallback's cleanup entirely.
-
-    ``sweep_descendants`` is opt-in and passed only from the three call sites
-    that spawned the process themselves: signalling pids discovered from a
-    caller-supplied pid we do not own would be unsafe.
-    """
-    escapees: list[int] = []
-    if sweep_descendants:
-        try:
-            escapees = _descendant_pids(proc.pid)
-        except Exception:  # noqa: BLE001 — discovery is best effort
-            escapees = []
-
-    def signal_group(sig: int) -> None:
-        try:
-            os.killpg(os.getpgid(proc.pid), sig)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.send_signal(sig)
-            except (ProcessLookupError, OSError):
-                pass
-
-    signal_group(signal.SIGTERM)
-    reaped = False
+    # Portable CPU-test fallback.  Production training is Linux, where the
+    # pidfd branch above makes identity validation and signalling atomic.
+    current = _process_info(identity.pid)
+    if current is None or current.identity != identity:
+        return True
+    if current.state.startswith("Z"):
+        return True
     try:
-        proc.wait(timeout=5)
-        reaped = True
-    except subprocess.TimeoutExpired:
-        pass
-    except Exception:  # noqa: BLE001 — an unwaitable child is not a forfeit
+        os.kill(identity.pid, sig)
+    except ProcessLookupError:
+        return True
+    except OSError:
         return False
-    if not reaped:
-        signal_group(signal.SIGKILL)
+    return True
+
+
+def _signal_leader_group(child: _KohyaChild, sig: int) -> bool:
+    current = _process_info(child.pid)
+    if (
+        child.leader_identity is None
+        or current is None
+        or current.identity != child.leader_identity
+    ):
+        child.last_error = f"leader {child.pid} identity unavailable or changed"
+        return False
+    if child.pgid is None or current.pgid != child.pgid:
+        child.last_error = f"leader {child.pid} process group identity changed"
+        return False
+    try:
+        os.killpg(child.pgid, sig)
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        child.last_error = f"cannot signal Kohya process group {child.pgid}: {exc}"
+        return False
+    return True
+
+
+def _signal_owned_descendants(child: _KohyaChild, sig: int) -> bool:
+    for identity in list(child.descendants.values()):
         try:
-            proc.wait(timeout=10)
-            reaped = True
+            if not _signal_process_identity(identity, sig):
+                child.last_error = (
+                    f"cannot signal descendant pid={identity.pid} safely"
+                )
+                return False
+        except _ProcessInspectionError as exc:
+            child.last_error = f"descendant identity inspection failed: {exc}"
+            return False
+    return True
+
+
+def _wait_for_descendants(child: _KohyaChild, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    quiet_scans = 0
+    while True:
+        try:
+            table = _refresh_kohya_identities(child)
+        except _ProcessInspectionError as exc:
+            child.last_error = f"descendant discovery failed: {exc}"
+            return False
+
+        alive: list[_ProcessIdentity] = []
+        for pid, identity in list(child.descendants.items()):
+            current = table.get(pid)
+            if current is None or current.identity != identity:
+                # PID reuse proves the recorded lifetime is gone.  Never touch
+                # the replacement, and release only this old identity.
+                child.descendants.pop(pid, None)
+                continue
+            alive.append(identity)
+
+        if not alive:
+            quiet_scans += 1
+            # One /proc list can race a final fork.  Require a second complete
+            # token/identity scan after a settle interval before releasing the
+            # registry and handing the GPU to another trainer.
+            if quiet_scans >= 2:
+                return True
+            time.sleep(0.05)
+            continue
+        quiet_scans = 0
+        if time.monotonic() >= deadline:
+            child.last_error = (
+                "descendants did not disappear/reap: "
+                + ",".join(str(identity.pid) for identity in alive)
+            )
+            return False
+        for identity in alive:
+            try:
+                if not _signal_process_identity(identity, signal.SIGKILL):
+                    child.last_error = (
+                        f"cannot SIGKILL descendant pid={identity.pid} safely"
+                    )
+                    return False
+            except _ProcessInspectionError as exc:
+                child.last_error = f"descendant identity inspection failed: {exc}"
+                return False
+        time.sleep(0.05)
+
+
+def _as_kohya_child(proc_or_child: subprocess.Popen | _KohyaChild) -> _KohyaChild:
+    if isinstance(proc_or_child, _KohyaChild):
+        return proc_or_child
+    with _ACTIVE_CHILDREN_LOCK:
+        for child in _ACTIVE_KOHYA_CHILDREN:
+            if child.proc is proc_or_child:
+                return child
+    pid = getattr(proc_or_child, "pid", 0)
+    child = _KohyaChild(proc=proc_or_child, pid=pid, token=None)
+    try:
+        _refresh_kohya_identities(child)
+    except BaseException as exc:  # noqa: BLE001
+        child.last_error = f"identity registration failed: {type(exc).__name__}: {exc}"
+    return child
+
+
+def _terminate(
+    proc_or_child: subprocess.Popen | _KohyaChild,
+    *,
+    sweep_descendants: bool = False,
+) -> bool:
+    """Terminate the identity-bound trainer tree and reap its Popen leader.
+
+    True is a positive proof: the direct child was waited/reaped and every
+    recorded or token-discovered descendant is absent (or its PID now has a
+    different start identity).  Any helper/identity uncertainty returns False
+    and leaves a registered record owned by the outer fail-closed barrier.
+    """
+    child = _as_kohya_child(proc_or_child)
+    child.last_error = None
+    try:
+        _refresh_kohya_identities(child)
+    except _ProcessInspectionError as exc:
+        child.last_error = f"initial process inspection failed: {exc}"
+
+    try:
+        running = child.proc.poll() is None
+    except Exception as exc:  # noqa: BLE001
+        child.last_error = f"leader poll failed: {type(exc).__name__}: {exc}"
+        return False
+
+    if running:
+        try:
+            if not _signal_leader_group(child, signal.SIGTERM):
+                return False
+            if sweep_descendants and not _signal_owned_descendants(
+                child, signal.SIGTERM
+            ):
+                return False
+        except _ProcessInspectionError as exc:
+            child.last_error = f"leader identity inspection failed: {exc}"
+            return False
+        try:
+            child.proc.wait(timeout=5)
+            running = False
         except subprocess.TimeoutExpired:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            child.last_error = f"leader wait failed: {type(exc).__name__}: {exc}"
             return False
-        except Exception:  # noqa: BLE001
+
+    if running:
+        try:
+            _refresh_kohya_identities(child)
+            if not _signal_leader_group(child, signal.SIGKILL):
+                return False
+            if sweep_descendants and not _signal_owned_descendants(
+                child, signal.SIGKILL
+            ):
+                return False
+        except _ProcessInspectionError as exc:
+            child.last_error = f"kill identity inspection failed: {exc}"
             return False
-    return _sweep_descendants(escapees) == 0
+        try:
+            child.proc.wait(timeout=10)
+            running = False
+        except subprocess.TimeoutExpired:
+            child.last_error = f"leader pid={child.pid} survived SIGKILL deadline"
+            return False
+        except Exception as exc:  # noqa: BLE001
+            child.last_error = f"leader reap failed: {type(exc).__name__}: {exc}"
+            return False
+
+    if running:
+        child.last_error = f"leader pid={child.pid} shutdown unverified"
+        return False
+    if not sweep_descendants:
+        return True
+    if not _signal_owned_descendants(child, signal.SIGKILL):
+        return False
+    return _wait_for_descendants(child)
 
 
 def _tail_log(path: str, lines: int = 15) -> None:

@@ -90,9 +90,16 @@ EXPECTED_ALL_STALL_S = {"toolkit": 2615, "legacy": 3685}
 # SINGLE-STALL = the OBSERVED failure mode: one command stalls, the retry
 # succeeds.  This is the number the caps actually control.
 EXPECTED_SINGLE_STALL_OVERHEAD_S = {"toolkit": 635, "legacy": 635}
-# MEASURED end-to-end wall on the validator's own builder (classic, no
-# BuildKit), bases pre-pulled -- same timed build as the table above.
-MEASURED_NORMAL_BUILD_S = {"toolkit": 678, "legacy": 1326}
+# Latest exact end-to-end warm wall on the validator's classic builder.  The
+# legacy datum is the final bd852dc H100 PCIe nocache build (2026-08-20); 1326 s
+# was the earlier A100-host observation, and the 245 s host spread is larger
+# than the latest warm margin.  One build may raise, never lower, timeout caps.
+# Source: evidence/week9-rehearsal-20260819/alpha/vm-evidence-mirror/
+# legacy-build-timing.txt (sealed; cited here, never edited by this repair).
+MEASURED_NORMAL_BUILD_S = {"toolkit": 678, "legacy": 1571}
+LEGACY_PRIOR_WARM_BUILD_S = 1326
+LEGACY_OBSERVED_HOST_SPREAD_S = 245
+LEGACY_WARM_MARGIN_S = 229
 # Cost of a first build on a host whose image store is empty.  The timed run's
 # own cold-pull attempt did not evict the bases (PULL_AITOOLKIT_s=1), so it is
 # not a cold observation; this is the 2026-08-19 rehearsal's measured pull of
@@ -100,7 +107,8 @@ MEASURED_NORMAL_BUILD_S = {"toolkit": 678, "legacy": 1326}
 BASE_PULL_S = 272
 # The legacy image still cannot absorb a stall on its most expensive step.
 # Pinned so the week-10 build-reduction work has a target.
-LEGACY_SINGLE_STALL_DEFICIT_S = 161
+LEGACY_SINGLE_STALL_DEFICIT_S = 406
+LEGACY_COLD_BASELINE_DEFICIT_S = 43
 # No single attempt may occupy more than a third of the validator's window.
 MAX_PER_ATTEMPT_CAP_S = 600
 
@@ -390,11 +398,31 @@ def _stall_overhead_s(per_attempt: int) -> int:
 
 
 @pytest.mark.parametrize("name", sorted(DOCKERFILES))
-def test_measured_normal_build_fits_the_window_warm_and_cold(name: str) -> None:
+def test_measured_warm_build_fits_the_validator_window(name: str) -> None:
     warm = MEASURED_NORMAL_BUILD_S[name]
-    cold = warm + BASE_PULL_S
     assert warm <= VALIDATOR_BUILD_TIMEOUT_S, warm
-    assert cold <= VALIDATOR_BUILD_TIMEOUT_S, cold
+
+
+def test_latest_legacy_warm_margin_and_observed_host_spread_are_pinned() -> None:
+    warm = MEASURED_NORMAL_BUILD_S["legacy"]
+    assert warm == 1571
+    assert VALIDATOR_BUILD_TIMEOUT_S - warm == LEGACY_WARM_MARGIN_S
+    assert warm - LEGACY_PRIOR_WARM_BUILD_S == LEGACY_OBSERVED_HOST_SPREAD_S
+    assert LEGACY_OBSERVED_HOST_SPREAD_S > LEGACY_WARM_MARGIN_S
+
+
+def test_toolkit_cold_estimate_still_fits_the_validator_window() -> None:
+    cold = MEASURED_NORMAL_BUILD_S["toolkit"] + BASE_PULL_S
+    assert cold == 950
+    assert cold <= VALIDATOR_BUILD_TIMEOUT_S
+
+
+def test_legacy_cold_estimate_is_hold_not_a_claimed_pass() -> None:
+    """1571 warm + measured 272 pull = 1843 estimate, not a cold observation."""
+    cold_estimate = MEASURED_NORMAL_BUILD_S["legacy"] + BASE_PULL_S
+    assert cold_estimate == 1843
+    assert cold_estimate - VALIDATOR_BUILD_TIMEOUT_S == LEGACY_COLD_BASELINE_DEFICIT_S
+    assert cold_estimate > VALIDATOR_BUILD_TIMEOUT_S
 
 
 def test_toolkit_absorbs_one_stalled_step_inside_the_validator_window() -> None:
@@ -414,7 +442,7 @@ def test_toolkit_absorbs_one_stalled_step_inside_the_validator_window() -> None:
 def test_legacy_single_stall_deficit_is_pinned_not_hidden() -> None:
     """The legacy image still cannot absorb a stall on its most expensive step.
 
-    Measured, not modelled: 1326 + 635 = 1961 s, 161 s over. This is the
+    Latest measured warm wall: 1571 + 635 = 2206 s, 406 s over. This is the
     week-10 build-reduction target.
     """
     total = (
@@ -424,8 +452,8 @@ def test_legacy_single_stall_deficit_is_pinned_not_hidden() -> None:
     assert total - VALIDATOR_BUILD_TIMEOUT_S == LEGACY_SINGLE_STALL_DEFICIT_S
 
 
-def test_legacy_survives_a_stall_on_every_step_except_requirements() -> None:
-    """Which stalls are survivable is now a measured fact, not a worst case."""
+def test_legacy_warm_retry_stalls_except_requirements_still_fit() -> None:
+    """Warm retry-network outcomes use the latest exact 1571 s baseline."""
     warm = MEASURED_NORMAL_BUILD_S["legacy"]
     survivable, fatal = [], []
     for per_attempt, _b, _a, rest in _retry_calls(_read("legacy")):
@@ -434,7 +462,8 @@ def test_legacy_survives_a_stall_on_every_step_except_requirements() -> None:
         (survivable if total <= VALIDATOR_BUILD_TIMEOUT_S else fatal).append(token)
     # the apt loop is not a retry_network call; one failed attempt costs
     # (60+30) + (150+30) + 5 backoff
-    assert warm + 60 + _KILL_GRACE_S + 150 + _KILL_GRACE_S + 5 <= VALIDATOR_BUILD_TIMEOUT_S
+    # The separate apt loop is now also fatal: 1571 + 275 = 1846.
+    assert warm + 60 + _KILL_GRACE_S + 150 + _KILL_GRACE_S + 5 > VALIDATOR_BUILD_TIMEOUT_S
     assert fatal == ["requirements.txt"], (survivable, fatal)
     assert set(survivable) == {
         "git", "torch==2.6.0", "torchcodec==0.2.1",
@@ -442,24 +471,23 @@ def test_legacy_survives_a_stall_on_every_step_except_requirements() -> None:
     }
 
 
-def test_legacy_on_a_cold_image_store_survives_only_the_cheapest_stalls() -> None:
-    """First build on a fresh host: 1598 s leaves 202 s, so most stalls are fatal.
+def test_legacy_cold_hold_cannot_absorb_any_stall() -> None:
+    """The modeled cold baseline is already 43 s outside the build window.
 
-    No cap set can fix this: closing it would need every cap below ~170 s, and
-    the measured requirements step alone is 215 s. It is a build-length
-    problem (week-10 single-staging), not a retry-policy problem.
+    This is 1571 s observed warm plus a separately measured 272 s base pull,
+    not a measured cold run.  It is a build-length HOLD; changing retry caps
+    on one datum cannot make the cold baseline fit.
     """
     cold = MEASURED_NORMAL_BUILD_S["legacy"] + BASE_PULL_S
-    assert cold == 1598
+    assert cold == 1843
+    assert cold > VALIDATOR_BUILD_TIMEOUT_S
     survivable = {
         _token_of(rest)
         for per_attempt, _b, _a, rest in _retry_calls(_read("legacy"))
         if cold + _stall_overhead_s(per_attempt) <= VALIDATOR_BUILD_TIMEOUT_S
     }
-    assert survivable == {
-        "git", "torch==2.6.0", "torchcodec==0.2.1", "flux-tokenizer-download",
-    }
-    # even the apt loop's single failed attempt no longer fits
+    assert survivable == set()
+    # The apt loop's single failed attempt also cannot fit.
     assert cold + 60 + _KILL_GRACE_S + 150 + _KILL_GRACE_S + 5 > VALIDATOR_BUILD_TIMEOUT_S
 
 
