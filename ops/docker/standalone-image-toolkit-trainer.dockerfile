@@ -30,12 +30,30 @@ RUN python3 /opt/sn56/verify-image-runtime.py \
 WORKDIR /app/ai-toolkit
 # Phase 1 constrains the ordinary Python graph while leaving the explicitly
 # installed CUDA/Torch island and easy_dwpose's known metadata conflict open.
-RUN retry_network() { \
+# WEEK-9 HAZARD-1 (evidence/week9-hazards-20260819/CHANGES.md): every network
+# attempt is bounded twice -- an outer `timeout` per attempt (converts a hung
+# TCP stream into a non-zero status the retry loop can act on) and a total
+# per-command budget (bounds the pathological all-attempts-stall case).  git's
+# own stall detector is exported for the git clones pip runs for the two
+# `git+https` requirements, which `timeout` alone would only kill wholesale.
+RUN export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
+    retry_network() { \
+        attempt_timeout_s=$1; \
+        attempt_budget_s=$2; \
+        shift 2; \
+        command -v timeout >/dev/null 2>&1 || { \
+            echo "SN56_NETWORK_TIMEOUT unavailable=timeout command=$1" >&2; \
+            return 127; \
+        }; \
+        budget_deadline=$(( $(date +%s) + attempt_budget_s )); \
         attempt=1; \
         while :; do \
-            "$@" && return 0; \
+            timeout -k 30 "$attempt_timeout_s" "$@" && return 0; \
             status=$?; \
-            if [ "$attempt" -ge 5 ]; then \
+            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then \
+                echo "SN56_NETWORK_TIMEOUT attempt=$attempt timeout_seconds=$attempt_timeout_s command=$1 status=$status" >&2; \
+            fi; \
+            if [ "$attempt" -ge 5 ] || [ "$(date +%s)" -ge "$budget_deadline" ]; then \
                 echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=$1 status=$status" >&2; \
                 return "$status"; \
             fi; \
@@ -45,12 +63,12 @@ RUN retry_network() { \
             attempt=$((attempt + 1)); \
         done; \
     }; \
-    retry_network git fetch origin 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
+    retry_network 120 600 git fetch origin 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
     git checkout 99be3d96a2468d3a5228a4eb05ba67e63c586b4e && \
-    retry_network pip install --no-cache-dir \
+    retry_network 1200 1800 pip install --no-cache-dir \
         --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
         --requirement requirements.txt && \
-    retry_network pip install --no-cache-dir \
+    retry_network 300 900 pip install --no-cache-dir \
         torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
         --index-url https://download.pytorch.org/whl/cu124
 
@@ -58,12 +76,30 @@ RUN retry_network() { \
 # Torch 2.9.  G.O.D deliberately pins this image to Torch 2.6/cu124; the official
 # TorchCodec compatibility matrix maps that ABI to the 0.2 series.  Repin after
 # requirements.txt and Torch so even optional media imports remain loadable.
-RUN retry_network() { \
+# WEEK-9 HAZARD-1 (evidence/week9-hazards-20260819/CHANGES.md): every network
+# attempt is bounded twice -- an outer `timeout` per attempt (converts a hung
+# TCP stream into a non-zero status the retry loop can act on) and a total
+# per-command budget (bounds the pathological all-attempts-stall case).  git's
+# own stall detector is exported for the git clones pip runs for the two
+# `git+https` requirements, which `timeout` alone would only kill wholesale.
+RUN export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
+    retry_network() { \
+        attempt_timeout_s=$1; \
+        attempt_budget_s=$2; \
+        shift 2; \
+        command -v timeout >/dev/null 2>&1 || { \
+            echo "SN56_NETWORK_TIMEOUT unavailable=timeout command=$1" >&2; \
+            return 127; \
+        }; \
+        budget_deadline=$(( $(date +%s) + attempt_budget_s )); \
         attempt=1; \
         while :; do \
-            "$@" && return 0; \
+            timeout -k 30 "$attempt_timeout_s" "$@" && return 0; \
             status=$?; \
-            if [ "$attempt" -ge 5 ]; then \
+            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then \
+                echo "SN56_NETWORK_TIMEOUT attempt=$attempt timeout_seconds=$attempt_timeout_s command=$1 status=$status" >&2; \
+            fi; \
+            if [ "$attempt" -ge 5 ] || [ "$(date +%s)" -ge "$budget_deadline" ]; then \
                 echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=$1 status=$status" >&2; \
                 return "$status"; \
             fi; \
@@ -73,7 +109,7 @@ RUN retry_network() { \
             attempt=$((attempt + 1)); \
         done; \
     }; \
-    retry_network pip install --no-cache-dir \
+    retry_network 300 900 pip install --no-cache-dir \
         --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
         torchcodec==0.2.1 pyyaml Pillow numpy safetensors
 
@@ -81,12 +117,30 @@ RUN retry_network() { \
 # resolution. --no-deps preserves the intentional easy_dwpose/hub metadata
 # mismatch. The verifier checks the serialized metadata inventory and requires
 # that mismatch to be the only output from `pip check`.
-RUN retry_network() { \
+# WEEK-9 HAZARD-1 (evidence/week9-hazards-20260819/CHANGES.md): every network
+# attempt is bounded twice -- an outer `timeout` per attempt (converts a hung
+# TCP stream into a non-zero status the retry loop can act on) and a total
+# per-command budget (bounds the pathological all-attempts-stall case).  git's
+# own stall detector is exported for the git clones pip runs for the two
+# `git+https` requirements, which `timeout` alone would only kill wholesale.
+RUN export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
+    retry_network() { \
+        attempt_timeout_s=$1; \
+        attempt_budget_s=$2; \
+        shift 2; \
+        command -v timeout >/dev/null 2>&1 || { \
+            echo "SN56_NETWORK_TIMEOUT unavailable=timeout command=$1" >&2; \
+            return 127; \
+        }; \
+        budget_deadline=$(( $(date +%s) + attempt_budget_s )); \
         attempt=1; \
         while :; do \
-            "$@" && return 0; \
+            timeout -k 30 "$attempt_timeout_s" "$@" && return 0; \
             status=$?; \
-            if [ "$attempt" -ge 5 ]; then \
+            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then \
+                echo "SN56_NETWORK_TIMEOUT attempt=$attempt timeout_seconds=$attempt_timeout_s command=$1 status=$status" >&2; \
+            fi; \
+            if [ "$attempt" -ge 5 ] || [ "$(date +%s)" -ge "$budget_deadline" ]; then \
                 echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=$1 status=$status" >&2; \
                 return "$status"; \
             fi; \
@@ -96,7 +150,7 @@ RUN retry_network() { \
             attempt=$((attempt + 1)); \
         done; \
     }; \
-    retry_network python3 -m pip install --no-cache-dir --no-deps \
+    retry_network 600 1200 python3 -m pip install --no-cache-dir --no-deps \
         --extra-index-url https://download.pytorch.org/whl/cu124 \
         --requirement /opt/sn56/image-runtime-lock.txt && \
     python3 /opt/sn56/verify-image-runtime.py \

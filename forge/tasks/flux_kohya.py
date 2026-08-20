@@ -74,11 +74,77 @@ _SNAPSHOT_MIN_CHECKPOINT_BYTES = 10 * 1024**3
 _MAX_SAFETENSORS_HEADER_BYTES = 256 * 1024 * 1024
 
 
+# WEEK-9 HAZARD 2 (evidence/week9-hazards-20260819/CHANGES.md).  The snapshot
+# route falls back to ai-toolkit on ANY Kohya failure.  A Kohya child that
+# outlives that transition would train on the same GPU as ai-toolkit: VRAM
+# exhaustion, or a truncated/interleaved artifact.  Every child this process
+# spawns is registered here so the fallback can prove none is left alive,
+# including on the paths that never reach _run_kohya's own cleanup.
+_ACTIVE_CHILDREN_LOCK = threading.Lock()
+_ACTIVE_KOHYA_CHILDREN: list[subprocess.Popen] = []
+
+
+def _register_kohya_child(proc: subprocess.Popen) -> None:
+    with _ACTIVE_CHILDREN_LOCK:
+        _ACTIVE_KOHYA_CHILDREN.append(proc)
+
+
+def _forget_kohya_child(proc: subprocess.Popen) -> None:
+    with _ACTIVE_CHILDREN_LOCK:
+        try:
+            _ACTIVE_KOHYA_CHILDREN.remove(proc)
+        except ValueError:
+            pass
+
+
+def reap_kohya_children(reason: str) -> int:
+    """Terminate AND reap every Kohya child this process still owns.
+
+    Returns the number confirmed dead.  Never raises and never blocks longer
+    than ``_terminate``'s own 15 s escalation per child: a forfeit is worse
+    than an unclean handoff, so a child we cannot kill is reported through
+    telemetry and the fallback proceeds anyway.
+    """
+    with _ACTIVE_CHILDREN_LOCK:
+        pending = list(_ACTIVE_KOHYA_CHILDREN)
+        _ACTIVE_KOHYA_CHILDREN.clear()
+    reaped = 0
+    survived = 0
+    for proc in pending:
+        try:
+            if proc.poll() is not None:
+                continue
+        except Exception:  # noqa: BLE001 — unknown state: try to kill it
+            pass
+        if _terminate(proc):
+            reaped += 1
+        else:
+            survived += 1
+    if reaped or survived:
+        try:
+            telemetry.event(
+                "kohya_child_reaped",
+                reason=reason,
+                reaped=reaped,
+                survived=survived,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must never forfeit
+            pass
+    return reaped
+
+
 def run(spec: ImageSpec, deadline: Deadline) -> None:
     layout, standalone_model = resolve_flux_cache_layout(spec.cached_model_dir)
     if layout == _SNAPSHOT_LAYOUT:
         if _attempt_snapshot_kohya(spec, deadline):
             return
+        # HAZARD 2 barrier.  This is the single choke point every fallback
+        # path funnels through — env opt-out, ineligible cache, missing
+        # runtime, budget floor, config rejection, crash, timeout — so it is
+        # the only place that can prove the GPU is free before ai-toolkit
+        # starts.  It emits nothing when no child was left behind, so the
+        # byte-identical fallback contract is untouched.
+        reap_kohya_children("flux_snapshot_fallback")
         telemetry.set_meta(backend="aitoolkit", base_model_layout=layout)
         telemetry.event(
             "flux_backend_selected",
@@ -510,6 +576,7 @@ def _run_kohya(
                 start_new_session=True,
                 env=_kohya_subprocess_env(),
             )
+            _register_kohya_child(proc)
             while proc.poll() is None:
                 # Deadline.remaining() already excludes the CLI's 180-second
                 # export reserve. Stop one additional boundary margin early so
@@ -525,6 +592,32 @@ def _run_kohya(
             gpu_thread.join(timeout=6)
         if gpu_peak["mb"] > 0:
             telemetry.sample("gpu_peak_mb", gpu_peak["mb"])
+        # WEEK-9 HAZARD 2: the poll loop is not the only way out of this
+        # frame.  Anything raising inside it (a clock error, a telemetry
+        # failure, KeyboardInterrupt) previously left the trainer running
+        # while the caller fell back to ai-toolkit on the same GPU.  Reap
+        # here on EVERY exit; keep the child registered if we could not
+        # confirm its death so the fallback barrier tries again.
+        if proc is not None:
+            still_running = True
+            try:
+                still_running = proc.poll() is None
+            except Exception:  # noqa: BLE001 — unknown state: assume alive
+                pass
+            confirmed = True
+            if still_running:
+                confirmed = _terminate(proc)
+                try:
+                    telemetry.event(
+                        "kohya_child_reaped",
+                        reason="run_kohya_exit",
+                        reaped=1 if confirmed else 0,
+                        survived=0 if confirmed else 1,
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not forfeit
+                    pass
+            if confirmed:
+                _forget_kohya_child(proc)
 
     rc = None if proc is None else proc.returncode
     telemetry.event(
@@ -663,22 +756,40 @@ def _kohya_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _terminate(proc: subprocess.Popen) -> None:
+def _terminate(proc: subprocess.Popen) -> bool:
+    """Signal the child's process group, then REAP it.  Never raises.
+
+    Returns True only when the child is known to be gone (waited on, so no
+    zombie is left holding the GPU handle).  week9-rc let the final
+    ``wait(timeout=10)`` raise ``TimeoutExpired``, which propagated out of
+    ``_run_kohya`` and skipped the FLUX fallback's cleanup entirely.
+    """
+
     def signal_group(sig: int) -> None:
         try:
             os.killpg(os.getpgid(proc.pid), sig)
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.send_signal(sig)
-            except ProcessLookupError:
+            except (ProcessLookupError, OSError):
                 pass
 
     signal_group(signal.SIGTERM)
     try:
         proc.wait(timeout=5)
+        return True
     except subprocess.TimeoutExpired:
-        signal_group(signal.SIGKILL)
+        pass
+    except Exception:  # noqa: BLE001 — an unwaitable child is not a forfeit
+        return False
+    signal_group(signal.SIGKILL)
+    try:
         proc.wait(timeout=10)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _tail_log(path: str, lines: int = 15) -> None:

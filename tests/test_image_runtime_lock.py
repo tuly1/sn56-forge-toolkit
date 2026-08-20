@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
+import re
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -212,13 +213,21 @@ def test_image_build_network_access_has_bounded_retries(
     assert contents.count('if [ "$attempt" -ge 5 ]') == retry_loop_count
     assert contents.count("SN56_NETWORK_RETRY exhausted") == retry_loop_count
     assert contents.count("SN56_NETWORK_RETRY retry=") == retry_loop_count
-    assert "retry_network git fetch origin 99be3d96" in contents
-    assert contents.count("retry_network pip install --no-cache-dir") == 3
-    assert "retry_network python3 -m pip install --no-cache-dir --no-deps" in contents
+    # WEEK-9 HAZARD 1: each call now carries <per-attempt timeout> <budget>
+    # seconds; see tests/test_build_network_hazards.py for the bound itself.
+    assert "retry_network 120 600 git fetch origin 99be3d96" in contents
+    assert (
+        len(re.findall(r"retry_network \d+ \d+ pip install --no-cache-dir", contents))
+        == 3
+    )
+    assert (
+        "retry_network 600 1200 python3 -m pip install --no-cache-dir --no-deps"
+        in contents
+    )
     assert "--network=host" not in contents
 
     locked_install = contents.index(
-        "retry_network python3 -m pip install --no-cache-dir --no-deps"
+        "retry_network 600 1200 python3 -m pip install --no-cache-dir --no-deps"
     )
     assert contents.index("python3 /opt/sn56/verify-image-runtime.py", locked_install) > (
         locked_install
@@ -230,7 +239,7 @@ def test_legacy_flux_tokenizer_stage_is_retried_but_verification_is_not():
     stage = contents.index("python3 -m forge.flux_kohya_tokenizers stage")
     verify = contents.index("python3 -m forge.flux_kohya_tokenizers verify")
 
-    assert contents.rfind("retry_network env", 0, stage) != -1
+    assert contents.rfind("retry_network 600 1200 env", 0, stage) != -1
     assert stage < verify
 
 
