@@ -869,7 +869,7 @@ def _terminate(proc: subprocess.Popen, *, sweep_descendants: bool = False) -> bo
     ``wait(timeout=10)`` raise ``TimeoutExpired``, which propagated out of
     ``_run_kohya`` and skipped the FLUX fallback's cleanup entirely.
 
-    ``sweep_descendants`` is opt-in and passed only from the two call sites
+    ``sweep_descendants`` is opt-in and passed only from the three call sites
     that spawned the process themselves: signalling pids discovered from a
     caller-supplied pid we do not own would be unsafe.
     """

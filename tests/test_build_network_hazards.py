@@ -46,19 +46,40 @@ _KILL_GRACE_S = 30
 _APT_ATTEMPTS = 3
 _APT_WORST_S = _APT_ATTEMPTS * (60 + _KILL_GRACE_S + 150 + _KILL_GRACE_S) + 15
 
-# Observed normal-case maxima across every archived clean build, re-derivable
-# with evidence/week9-hazards-20260819/measure_observed_network_durations.py.
-# A cap below its step's observed max would manufacture failures on healthy
-# builds, so every cap is checked against these.
-OBSERVED_MAX_NORMAL_S = {
-    "git": 2.5,
-    "requirements.txt": 399.4,
-    "torch==2.6.0": 4.2,
-    "torchcodec==0.2.1": 5.2,
-    "image-runtime-lock.txt": 100.5,
-    "flux-tokenizer-download": 23.0,
+# MEASURED on the builder production actually uses: the 2026-08-20 timed build,
+# DOCKER_BUILDKIT=0 --no-cache, bases pre-pulled.
+#   log      evidence/week9-rehearsal-20260819/beta/build-proof/build-567cc73-classic.log
+#   extract  evidence/week9-hazards-20260819/measure_classic_build.py
+# These REPLACE the BuildKit-derived table this guard used to validate against.
+# That was the structural defect the reviewer identified (R4): a guard computed
+# from BuildKit numbers cannot catch a cap that is too tight for the classic
+# builder.  Each value is the larger of the two images' measurements, and for
+# steps whose command is not separately timestamped it is the whole step's
+# elapsed time, i.e. an upper bound on the command.
+MEASURED_CLASSIC_NORMAL_S = {
+    "git": 1.0,                       # both images: fetch+checkout inside 1 s
+    "requirements.txt": 215.0,        # legacy 215 s, toolkit 189 s
+    "torch==2.6.0": 21.0,             # legacy 21 s, toolkit 4 s
+    "torchcodec==0.2.1": 21.0,        # whole step: legacy 21 s, toolkit 15 s
+    "image-runtime-lock.txt": 64.0,   # toolkit pip portion; legacy step 112 s
+    "flux-tokenizer-download": 25.0,  # whole step, legacy only
 }
+# A cap below its step's normal duration manufactures failures on healthy
+# builds -- which under a hard 1800 s limit with no retry is a self-inflicted
+# DNF, strictly worse than the hang it replaced.
 MIN_CAP_RATIO = 1.35
+
+# Binding rule adopted 2026-08-20: a single timed build may RAISE a cap, never
+# LOWER one -- one measurement has no tail. These are the caps as shipped at
+# 567cc73; the guard forbids a future edit from going below them.
+CAP_FLOOR_S = {
+    "git": 60,
+    "requirements.txt": 600,
+    "torch==2.6.0": 90,
+    "torchcodec==0.2.1": 90,
+    "image-runtime-lock.txt": 180,
+    "flux-tokenizer-download": 90,
+}
 
 # Pinned so that changing a timeout has to move a number a reviewer can see.
 # ALL-STALL = every network command burns every attempt.  Both exceed the wall
@@ -69,13 +90,17 @@ EXPECTED_ALL_STALL_S = {"toolkit": 2615, "legacy": 3685}
 # SINGLE-STALL = the OBSERVED failure mode: one command stalls, the retry
 # succeeds.  This is the number the caps actually control.
 EXPECTED_SINGLE_STALL_OVERHEAD_S = {"toolkit": 635, "legacy": 635}
-# Observed normal end-to-end build wall time on the validator's own builder
-# (classic, no BuildKit).  legacy: OBSERVED 2026-08-19 rehearsal 15:38->16:02Z.
-# toolkit: INFERRED, BuildKit layer sum x the legacy classic/BuildKit ratio.
-OBSERVED_NORMAL_BUILD_S = {"toolkit": 1155, "legacy": 1440}
-# The legacy image cannot absorb even one stalled-and-retried step.  Pinned so
-# the build-reduction work has a target and any regression is visible.
-LEGACY_SINGLE_STALL_DEFICIT_S = 275
+# MEASURED end-to-end wall on the validator's own builder (classic, no
+# BuildKit), bases pre-pulled -- same timed build as the table above.
+MEASURED_NORMAL_BUILD_S = {"toolkit": 678, "legacy": 1326}
+# Cost of a first build on a host whose image store is empty.  The timed run's
+# own cold-pull attempt did not evict the bases (PULL_AITOOLKIT_s=1), so it is
+# not a cold observation; this is the 2026-08-19 rehearsal's measured pull of
+# BOTH bases, 14:07:41Z -> 14:12:13Z (beta/setup/build-images.log).
+BASE_PULL_S = 272
+# The legacy image still cannot absorb a stall on its most expensive step.
+# Pinned so the week-10 build-reduction work has a target.
+LEGACY_SINGLE_STALL_DEFICIT_S = 161
 # No single attempt may occupy more than a third of the validator's window.
 MAX_PER_ATTEMPT_CAP_S = 600
 
@@ -222,25 +247,62 @@ def test_every_retry_network_call_carries_a_timeout_a_budget_and_attempts(
         assert 2 <= attempts <= 3, (rest, attempts)
 
 
+def _token_of(rest: str) -> str | None:
+    for token in MEASURED_CLASSIC_NORMAL_S:
+        if token in rest:
+            return token
+    return None
+
+
 @pytest.mark.parametrize("name", sorted(DOCKERFILES))
 def test_no_cap_is_tight_enough_to_break_a_healthy_build(name: str) -> None:
-    """A cap under its step's observed normal maximum manufactures failures."""
+    """The guard the reviewer asked for: validated against the CLASSIC table.
+
+    Every cap must clear MIN_CAP_RATIO x the duration that step actually took
+    on the builder production uses.  Computed from BuildKit numbers this test
+    could not have caught a classic-too-tight cap at all.
+    """
+    calls = _retry_calls(_read(name))
     checked = 0
+    for per_attempt, _budget, _attempts, rest in calls:
+        token = _token_of(rest)
+        assert token is not None, f"{name}: unmapped retry_network call {rest[:60]!r}"
+        measured = MEASURED_CLASSIC_NORMAL_S[token]
+        assert per_attempt >= MIN_CAP_RATIO * measured, (
+            f"{name}: cap {per_attempt}s for {token} is below {MIN_CAP_RATIO}x "
+            f"the MEASURED classic normal {measured}s -- it would fire on a "
+            "healthy build"
+        )
+        checked += 1
+    assert checked == len(calls)
+
+
+@pytest.mark.parametrize("name", sorted(DOCKERFILES))
+def test_caps_are_never_lowered_below_the_measured_baseline(name: str) -> None:
+    """Binding rule (2026-08-20): a single timed build may only RAISE a cap."""
     for per_attempt, _budget, _attempts, rest in _retry_calls(_read(name)):
-        for token, observed in OBSERVED_MAX_NORMAL_S.items():
-            if token in rest:
-                assert per_attempt >= MIN_CAP_RATIO * observed, (
-                    f"{name}: cap {per_attempt}s for {token} is below "
-                    f"{MIN_CAP_RATIO}x the observed normal max {observed}s"
-                )
-                checked += 1
-                break
-    assert checked == len(_retry_calls(_read(name)))
+        token = _token_of(rest)
+        assert per_attempt >= CAP_FLOOR_S[token], (
+            f"{name}: cap {per_attempt}s for {token} is below the 567cc73 "
+            f"floor {CAP_FLOOR_S[token]}s; lowering a cap needs new evidence, "
+            "not one timed build"
+        )
 
 
-def test_apt_caps_clear_the_observed_apt_layer_maximum() -> None:
-    """apt update + install together, against the whole layer's observed max."""
-    assert 60 + 150 >= MIN_CAP_RATIO * 49.0
+@pytest.mark.parametrize("name", sorted(DOCKERFILES))
+def test_measured_cap_headroom_is_pinned(name: str) -> None:
+    """Pin the actual margins so a future edit has to move a visible number."""
+    margins = {
+        _token_of(rest): round(per_attempt / MEASURED_CLASSIC_NORMAL_S[_token_of(rest)], 2)
+        for per_attempt, _b, _a, rest in _retry_calls(_read(name))
+    }
+    assert min(margins.values()) >= 2.5, margins
+    assert margins["requirements.txt"] == 2.79, margins
+
+
+def test_apt_caps_clear_the_measured_apt_step() -> None:
+    """apt update + install together, against the measured classic step (55 s)."""
+    assert 60 + 150 >= MIN_CAP_RATIO * 55.0
 
 
 @pytest.mark.parametrize("name", sorted(DOCKERFILES))
@@ -316,25 +378,89 @@ def test_single_stall_overhead_is_pinned(name: str) -> None:
     )
 
 
+def _stall_overhead_s(per_attempt: int) -> int:
+    """Seconds wasted when a step stalls once and the retry then succeeds.
+
+    The budget is a START-GATE, not a ceiling: an attempt that begins before
+    the budget expires runs to its full per-attempt cap (OBSERVED in the
+    negative control -- 195 s elapsed against a 150 s budget).  So the wasted
+    time is the whole cap plus the SIGKILL grace plus one backoff sleep.
+    """
+    return per_attempt + _KILL_GRACE_S + 5
+
+
+@pytest.mark.parametrize("name", sorted(DOCKERFILES))
+def test_measured_normal_build_fits_the_window_warm_and_cold(name: str) -> None:
+    warm = MEASURED_NORMAL_BUILD_S[name]
+    cold = warm + BASE_PULL_S
+    assert warm <= VALIDATOR_BUILD_TIMEOUT_S, warm
+    assert cold <= VALIDATOR_BUILD_TIMEOUT_S, cold
+
+
 def test_toolkit_absorbs_one_stalled_step_inside_the_validator_window() -> None:
-    total = (
-        OBSERVED_NORMAL_BUILD_S["toolkit"]
-        + EXPECTED_SINGLE_STALL_OVERHEAD_S["toolkit"]
-    )
-    assert total <= VALIDATOR_BUILD_TIMEOUT_S, total
+    """Re-pinned against the MEASURED classic wall (678 s), not a model.
+
+    Supersedes the provisional constant that made this green on an optimistic
+    1.91x ratio; the standing warning attached to it is withdrawn.
+    """
+    warm = MEASURED_NORMAL_BUILD_S["toolkit"]
+    assert warm + EXPECTED_SINGLE_STALL_OVERHEAD_S["toolkit"] == 1313
+    assert warm + EXPECTED_SINGLE_STALL_OVERHEAD_S["toolkit"] <= VALIDATOR_BUILD_TIMEOUT_S
+    # and still fits on a cold image store
+    cold = warm + BASE_PULL_S
+    assert cold + EXPECTED_SINGLE_STALL_OVERHEAD_S["toolkit"] <= VALIDATOR_BUILD_TIMEOUT_S
 
 
 def test_legacy_single_stall_deficit_is_pinned_not_hidden() -> None:
-    """The legacy image cannot absorb one stalled step. Pin the shortfall.
+    """The legacy image still cannot absorb a stall on its most expensive step.
 
-    This is the build-reduction target: cut this many seconds off the legacy
-    build and a stalled network step stops being an automatic flux DNF.
+    Measured, not modelled: 1326 + 635 = 1961 s, 161 s over. This is the
+    week-10 build-reduction target.
     """
     total = (
-        OBSERVED_NORMAL_BUILD_S["legacy"]
+        MEASURED_NORMAL_BUILD_S["legacy"]
         + EXPECTED_SINGLE_STALL_OVERHEAD_S["legacy"]
     )
     assert total - VALIDATOR_BUILD_TIMEOUT_S == LEGACY_SINGLE_STALL_DEFICIT_S
+
+
+def test_legacy_survives_a_stall_on_every_step_except_requirements() -> None:
+    """Which stalls are survivable is now a measured fact, not a worst case."""
+    warm = MEASURED_NORMAL_BUILD_S["legacy"]
+    survivable, fatal = [], []
+    for per_attempt, _b, _a, rest in _retry_calls(_read("legacy")):
+        token = _token_of(rest)
+        total = warm + _stall_overhead_s(per_attempt)
+        (survivable if total <= VALIDATOR_BUILD_TIMEOUT_S else fatal).append(token)
+    # the apt loop is not a retry_network call; one failed attempt costs
+    # (60+30) + (150+30) + 5 backoff
+    assert warm + 60 + _KILL_GRACE_S + 150 + _KILL_GRACE_S + 5 <= VALIDATOR_BUILD_TIMEOUT_S
+    assert fatal == ["requirements.txt"], (survivable, fatal)
+    assert set(survivable) == {
+        "git", "torch==2.6.0", "torchcodec==0.2.1",
+        "image-runtime-lock.txt", "flux-tokenizer-download",
+    }
+
+
+def test_legacy_on_a_cold_image_store_survives_only_the_cheapest_stalls() -> None:
+    """First build on a fresh host: 1598 s leaves 202 s, so most stalls are fatal.
+
+    No cap set can fix this: closing it would need every cap below ~170 s, and
+    the measured requirements step alone is 215 s. It is a build-length
+    problem (week-10 single-staging), not a retry-policy problem.
+    """
+    cold = MEASURED_NORMAL_BUILD_S["legacy"] + BASE_PULL_S
+    assert cold == 1598
+    survivable = {
+        _token_of(rest)
+        for per_attempt, _b, _a, rest in _retry_calls(_read("legacy"))
+        if cold + _stall_overhead_s(per_attempt) <= VALIDATOR_BUILD_TIMEOUT_S
+    }
+    assert survivable == {
+        "git", "torch==2.6.0", "torchcodec==0.2.1", "flux-tokenizer-download",
+    }
+    # even the apt loop's single failed attempt no longer fits
+    assert cold + 60 + _KILL_GRACE_S + 150 + _KILL_GRACE_S + 5 > VALIDATOR_BUILD_TIMEOUT_S
 
 
 @pytest.mark.parametrize("name", sorted(DOCKERFILES))
