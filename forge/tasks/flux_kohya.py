@@ -116,7 +116,7 @@ def reap_kohya_children(reason: str) -> int:
                 continue
         except Exception:  # noqa: BLE001 — unknown state: try to kill it
             pass
-        if _terminate(proc):
+        if _terminate(proc, sweep_descendants=True):
             reaped += 1
         else:
             survived += 1
@@ -134,36 +134,45 @@ def reap_kohya_children(reason: str) -> int:
 
 
 def run(spec: ImageSpec, deadline: Deadline) -> None:
-    layout, standalone_model = resolve_flux_cache_layout(spec.cached_model_dir)
-    if layout == _SNAPSHOT_LAYOUT:
-        if _attempt_snapshot_kohya(spec, deadline):
+    # HAZARD 2, outer guard: the barrier must run on EVERY exit, not only on
+    # the fallback.  On the SUCCESS path a child whose death `_terminate`
+    # could not confirm (the CUDA uninterruptible-sleep case this fix exists
+    # for) would otherwise stay alive through export, still writing into
+    # save_root and still holding VRAM.  A no-op when the registry is empty.
+    try:
+        layout, standalone_model = resolve_flux_cache_layout(spec.cached_model_dir)
+        if layout == _SNAPSHOT_LAYOUT:
+            if _attempt_snapshot_kohya(spec, deadline):
+                return
+            # HAZARD 2 barrier.  This is the single choke point every fallback
+            # path funnels through — env opt-out, ineligible cache, missing
+            # runtime, budget floor, config rejection, crash, timeout — so it
+            # is the only place that can prove the GPU is free BEFORE
+            # ai-toolkit starts.  It emits nothing when no child was left
+            # behind, so the byte-identical fallback contract is untouched.
+            reap_kohya_children("flux_snapshot_fallback")
+            telemetry.set_meta(backend="aitoolkit", base_model_layout=layout)
+            telemetry.event(
+                "flux_backend_selected",
+                backend="aitoolkit",
+                cache_layout=layout,
+            )
+            # Import lazily: the Kohya image contains both runtimes, while
+            # this module must remain importable in unit tests without
+            # ai-toolkit deps.
+            from forge.tasks import aitoolkit
+
+            aitoolkit.run(spec, deadline)
             return
-        # HAZARD 2 barrier.  This is the single choke point every fallback
-        # path funnels through — env opt-out, ineligible cache, missing
-        # runtime, budget floor, config rejection, crash, timeout — so it is
-        # the only place that can prove the GPU is free before ai-toolkit
-        # starts.  It emits nothing when no child was left behind, so the
-        # byte-identical fallback contract is untouched.
-        reap_kohya_children("flux_snapshot_fallback")
-        telemetry.set_meta(backend="aitoolkit", base_model_layout=layout)
+
         telemetry.event(
             "flux_backend_selected",
-            backend="aitoolkit",
+            backend="kohya",
             cache_layout=layout,
         )
-        # Import lazily: the Kohya image contains both runtimes, while this
-        # module must remain importable in unit tests without ai-toolkit deps.
-        from forge.tasks import aitoolkit
-
-        aitoolkit.run(spec, deadline)
-        return
-
-    telemetry.event(
-        "flux_backend_selected",
-        backend="kohya",
-        cache_layout=layout,
-    )
-    _run_standalone_kohya(spec, deadline, standalone_model)
+        _run_standalone_kohya(spec, deadline, standalone_model)
+    finally:
+        reap_kohya_children("flux_run_exit")
 
 
 def _attempt_snapshot_kohya(spec: ImageSpec, deadline: Deadline) -> bool:
@@ -583,7 +592,7 @@ def _run_kohya(
                 # process-group termination and atomic promotion cannot race it.
                 if deadline.remaining() <= _STOP_MARGIN_S:
                     stopped_by_deadline = True
-                    _terminate(proc)
+                    _terminate(proc, sweep_descendants=True)
                     break
                 time.sleep(_POLL_SECONDS)
     finally:
@@ -606,7 +615,7 @@ def _run_kohya(
                 pass
             confirmed = True
             if still_running:
-                confirmed = _terminate(proc)
+                confirmed = _terminate(proc, sweep_descendants=True)
                 try:
                     telemetry.event(
                         "kohya_child_reaped",
@@ -756,14 +765,120 @@ def _kohya_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _terminate(proc: subprocess.Popen) -> bool:
+def _parent_map() -> dict[int, int]:
+    """pid -> ppid for every visible process.  Best effort; {} on failure."""
+    mapping: dict[int, int] = {}
+    try:
+        if os.path.isdir("/proc"):
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/stat", "rb") as handle:
+                        raw = handle.read()
+                except OSError:
+                    continue
+                # The comm field may contain spaces and parentheses; every
+                # field after the final ')' is safe to split on whitespace.
+                tail = raw[raw.rfind(b")") + 1 :].split()
+                if len(tail) >= 2:
+                    try:
+                        mapping[int(entry)] = int(tail[1])
+                    except ValueError:
+                        continue
+            return mapping
+        result = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                mapping[int(parts[0])] = int(parts[1])
+    except Exception:  # noqa: BLE001 — discovery is best effort
+        return {}
+    return mapping
+
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Live descendants of ``root_pid``, deepest first.  Never raises.
+
+    WEEK-9 HAZARD 2(a): a grandchild that calls ``setsid()`` leaves the
+    child's process group, so ``os.killpg`` cannot reach it.  Snapshot the
+    tree BEFORE signalling and sweep any survivor afterwards.
+    """
+    children: dict[int, list[int]] = {}
+    for pid, ppid in _parent_map().items():
+        children.setdefault(ppid, []).append(pid)
+    ordered: list[int] = []
+    frontier = list(children.get(root_pid, ()))
+    seen = {root_pid}
+    while frontier:
+        pid = frontier.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        ordered.append(pid)
+        frontier.extend(children.get(pid, ()))
+    ordered.reverse()  # deepest first
+    return ordered
+
+
+def _sweep_descendants(pids: list[int]) -> int:
+    """SIGKILL any listed pid still alive.  Returns the survivor count.
+
+    These are orphans once their parent is reaped, so ``waitpid`` is not ours
+    to call — killing them is what frees the GPU.  Only pids observed as
+    descendants of our own child before we signalled it are touched.
+    """
+    survivors = 0
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue  # already gone
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        # SIGKILL is immediate, but the pid stays visible until whoever
+        # inherited it reaps the zombie.  Give that a bounded moment before
+        # calling it a survivor.
+        deadline = time.monotonic() + 5.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                alive = False
+                break
+            time.sleep(0.05)
+        if alive:
+            survivors += 1
+    return survivors
+
+
+def _terminate(proc: subprocess.Popen, *, sweep_descendants: bool = False) -> bool:
     """Signal the child's process group, then REAP it.  Never raises.
 
     Returns True only when the child is known to be gone (waited on, so no
-    zombie is left holding the GPU handle).  week9-rc let the final
+    zombie is left holding the GPU handle) AND, when ``sweep_descendants`` is
+    set, no ``setsid`` grandchild survived the sweep.  week9-rc let the final
     ``wait(timeout=10)`` raise ``TimeoutExpired``, which propagated out of
     ``_run_kohya`` and skipped the FLUX fallback's cleanup entirely.
+
+    ``sweep_descendants`` is opt-in and passed only from the two call sites
+    that spawned the process themselves: signalling pids discovered from a
+    caller-supplied pid we do not own would be unsafe.
     """
+    escapees: list[int] = []
+    if sweep_descendants:
+        try:
+            escapees = _descendant_pids(proc.pid)
+        except Exception:  # noqa: BLE001 — discovery is best effort
+            escapees = []
 
     def signal_group(sig: int) -> None:
         try:
@@ -775,21 +890,24 @@ def _terminate(proc: subprocess.Popen) -> bool:
                 pass
 
     signal_group(signal.SIGTERM)
+    reaped = False
     try:
         proc.wait(timeout=5)
-        return True
+        reaped = True
     except subprocess.TimeoutExpired:
         pass
     except Exception:  # noqa: BLE001 — an unwaitable child is not a forfeit
         return False
-    signal_group(signal.SIGKILL)
-    try:
-        proc.wait(timeout=10)
-        return True
-    except subprocess.TimeoutExpired:
-        return False
-    except Exception:  # noqa: BLE001
-        return False
+    if not reaped:
+        signal_group(signal.SIGKILL)
+        try:
+            proc.wait(timeout=10)
+            reaped = True
+        except subprocess.TimeoutExpired:
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+    return _sweep_descendants(escapees) == 0
 
 
 def _tail_log(path: str, lines: int = 15) -> None:

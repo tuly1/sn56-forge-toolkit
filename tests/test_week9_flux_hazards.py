@@ -13,6 +13,7 @@ running.  These tests spawn REAL child processes and fail on the week9-rc code.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -313,7 +314,9 @@ def test_an_unconfirmed_child_stays_registered_for_the_fallback_barrier(monkeypa
     zombie = Zombie()
     flux_kohya._register_kohya_child(zombie)
     monkeypatch.setattr(
-        flux_kohya, "_terminate", lambda proc: calls.append("terminate") or False
+        flux_kohya,
+        "_terminate",
+        lambda proc, **kwargs: calls.append("terminate") or False,
     )
     monkeypatch.setattr(flux_kohya.telemetry, "event", lambda name, **values: None)
 
@@ -369,3 +372,176 @@ def test_registry_and_barrier_are_importable_module_surface():
     assert callable(flux_kohya.reap_kohya_children)
     assert isinstance(flux_kohya._ACTIVE_KOHYA_CHILDREN, list)
     assert os.path.basename(flux_kohya.__file__) == "flux_kohya.py"
+
+
+# --------------------------------------------------------------------------
+# Escapes found by the independent reviewer (Z6 A1 / A2)
+# --------------------------------------------------------------------------
+
+
+def _spawn_setsid_grandchild(tmp_path):
+    """parent -> grandchild that leaves the process group via setsid().
+
+    Returns (parent Popen, grandchild pid).  This is the shape `os.killpg`
+    cannot reach: the grandchild is in its own session, so the group kill
+    misses it entirely.
+    """
+    marker = tmp_path / "grandchild.pid"
+    script = (
+        "import os, subprocess, sys, time\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time; time.sleep(300)'],\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        f"open({str(marker)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(300)\n"
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if marker.exists() and marker.read_text().strip():
+            break
+        time.sleep(0.05)
+    else:  # pragma: no cover - environment failure, not a product defect
+        parent.kill()
+        parent.wait(timeout=10)
+        pytest.fail("the test's own grandchild never started")
+    return parent, int(marker.read_text().strip())
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def test_a_setsid_grandchild_does_not_survive_the_barrier(monkeypatch, tmp_path):
+    """Reviewer Z6-A1: os.killpg alone leaves a re-sessioned grandchild alive."""
+    parent, grandchild_pid = _spawn_setsid_grandchild(tmp_path)
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        flux_kohya.telemetry,
+        "event",
+        lambda name, **values: events.append((name, values)),
+    )
+    try:
+        flux_kohya._register_kohya_child(parent)
+        reaped = flux_kohya.reap_kohya_children("grandchild_probe")
+
+        assert parent.poll() is not None, "the direct child was not reaped"
+        # _sweep_descendants already waited for the kill to land.
+        assert not _alive(grandchild_pid), (
+            "a setsid grandchild outlived the barrier and still holds the GPU"
+        )
+        assert reaped == 1
+    finally:
+        for pid in (grandchild_pid,):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=10)
+
+
+def test_descendant_discovery_finds_a_re_sessioned_grandchild(tmp_path):
+    """The snapshot itself must see through setsid, or the sweep is empty."""
+    parent, grandchild_pid = _spawn_setsid_grandchild(tmp_path)
+    try:
+        assert grandchild_pid in flux_kohya._descendant_pids(parent.pid)
+    finally:
+        for pid in (grandchild_pid,):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        parent.kill()
+        parent.wait(timeout=10)
+
+
+def test_descendant_sweep_is_opt_in_only(monkeypatch):
+    """A pid we did not spawn must never make us signal unrelated processes."""
+    monkeypatch.setattr(
+        flux_kohya, "_descendant_pids", lambda pid: pytest.fail("discovery ran")
+    )
+    swept: list[list[int]] = []
+    monkeypatch.setattr(
+        flux_kohya, "_sweep_descendants", lambda pids: swept.append(pids) or 0
+    )
+    monkeypatch.setattr(flux_kohya.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(flux_kohya.os, "killpg", lambda pgid, sig: None)
+
+    class Double:
+        pid = 1
+
+        def wait(self, timeout):
+            return 0
+
+    assert flux_kohya._terminate(Double()) is True
+    assert swept == [[]], "nothing was discovered, so nothing may be signalled"
+
+
+def test_the_success_path_also_reaps_an_unconfirmed_child(monkeypatch, tmp_path):
+    """Reviewer Z6-A2: run() used to return before the barrier on success."""
+    child = _spawn_sleeper()
+    events: list[tuple[str, dict]] = []
+
+    monkeypatch.setattr(
+        flux_kohya,
+        "resolve_flux_cache_layout",
+        lambda cached_model_dir: (flux_kohya._SNAPSHOT_LAYOUT, None),
+    )
+
+    def succeed_but_leak(spec, deadline):
+        # _train_with_kohya returned True (finalize found a rung) while
+        # _terminate could not confirm the child's death.
+        flux_kohya._register_kohya_child(child)
+        return True
+
+    monkeypatch.setattr(flux_kohya, "_attempt_snapshot_kohya", succeed_but_leak)
+    monkeypatch.setattr(flux_kohya.telemetry, "set_meta", lambda **values: None)
+    monkeypatch.setattr(
+        flux_kohya.telemetry,
+        "event",
+        lambda name, **values: events.append((name, values)),
+    )
+
+    flux_kohya.run(_spec(), _Deadline())
+
+    assert child.poll() is not None, (
+        "a kohya child outlived a SUCCESSFUL flux run and kept holding VRAM"
+    )
+    assert child.returncode is not None
+    assert flux_kohya._ACTIVE_KOHYA_CHILDREN == []
+    assert [
+        values for name, values in events if name == "kohya_child_reaped"
+    ] == [{"reason": "flux_run_exit", "reaped": 1, "survived": 0}]
+
+
+def test_the_standalone_path_also_ends_with_the_barrier(monkeypatch, tmp_path):
+    child = _spawn_sleeper()
+    monkeypatch.setattr(
+        flux_kohya,
+        "resolve_flux_cache_layout",
+        lambda cached_model_dir: (flux_kohya._STANDALONE_LAYOUT, "/cache/flux.safetensors"),
+    )
+
+    def leaky_standalone(spec, deadline, base_model):
+        flux_kohya._register_kohya_child(child)
+
+    monkeypatch.setattr(flux_kohya, "_run_standalone_kohya", leaky_standalone)
+    monkeypatch.setattr(flux_kohya.telemetry, "set_meta", lambda **values: None)
+    monkeypatch.setattr(flux_kohya.telemetry, "event", lambda name, **values: None)
+
+    flux_kohya.run(_spec(), _Deadline())
+
+    assert child.poll() is not None
+    assert flux_kohya._ACTIVE_KOHYA_CHILDREN == []

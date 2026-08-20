@@ -210,24 +210,34 @@ def test_image_build_network_access_has_bounded_retries(
     contents = dockerfile.read_text(encoding="utf-8")
 
     assert contents.count("retry_network()") == helper_count
-    assert contents.count('if [ "$attempt" -ge 5 ]') == retry_loop_count
+    # WEEK-9 HAZARD 1: the attempt ceiling became per-call (`$attempt_max`)
+    # once the caps were sized against the validator's 1800 s build limit;
+    # the apt loop keeps its own literal, now 3 instead of 5.
+    assert (
+        contents.count('if [ "$attempt" -ge "$attempt_max" ]')
+        + contents.count('if [ "$attempt" -ge 3 ]')
+    ) == retry_loop_count
     assert contents.count("SN56_NETWORK_RETRY exhausted") == retry_loop_count
     assert contents.count("SN56_NETWORK_RETRY retry=") == retry_loop_count
-    # WEEK-9 HAZARD 1: each call now carries <per-attempt timeout> <budget>
-    # seconds; see tests/test_build_network_hazards.py for the bound itself.
-    assert "retry_network 120 600 git fetch origin 99be3d96" in contents
+    # Each call carries <per-attempt timeout> <budget> <max attempts> seconds;
+    # see tests/test_build_network_hazards.py for the bounds themselves.
+    assert "retry_network 60 150 3 git fetch origin 99be3d96" in contents
     assert (
-        len(re.findall(r"retry_network \d+ \d+ pip install --no-cache-dir", contents))
+        len(
+            re.findall(
+                r"retry_network \d+ \d+ \d+ pip install --no-cache-dir", contents
+            )
+        )
         == 3
     )
     assert (
-        "retry_network 600 1200 python3 -m pip install --no-cache-dir --no-deps"
+        "retry_network 180 220 2 python3 -m pip install --no-cache-dir --no-deps"
         in contents
     )
     assert "--network=host" not in contents
 
     locked_install = contents.index(
-        "retry_network 600 1200 python3 -m pip install --no-cache-dir --no-deps"
+        "retry_network 180 220 2 python3 -m pip install --no-cache-dir --no-deps"
     )
     assert contents.index("python3 /opt/sn56/verify-image-runtime.py", locked_install) > (
         locked_install
@@ -239,7 +249,7 @@ def test_legacy_flux_tokenizer_stage_is_retried_but_verification_is_not():
     stage = contents.index("python3 -m forge.flux_kohya_tokenizers stage")
     verify = contents.index("python3 -m forge.flux_kohya_tokenizers verify")
 
-    assert contents.rfind("retry_network 600 1200 env", 0, stage) != -1
+    assert contents.rfind("retry_network 90 120 2 env", 0, stage) != -1
     assert stage < verify
 
 
