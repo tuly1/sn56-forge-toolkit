@@ -78,24 +78,24 @@ def _activation(*, owner_override: bool = False) -> dict:
 # What `recipe.size_scaled_steps("ideogram4", 12, 0.75, ...)` materialises for
 # the fixture shape below.  Was 107 under the discredited Jul-16 row
 # (base 140 / p 0.50 / max 400), briefly 177 under the withdrawn two-point fit
-# to the champion's step counts, then 421 under `base 500 / p 0.32` — and is
-# now 414 under `base 517 / p 0.32`.
+# to the champion's step counts, then 421 under `base 500 / p 0.32`, then 414
+# under `base 517 / p 0.32` — and is now 954 under the WEEK-9 row
+# (base 1250 / p 0.32 / max 1650 with do_cfg removed and SEC_PER_IT 2.1).
 #
 # THE SIZE ARGUMENT IS n_train, NOT `image_text_pairs` (2026-08-07).  The
-# fixture shape moved 36 -> 14 pairs at the same 0.75 h ON PURPOSE, because
-# 14/0.75 is the REAL Aug-3 `1365fa1c` shape — but the container is handed
-# 14 - ceil(1.4) = 12 of those images (OBSERVED: that task's train_data.zip
-# holds 12 image/caption pairs), so 12 is what `build_config` must be called
-# with here.  At that shape the SIZE LAW binds (414 against a 477 clock cap),
-# so this constant is invariant to `MARGIN` and to `SEC_PER_IT["ideogram4"]`.
-# At 36 pairs the CLOCK binds instead (477 at MARGIN 0.92, 432 at 0.85), which
-# would have coupled this release-policy contract to a constant another unit is
-# actively revising.
+# fixture shape is the REAL Aug-3 `1365fa1c` shape (14 pairs, 0.75 h), and the
+# container is handed 14 - ceil(1.4) = 12 of those images (OBSERVED: that
+# task's train_data.zip holds 12 image/caption pairs), so 12 is what
+# `build_config` must be called with here.  WEEK-9 NOTE: at this shape the
+# CLOCK now binds (law 1001 vs cap int((2484-480)/2.1) = 954) — the week-9 row
+# deliberately plans into the no-cfg clock at small-hours shapes, so this
+# constant is now coupled to SEC_PER_IT["ideogram4"]=2.1 and MARGIN 0.92, and
+# a revision of either is EXPECTED to show up here as a deliberate edit.
 #
 # Pinned in ONE place so a depth change shows up as a single deliberate edit
 # rather than four silent ones; the depth law itself is guarded in
 # tests/test_week6_ideogram_depth.py and tests/test_week6_depth_geometry.py.
-PLANNED_STEPS = 414
+PLANNED_STEPS = 954
 
 
 def _build(monkeypatch: pytest.MonkeyPatch) -> dict:
@@ -197,16 +197,19 @@ def test_literal_production_activation_is_hash_bound_owner_override() -> None:
     )
     assert active["selection_basis"] == "null_result_owner_override"
     assert active["owner_override"] is True
-    # Re-signed a SECOND time, for the VACATION of the Week-6 EMA-horizon
-    # amendment.  The record once again authorises the bare I-J20-D2 port —
-    # `_POLICY_BODY["amendments"]` is empty — and `amendment_sha256` now scopes
-    # the signature to the vacation record rather than to a live divergence.
+    # Re-signed a THIRD time (week-9), for the do_cfg/cfg_scale REMOVAL.
+    # `_POLICY_BODY["amendments"]` now carries exactly one live record —
+    # WEEK9_DO_CFG_AMENDMENT — and `amendment_sha256` scopes the signature to
+    # it; the week-6 vacation record stays embedded in the policy body.
     assert active["amendment_sha256"] == policy.AMENDMENT_SHA256
+    assert policy.AMENDMENT_SHA256 != policy.WEEK6_AMENDMENT_SHA256
+    assert policy._POLICY_BODY["amendments"] == [policy.WEEK9_DO_CFG_AMENDMENT]
     assert active["activation_sha256"] == (
-        "04261257fadfc780fe70f557b1f5b6c6672e09631b804d51d9d28863f0ba348c"
+        "dda89490a1bdd885cb528c7c1661427a06b1560496f9b153e74b280c4237dc1e"
     )
-    # The port itself is unchanged: deployment is still NOT authorised by the
-    # record, so re-signing did not widen the authority it carries.
+    # Deployment is still NOT authorised by the record, so re-signing did not
+    # widen the authority it carries: repointing the served pin remains a
+    # separate, explicit owner step.
     assert active["deployment_authorized"] is False
     assert active["release_authorized"] is True
 
@@ -244,8 +247,14 @@ def test_active_recipe_matches_the_scored_production_projection(
         # amendment is VACATED.  Guarded in detail by
         # tests/test_week6_ideogram_ema_horizon.py.
         "ema_config": {"use_ema": True, "ema_decay": 0.995},
-        "do_cfg": True,
-        "cfg_scale": 10.0,
+        # WEEK-9: do_cfg/cfg_scale ABSENT (train.get -> None).  The removal is
+        # the primary Aug-17 response: at pin 99be3d96 do_cfg trained
+        # pred = uncond + 10*(cond - uncond) with detach_unconditional=False
+        # (SDTrainer.py:1269-1271, base_model.py:947-949) — a -9x gradient on
+        # the blank-prompt branch that is 75% of the validator score.  See
+        # policy.WEEK9_DO_CFG_AMENDMENT and tests/test_week9_recipe_pins.py.
+        "do_cfg": None,
+        "cfg_scale": None,
         "steps": PLANNED_STEPS,
     }
     control = policy.checkpoint_control(cfg)

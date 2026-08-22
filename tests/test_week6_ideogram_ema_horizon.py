@@ -74,9 +74,13 @@ REAL_SHAPES = [
     # 40 — OBSERVED from each zip's central directory.  Feeding the audit N here
     # made this file certify depths (421/616/589) that were never emitted; what
     # `recipe` actually produced at the real abscissa was 401/593/569.
-    ("1365fa1c", 12, 0.75, 414),  # R1 draw shape; tightest budget  (N=14)
-    ("84be9fcd", 41, 1.0, 614),   # (N=46)
-    ("b72da8c6", 36, 1.0, 589),   # (N=40) — unchanged; the one coincidence
+    # WEEK-9 (2026-08-18): depths moved to the no-do_cfg row (base 1250 /
+    # max 1650, SEC_PER_IT 2.1): the 0.75 h shape is clock-bound at 954 and
+    # both 1.0 h shapes are clock-bound at 1348.  See recipe.py's week-9
+    # ideogram4 block and tests/test_week9_recipe_pins.py.
+    ("1365fa1c", 12, 0.75, 954),  # R1 draw shape; tightest budget  (N=14)
+    ("84be9fcd", 41, 1.0, 1348),  # (N=46)
+    ("b72da8c6", 36, 1.0, 1348),  # (N=40)
 ]
 IDS = [row[0] for row in REAL_SHAPES]
 
@@ -465,6 +469,10 @@ def test_099_would_ship_a_stronger_adapter_at_every_real_shape(row) -> None:
         421 steps: 0.720 -> 0.894   (x1.24)
         589 steps: 0.816 -> 0.940   (x1.15)
         616 steps: 0.828 -> 0.945   (x1.14)
+    WEEK-9 (deeper plans; both decays converge toward 1 with depth, so the
+    multiplier compresses but never inverts):
+        954 steps:  0.913 -> 0.973  (x1.065)
+        1348 steps: 0.952 -> 0.984  (x1.033)
     This test does NOT dispute the arithmetic that motivated the amendment — it
     pins it.  What changed is that on ideogram4 "exports more of the delta" is a
     COST, not a recovery.
@@ -474,7 +482,7 @@ def test_099_would_ship_a_stronger_adapter_at_every_real_shape(row) -> None:
     shipped = exported_fraction(steps, SHIPPED_DECAY, lr)
     rejected = exported_fraction(steps, REJECTED_DECAY, lr)
     assert rejected > shipped
-    assert rejected / shipped >= 1.10
+    assert rejected / shipped >= 1.03
 
 
 @pytest.mark.parametrize("row", REAL_SHAPES, ids=IDS)
@@ -505,7 +513,14 @@ def test_the_strength_increase_is_robust_to_the_delta_growth_model(row) -> None:
     for lr in models:
         shipped = exported_fraction(steps, SHIPPED_DECAY, lr)
         rejected = exported_fraction(steps, REJECTED_DECAY, lr)
-        assert rejected / shipped >= 1.08
+        # WEEK-9: 1.08 -> 1.005.  At the deeper week-9 plans (954/1348) both
+        # decays sit close to 1.0 and the multiplier compresses — computed
+        # floor across the five models is x1.026 at 954 and x1.009 at 1348
+        # (kappa=T/6 saturating).  The ROBUSTNESS claim — every growth model
+        # gives the same SIGN (0.99 always exports MORE) — is unchanged and
+        # is what this asserts.
+        assert rejected / shipped >= 1.005
+        assert rejected > shipped
 
 
 def test_the_ema_model_reproduces_the_independently_derived_numbers() -> None:
@@ -531,20 +546,21 @@ def test_the_ema_model_reproduces_the_independently_derived_numbers() -> None:
 def test_shipped_decay_reproduces_the_in_family_anchor_strength() -> None:
     """At the anchor's own shape we must land on the anchor, not past it.
 
-    `recipe.size_scaled_steps` ships EXACTLY the anchor's 378 steps at its own
-    shape (n_train 9 / h 0.75) after the week-6 abscissa refit, so depth is
-    matched and the decay ALONE decides exported strength.  0.995 lands within
-    ~5%; 0.99 overshoots by ~33%.  (This docstring previously said "390 steps at
-    N=11" — the law was being evaluated at the auditing record's N instead of the
-    abscissa the container receives.)
+    WEEK-9 NOTE: the depth law no longer reproduces the anchor's 378 at its
+    shape — it ships 913 there (the Jul-20 anchor is SUPERSEDED: its own
+    operator abandoned the recipe and its winning 0.0502 is the Aug-17
+    catastrophic tail; see recipe.py's week-9 ideogram4 block).  The DECAY
+    adjudication is separate from depth and is unchanged, so it is now pinned
+    AT THE FIXED anchor depth of 378 steps, where the original comparison was
+    made: 0.995 lands within ~5%; 0.99 overshoots by ~33%.
     """
     lr = our_cosine_lr()
     ours = recipe.size_scaled_steps("ideogram4", ANCHOR_N_TRAIN, 0.75, 2000)
-    assert ours == ANCHOR_STEPS, f"anchor-shape depth moved to {ours}"
+    assert ours == 913, f"anchor-shape depth moved to {ours}"  # week-9 law
 
     anchor = exported_strength(ANCHOR_STEPS, ANCHOR_DECAY, lr)
-    at_shipped = exported_strength(ours, SHIPPED_DECAY, lr) / anchor
-    at_rejected = exported_strength(ours, REJECTED_DECAY, lr) / anchor
+    at_shipped = exported_strength(ANCHOR_STEPS, SHIPPED_DECAY, lr) / anchor
+    at_rejected = exported_strength(ANCHOR_STEPS, REJECTED_DECAY, lr) / anchor
 
     assert at_shipped == pytest.approx(1.05, abs=0.06)
     assert at_rejected == pytest.approx(1.33, abs=0.06)
@@ -557,16 +573,19 @@ def test_the_rejected_decay_prices_above_our_elimination_margin() -> None:
     Feeding the two candidate strength ratios through the curvature measured on
     the matched pair: 0.995 prices at a fraction of a percent, 0.99 at ~10%.
     We were eliminated in Aug-3 R1 by 0.97%.  ideogram4 is ~half the R1 draw.
+
+    WEEK-9: evaluated at the FIXED anchor depth (378) — the decay decision's
+    original frame — because the week-9 depth law deliberately ships past the
+    anchor (see test_shipped_decay_reproduces_the_in_family_anchor_strength).
     """
     lr = our_cosine_lr()
-    ours = recipe.size_scaled_steps("ideogram4", ANCHOR_N_TRAIN, 0.75, 2000)
     anchor = exported_strength(ANCHOR_STEPS, ANCHOR_DECAY, lr)
 
     cost_shipped = strength_penalty(
-        exported_strength(ours, SHIPPED_DECAY, lr) / anchor
+        exported_strength(ANCHOR_STEPS, SHIPPED_DECAY, lr) / anchor
     )
     cost_rejected = strength_penalty(
-        exported_strength(ours, REJECTED_DECAY, lr) / anchor
+        exported_strength(ANCHOR_STEPS, REJECTED_DECAY, lr) / anchor
     )
     assert cost_shipped < AUG3_ELIMINATION_MARGIN
     assert cost_rejected > 5 * AUG3_ELIMINATION_MARGIN
@@ -635,23 +654,32 @@ def test_amendment_record_is_vacated_and_hash_bound() -> None:
     # Vacated means the amended value is back at the validated value.
     assert amendment["amended_value"] == SHIPPED_DECAY
     assert amendment["amended_value"] != REJECTED_DECAY
-    # With no divergence left, the source cell's score covers the whole recipe.
+    # The EMA side has no divergence from the source cell.
     assert amendment["covered_by_source_validation_cell"] is True
-    assert policy.AMENDMENT_SHA256 == hashlib.sha256(
+    # WEEK-9: the vacated EMA record keeps its own hash constant
+    # (WEEK6_AMENDMENT_SHA256); the activation-scoped AMENDMENT_SHA256 now
+    # binds the LIVE week-9 do_cfg-removal record instead.
+    assert policy.WEEK6_AMENDMENT_SHA256 == hashlib.sha256(
         policy._canonical_bytes(amendment)
+    ).hexdigest()
+    assert policy.AMENDMENT_SHA256 == hashlib.sha256(
+        policy._canonical_bytes(policy.WEEK9_DO_CFG_AMENDMENT)
     ).hexdigest()
     assert policy._EXPECTED_RECIPE["train"]["ema_config"] == {
         "use_ema": True,
         "ema_decay": SHIPPED_DECAY,
     }
-    # No LIVE amendment: the shipped recipe is the bare I-J20-D2 port again.
-    assert policy._POLICY_BODY["amendments"] == []
+    # WEEK-9: exactly ONE live amendment — the do_cfg/cfg_scale removal.  The
+    # EMA vacation record stays alongside, and the calibration-provenance flag
+    # is honestly False: the projection now diverges from I-J20-D2 on the two
+    # do_cfg fields (which the cell ran at true/10.0).
+    assert policy._POLICY_BODY["amendments"] == [policy.WEEK9_DO_CFG_AMENDMENT]
     assert amendment in policy._POLICY_BODY["vacated_amendments"]
     assert (
         policy._POLICY_BODY["calibration_provenance"][
             "covers_recipe_projection_exactly"
         ]
-        is True
+        is False
     )
 
 

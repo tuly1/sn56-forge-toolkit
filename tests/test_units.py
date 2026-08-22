@@ -300,6 +300,11 @@ def test_krea_week6_materialization_table(hours, expected):
 
 
 def test_recipe_save_every():
+    assert recipe.FIXED_SAVE_EVERY == {"ideogram4": 200}
+    assert recipe.kill_safe_save_every(1348, 250, "ideogram4") == 200
+    # Krea is inherited from the live recipe and stays adaptive.
+    assert recipe.kill_safe_save_every(1432, 250, "krea2") == 287
+
     # Fixed four-candidate budget, including runs longer than template cadence.
     assert recipe.kill_safe_save_every(2000, 250) == 401
     assert recipe.kill_safe_save_every(700, 250) == 141

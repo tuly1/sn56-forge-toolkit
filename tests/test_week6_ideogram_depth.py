@@ -25,9 +25,16 @@ our own pipeline are asserted here instead:
       untrained init".  That is FALSE: ``lora_up`` is zero-initialised
       (``toolkit/lora_special.py:122``), so the init contributes no adapter
       effect at all.  See the per-test docstring below.)
-  (b) the do_cfg clock ceiling — ``do_cfg: true`` runs the transformer at batch
-      2, so our per-step cost is ~2x the field's and the reachable depth is
-      correspondingly halved.
+  (b) the do_cfg clock ceiling — ``do_cfg: true`` ran the transformer at batch
+      2, so our per-step cost was ~2x the field's.  WEEK-9 (2026-08-18):
+      do_cfg is REMOVED (Aug-17 last-place-x3; the -9x blank-prompt
+      anti-training traced at the pin — forge/ideogram_release_policy.py
+      WEEK9_DO_CFG_AMENDMENT), SEC_PER_IT is back at the field-bound-derived
+      2.1, and the depth row is base 1250 / max 1650: at the Aug-3 shapes the
+      CLOCK now binds (954 @0.75 h, 1348 @1.0 h) BY DESIGN — deep-plan +
+      200-step ladder for selection.  Several tests below were rewritten for
+      that structure; the superseded week-6 adjudications are kept in the
+      docstrings as history.
 
 Evidence:
   ops/experiments/week6/FIELD-DEPTH-LAW-AUDIT.md            §6.2
@@ -62,8 +69,9 @@ REAL_IDEOGRAM_TASKS = [
     # CORRECTED: the deep arm is 800, not ">900".  5GU4Xkd3 trained to 900
     # (metadata on last_000000900) and its `last.safetensors` has the same LFS
     # oid as its `last_000000800.safetensors`.
-    # n_train 12 (N=14): OBSERVED in the zip central directory.  421 -> 414.
-    ("1365fa1c", "product", 12, 0.75, 174, 414),
+    # n_train 12 (N=14): OBSERVED in the zip central directory.  421 -> 414
+    # (week 6) -> 954 (WEEK-9: no-do_cfg clock cap at 0.75 h, law 1001).
+    ("1365fa1c", "product", 12, 0.75, 174, 954),
     # b72da8c6: BOTH arms deep (1100 rank 1 vs 1523 rank 2, +4.4%).  No shallow
     # arm exists on this task, so it cannot show that a shallow run would lose —
     # only that 1100 ~= 1523.
@@ -73,13 +81,14 @@ REAL_IDEOGRAM_TASKS = [
     # and is the ONLY ideogram4 config in the field with no `ema_config` block —
     # the same operator ran EMA 0.99 on the two tasks he WON, so depth and EMA
     # are confounded within his own three runs.
-    # n_train 36 (N=40).  589 is unchanged: base 500 at N=40 and base 517 at
-    # n_train 36 both land on 589, the one coincidence in the table.
-    ("b72da8c6", "style", 36, 1.0, 1100, 589),
+    # n_train 36 (N=40).  589 (week 6) -> 1348 (WEEK-9: 1.0 h clock cap; law
+    # 1423 at base 1250).
+    ("b72da8c6", "style", 36, 1.0, 1100, 1348),
     # 84be9fcd: 341 (rank 1) vs an opponent who published ONE FILE, no
     # __metadata__ and no checkpoint ladder.  ZERO depth information.
-    # n_train 41 (N=46).  616 -> 614.
-    ("84be9fcd", "style", 41, 1.0, 341, 614),
+    # n_train 41 (N=46).  616 -> 614 (week 6) -> 1348 (WEEK-9: 1.0 h clock
+    # cap; law 1484 at base 1250).
+    ("84be9fcd", "style", 41, 1.0, 341, 1348),
 ]
 IDS = [row[0] for row in REAL_IDEOGRAM_TASKS]
 
@@ -215,8 +224,12 @@ def test_activated_policy_still_carries_the_lr_and_ema_this_law_assumes():
     replaced rather than re-tuned — see
     ``test_ideogram4_export_stays_inside_the_measured_strength_band``.
 
-    The SHIPPED DEPTHS still do not move: 414/589/614 are set by the size law and
-    the do_cfg clock ceiling at either decay.
+    WEEK-9: the depth law is no longer decoupled — do_cfg is REMOVED (the
+    projection requires the keys ABSENT) and the depths are 954/1348/1348 with
+    the clock binding at the Aug-3 shapes.  The lr/EMA pins below are
+    unchanged: the week-9 change removed do_cfg ONLY, exactly per the ideogram
+    lane's scoping ("the residual placement gap ... a recipe-parity lane
+    should look at them AFTER do_cfg is decided").
 
     ``lr`` is deliberately still pinned hard: it is the coupled decision the
     Week-6 amendment did NOT take, and the depth law IS derived from it.
@@ -225,23 +238,26 @@ def test_activated_policy_still_carries_the_lr_and_ema_this_law_assumes():
     assert train["lr"] == 2.5e-5
     assert train["lr_scheduler"] == "cosine"
     assert train["lr_scheduler_params"] == {"eta_min": 2.5e-6}
-    assert train["do_cfg"] is True and train["cfg_scale"] == 10.0
+    # WEEK-9: absence enforced through the projection (train.get -> None).
+    assert train["do_cfg"] is None and train["cfg_scale"] is None
     assert train["ema_config"] == {"use_ema": True, "ema_decay": EXPECTED_EMA_DECAY}
     assert EMA_DECAY == EXPECTED_EMA_DECAY
     # The amendment record is retained as a VACATED record rather than deleted,
     # so the audit trail shows the field moved and moved back, and the shipped
     # decay is once again the I-J20-D2 port's own validated value with no live
-    # divergence.  A future re-adoption of 0.99 must land a NEW amendment.
+    # EMA divergence.  A future re-adoption of 0.99 must land a NEW amendment.
     amendment = ideogram_release_policy.WEEK6_EMA_AMENDMENT
     assert amendment["field"] == "config.process[0].train.ema_config.ema_decay"
     assert amendment["status"] == "vacated"
     # Vacated means the record no longer carries a divergence at all: BOTH the
-    # validated and the amended value are back on the anchor's 0.995, so the
-    # emitted recipe is the I-J20-D2 port with zero live amendments.
+    # validated and the amended value are back on the anchor's 0.995.
     assert amendment["validated_value"] == EXPECTED_EMA_DECAY
     assert amendment["amended_value"] == EXPECTED_EMA_DECAY
     assert amendment["covered_by_source_validation_cell"] is True
-    assert ideogram_release_policy._POLICY_BODY["amendments"] == []
+    # WEEK-9: the one LIVE amendment is the do_cfg/cfg_scale removal.
+    assert ideogram_release_policy._POLICY_BODY["amendments"] == [
+        ideogram_release_policy.WEEK9_DO_CFG_AMENDMENT
+    ]
     assert amendment in ideogram_release_policy._POLICY_BODY["vacated_amendments"]
     assert (
         ideogram_release_policy.PRODUCTION_ACTIVATION["amendment_sha256"]
@@ -275,43 +291,56 @@ def test_the_attenuation_model_matches_its_published_anchors():
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
-def test_ideogram4_depth_is_set_by_our_own_pipeline_not_the_field(row):
-    """The size law must BIND, and bind below the do_cfg clock ceiling."""
+def test_ideogram4_week9_binding_structure(row):
+    """WEEK-9 REPLACEMENT of `..._depth_is_set_by_our_own_pipeline_not_the_field`.
+
+    The week-6 premise ("the size law must bind, below the do_cfg clock
+    ceiling") is inverted BY DESIGN: with do_cfg removed the row plans deep
+    (base 1250, ~1.2x the field's 1h rank-1..9 geometric-mean ship of 923) and
+    lets the no-cfg clock cap be the ceiling at the bigger shapes — the
+    field's mechanism is deep-train + per-task selection off a 200-step
+    ladder, and selection can only choose <= plan (week9-ideogram4-lane REPORT
+    §3-§4.1).  At the Aug-3 shapes the CLOCK binds (954 @0.75 h, 1348 @1.0 h);
+    at the Aug-17 anchor shapes (n=16 @1.0 h -> 1098, n=10 @0.75 h -> 945)
+    the LAW binds.  Both structures are asserted, so neither can silently
+    drift.
+    """
     _task, _family, pairs, hours, _winner, expected = row
     sec = recipe.SEC_PER_IT["ideogram4"]
     steps = recipe.size_scaled_steps("ideogram4", pairs, hours, 2000)
     assert steps == expected
 
     cap = _cap(hours, recipe.MARGIN, sec)
-    assert steps < cap, "the size law, not the clock, must decide ideogram4 depth"
-    # ...and it must bind with real room, not by one step.  A cap built on an
-    # INFERRED constant (the 2x do_cfg multiplier) is not something to run flat
-    # into: qwen-image already showed what that costs.
-    assert steps <= 0.95 * cap
-
-
-@pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
-def test_ideogram4_depth_is_invariant_to_margin_and_sec_per_it(row):
-    """The other week-6 fixes must not be able to move this row.
-
-    MARGIN is under revision (globally 0.92 today, possibly per-type tomorrow)
-    and SEC_PER_IT["ideogram4"] rests on an INFERRED 2x do_cfg multiplier that
-    the two week-6 audits disagreed about.  Because the size law binds, neither
-    can change what ideogram4 ships — except for the single tightest shape under
-    the most pessimistic combination, and then only marginally.
-    """
-    _task, _family, pairs, hours, _winner, expected = row
+    assert steps == cap, "Aug-3 shapes are clock-bound under the week-9 row"
     law = recipe.STEP_TABLE["ideogram4"]
-    scaled = law["base"] * (pairs / law["n_ref"]) ** law["p"]
-    scaled = int(round(max(law["min"], min(law["max"], scaled))))
-    assert scaled == expected
+    pure = law["base"] * (pairs / law["n_ref"]) ** law["p"]
+    assert pure > cap  # the law wanted more; the clock is the honest ceiling
+    # The Aug-17 anchor shapes stay LAW-bound (the row's calibration points).
+    assert recipe.size_scaled_steps("ideogram4", 16, 1.0, 2000) == 1098
+    assert recipe.size_scaled_steps("ideogram4", 10, 0.75, 2000) == 945
 
-    for margin in (0.85, 0.90, 0.92, 0.95):
-        for sec in (2.1, 3.0, 4.2):
-            shipped = max(1, min(scaled, _cap(hours, margin, sec)))
-            # Worst case in the grid is margin 0.85 x sec 4.2 on the 1.0 h
-            # shapes, which clips 616 to 614 — 0.3%.
-            assert shipped >= expected - 3
+
+def test_ideogram4_depth_is_coupled_to_the_clock_and_says_so():
+    """WEEK-9 REPLACEMENT of `..._depth_is_invariant_to_margin_and_sec_per_it`.
+
+    The week-6 row was sized so MARGIN/SEC revisions could not move it.  The
+    week-9 row deliberately plans INTO the clock at the large Aug-3 shapes, so
+    it IS coupled to SEC_PER_IT["ideogram4"]=2.1 and MARGIN 0.92 — a revision
+    of either must show up as a deliberate edit here and in the emission pins
+    (tests/test_week9_recipe_pins.py), not as silent drift.  The coupling is
+    bounded: at the law-bound Aug-17 anchor shapes the emission is invariant
+    over the plausible grid.
+    """
+    for margin in (0.90, 0.92, 0.95):
+        for sec in (2.0, 2.1, 2.2):
+            # law-bound anchor shape: invariant
+            law = recipe.STEP_TABLE["ideogram4"]
+            scaled = int(round(law["base"] * (16 / 24) ** law["p"]))
+            assert min(scaled, _cap(1.0, margin, sec)) == scaled
+    # clock-bound shape: moves exactly with the cap, as designed
+    assert recipe.size_scaled_steps("ideogram4", 41, 1.0, 2000) == _cap(
+        1.0, recipe.MARGIN, recipe.SEC_PER_IT["ideogram4"]
+    )
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
@@ -379,6 +408,35 @@ def test_ideogram4_export_stays_inside_the_measured_strength_band(row):
     degrades late".  The band is therefore a TRIPWIRE forcing re-argument, not a
     claim that the optimum is 1.0x.  See the week-6 release note's "known unfixed
     exposure" for the full statement.
+
+    WEEK-9 SUPERSESSION (2026-08-18) — THE BAND'S TRIPWIRE FIRED AND THE
+    RE-ARGUMENT HAPPENED.  The week-9 depths (954/1348/1348) model at
+    3.36x/4.95x/4.95x the Jul-20 anchor — far past the old 2.0x ceiling — and
+    that is DELIBERATE, argued from the evidence the band's own docstring
+    pre-authorized ("the band is therefore a TRIPWIRE forcing re-argument, not
+    a claim that the optimum is 1.0x"):
+      1. THE ANCHOR'S TIER IS DEAD.  The band was calibrated to reproduce
+         5FNLSgh8's Jul-20 win at 0.0502341.  On Aug-17, 0.0502 IS the
+         catastrophic tail (rank 12 of 13 on 168078ad), and the anchor's own
+         operator now plans 2000 steps with a 200-step selection ladder
+         (week9-ideogram4-lane REPORT §4.0).  A band that rejects every
+         Aug-17 survivor is measuring distance from a tier the field vacated.
+      2. THE 2.0x "MEASURED-BAD" POINT RAN do_cfg.  5EACrayt's Jul-20 config
+         carried `do_cfg: true, cfg_scale: 10.0` (as did the anchor's); with
+         the week-9 mechanism trace (-9x blank-prompt anti-training) the
+         +92.1% at 2x lr is an lr x do_cfg interaction measurement, not a
+         clean strength measurement for a no-cfg recipe.
+      3. THE DEPTH-AXIS EXTRAPOLATION WAS ALREADY FLAGGED FALSE in this very
+         docstring ("the field falsifies that extrapolation along the DEPTH
+         axis") — b72da8c6's top two shipped modelled strengths far past 2x.
+         Aug-17 replicates it: ranks 1-9 shipped 600-1650 steps and the only
+         catastrophic entries are the do_cfg ones.
+    WHAT IS ASSERTED NOW: the modelled ratios are pinned (so the model is
+    still exercised and drift still shows), the old-band breach is EXPLICIT
+    (>2.0x, documented exposure, CHANGES.md §3A records the fallback: if
+    checkpoint selection cannot be trusted by Aug-24, cap the plan at ~900 =
+    the field GM), and the shallow floor still rejects the retired two-point
+    law.
     """
     _task, _family, pairs, hours, _winner, expected = row
     steps = recipe.size_scaled_steps("ideogram4", pairs, hours, 2000)
@@ -391,43 +449,42 @@ def test_ideogram4_export_stays_inside_the_measured_strength_band(row):
         f"{_task}: exported strength is only {ratio:.3f}x the in-family rank-1 "
         f"anchor at {steps} steps / decay {EMA_DECAY} — too shallow"
     )
-    assert ratio < MATCHED_PAIR_OVERSTRENGTH_RATIO, (
-        f"{_task}: exported strength {ratio:.3f}x reaches the magnitude measured "
-        f"at rank 13 of 16 (5EACrayt, 2x lr, same depth, +92.1% loss)"
+    # WEEK-9: the old `< 2.0` ceiling is deliberately, explicitly exceeded.
+    expected_ratio = {"1365fa1c": 3.36, "b72da8c6": 4.95, "84be9fcd": 4.95}
+    assert ratio == pytest.approx(expected_ratio[_task], abs=0.06), (
+        f"{_task}: modelled strength ratio {ratio:.3f} drifted from the "
+        f"week-9 documented exposure {expected_ratio[_task]}"
     )
+    assert ratio > MATCHED_PAIR_OVERSTRENGTH_RATIO  # the breach is on purpose
     # The retired c424362 two-point law is strictly rejected by the lower bound.
     old_law = int(round(240 * (pairs / 24) ** 0.57))
     assert exported_strength(old_law, EMA_DECAY) / anchor < 0.85
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
-def test_readopting_099_would_breach_the_band_on_a_real_shape(row):
-    """Why the Week-6 EMA amendment was vacated, in the band's own units.
+def test_readopting_099_would_raise_exported_strength_further(row):
+    """The direction that decided the week-6 EMA vacation still holds.
 
-    0.99 halves the averaging horizon (99 steps against 199), so the export
-    carries a larger share of a path whose magnitude is already set by depth.
-    On the two 1.0 h shapes that pushes the modelled strength PAST the measured
-    over-strength point; on the 0.75 h shape it does not, which is precisely why
-    the amendment looked harmless when it was only checked at R1.
+    0.99 halves the averaging horizon (99 steps against 199), so at any fixed
+    depth the export carries MORE of the path: strength(0.99) > strength(0.995)
+    at every week-9 depth.  The old per-shape "breach" bookkeeping against the
+    2.0x band is retired with the band (see the supersession note above);
+    0.995 remains the shipped decay, guarded by
+    tests/test_week6_ideogram_ema_horizon.py at the fixed anchor depth.
     """
     _task, _family, pairs, hours, _winner, expected = row
     anchor = exported_strength(JUL20_IN_FAMILY_WINNER_STEPS, 0.995)
     at_099 = exported_strength(expected, 0.99) / anchor
     at_0995 = exported_strength(expected, 0.995) / anchor
     assert at_099 > at_0995
-    breached = {"b72da8c6": True, "84be9fcd": True, "1365fa1c": False}
-    assert (at_099 >= MATCHED_PAIR_OVERSTRENGTH_RATIO) is breached[_task], (
-        _task,
-        at_099,
-    )
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
-def test_ideogram4_fits_the_budget_at_the_do_cfg_corrected_rate(row):
-    """(b) the do_cfg clock ceiling — the reason this law is not deeper still.
+def test_ideogram4_fits_the_budget_at_the_no_cfg_rate(row):
+    """(b) the clock ceiling — the reason this law is not deeper still.
 
-    Asserted at the honest 4.2 s/step, and then again at the rate that would
-    make us miss the deadline, which must be >=20% worse than modelled.
+    HISTORY (week 6): asserted at the do_cfg-doubled 4.2 s/step with a >=20%
+    rate cushion, which the law-bound row of that era afforded.
 
     THREE DIFFERENT THRESHOLDS EXIST HERE and the previous docstring blurred
     them into one ("truncates only above 5.06 s/step ... 2.47x the field bound"),
@@ -448,22 +505,33 @@ def test_ideogram4_fits_the_budget_at_the_do_cfg_corrected_rate(row):
     ``breaking_rate`` below still omits ``STOP_MARGIN_S`` (it is a 45 s / ~1.4%
     optimism on a 1.0 h budget); the assertion is a floor, so the direction is
     safe, but the number it computes is 5.065, not 4.992.
+
+    WEEK-9 REWRITE: the constant is 2.1 (do_cfg removed; SEC_PER_IT block) and
+    the Aug-3 shapes are deliberately CLOCK-BOUND, so the old >=1.20x rate
+    cushion is structurally impossible there — a clock-filled plan's runtime
+    tolerance is the MARGIN property (~1.10x: (budget-480)/(budget*0.92-480)),
+    identical for every clock-bound type in the table.  Asserted as such, and
+    the >=1.25x cushion is asserted where it still applies: the law-bound
+    Aug-17 anchor shape (n=16 @1.0 h, 1098 steps).  A truncation DEGRADES to a
+    200-step rung, never forfeits (next test).
     """
     _task, _family, pairs, hours, _winner, expected = row
     steps = recipe.size_scaled_steps("ideogram4", pairs, hours, 2000)
     budget = hours * 3600.0
     wall = recipe.projected_wall_s("ideogram4", steps)
-    assert wall <= budget * recipe.MARGIN
-    # Utilisation: the audit's headline ideogram4 defect was that every task
-    # left 75-77% of its grant unused.  Fixed, without filling it to the brim.
-    assert 0.78 <= wall / budget <= 0.90
+    assert wall <= budget * recipe.MARGIN + recipe.SEC_PER_IT["ideogram4"]
+    # Utilisation: clock-bound plans fill to the margin cap by construction.
+    assert 0.88 <= wall / budget <= 0.921
 
     # The rate at which the SOFT stop (hard deadline minus the export reserve)
     # would truncate us.  _run_toolkit gates termination on remaining(), which
     # already subtracts EXPORT_RESERVE_S.
     trainable_s = budget - recipe.EXPORT_RESERVE_S - recipe.STARTUP_S
     breaking_rate = trainable_s / steps
-    assert breaking_rate >= 1.20 * recipe.SEC_PER_IT["ideogram4"]
+    assert breaking_rate >= 1.10 * recipe.SEC_PER_IT["ideogram4"]
+    # Law-bound anchor shape keeps a real rate cushion.
+    law_steps = recipe.size_scaled_steps("ideogram4", 16, 1.0, 2000)
+    assert (3600.0 - 480.0) / law_steps >= 1.25 * recipe.SEC_PER_IT["ideogram4"]
 
 
 @pytest.mark.parametrize("row", REAL_IDEOGRAM_TASKS, ids=IDS)
@@ -476,9 +544,13 @@ def test_ideogram4_truncation_degrades_rather_than_forfeits(row):
     """
     _task, _family, pairs, hours, _winner, expected = row
     steps = recipe.size_scaled_steps("ideogram4", pairs, hours, 2000)
-    save_every = recipe.kill_safe_save_every(steps, 200)
+    # WEEK-9: production cadence is the FIXED 200 (recipe.FIXED_SAVE_EVERY,
+    # field's save100-200 ladder shape; selection needs rungs), so the
+    # model_type is passed and the rung count widens from 4 to up to 6.
+    save_every = recipe.kill_safe_save_every(steps, 200, "ideogram4")
+    assert save_every == 200
     periodic = (steps - 1) // save_every
-    assert 3 <= periodic <= 5
+    assert 3 <= periodic <= 10
 
     budget = hours * 3600.0
     first = recipe.first_save_wall_s("ideogram4", steps, save_every)
@@ -494,19 +566,17 @@ def test_ideogram4_truncation_degrades_rather_than_forfeits(row):
 def test_where_the_clock_takes_over_from_the_law_is_known_and_bounded():
     """On SHORT grants the clock does bind, and that is stated rather than hidden.
 
-    The law is deliberately sized so it binds on every 1.0 h shape up to N=50
-    and on the real 0.75 h shape (N=14).  It does NOT bind on a 0.75 h task with
-    N >= ~21, because ``do_cfg`` costs us 4.2 s/step and a 0.75 h grant only
-    buys 477 of them.  Round 1 was a 0.75 h task on Aug-3, so this corner is
-    reachable on Monday and is asserted, not assumed:
-
-      * the crossover sits at N ~= 21 (below the Aug-3 style-task sizes);
-      * at the cap we still ship materially deeper than the withdrawn law;
-      * a clock-bound run keeps four periodic candidates, so a deadline stop
-        promotes ~80% of the planned depth rather than forfeiting.
-
-    The ~10% rate tolerance of a clock-bound run is a property of MARGIN, not of
-    this row, and it is identical for every clock-bound type in the table.
+    WEEK-9 STRUCTURE (do_cfg removed, base 1250, SEC 2.1): the row plans
+    deliberately INTO the clock —
+      * 0.75 h: cap 954, law crosses it at n_train 11 (1250*(11/24)^0.32 =
+        975 > 954), so every 0.75 h task with n_train >= 11 is clock-bound;
+        the Aug-17 0.75 h anchor (n=10 -> 945) sits just under it, law-bound.
+      * 1.0 h: cap 1348, law crosses at n_train 31 — the Aug-17 1.0 h anchor
+        (n=16 -> 1098) is law-bound, the big Aug-3 shapes (36/41) clock-bound.
+    A clock-bound run keeps its 200-step ladder, so a deadline stop promotes
+    a rung, never forfeits.  The ~10% rate tolerance of a clock-bound run is
+    a property of MARGIN, not of this row, and it is identical for every
+    clock-bound type in the table.
     """
     cap_075 = _cap(0.75, recipe.MARGIN, recipe.SEC_PER_IT["ideogram4"])
     law = recipe.STEP_TABLE["ideogram4"]
@@ -515,20 +585,22 @@ def test_where_the_clock_takes_over_from_the_law_is_known_and_bounded():
         return law["base"] * (n / law["n_ref"]) ** law["p"]
 
     crossover = next(n for n in range(5, 60) if pure(n) > cap_075)
-    assert 18 <= crossover <= 24
+    assert 10 <= crossover <= 12
 
     for pairs in (24, 36, 50):
         steps = recipe.size_scaled_steps("ideogram4", pairs, 0.75, 2000)
         assert steps == cap_075
         # still far deeper than the withdrawn two-point law would have shipped
         assert steps > int(round(240 * (pairs / 24) ** 0.57))
-        save_every = recipe.kill_safe_save_every(steps, 200)
+        save_every = recipe.kill_safe_save_every(steps, 200, "ideogram4")
         periodic = (steps - 1) // save_every
         assert periodic >= 3
         assert (periodic * save_every) / steps >= 0.75
-    # ...and every 1.0 h shape in the observed size range stays law-bound.
+    # ...and the 1.0 h crossover is where the week-9 block says it is.
     cap_10 = _cap(1.0, recipe.MARGIN, recipe.SEC_PER_IT["ideogram4"])
-    assert recipe.size_scaled_steps("ideogram4", 50, 1.0, 2000) < cap_10
+    crossover_10 = next(n for n in range(5, 80) if pure(n) > cap_10)
+    assert 29 <= crossover_10 <= 33
+    assert recipe.size_scaled_steps("ideogram4", 50, 1.0, 2000) == cap_10
 
 
 def test_ideogram4_law_is_flat_because_the_field_has_no_size_signal():
@@ -586,25 +658,35 @@ def test_ideogram4_matches_the_only_in_family_field_winner():
     exact task.
 
     EVALUATED AT n_train, NOT AT N.  The winner's container held 9 images, and
-    so will ours; `base` is set to 378/(9/24)**0.32 = 517.4 so the equality is
-    exact rather than "+3.2% at a shape the runtime never sees".
+    so will ours; `base` was set to 378/(9/24)**0.32 = 517.4 so the equality
+    was exact rather than "+3.2% at a shape the runtime never sees".
+
+    WEEK-9 SUPERSESSION (2026-08-18): the equality pin is RETIRED, because the
+    anchor itself is retired — deliberately, on three Aug-17 observations
+    (week9-ideogram4-lane REPORT §4.0):
+      1. The anchor's operator (5FNLSgh8) ABANDONED this recipe: their Aug-17
+         config is lr 4e-4 constant, no do_cfg, no TE-train, min_denoising 250,
+         cache_text_embeddings, planned 2000 with a 200-step selection ladder.
+      2. The anchor's winning 0.0502341 IS the Aug-17 catastrophic tail (rank
+         12 of 13 on 168078ad at 0.05205): the tier it calibrates to no longer
+         places.
+      3. Depth was not the Aug-17 catastrophe variable (do_cfg was), and ranks
+         1-9 shipped 600-1650 on the 1h shapes.
+    The row now ships 913 at the anchor shape (law-bound: 1250*(9/24)^0.32 =
+    913.3 < the 954 cap) — pinned exactly so drift is still a deliberate act.
     """
     shipped = recipe.size_scaled_steps(
         "ideogram4", JUL20_R1_N_TRAIN, JUL20_R1_HOURS, 1000
     )
-    ratio = shipped / JUL20_IN_FAMILY_WINNER_STEPS
-    assert shipped == JUL20_IN_FAMILY_WINNER_STEPS, (
-        f"the row no longer reproduces its own calibration anchor: {shipped} "
-        f"!= {JUL20_IN_FAMILY_WINNER_STEPS}"
+    assert shipped == 913, (
+        f"anchor-shape emission moved: {shipped} != the week-9 documented 913"
     )
-    assert 0.75 <= ratio <= 1.35, (
-        f"n_train={JUL20_R1_N_TRAIN} h={JUL20_R1_HOURS} ships {shipped} steps against "
-        f"the only in-family field winner's {JUL20_IN_FAMILY_WINNER_STEPS} "
-        f"({ratio:.2f}x)"
-    )
-    # The anchor must be the LAW, not the clock: if the clock were binding here
-    # the agreement would be an accident of SEC_PER_IT (which is UNMEASURED for
-    # ideogram4) rather than a property of the depth policy.
+    # The historical anchor is deliberately below the week-9 plan; keep the
+    # relation pinned so the supersession stays visible.
+    assert shipped > JUL20_IN_FAMILY_WINNER_STEPS
+    # The anchor shape must be the LAW, not the clock: if the clock were
+    # binding here the number would be an accident of SEC_PER_IT (UNMEASURED
+    # without do_cfg) rather than a property of the depth policy.
     law = recipe.STEP_TABLE["ideogram4"]
     pure = law["base"] * (JUL20_R1_N_TRAIN / law["n_ref"]) ** law["p"]
     assert shipped == int(round(max(law["min"], min(law["max"], pure))))
@@ -661,19 +743,33 @@ def test_ideogram4_bounds_can_actually_bind():
     tournament.  ``min`` is the opposite kind of bound: it guards the unobserved
     small tail, below the n_train 9 minimum ever seen — which is exactly the
     Jul-20 R1 shape this row is anchored on, so ``min`` must NOT bind there.
+
+    WEEK-9 RESTATEMENT: with do_cfg removed, the LIVE ceiling on the observed
+    range is the CLOCK (1348 @1.0 h, 954 @0.75 h), and the bounds' roles
+    changed with it:
+      * max 1650 = the deepest ship ever observed (5D7iEJm5, 168078ad).  It
+        first changes the raw law at n_train 58 — ABOVE the observed 8..45 —
+        so it is pure anti-extrapolation; the clock binds long before it
+        (from n_train 31 at 1.0 h).  That is deliberate and asserted, not an
+        inert-ceiling accident: the old inertness test was about a POWER law
+        whose max nothing could reach AND whose clock never bound — here the
+        clock is the working ceiling.
+      * min 350 is now fully inert (the law's smallest value in-range is 452
+        at n_train 1) — kept as an anti-typo floor only, stated honestly.
     """
     law = recipe.STEP_TABLE["ideogram4"]
 
     def pure(n):
         return law["base"] * (n / law["n_ref"]) ** law["p"]
 
-    # the largest ideogram4 abscissa ever observed is 41; the largest of ANY
-    # type is 45 (f6725c2b, N=50).  `max` must sit between them.
-    assert pure(41) < law["max"] <= pure(45), "max must bind inside n_train 8..45"
-    assert recipe.size_scaled_steps("ideogram4", 45, 1.0, 2000) == law["max"]
-    # min binds strictly below the smallest ideogram4 abscissa ever observed
-    # (n_train 9, from the N=11 Jul-20 R1 task 3cfa1578).
-    assert pure(9) > law["min"] >= pure(7)
+    # max binds only beyond the observed range; the clock binds inside it.
+    assert pure(45) < law["max"], "max stays anti-extrapolation-only"
+    crossover = next(n for n in range(1, 200) if pure(n) >= law["max"])
+    assert 55 <= crossover <= 60  # computed 58; CHANGES.md §3A
+    cap_10 = _cap(1.0, recipe.MARGIN, recipe.SEC_PER_IT["ideogram4"])
+    assert recipe.size_scaled_steps("ideogram4", 45, 1.0, 2000) == cap_10 == 1348
+    # min: inert anti-typo floor — the law never goes that low for n >= 1.
+    assert pure(1) > law["min"]
 
 
 def test_no_family_router_was_introduced():

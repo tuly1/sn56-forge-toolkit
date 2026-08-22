@@ -531,7 +531,49 @@ STEP_TABLE = {
     # base 500 -> 517, ABSCISSA REFIT ONLY (2026-08-07): 378/(9/24)^0.32 =
     # 517.4.  p/min/max deliberately untouched — the row's HELD adjudication
     # above is unchanged, this restores the depth it always claimed to ship.
-    "ideogram4": dict(base=517, n_ref=_N_REF, p=0.32, min=350, max=620),
+    #
+    # WEEK-9 (2026-08-18): base 517 -> 1250, max 620 -> 1650, CONDITIONAL ON
+    # do_cfg OFF (removed the same commit; forge/ideogram_release_policy.py
+    # WEEK9_DO_CFG_AMENDMENT).  The Aug-17 tournament drew three ideogram4
+    # tasks and we finished LAST on all three at 4.1x/7.4x/4.1x the field best
+    # — with the do_cfg recipe this row was calibrated around.  What Aug-17
+    # showed about depth (week9-ideogram4-lane REPORT §3):
+    #   * The row's HELD pre-commitment (above: "if ideogram4 is the R1 draw
+    #     and we lose, the correct next experiment is do_cfg on/off ... NOT
+    #     another depth change") is HONORED: do_cfg removal is the primary
+    #     change; this row only converts the freed clock (s/step halves) into
+    #     plan.
+    #   * The Jul-20 in-family anchor (5FNLSgh8, 378 steps, won at 0.0502) is
+    #     SUPERSEDED BY ITS OWN OPERATOR: their Aug-17 config plans 2000 with
+    #     a 200-step selection ladder, and 0.0502 IS the Aug-17 catastrophic
+    #     tail (rank 12/13 on 168078ad).  Anchor-loyalty now argues FOR depth.
+    #   * 1h-task ranks 1-9 shipped {1650,>700,>1500,?,600,?,>200,>700,800}
+    #     (oid-verified where stated; REPORT §3).  Geometric mean of the nine
+    #     with depth evidence = 923.6.  base=1250 plans ~1.2x ABOVE that GM
+    #     deliberately: the field's mechanism is deep-train + per-task
+    #     checkpoint selection (both published selectors shipped their local
+    #     argmin, swinging 400-1400 between same-hour tasks), selection can
+    #     only choose <= plan, and the two worst non-cfg finishers were
+    #     final-step ships at 1200 with NO selection.  Plan stays inside both
+    #     clock ceilings: 1.0h cap int((3312-480)/2.1) = 1348, 0.75h cap 954.
+    #   * max 620 -> 1650 = the deepest ship ever observed (5D7iEJm5 r1,
+    #     168078ad).  The new max first binds at n_train 58 (above the
+    #     observed 8-45 range) — anti-extrapolation only; at 1.0h the clock
+    #     cap 1348 binds first from n_train ~31.
+    #   * p/min UNTOUCHED: still no size signal in the field (depth is not the
+    #     placement variable among survivors — 5FjDsFGA shipped 100-200 steps
+    #     mid-field while we were last at 384-456; the catastrophe variable
+    #     was do_cfg).
+    #   * Emissions at the Aug-17 anchor shapes: n=16 @1.0h -> 1098 (law),
+    #     n=10 @0.75h -> 945 (law; cap 954).  vs 456/384 shipped on Aug-17 =
+    #     ~2.4x.  (The lane report wrote 944/1349 for the n=10 law and 1.0h
+    #     cap; recomputed under this file's int(round())/int() semantics they
+    #     are 945/1348 — CHANGES.md §3A records the discrepancy.)
+    # COUPLING, stated: without working checkpoint selection this plans the
+    # exact-final DEEPER than the field's verified winning ships (GM 923).
+    # The selection lane owns that risk; if selection cannot be trusted by
+    # Aug-24 the fallback is base ~900 (the GM), recorded in CHANGES.md §3A.
+    "ideogram4": dict(base=1250, n_ref=_N_REF, p=0.32, min=350, max=1650),
     # z-image — was base=1100 p=0.50 min=400 max=2000, then 930.  Cleanest
     # result in the audit: TWO DIFFERENT rank-1 operators with different recipes
     # imply the same law, and the agreement gets TIGHTER at the corrected
@@ -715,19 +757,24 @@ SEC_PER_IT = {
     # we actually shipped on Aug-3, and the fit below puts 1148 at rank ~10, the
     # same band the 1336 that SEC=1.5 would have produced.  The bet is bounded.
     "krea2": 1.35,
-    # ideogram4 3.0 -> 4.2.  NOTE THIS GOES UP, AND IT IS THE ONE PLACE THE TWO
-    # WEEK-6 AUDITS DISAGREE.  The field bound of 2.05 s/step was measured on
-    # field configs, which do NOT set `do_cfg`.  OUR config does:
-    # `forge.ideogram_release_policy` sets `do_cfg: true` + `cfg_scale: 10.0`,
-    # which runs the transformer at BATCH 2 every step (uncond not detached) and
-    # adds a second grad-enabled forward through the 8B Qwen3-VL text encoder
-    # (PIPELINE-MATERIALIZATION-AUDIT D6).  ~2x the field's per-step cost, so
-    # 2.05 * 2 ~= 4.2 is the honest constant FOR OUR PIPELINE.  This costs us
-    # nothing on the real shapes: on all three Aug-3 ideogram4 tasks the size law
-    # (414/614/589) still binds below the 4.2-based cap (477/674/674), so the
-    # materialised steps are identical to what a 2.1 constant would give — while
-    # preserving the kill-safety margin that a 2x-optimistic constant would burn.
-    "ideogram4": 4.2,
+    # ideogram4 3.0 -> 4.2 (week 6) -> 2.1 (WEEK-9).  The 4.2 was explicitly
+    # the do_cfg tax: `do_cfg: true` ran the transformer at BATCH 2 every step
+    # (uncond not detached) plus a second grad-enabled forward through the 8B
+    # Qwen3-VL text encoder (PIPELINE-MATERIALIZATION-AUDIT D6), so the field's
+    # 2.019 s/step bound (5FBmn1ax completed 1523 in 1.0 h) was doubled to
+    # 4.038 and padded to 4.2.  WEEK-9 REMOVES do_cfg from the recipe
+    # (forge/ideogram_release_policy.py WEEK9_DO_CFG_AMENDMENT) -> the batch-2
+    # multiplier disappears -> the honest constant is the field bound with the
+    # SAME ~4% pad: 2.019 * 1.04 ~= 2.1.  This constant is load-bearing now:
+    # the week-9 depth row plans INTO the clock at 1.0h/large-n (cap 1348
+    # binds), so the time model must reflect the halved step cost or clock
+    # caps would miscompute by 2x in both directions.  Consumers audited:
+    # size_scaled_steps cap, projected_wall_s, first_save_wall_s, and
+    # FIELD_DEMONSTRATED_DEPTH (its do_cfg-halved 761 entry restored to 1523
+    # in the same commit).  UNMEASURED ON OUR HOST without do_cfg — same
+    # epistemic status as z-image's 1.8, and flagged for the first no-cfg GPU
+    # run to verify.
+    "ideogram4": 2.1,
     # z-image 3.0 -> 1.8.  A field miner completed 2000 steps in a 1.0 h task
     # (=> <= 1.56 s/step); 1.8 is a 15% pad.  UNMEASURED ON OUR HOST — we have
     # never run z-image ourselves.  This is the least-verified reduction here.
@@ -849,8 +896,11 @@ FIELD_DEMONSTRATED_DEPTH = {
     # guard.  754 makes the flux plan land exactly on its own ceiling.
     "flux": (0.75, 754, "5FW2Eaae 241cda6c rank 1, 58 kohya epochs x n_train=13"),
     "krea2": (0.75, 1432, "5FBmn1ax + 5FjDsFGA 41025fb5, cfg 1432 shipped 1432"),
-    "ideogram4": (1.0, 761, "5FBmn1ax b72da8c6 cfg 1523 shipped 1523, HALVED "
-                            "for our do_cfg batch-2 step (2.019 -> 4.038 s/step)"),
+    # WEEK-9: 761 -> 1523.  The halving existed only because our config ran
+    # do_cfg (batch-2 forward, 2x s/step); do_cfg is removed this commit, so
+    # the field's demonstrated depth applies to our pipeline at face value.
+    "ideogram4": (1.0, 1523, "5FBmn1ax b72da8c6 cfg 1523 shipped 1523; "
+                             "week-9 un-halved — do_cfg removed, batch-1 step"),
     "z-image": (1.0, 2000, "5D2Qee4V b290d171, cfg 2000 shipped 2000"),
     "qwen-image": (1.25, 850, "5FW2Eaae + 5FpdSckw 7421f056, cfg 1150 both "
                               "killed with their last save at 850"),
@@ -973,17 +1023,36 @@ def first_save_wall_s(model_type, steps, save_every):
         return STARTUP_S
 
 
-def kill_safe_save_every(steps, template_save_every):
-    """Budget about four useful periodic candidates plus the exact final.
+# WEEK-9 (2026-08-18): FIXED per-type checkpoint cadence.
+#   ideogram4 200: week-9 ideogram4 lane REPORT §2.2/§4.1 — the Aug-17 field
+#                  ships save_every 100-200 ladders, and the two operators
+#                  with published selector output (5EACrayt/5FNLSgh8) shipped
+#                  their local argmin off a 200-step ladder on all six task
+#                  entries; our quarter-saves (114/228/342/456 on Aug-17) gave
+#                  selection nothing to choose from.  Template
+#                  max_step_saves_to_keep is 100 on both types, so the full
+#                  ladder is retained on disk.
+# Below 200 planned steps the adaptive kill-safe branch stands: a heavily
+# clock-capped run still needs a mid-run recovery point earlier than step 200.
+FIXED_SAVE_EVERY = {"ideogram4": 200}
+
+
+def kill_safe_save_every(steps, template_save_every, model_type=None):
+    """Budget periodic candidates plus the exact final.
 
     Saving is the only mid-run kill-safety, but each tournament save took tens of
-    seconds.  A fixed candidate budget is easier to reason about than ``steps//8``:
+    seconds.  Types with a FIXED_SAVE_EVERY entry get that fixed cadence whenever
+    the plan is at least one interval deep. Everything else keeps the adaptive rule:
     target four periodic saves and do not save more often than every 25 steps on
     short jobs.  The first ordinary candidate lands at about 20% of the planned
     run, while the very-short-run branch emits a recovery point near halfway.
+    ``model_type`` omitted -> adaptive rule, so existing callers are unchanged.
     """
     try:
         s = max(1, int(steps))
+        fixed = FIXED_SAVE_EVERY.get((model_type or "").strip().lower())
+        if fixed is not None and s >= int(fixed):
+            return int(fixed)
         template = max(1, int(template_save_every))
         if s < 25:
             # A heavily time-capped run still needs one mid-run recovery point;

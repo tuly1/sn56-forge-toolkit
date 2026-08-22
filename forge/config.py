@@ -111,7 +111,9 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
         try:
             p = cfg["config"]["process"][0]
             p["save"]["save_every"] = recipe.kill_safe_save_every(
-                p["train"]["steps"], p["save"].get("save_every", 250)
+                p["train"]["steps"],
+                p["save"].get("save_every", 250),
+                getattr(spec, "model_type", None),
             )
         except Exception:
             pass
@@ -148,8 +150,10 @@ def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:
         spec.model_type, num_images, hours_to_complete, template_steps
     )
     p["train"]["steps"] = steps
+    # Route only explicitly fixed model types to their field cadence; every
+    # other type retains the adaptive kill-safe rule.
     p["save"]["save_every"] = recipe.kill_safe_save_every(
-        steps, p["save"].get("save_every", 250)
+        steps, p["save"].get("save_every", 250), spec.model_type
     )
 
     _apply_eval_geometry(p, spec)

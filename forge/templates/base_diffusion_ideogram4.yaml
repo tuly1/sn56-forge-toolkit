@@ -51,6 +51,28 @@ config:
       optimizer: adamw8bit
       timestep_type: linear
       content_or_style: balanced
+      # WEEK-9 (2026-08-18): min_denoising_steps 250 ADDED — the Aug-17
+      # ideogram4 field's winning operators ship exactly this value
+      # (5D7iEJm5 rank-1, 5EACrayt, 5FNLSgh8, 5HKEAZxF publish
+      # `min_denoising_steps: 250`; week9-ideogram4-lane REPORT §2.2).
+      # TRACED at ai-toolkit pin 99be3d96 (consumption verified, not assumed):
+      # parsed toolkit/config_modules.py:369 (train.min_denoising_steps,
+      # default 0) -> BaseSDTrainProcess.py:1148 min_noise_steps -> balanced
+      # branch :1276-1293 (flowmatch: min_idx = min_noise_steps,
+      # randint(min_idx, max_idx)) -> :1297-1298 timesteps =
+      # noise_scheduler.timesteps[indices].  For timestep_type 'linear' the
+      # timestep array is torch.linspace(1000, 1) — DESCENDING
+      # (toolkit/samplers/custom_flowmatch_sampler.py:107-118) — so excluding
+      # indices 0-249 excludes t in (~750, 1000], the HIGHEST-noise band.
+      # WHY: the evaluator reconstructs at denoise 0.75 (G.O.D constants.py:31)
+      # and NEVER VISITS t > ~750; gradient spent there is spent on an
+      # unscored region (eval-band alignment).  Theory: SpeeD (CVPR 2025,
+      # arXiv:2405.17403) — near-T "convergence area" timesteps contribute
+      # little; suppressing them accelerates training ~3x.  Evidence:
+      # week9-research-scout REPORT §1 F1.1 (verdict THIS-WEEK, field value
+      # per type).  Effect: re-aims ~25% of the step budget into the scored
+      # band on BOTH scored terms.  Guarded by tests/test_week9_recipe_pins.py.
+      min_denoising_steps: 250
       optimizer_params:
         weight_decay: 0.0001
       unload_text_encoder: false
