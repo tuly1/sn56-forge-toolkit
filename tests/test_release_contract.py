@@ -134,6 +134,24 @@ _REPOS = {{
 '''
 
 
+def fiber_auth_body(*, validator_count: int = 2, signature_count: int = 1) -> str:
+    detail = (
+        [
+            {"type": "missing", "loc": ["header", "validator-hotkey"]}
+            for _ in range(validator_count)
+        ]
+        + [
+            {"type": "missing", "loc": ["header", "signature"]}
+            for _ in range(signature_count)
+        ]
+        + [
+            {"type": "missing", "loc": ["header", "miner-hotkey"]},
+            {"type": "missing", "loc": ["header", "nonce"]},
+        ]
+    )
+    return json.dumps({"detail": detail})
+
+
 def ready_receipt_for_manifest(manifest_path: Path, data: dict) -> dict:
     policy_raw = DOCKER_POLICY_PATH.read_bytes()
     return {
@@ -939,6 +957,60 @@ def test_hold_manifest_dry_run_succeeds_from_exact_rollback_pin(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "DRY RUN COMPLETE -- nothing was modified" in proc.stdout
     assert "NON-SHIPPABLE" in proc.stdout
+    assert endpoint.read_text(encoding="utf-8") == before
+
+
+def test_forward_dry_run_accepts_only_observed_validator_hotkey_duplicate(
+    isolated_release: tuple[Path, Path], tmp_path: Path
+):
+    remote, reviewed = isolated_release
+    mockroot = tmp_path / "host"
+    mockroot.mkdir()
+    endpoint = mockroot / "training_repo.py"
+    before = training_repo_source(ROLLBACK)
+    endpoint.write_text(before, encoding="utf-8")
+    (mockroot / "fiber-auth-body.json").write_text(
+        fiber_auth_body(),
+        encoding="utf-8",
+    )
+
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "exact Fiber auth-stage route" in proc.stdout
+    assert "DRY RUN COMPLETE -- nothing was modified" in proc.stdout
+    assert endpoint.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    ("validator_count", "signature_count"),
+    [(1, 1), (2, 2), (3, 1)],
+    ids=["obsolete-four", "wrong-header-duplicate", "too-many-validator-duplicates"],
+)
+def test_forward_dry_run_rejects_every_other_auth_header_multiset(
+    isolated_release: tuple[Path, Path],
+    tmp_path: Path,
+    validator_count: int,
+    signature_count: int,
+):
+    remote, reviewed = isolated_release
+    mockroot = tmp_path / "host"
+    mockroot.mkdir()
+    endpoint = mockroot / "training_repo.py"
+    before = training_repo_source(ROLLBACK)
+    endpoint.write_text(before, encoding="utf-8")
+    (mockroot / "fiber-auth-body.json").write_text(
+        fiber_auth_body(
+            validator_count=validator_count,
+            signature_count=signature_count,
+        ),
+        encoding="utf-8",
+    )
+
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+
+    assert proc.returncode == 5
+    assert "exact Fiber auth stage" in proc.stdout
     assert endpoint.read_text(encoding="utf-8") == before
 
 

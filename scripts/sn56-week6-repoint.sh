@@ -475,7 +475,7 @@ h_probe_exchange() { local host="$1" path="$2" code
     if [ -f "$MOCKROOT/fiber-auth-body.json" ]; then
       cat "$MOCKROOT/fiber-auth-body.json"
     else
-      printf '%s\n' '{"detail":[{"type":"missing","loc":["header","validator-hotkey"]},{"type":"missing","loc":["header","signature"]},{"type":"missing","loc":["header","miner-hotkey"]},{"type":"missing","loc":["header","nonce"]}]}'
+      printf '%s\n' '{"detail":[{"type":"missing","loc":["header","validator-hotkey"]},{"type":"missing","loc":["header","validator-hotkey"]},{"type":"missing","loc":["header","signature"]},{"type":"missing","loc":["header","miner-hotkey"]},{"type":"missing","loc":["header","nonce"]}]}'
     fi
   else
     ssh -o BatchMode=yes "$SSH_HOST" "body=\$(mktemp); code=\$(curl -sS -o \"\$body\" -w '%{http_code}' --max-time 10 'http://$host:$PORT$path' 2>/dev/null || printf 000); printf '%s\\n' \"\$code\"; cat \"\$body\"; rm -f \"\$body\""
@@ -557,6 +557,7 @@ mock_probe() {
 }
 
 cat > "$RUNDIR/verify_fiber_auth.py" <<'PYEOF'
+import collections
 import json
 import sys
 
@@ -573,10 +574,10 @@ except Exception as exc:
     raise SystemExit(1)
 detail = payload.get("detail") if isinstance(payload, dict) else None
 expected = {"validator-hotkey", "signature", "miner-hotkey", "nonce"}
-if not isinstance(detail, list) or len(detail) != len(expected):
-    print("BAD: Fiber validation detail must contain exactly four auth-header errors")
+if not isinstance(detail, list):
+    print("BAD: Fiber validation detail is not an array")
     raise SystemExit(1)
-seen = set()
+counts = collections.Counter()
 for item in detail:
     if not isinstance(item, dict) or item.get("type") != "missing":
         print(f"BAD: non-missing Fiber validation error: {item!r}")
@@ -586,11 +587,18 @@ for item in detail:
     if len(lowered) != 2 or lowered[0] != "header" or lowered[1] not in expected:
         print(f"BAD: unexpected Fiber validation location: {loc!r}")
         raise SystemExit(1)
-    seen.add(lowered[1])
-if seen != expected:
-    print(f"BAD: auth headers {sorted(seen)!r}, expected {sorted(expected)!r}")
+    counts[lowered[1]] += 1
+expected_once = collections.Counter({name: 1 for name in expected})
+observed_live = expected_once.copy()
+observed_live["validator-hotkey"] = 2
+if counts != observed_live:
+    print(
+        "BAD: auth-header multiset "
+        f"{dict(sorted(counts.items()))!r}, expected observed-live "
+        f"{dict(sorted(observed_live.items()))!r}"
+    )
     raise SystemExit(1)
-print("OK: exact Fiber auth-stage response")
+print(f"OK: exact Fiber auth-stage response {dict(sorted(counts.items()))}")
 PYEOF
 
 # ============================================================================

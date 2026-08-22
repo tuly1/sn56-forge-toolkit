@@ -45,19 +45,23 @@ def _manifest() -> dict:
 
 
 def _fiber_v27_body() -> str:
-    return json.dumps(
+    detail = [
         {
-            "detail": [
-                {
-                    "type": "missing",
-                    "loc": ["header", "validator-hotkey"],
-                    "msg": "Field required",
-                },
-                {"type": "missing", "loc": ["header", "signature"]},
-                {"type": "missing", "loc": ["header", "miner-hotkey"]},
-                {"type": "missing", "loc": ["header", "nonce"]},
-            ]
-        }
+            "type": "missing",
+            "loc": ["header", "validator-hotkey"],
+            "msg": "Field required",
+        },
+        {
+            "type": "missing",
+            "loc": ["header", "validator-hotkey"],
+            "msg": "Field required",
+        },
+        {"type": "missing", "loc": ["header", "signature"]},
+        {"type": "missing", "loc": ["header", "miner-hotkey"]},
+        {"type": "missing", "loc": ["header", "nonce"]},
+    ]
+    return json.dumps(
+        {"detail": detail}
     )
 
 
@@ -518,6 +522,52 @@ def test_enum_rejection_422_is_not_route_success(tmp_path: Path) -> None:
     assert result.returncode == 1, result.stdout + result.stderr
     assert _state(result.stdout, "endpoint.reachable") == "FAIL"
     assert "path/enum validation" in result.stdout
+
+
+def test_observed_duplicate_validator_hotkey_is_exact_route_success(
+    tmp_path: Path,
+) -> None:
+    manifest, fixtures, baseline = _green_case(tmp_path)
+    observed = _fiber_v27_body()
+    _write(fixtures / "endpoint.body", observed)
+    pin_evidence = _pin_evidence()
+    pin_evidence["loopback_body"] = observed
+    _write(fixtures / "endpoint_pin.out", json.dumps(pin_evidence))
+
+    result = _run_existing_case(manifest, fixtures, baseline)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _state(result.stdout, "endpoint.reachable") == "PASS"
+    assert _state(result.stdout, "endpoint.pin") == "PASS"
+    assert "validator-hotkey': 2" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["obsolete-four", "wrong-header-duplicate", "third-validator-hotkey"],
+)
+def test_only_observed_validator_hotkey_duplicate_is_tolerated(
+    tmp_path: Path, mutation: str
+) -> None:
+    manifest, fixtures, baseline = _green_case(tmp_path)
+    payload = json.loads(_fiber_v27_body())
+    if mutation == "obsolete-four":
+        payload["detail"].pop(0)
+    elif mutation == "wrong-header-duplicate":
+        payload["detail"].append(
+            {"type": "missing", "loc": ["header", "signature"]}
+        )
+    else:
+        payload["detail"].append(
+            {"type": "missing", "loc": ["header", "validator-hotkey"]}
+        )
+    _write(fixtures / "endpoint.body", json.dumps(payload))
+
+    result = _run_existing_case(manifest, fixtures, baseline)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert _state(result.stdout, "endpoint.reachable") == "FAIL"
+    assert "missing-header multiset differs" in result.stdout
 
 
 @pytest.mark.parametrize(

@@ -486,6 +486,7 @@ EP_CODE="$(_http_exchange endpoint "$EP_URL" "$EP_BODY_FILE")"
 EP_BODY="$(cat "$EP_BODY_FILE")"
 rm -f "$EP_BODY_FILE"
 EP_BODY_VERDICT="$(SN56_ENDPOINT_BODY="$EP_BODY" python3 - <<'PY'
+import collections
 import json
 import os
 
@@ -499,8 +500,7 @@ if not isinstance(detail, list) or not detail:
     print("BAD\tvalidation body has no non-empty detail array")
     raise SystemExit
 
-auth_header_errors = 0
-auth_headers_seen = set()
+auth_header_counts = collections.Counter()
 fiber_v27_headers = {"validator-hotkey", "signature", "miner-hotkey", "nonce"}
 for item in detail:
     if not isinstance(item, dict):
@@ -520,19 +520,22 @@ for item in detail:
     if header_name not in fiber_v27_headers or kind != "missing":
         print(f"BAD\tunexpected validation error outside missing auth headers: {loc!r} / {kind!r}")
         raise SystemExit
-    auth_header_errors += 1
-    auth_headers_seen.add(header_name)
+    auth_header_counts[header_name] += 1
 
-if auth_headers_seen != fiber_v27_headers or auth_header_errors != len(fiber_v27_headers):
-    missing = sorted(fiber_v27_headers - auth_headers_seen)
-    extra = sorted(auth_headers_seen - fiber_v27_headers)
+expected_once = collections.Counter({name: 1 for name in fiber_v27_headers})
+observed_live = expected_once.copy()
+observed_live["validator-hotkey"] = 2
+if auth_header_counts != observed_live:
     print(
-        "BAD\texact Fiber v2.7 missing-header contract differs "
-        f"(missing={missing}, extra={extra}, errors={auth_header_errors})"
+        "BAD\texact Fiber v2.7 missing-header multiset differs "
+        f"(got={dict(sorted(auth_header_counts.items()))}, "
+        f"want-observed-live={dict(sorted(observed_live.items()))})"
     )
 else:
-    names = ",".join(sorted(auth_headers_seen))
-    print(f"OK\t{auth_header_errors} missing auth-header error(s) [{names}], no path/enum error")
+    print(
+        f"OK\t{sum(auth_header_counts.values())} missing auth-header error(s) "
+        f"{dict(sorted(auth_header_counts.items()))}, no path/enum error"
+    )
 PY
 )"
 EP_BODY_STATE="${EP_BODY_VERDICT%%$'\t'*}"
@@ -797,15 +800,17 @@ if not isinstance(value.get("pyc_mtime_epoch"), (int, float)):
     wrong.append("pyc mtime is unreadable")
 
 def exact_fiber_v27_route(body):
+    import collections
+
     try:
         payload = json.loads(body)
     except Exception as exc:
         return f"loopback response is malformed JSON: {exc}"
     detail = payload.get("detail") if isinstance(payload, dict) else None
     expected_headers = {"validator-hotkey", "signature", "miner-hotkey", "nonce"}
-    if not isinstance(detail, list) or len(detail) != len(expected_headers):
-        return f"loopback detail has {len(detail) if isinstance(detail, list) else 'no'} errors (want 4)"
-    seen = set()
+    if not isinstance(detail, list):
+        return "loopback detail is not an array"
+    counts = collections.Counter()
     for item in detail:
         if not isinstance(item, dict) or item.get("type") != "missing":
             return f"loopback detail contains a non-missing error: {item!r}"
@@ -813,9 +818,15 @@ def exact_fiber_v27_route(body):
         lowered = [str(part).lower() for part in loc] if isinstance(loc, list) else []
         if len(lowered) != 2 or lowered[0] != "header" or lowered[1] not in expected_headers:
             return f"loopback detail has unexpected location: {loc!r}"
-        seen.add(lowered[1])
-    if seen != expected_headers:
-        return f"loopback auth headers={sorted(seen)!r} (want {sorted(expected_headers)!r})"
+        counts[lowered[1]] += 1
+    expected_once = collections.Counter({name: 1 for name in expected_headers})
+    observed_live = expected_once.copy()
+    observed_live["validator-hotkey"] = 2
+    if counts != observed_live:
+        return (
+            f"loopback auth-header multiset={dict(sorted(counts.items()))!r} "
+            f"(want observed-live {dict(sorted(observed_live.items()))!r})"
+        )
     return None
 
 loopback_problem = exact_fiber_v27_route(value.get("loopback_body", ""))

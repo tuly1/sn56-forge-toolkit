@@ -274,9 +274,11 @@ changing that baseline requires a new validator diff review.
 
 The off-host check separately performs an exact GET of
 `http://65.108.77.230:7999/training_repo/image`. Success is HTTP 422 with the
-Fiber v2.7 missing-header contract for exactly `validator-hotkey`, `signature`,
-`miner-hotkey`, and `nonce`. An enum/path 422, partial/extra header errors,
-malformed body, HTTP 400, or a different route fails.
+observed Fiber v2.7 missing-header multiset: `validator-hotkey` exactly twice,
+and `signature`, `miner-hotkey`, and `nonce` exactly once each. Every row must
+have type `missing` and a two-part `header` location. The obsolete four-row
+variant, an enum/path 422, any other partial/extra header error, malformed body,
+HTTP 400, or a different route fails.
 
 The host-side served-pin proof requires the systemd unit to report exact user
 `miner`, working directory `/home/miner/god`, and the manifest's exact
