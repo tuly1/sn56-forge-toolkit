@@ -171,6 +171,7 @@ RUN set -eu; \
     test ! -e /opt/sn56/legacy-aitoolkit-toolchain-lock.txt; \
     test ! -e /opt/sn56/legacy-os-package-inventory.txt; \
     test ! -e /opt/sn56/legacy-os-package-inventory.sha256; \
+    chmod 0644 /opt/sn56/image-runtime-lock.txt /opt/sn56/image-runtime-phase1-constraints.txt /opt/sn56/verify_image_runtime.py; \
     command -v timeout >/dev/null 2>&1 || { \
       echo "SN56_NETWORK_TIMEOUT unavailable=timeout command=apt-toolchain" >&2; \
       exit 127; \

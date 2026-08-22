@@ -583,6 +583,9 @@ def test_legacy_layer_consolidation_preserves_exact_runtime_paths() -> None:
     final_order = (
         "test -f /opt/sn56/image-runtime-lock.txt",
         "test ! -e /opt/sn56/legacy-aitoolkit-toolchain-lock.txt",
+        "chmod 0644 /opt/sn56/image-runtime-lock.txt "
+        "/opt/sn56/image-runtime-phase1-constraints.txt "
+        "/opt/sn56/verify_image_runtime.py",
         "SN56_NETWORK_TIMEOUT unavailable=timeout command=apt-toolchain",
         "timeout -k 30 60 apt-get",
         "timeout -k 30 150 apt-get",

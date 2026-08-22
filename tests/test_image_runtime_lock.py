@@ -204,12 +204,17 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
         "/opt/sn56/legacy-os-package-inventory.sha256",
     ):
         assert f"test ! -e {generated_output}" in final_stage
+    mode_normalization = final_stage.index(
+        "chmod 0644 /opt/sn56/image-runtime-lock.txt "
+        "/opt/sn56/image-runtime-phase1-constraints.txt "
+        "/opt/sn56/verify_image_runtime.py"
+    )
     apt_toolchain = final_stage.index(
         "SN56_NETWORK_TIMEOUT unavailable=timeout command=apt-toolchain"
     )
     assert "mv /opt/sn56/verify_image_runtime.py " in final_stage
     verifier_rename = final_stage.index("mv /opt/sn56/verify_image_runtime.py")
-    assert final_run < apt_toolchain < verifier_rename
+    assert final_run < mode_normalization < apt_toolchain < verifier_rename
     assert final_stage.count("retry_network()") == 1
     ai_toolkit_cwd = final_stage.index("cd /app/ai-toolkit")
     restored_app_cwd = final_stage.index("cd /app &&", ai_toolkit_cwd)
