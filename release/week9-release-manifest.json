@@ -2,9 +2,9 @@
   "schema_version": 1,
   "release_state": "hold",
   "target": {
-    "commit": "40b831a0a0d36cbed2f8e49905ba548768680be4",
-    "tree": "40f3a78a99f598d205edf76543ac792ccb7d28b1",
-    "tree_records_sha256": "14a2be335169db4fd954f60f323a7a21d460d53e4bc1f0224106279e880efc0c",
+    "commit": "0000000000000000000000000000000000000000",
+    "tree": "0000000000000000000000000000000000000000",
+    "tree_records_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "ref": "refs/heads/week9-rc"
   },
   "rollback": {
@@ -15,7 +15,7 @@
   },
   "source": {
     "repository_url": "https://github.com/tuly1/sn56-forge-toolkit.git",
-    "reviewed_worktree": "/Users/atulyashetty/Test/SN56-project/workspaces/worktrees/week9-flux-hazard-final-codex"
+    "reviewed_worktree": "/REQUIRED/FINAL/CLEAN/CANDIDATE/WORKTREE"
   },
   "dockerfiles": [
     {
@@ -29,161 +29,8 @@
   ],
   "allowed_changes": {
     "base_commit": "75a0a20c2deda82cfa727e082e60a95bea5befb3",
-    "name_status_sha256": "424e85fb4ce70ade6d5590ac2c3b9b3ec7c290fc904afd87d5a3ee44ffe16ade",
-    "entries": [
-      {
-        "status": "M",
-        "path": "forge/config.py"
-      },
-      {
-        "status": "A",
-        "path": "forge/evalgrid_constants.py"
-      },
-      {
-        "status": "A",
-        "path": "forge/evalgrid_snap.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/flux_kohya_config.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/ideogram_release_policy.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/recipe.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/tasks/aitoolkit.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/tasks/checkpoints.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/tasks/dispatch.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/tasks/flux_kohya.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/tasks/holdout.py"
-      },
-      {
-        "status": "A",
-        "path": "forge/tasks/reconstruction.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/telemetry.py"
-      },
-      {
-        "status": "M",
-        "path": "forge/templates/base_diffusion_ideogram4.yaml"
-      },
-      {
-        "status": "M",
-        "path": "forge/templates/base_diffusion_krea2.yaml"
-      },
-      {
-        "status": "M",
-        "path": "forge/templates/base_diffusion_zimage.yaml"
-      },
-      {
-        "status": "M",
-        "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile"
-      },
-      {
-        "status": "M",
-        "path": "ops/docker/standalone-image-trainer.dockerfile"
-      },
-      {
-        "status": "A",
-        "path": "tests/data/week9_flux_family/golden_week9rc_flux_aitoolkit_config.yaml"
-      },
-      {
-        "status": "A",
-        "path": "tests/data/week9_flux_family/phaseD-field.toml"
-      },
-      {
-        "status": "A",
-        "path": "tests/data/week9_flux_family/regen_golden.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_blank_prompt_training.py"
-      },
-      {
-        "status": "A",
-        "path": "tests/test_build_network_hazards.py"
-      },
-      {
-        "status": "A",
-        "path": "tests/test_evalgrid_snap.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_flux_kohya.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_holdout.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_ideogram_release_policy.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_image_runtime_lock.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_loss_and_ema_policy.py"
-      },
-      {
-        "status": "A",
-        "path": "tests/test_reconstruction.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_telemetry_safety.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_units.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_week6_depth_geometry.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_week6_ideogram_depth.py"
-      },
-      {
-        "status": "M",
-        "path": "tests/test_week6_ideogram_ema_horizon.py"
-      },
-      {
-        "status": "A",
-        "path": "tests/test_week9_flux_family.py"
-      },
-      {
-        "status": "A",
-        "path": "tests/test_week9_flux_hazards.py"
-      },
-      {
-        "status": "A",
-        "path": "tests/test_week9_recipe_pins.py"
-      }
-    ]
+    "name_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "entries": []
   },
   "production": {
     "ssh_host": "hetzner",

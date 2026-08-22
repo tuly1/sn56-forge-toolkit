@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -15,16 +16,19 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "scripts" / "sn56-release-contract.py"
 REPOINT_PATH = ROOT / "scripts" / "sn56-week6-repoint.sh"
+ROLLBACK_PATH = ROOT / "scripts" / "sn56-week6-rollback.sh"
+RUNBOOK_PATH = ROOT / "SUNDAY-RELEASE-RUNBOOK.md"
 MANIFEST_PATH = ROOT / "release" / "week9-release-manifest.json"
+SELECTED_MANIFEST_PATH = ROOT / "tests" / "data" / "week9-release-selected-hold.json"
 DOCKER_POLICY_PATH = ROOT / "release" / "week9-docker-policy.json"
 READINESS_PATH = ROOT / "release" / "week9-release-readiness.json"
 
-MANIFEST = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+MANIFEST = json.loads(SELECTED_MANIFEST_PATH.read_text(encoding="utf-8"))
 DOCKER_POLICY = json.loads(DOCKER_POLICY_PATH.read_text(encoding="utf-8"))
 TARGET = MANIFEST["target"]["commit"]
 TARGET_TREE = MANIFEST["target"]["tree"]
 DOCKER_CERTIFICATION_COMMIT = DOCKER_POLICY["certification_source"]["commit"]
-CED = "ced58e2e3db68f9ca094b4959de7e2f4a812c0ac"
+UNRELATED = "bd852dc0986b661983b70a8e2d225b6da0be971e"
 ROLLBACK = "75a0a20c2deda82cfa727e082e60a95bea5befb3"
 TEXT_PIN = "8f11684e30a556b305dec9dd8eec9794bdae8cde"
 
@@ -58,7 +62,7 @@ def contract():
 
 @pytest.fixture(scope="session")
 def manifest() -> dict:
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    return json.loads(SELECTED_MANIFEST_PATH.read_text(encoding="utf-8"))
 
 
 @pytest.fixture(scope="session")
@@ -186,6 +190,12 @@ def repoint_command(
     mockroot: Path,
     *extra: str,
 ) -> list[str]:
+    endpoint = mockroot / "training_repo.py"
+    pyc = mockroot / "__pycache__" / "training_repo.cpython-312.pyc"
+    if endpoint.exists() and not pyc.exists():
+        pins = __import__("re").findall(r"[0-9a-f]{40}", endpoint.read_text(encoding="utf-8"))
+        pyc.parent.mkdir(parents=True, exist_ok=True)
+        pyc.write_bytes(b"mock-pyc\0" + b"\0".join(pin.encode("ascii") for pin in pins))
     return [
         "bash",
         str(REPOINT_PATH),
@@ -205,7 +215,7 @@ def test_checked_in_safe_baseline_hold_contract_passes_with_exact_local_refs(
     contract, manifest: dict, isolated_release: tuple[Path, Path]
 ):
     remote, reviewed = isolated_release
-    receipt = validate(contract, MANIFEST_PATH, remote, reviewed)
+    receipt = validate(contract, SELECTED_MANIFEST_PATH, remote, reviewed)
 
     assert receipt["release_state"] == "hold"
     assert receipt["target"]["commit"] == TARGET
@@ -229,18 +239,100 @@ def test_checked_in_safe_baseline_hold_contract_passes_with_exact_local_refs(
     )
 
 
-def test_positional_ced_target_is_not_an_interface():
-    proc = run(["bash", REPOINT_PATH, CED, "--contract-only"], cwd=ROOT)
+def test_checked_in_manifest_is_an_explicit_unselected_hold(contract):
+    placeholder = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    contract.validate_schema(placeholder)
+    assert placeholder["release_state"] == "hold"
+    assert placeholder["target"] == contract.UNSELECTED_TARGET
+    with pytest.raises(contract.ContractError, match="final target is unselected"):
+        contract.validate_contract(MANIFEST_PATH)
+
+
+def test_unselected_target_cannot_be_flipped_ready(contract):
+    placeholder = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    placeholder["release_state"] = "ready"
+    with pytest.raises(contract.ContractError, match="unselected final target"):
+        contract.validate_schema(placeholder)
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="ssh-keygen unavailable")
+def test_ready_manifest_requires_exact_trusted_detached_signature(
+    contract, manifest: dict, tmp_path: Path
+):
+    ready = copy.deepcopy(manifest)
+    ready["release_state"] = "ready"
+    signed = write_manifest(tmp_path, ready, "final.json")
+    key = tmp_path / "release-key"
+    proc = run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key])
+    assert proc.returncode == 0, proc.stderr
+    allowed = tmp_path / "allowed-signers"
+    allowed.write_text(
+        f"{contract.SIGNING_PRINCIPAL} {key.with_suffix('.pub').read_text(encoding='utf-8').strip()}\n",
+        encoding="utf-8",
+    )
+    proc = run(
+        [
+            "ssh-keygen",
+            "-Y",
+            "sign",
+            "-f",
+            key,
+            "-n",
+            contract.SIGNING_NAMESPACE,
+            signed,
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    receipt = contract.verify_manifest_signature(
+        signed,
+        ready,
+        signed.read_bytes(),
+        mock=False,
+        allowed_signers_path=allowed,
+    )
+    assert receipt["state"] == "verified"
+    assert receipt["principal"] == contract.SIGNING_PRINCIPAL
+
+    tampered = copy.deepcopy(ready)
+    tampered["target"]["commit"] = UNRELATED
+    signed.write_text(json.dumps(tampered, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(contract.ContractError, match="signature verification failed"):
+        contract.verify_manifest_signature(
+            signed,
+            tampered,
+            signed.read_bytes(),
+            mock=False,
+            allowed_signers_path=allowed,
+        )
+
+
+def test_positional_target_is_not_an_interface():
+    proc = run(["bash", REPOINT_PATH, UNRELATED, "--contract-only"], cwd=ROOT)
     assert proc.returncode == 2
     assert "positional target SHAs are forbidden" in proc.stderr
 
 
-def test_mutating_manifest_target_to_ced_fails_exact_head_binding(
+def test_one_line_rollback_and_current_runbook_bind_exact_prestate():
+    wrapper = ROLLBACK_PATH.read_text(encoding="utf-8")
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    assert os.access(ROLLBACK_PATH, os.X_OK)
+    assert f'EXPECTED_ROLLBACK="{ROLLBACK}"' in wrapper
+    assert "084ea914c6c5cbac4fa26a2138bd7195ebd71488" not in wrapper
+    assert 'exec "$REPOINT" --manifest "$MANIFEST" --rollback "$@"' in wrapper
+    assert ROLLBACK in runbook
+    assert "ced58e2" not in runbook
+    assert "47261" in runbook and "preserve-forever" in runbook
+    assert "optional) delete" not in runbook.lower()
+    assert "orphan volume" not in runbook.lower()
+
+
+def test_mutating_manifest_target_fails_exact_head_binding(
     contract, manifest: dict, isolated_release: tuple[Path, Path], tmp_path: Path
 ):
     remote, reviewed = isolated_release
     changed = copy.deepcopy(manifest)
-    changed["target"]["commit"] = CED
+    changed["target"]["commit"] = UNRELATED
     path = write_manifest(tmp_path, changed)
 
     with pytest.raises(contract.ContractError, match="HEAD is .* expected"):
@@ -268,17 +360,17 @@ def test_index_flags_cannot_hide_arbitrary_tracked_mutations(
     assert git(reviewed, "status", "--porcelain=v1", "--untracked-files=all") == ""
 
     with pytest.raises(contract.ContractError, match="forbidden assume-unchanged/skip-worktree"):
-        validate(contract, MANIFEST_PATH, remote, reviewed)
+        validate(contract, SELECTED_MANIFEST_PATH, remote, reviewed)
 
 
 def test_stale_target_ref_fails_even_when_commit_object_exists(
     contract, manifest: dict, isolated_release: tuple[Path, Path]
 ):
     remote, reviewed = isolated_release
-    git(remote, "update-ref", manifest["target"]["ref"], CED)
+    git(remote, "update-ref", manifest["target"]["ref"], UNRELATED)
 
     with pytest.raises(contract.ContractError, match="anonymous remote refs differ"):
-        validate(contract, MANIFEST_PATH, remote, reviewed)
+        validate(contract, SELECTED_MANIFEST_PATH, remote, reviewed)
 
 
 def test_dirty_reviewed_worktree_fails_on_untracked_bytes(
@@ -288,7 +380,7 @@ def test_dirty_reviewed_worktree_fails_on_untracked_bytes(
     (reviewed / "unreviewed.txt").write_text("dirty\n", encoding="utf-8")
 
     with pytest.raises(contract.ContractError, match="reviewed worktree is dirty"):
-        validate(contract, MANIFEST_PATH, remote, reviewed)
+        validate(contract, SELECTED_MANIFEST_PATH, remote, reviewed)
 
 
 def test_wrong_rollback_rejected_even_if_manifest_fields_are_coordinated(
@@ -296,12 +388,12 @@ def test_wrong_rollback_rejected_even_if_manifest_fields_are_coordinated(
 ):
     changed = copy.deepcopy(manifest)
     changed["rollback"] = {
-        "commit": CED,
+        "commit": UNRELATED,
         "tree": "5a5c6cf0ef6a650f630b015d45a4d8b18c805e8d",
         "tree_records_sha256": "c9869a6ddce294f4501b23d7a3f05cc6743402bac228fd755779babb51b0fb7b",
         "ref": manifest["rollback"]["ref"],
     }
-    changed["allowed_changes"]["base_commit"] = CED
+    changed["allowed_changes"]["base_commit"] = UNRELATED
 
     with pytest.raises(contract.ContractError, match="exact production rollback"):
         contract.validate_schema(changed)
@@ -336,7 +428,7 @@ def test_hold_manifest_refuses_forward_mutation_before_host_access(
 ):
     remote, reviewed = isolated_release
     mockroot = tmp_path / "host-does-not-exist"
-    proc = run_repoint(MANIFEST_PATH, remote, reviewed, mockroot)
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot)
 
     assert proc.returncode == 5
     assert "release_state is 'hold', not 'ready'; mutation forbidden" in proc.stderr
@@ -443,7 +535,7 @@ def test_post_confirmation_contract_revalidation_rejects_late_source_drift(
             pytest.fail(f"repoint never reached initial-contract gate:\n{stdout}\n{stderr}")
 
         if drift == "target-ref":
-            git(remote, "update-ref", manifest["target"]["ref"], CED)
+            git(remote, "update-ref", manifest["target"]["ref"], UNRELATED)
         else:
             (reviewed / "late-unreviewed.txt").write_text("dirty\n", encoding="utf-8")
         gate.write_text("continue\n", encoding="utf-8")
@@ -531,7 +623,7 @@ def test_term_after_apply_runs_verified_armed_rollback(
     assert proc.returncode == 143, proc.stdout + proc.stderr
     assert "TERM received with forward rollback armed" in proc.stdout
     assert "SIGNAL RECOVERY COMPLETE" in proc.stdout
-    assert "probe 422 -- endpoint healthy on the ORIGINAL pin" in proc.stdout
+    assert "endpoint reaches exact Fiber auth stage on the ORIGINAL pin" in proc.stdout
     assert endpoint.read_text(encoding="utf-8") == before
     assert not list(mockroot.glob("evidence-*.json"))
 
@@ -657,7 +749,7 @@ def test_final_anonymous_ref_reproof_rolls_back_if_target_ref_moves(
             pytest.fail(f"repoint never reached final-contract gate:\n{stdout}\n{stderr}")
 
         assert TARGET in endpoint.read_text(encoding="utf-8")
-        git(remote, "update-ref", manifest["target"]["ref"], CED)
+        git(remote, "update-ref", manifest["target"]["ref"], UNRELATED)
         gate.write_text("continue\n", encoding="utf-8")
         stdout, stderr = proc.communicate(timeout=60)
     finally:
@@ -703,6 +795,36 @@ def test_manual_rollback_remains_available_offline_with_dirty_target_worktree(
     assert TARGET not in endpoint.read_text(encoding="utf-8")
 
 
+def test_manual_rollback_is_a_proven_noop_at_exact_source_and_pyc_prestate(
+    manifest: dict, isolated_release: tuple[Path, Path], tmp_path: Path
+):
+    _, reviewed = isolated_release
+    ready_manifest, readiness = write_ready_release(tmp_path, manifest)
+    mockroot = tmp_path / "host"
+    mockroot.mkdir()
+    endpoint = mockroot / "training_repo.py"
+    before = training_repo_source(ROLLBACK)
+    endpoint.write_text(before, encoding="utf-8")
+
+    proc = run_repoint(
+        ready_manifest,
+        tmp_path / "offline.git",
+        reviewed,
+        mockroot,
+        "--readiness-receipt",
+        str(readiness),
+        "--rollback",
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (
+        "active service, source, running bytecode, and Fiber route already serve the rollback pin"
+        in proc.stdout
+    )
+    assert endpoint.read_text(encoding="utf-8") == before
+    assert not list((mockroot / "backups").glob("*.bak"))
+
+
 def test_manual_rollback_rejects_unknown_served_pin_even_with_ready_identity(
     manifest: dict, isolated_release: tuple[Path, Path], tmp_path: Path
 ):
@@ -711,7 +833,7 @@ def test_manual_rollback_rejects_unknown_served_pin_even_with_ready_identity(
     mockroot = tmp_path / "host"
     mockroot.mkdir()
     endpoint = mockroot / "training_repo.py"
-    before = training_repo_source(CED)
+    before = training_repo_source(UNRELATED)
     endpoint.write_text(before, encoding="utf-8")
 
     proc = run_repoint(
@@ -739,7 +861,7 @@ def test_hold_manifest_dry_run_succeeds_from_exact_rollback_pin(
     before = training_repo_source(ROLLBACK)
     endpoint.write_text(before, encoding="utf-8")
 
-    proc = run_repoint(MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "DRY RUN COMPLETE -- nothing was modified" in proc.stdout
@@ -754,10 +876,10 @@ def test_forward_dry_run_rejects_wrong_served_pin(
     mockroot = tmp_path / "host"
     mockroot.mkdir()
     endpoint = mockroot / "training_repo.py"
-    before = training_repo_source(CED)
+    before = training_repo_source(UNRELATED)
     endpoint.write_text(before, encoding="utf-8")
 
-    proc = run_repoint(MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
 
     assert proc.returncode == 5
     assert "forward preflight requires the exact rollback pin" in proc.stdout
@@ -776,11 +898,107 @@ def test_forward_dry_run_rejects_wrong_live_image_repository_before_write(
     )
     endpoint.write_text(before, encoding="utf-8")
 
-    proc = run_repoint(MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
 
     assert proc.returncode == 5
     assert "IMAGE github_repo is" in proc.stdout
     assert "expected reviewed repository" in proc.stdout
+    assert endpoint.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    "service_identity",
+    [
+        "root\n/home/miner/god\n/home/miner/.venv/bin/uvicorn miner.asgi:app --host 0.0.0.0 --port 7999 --env-file /home/miner/god/.1.env --log-level info\n",
+        "miner\n/tmp/wrong-god\n/home/miner/.venv/bin/uvicorn miner.asgi:app --host 0.0.0.0 --port 7999 --env-file /home/miner/god/.1.env --log-level info\n",
+        "miner\n/home/miner/god\n/usr/bin/python /tmp/wrong-service.py\n",
+    ],
+    ids=["wrong-user", "wrong-working-directory", "wrong-exec-start"],
+)
+def test_forward_dry_run_rejects_wrong_live_service_identity(
+    isolated_release: tuple[Path, Path], tmp_path: Path, service_identity: str
+):
+    remote, reviewed = isolated_release
+    mockroot = tmp_path / "host"
+    mockroot.mkdir()
+    endpoint = mockroot / "training_repo.py"
+    before = training_repo_source(ROLLBACK)
+    endpoint.write_text(before, encoding="utf-8")
+    (mockroot / "service-contract.out").write_text(service_identity, encoding="utf-8")
+
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+
+    assert proc.returncode == 5
+    assert "exact service user/cwd/ExecStart" not in proc.stdout
+    assert endpoint.read_text(encoding="utf-8") == before
+
+
+def test_forward_dry_run_rejects_stale_running_pyc(
+    isolated_release: tuple[Path, Path], tmp_path: Path
+):
+    remote, reviewed = isolated_release
+    mockroot = tmp_path / "host"
+    endpoint = mockroot / "training_repo.py"
+    endpoint.parent.mkdir(parents=True)
+    before = training_repo_source(ROLLBACK)
+    endpoint.write_text(before, encoding="utf-8")
+    pyc = mockroot / "__pycache__" / "training_repo.cpython-312.pyc"
+    pyc.parent.mkdir()
+    pyc.write_bytes(b"stale-pyc-without-reviewed-pins")
+
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+
+    assert proc.returncode == 5
+    assert "running bytecode prestate differs" in proc.stdout
+    assert endpoint.read_text(encoding="utf-8") == before
+
+
+def test_forward_dry_run_rejects_wrong_fiber_auth_stage_body(
+    isolated_release: tuple[Path, Path], tmp_path: Path
+):
+    remote, reviewed = isolated_release
+    mockroot = tmp_path / "host"
+    mockroot.mkdir()
+    endpoint = mockroot / "training_repo.py"
+    before = training_repo_source(ROLLBACK)
+    endpoint.write_text(before, encoding="utf-8")
+    (mockroot / "fiber-auth-body.json").write_text(
+        json.dumps({"detail": [{"type": "enum", "loc": ["path", "task_type"]}]}),
+        encoding="utf-8",
+    )
+
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+
+    assert proc.returncode == 5
+    assert "exact Fiber auth stage" in proc.stdout
+    assert endpoint.read_text(encoding="utf-8") == before
+
+
+def test_forward_dry_run_rejects_environment_repo_entry(
+    isolated_release: tuple[Path, Path], tmp_path: Path
+):
+    remote, reviewed = isolated_release
+    mockroot = tmp_path / "host"
+    mockroot.mkdir()
+    before = training_repo_source(ROLLBACK)
+    before = before.replace(
+        '    TEXT = "text"\n',
+        '    TEXT = "text"\n    ENVIRONMENT = "environment"\n',
+    ).replace(
+        "\n}\n",
+        '\n    TournamentType.ENVIRONMENT: TrainingRepoResponse(\n'
+        '        github_repo="https://example.invalid/environment.git",\n'
+        f'        commit_hash="{UNRELATED}",\n'
+        "    ),\n}\n",
+        1,
+    )
+    endpoint = mockroot / "training_repo.py"
+    endpoint.write_text(before, encoding="utf-8")
+
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+
+    assert proc.returncode == 5
+    assert "ENVIRONMENT must remain absent" in proc.stdout
     assert endpoint.read_text(encoding="utf-8") == before
 
 
@@ -792,7 +1010,7 @@ def test_prepare_readiness_refuses_hold_manifest(tmp_path: Path):
             CONTRACT_PATH,
             "--prepare-readiness",
             "--manifest",
-            MANIFEST_PATH,
+            SELECTED_MANIFEST_PATH,
             "--output",
             output,
         ],
@@ -922,7 +1140,7 @@ def test_regeneration_cannot_derive_or_bless_changed_docker_hashes(
 
     with pytest.raises(contract.ContractError, match="hashes are immutable"):
         contract.regenerate_manifest(
-            MANIFEST_PATH,
+            SELECTED_MANIFEST_PATH,
             reviewed,
             tmp_path / "must-not-exist.json",
             coordinated_policy,
@@ -956,7 +1174,7 @@ def test_mock_overrides_are_rejected_without_explicit_mock(contract, isolated_re
     remote, reviewed = isolated_release
     with pytest.raises(contract.ContractError, match="require explicit --mock"):
         contract.validate_contract(
-            MANIFEST_PATH,
+            SELECTED_MANIFEST_PATH,
             repository_url=str(remote),
             reviewed_worktree=str(reviewed),
         )
@@ -981,7 +1199,7 @@ def test_anonymous_git_proof_drops_inherited_git_config_and_credentials(
     assert "GITHUB_TOKEN" not in anonymous_env
     assert "SSH_AUTH_SOCK" not in anonymous_env
 
-    receipt = validate(contract, MANIFEST_PATH, remote, reviewed)
+    receipt = validate(contract, SELECTED_MANIFEST_PATH, remote, reviewed)
     assert receipt["target"]["commit"] == TARGET
 
 
@@ -992,7 +1210,7 @@ def test_receipt_write_is_exclusive(isolated_release: tuple[Path, Path], tmp_pat
         sys.executable,
         CONTRACT_PATH,
         "--manifest",
-        MANIFEST_PATH,
+        SELECTED_MANIFEST_PATH,
         "--contract-only",
         "--mock",
         "--repository-url",

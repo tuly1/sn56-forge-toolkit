@@ -3,9 +3,11 @@
 
 The manifest is the reviewed target authority.  This program deliberately has
 no target-SHA override: changing the candidate means regenerating and reviewing
-a new HOLD manifest.  Live validation re-proves both pinned refs through a
-fresh, credential-free anonymous clone.  Local URL/ref/worktree overrides are
-test hooks and are accepted only together with ``--mock``.
+a new HOLD manifest.  A READY manifest also requires a detached OpenSSH
+signature by the fixed release principal.  Live validation re-proves both
+pinned refs through a fresh, credential-free anonymous clone.  Local
+URL/ref/worktree overrides are test hooks and are accepted only together with
+``--mock``.
 """
 
 from __future__ import annotations
@@ -30,6 +32,10 @@ SCHEMA_VERSION = 1
 DEFAULT_MANIFEST = Path(__file__).resolve().parent.parent / "release" / "week9-release-manifest.json"
 DEFAULT_DOCKER_POLICY = Path(__file__).resolve().parent.parent / "release" / "week9-docker-policy.json"
 DEFAULT_READINESS_RECEIPT = Path(__file__).resolve().parent.parent / "release" / "week9-release-readiness.json"
+DEFAULT_ALLOWED_SIGNERS = Path(__file__).resolve().parent.parent / "release" / "week9-release-allowed-signers"
+
+SIGNING_PRINCIPAL = "sn56-week9-release"
+SIGNING_NAMESPACE = "sn56-week9-final-manifest"
 
 EXPECTED_REPOSITORY_URL = "https://github.com/tuly1/sn56-forge-toolkit.git"
 EXPECTED_ROLLBACK = {
@@ -38,6 +44,14 @@ EXPECTED_ROLLBACK = {
     "tree_records_sha256": "b158fae4fcf155cf754ce8056df28ae0eae247dd7300f132f29de92fd47006ad",
     "ref": "refs/heads/claude/week8-mse-revert",
 }
+UNSELECTED_TARGET = {
+    "commit": "0" * 40,
+    "tree": "0" * 40,
+    "tree_records_sha256": "0" * 64,
+    "ref": "refs/heads/week9-rc",
+}
+UNSELECTED_WORKTREE = "/REQUIRED/FINAL/CLEAN/CANDIDATE/WORKTREE"
+EMPTY_NAME_STATUS_SHA256 = hashlib.sha256(b"").hexdigest()
 EXPECTED_DOCKER_PATHS = (
     "ops/docker/standalone-image-toolkit-trainer.dockerfile",
     "ops/docker/standalone-image-trainer.dockerfile",
@@ -154,6 +168,10 @@ def canonical_name_status(entries: list[dict[str, str]]) -> bytes:
     return "".join(f"{entry['status']}\t{entry['path']}\n" for entry in entries).encode("utf-8")
 
 
+def target_is_unselected(data: dict[str, Any]) -> bool:
+    return data.get("target") == UNSELECTED_TARGET
+
+
 def validate_schema(data: dict[str, Any]) -> None:
     _expect_keys(
         data,
@@ -214,8 +232,8 @@ def validate_schema(data: dict[str, Any]) -> None:
     _require_hex(allowed["name_status_sha256"], HEX64, "allowed_changes.name_status_sha256")
     if allowed["base_commit"] != data["rollback"]["commit"]:
         raise ContractError("allowed_changes.base_commit must equal rollback.commit")
-    if not isinstance(allowed["entries"], list) or not allowed["entries"]:
-        raise ContractError("allowed_changes.entries must be a non-empty list")
+    if not isinstance(allowed["entries"], list):
+        raise ContractError("allowed_changes.entries must be a list")
     paths: list[str] = []
     for index, entry in enumerate(allowed["entries"]):
         entry = _expect_keys(entry, {"status", "path"}, f"allowed_changes.entries[{index}]")
@@ -230,9 +248,20 @@ def validate_schema(data: dict[str, Any]) -> None:
             "allowed_changes entries do not hash to allowed_changes.name_status_sha256 "
             f"({embedded_digest} != {allowed['name_status_sha256']})"
         )
-    missing_docker = sorted(set(EXPECTED_DOCKER_PATHS) - set(paths))
-    if missing_docker:
-        raise ContractError(f"allowed production delta omits Dockerfiles: {missing_docker}")
+    unselected = target_is_unselected(data)
+    if unselected:
+        if data["release_state"] != "hold":
+            raise ContractError("unselected final target must remain release_state 'hold'")
+        if source["reviewed_worktree"] != UNSELECTED_WORKTREE:
+            raise ContractError("unselected final target must retain the explicit worktree placeholder")
+        if allowed["entries"] or allowed["name_status_sha256"] != EMPTY_NAME_STATUS_SHA256:
+            raise ContractError("unselected final target must retain the empty allowed-change placeholder")
+    else:
+        if not allowed["entries"]:
+            raise ContractError("selected target allowed_changes.entries must be non-empty")
+        missing_docker = sorted(set(EXPECTED_DOCKER_PATHS) - set(paths))
+        if missing_docker:
+            raise ContractError(f"allowed production delta omits Dockerfiles: {missing_docker}")
 
     production = _expect_keys(data["production"], EXPECTED_PRODUCTION, "production")
     if production != EXPECTED_PRODUCTION:
@@ -305,6 +334,100 @@ def verify_docker_policy(
         "policy_state": policy["policy_state"],
         "certification_source": copy.deepcopy(policy["certification_source"]),
         "dockerfiles": copy.deepcopy(policy["dockerfiles"]),
+    }
+
+
+def manifest_signature_path(manifest_path: Path) -> Path:
+    return Path(f"{manifest_path}.sig")
+
+
+def verify_manifest_signature(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    manifest_raw: bytes,
+    *,
+    mock: bool,
+    allowed_signers_path: Path = DEFAULT_ALLOWED_SIGNERS,
+) -> dict[str, Any]:
+    """Verify the detached authority for a READY final-target manifest.
+
+    HOLD manifests cannot mutate production and therefore do not need a
+    signature. Mock mode is explicitly non-live and retains local fixture
+    ergonomics; focused tests exercise the real ssh-keygen verifier directly.
+    """
+
+    if manifest["release_state"] != "ready":
+        return {"state": "not-required-hold"}
+    if mock:
+        return {"state": "mock-bypassed", "live_usable": False}
+    if target_is_unselected(manifest):
+        raise ContractError("final target is unselected; regenerate a selected HOLD manifest first")
+
+    allowed = allowed_signers_path.resolve()
+    signature = manifest_signature_path(manifest_path).resolve()
+    if allowed_signers_path.is_symlink() or manifest_signature_path(manifest_path).is_symlink():
+        raise ContractError("release signer policy and detached signature must not be symlinks")
+    try:
+        allowed_raw = allowed.read_bytes()
+        signature_raw = signature.read_bytes()
+    except OSError as exc:
+        raise ContractError(f"cannot read final-manifest signature authority: {exc}") from exc
+    try:
+        allowed_text = allowed_raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise ContractError(f"release signer policy is not valid UTF-8: {exc}") from exc
+    lines = [
+        line.split()
+        for line in allowed_text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if len(lines) != 1 or len(lines[0]) < 3 or lines[0][0] != SIGNING_PRINCIPAL:
+        raise ContractError(
+            "release signer policy must contain exactly one reviewed entry for "
+            f"principal {SIGNING_PRINCIPAL!r}"
+        )
+    ssh_keygen = shutil.which("ssh-keygen")
+    if ssh_keygen is None:
+        raise ContractError("ssh-keygen is required to verify the final-manifest signature")
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "LC_ALL": "C",
+        "LANG": "C",
+    }
+    try:
+        proc = subprocess.run(
+            [
+                ssh_keygen,
+                "-Y",
+                "verify",
+                "-f",
+                str(allowed),
+                "-I",
+                SIGNING_PRINCIPAL,
+                "-n",
+                SIGNING_NAMESPACE,
+                "-s",
+                str(signature),
+            ],
+            input=manifest_raw,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+    except OSError as exc:
+        raise ContractError(f"could not execute ssh-keygen signature verifier: {exc}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        raise ContractError(f"final-manifest signature verification failed: {detail}")
+    return {
+        "state": "verified",
+        "principal": SIGNING_PRINCIPAL,
+        "namespace": SIGNING_NAMESPACE,
+        "signature_path": str(signature),
+        "signature_sha256": hashlib.sha256(signature_raw).hexdigest(),
+        "allowed_signers_path": str(allowed),
+        "allowed_signers_sha256": hashlib.sha256(allowed_raw).hexdigest(),
     }
 
 
@@ -778,6 +901,16 @@ def validate_contract(
     manifest_path = manifest_path.resolve()
     manifest, raw = load_manifest(manifest_path)
     validate_schema(manifest)
+    if target_is_unselected(manifest):
+        raise ContractError(
+            "final target is unselected; regenerate a selected HOLD manifest before validation"
+        )
+    manifest_signature = verify_manifest_signature(
+        manifest_path,
+        manifest,
+        raw,
+        mock=mock,
+    )
     docker_policy = verify_docker_policy(manifest, docker_policy_path)
     effective = effective_inputs(
         manifest,
@@ -798,6 +931,7 @@ def validate_contract(
         "manifest_path": str(manifest_path),
         "manifest_sha256": hashlib.sha256(raw).hexdigest(),
         "release_state": manifest["release_state"],
+        "manifest_signature": manifest_signature,
         "mock": mock,
         "target": copy.deepcopy(manifest["target"]),
         "rollback": copy.deepcopy(manifest["rollback"]),
@@ -835,6 +969,16 @@ def validate_rollback_contract(
     manifest_path = manifest_path.resolve()
     manifest, raw = load_manifest(manifest_path)
     validate_schema(manifest)
+    if target_is_unselected(manifest):
+        raise ContractError(
+            "final target is unselected; no released target exists for rollback authority"
+        )
+    manifest_signature = verify_manifest_signature(
+        manifest_path,
+        manifest,
+        raw,
+        mock=mock,
+    )
     docker_policy = verify_docker_policy(manifest, docker_policy_path)
     receipt = {
         "schema_version": SCHEMA_VERSION,
@@ -845,6 +989,7 @@ def validate_rollback_contract(
         "manifest_path": str(manifest_path),
         "manifest_sha256": hashlib.sha256(raw).hexdigest(),
         "release_state": manifest["release_state"],
+        "manifest_signature": manifest_signature,
         "mock": mock,
         "target": copy.deepcopy(manifest["target"]),
         "rollback": copy.deepcopy(manifest["rollback"]),

@@ -134,31 +134,39 @@ try:
         die(f"cannot load contract validator {contract_path}")
     contract = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(contract)
-    manifest, raw = contract.load_manifest(Path(manifest_path))
-    contract.validate_schema(manifest)
-    docker_policy = contract.verify_docker_policy(manifest, Path(policy_path))
-    manifest_sha = hashlib.sha256(raw).hexdigest()
     readiness_sha = "mock-not-required"
     if mode == "live":
-        if manifest["release_state"] != "ready":
+        preliminary, _ = contract.load_manifest(Path(manifest_path))
+        contract.validate_schema(preliminary)
+        if preliminary["release_state"] != "ready":
             die("live probe requires release_state=ready and its independent readiness receipt")
-        binding = {
-            "manifest_sha256": manifest_sha,
-            "release_state": manifest["release_state"],
-            "target": copy.deepcopy(manifest["target"]),
-            "rollback": copy.deepcopy(manifest["rollback"]),
-            "allowed_changes": {
-                "base_commit": manifest["allowed_changes"]["base_commit"],
-                "name_status_sha256": manifest["allowed_changes"]["name_status_sha256"],
-                "count": len(manifest["allowed_changes"]["entries"]),
-            },
-            "dockerfiles": copy.deepcopy(manifest["dockerfiles"]),
-            "docker_policy": docker_policy,
+        validated = contract.validate_contract(
+            Path(manifest_path), docker_policy_path=Path(policy_path)
+        )
+        manifest = {
+            "release_state": validated["release_state"],
+            "target": validated["target"],
+            "rollback": validated["rollback"],
+            "source": validated["source"],
+            "production": validated["production"],
+            "allowed_changes": validated["allowed_changes"],
+            "dockerfiles": validated["dockerfiles"],
         }
+        docker_policy = validated["docker_policy"]
+        manifest_sha = validated["manifest_sha256"]
+        if validated["release_state"] != "ready":
+            die("live probe requires release_state=ready and its independent readiness receipt")
         readiness = contract._validate_readiness_against_contract(
-            Path(readiness_path), binding
+            Path(readiness_path), validated
         )
         readiness_sha = readiness["sha256"]
+    else:
+        manifest, raw = contract.load_manifest(Path(manifest_path))
+        contract.validate_schema(manifest)
+        if contract.target_is_unselected(manifest):
+            die("mock probe requires an explicit selected test manifest")
+        docker_policy = contract.verify_docker_policy(manifest, Path(policy_path))
+        manifest_sha = hashlib.sha256(raw).hexdigest()
 except SystemExit:
     raise
 except Exception as exc:
@@ -167,6 +175,7 @@ except Exception as exc:
 production = manifest["production"]
 values = [
     manifest["release_state"], manifest["target"]["commit"],
+    manifest["target"]["tree"], manifest["target"]["ref"],
     manifest["rollback"]["commit"], production["ssh_host"],
     production["service"], production["service_user"],
     production["service_working_directory"], production["service_exec_start"],
@@ -180,7 +189,8 @@ print("\t".join(values))
 PY
 )" || exit 2
 
-IFS=$'\t' read -r RELEASE_STATE IMAGE_COMMIT ROLLBACK_COMMIT SSH_ALIAS \
+IFS=$'\t' read -r RELEASE_STATE IMAGE_COMMIT TARGET_TREE TARGET_REF \
+  ROLLBACK_COMMIT SSH_ALIAS \
   MINER_UNIT MINER_USER MINER_WORKING_DIRECTORY MINER_EXEC_START \
   MINER_ASGI_MODULE ENDPOINT_HOST ENDPOINT_PORT ENDPOINT_ROUTE \
   ENDPOINT_PATH ENDPOINT_PYC TEXT_PIN_EXPECTED SOURCE_REPOSITORY_URL \
@@ -590,10 +600,14 @@ for node in tree.body:
 if len(repos)!=1 or not isinstance(repos[0],ast.Dict):
     raise SystemExit(3)
 entries={}
+repo_names=[]
 for key,value in zip(repos[0].keys,repos[0].values):
-    name=key.attr if isinstance(key,ast.Attribute) else None
+    if not (isinstance(key,ast.Attribute) and isinstance(key.value,ast.Name) and key.value.id==\"TournamentType\"):
+        raise SystemExit(4)
+    name=key.attr
+    repo_names.append(name)
     if name not in (\"IMAGE\",\"TEXT\"):
-        continue
+        raise SystemExit(4)
     if name in entries or not isinstance(value,ast.Call):
         raise SystemExit(4)
     fields={}
@@ -601,7 +615,7 @@ for key,value in zip(repos[0].keys,repos[0].values):
         if kw.arg in (\"commit_hash\",\"github_repo\") and isinstance(kw.value,ast.Constant) and isinstance(kw.value.value,str):
             fields[kw.arg]=kw.value.value
     entries[name]=fields
-if set(entries)!={\"IMAGE\",\"TEXT\"} or \"commit_hash\" not in entries[\"IMAGE\"] or \"commit_hash\" not in entries[\"TEXT\"]:
+if repo_names != [\"IMAGE\",\"TEXT\"] or set(entries)!={\"IMAGE\",\"TEXT\"} or \"commit_hash\" not in entries[\"IMAGE\"] or \"commit_hash\" not in entries[\"TEXT\"]:
     raise SystemExit(5)
 pyc=Path(pyc_path).read_bytes()
 enc=lambda value:value.encode(\"ascii\")
@@ -645,6 +659,7 @@ except Exception as exc:
 pid_after=command(\"systemctl\",\"show\",service,\"-p\",\"MainPID\",\"--value\")
 active_after=command(\"systemctl\",\"is-active\",service)
 print(json.dumps({
+    \"repo_keys\":repo_names,
     \"source_image_pin\":entries[\"IMAGE\"][\"commit_hash\"],
     \"source_image_repo\":entries[\"IMAGE\"].get(\"github_repo\"),
     \"source_text_pin\":entries[\"TEXT\"][\"commit_hash\"],
@@ -700,6 +715,7 @@ except Exception as exc:
     print(f"BAD\tendpoint source/pyc evidence unreadable: {exc}")
     raise SystemExit
 wanted = {
+    "repo_keys": ["IMAGE", "TEXT"],
     "source_image_pin": target,
     "source_text_pin": text_pin,
     "source_target_count": 1,
@@ -1045,10 +1061,10 @@ if [ -n "$JSON_OUT" ]; then
     printf '{\n  "generated_at_utc": "%s",\n' "$(python3 -c "import datetime,sys;print(datetime.datetime.fromtimestamp(int(sys.argv[1]),datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))" "$NOW_EPOCH")"
     python3 -c '
 import json,sys
-labels=("manifest","release_state","manifest_sha256","docker_policy_sha256","readiness_receipt_sha256","target_commit")
+labels=("manifest","release_state","manifest_sha256","docker_policy_sha256","readiness_receipt_sha256","target_commit","target_tree","target_ref","source_repository","service")
 for label,value in zip(labels,sys.argv[1:]):
     print("  " + json.dumps(label) + ": " + json.dumps(value) + ",")
-' "$MANIFEST" "$RELEASE_STATE" "$MANIFEST_SHA256" "$DOCKER_POLICY_SHA256" "$READINESS_SHA256" "$IMAGE_COMMIT"
+' "$MANIFEST" "$RELEASE_STATE" "$MANIFEST_SHA256" "$DOCKER_POLICY_SHA256" "$READINESS_SHA256" "$IMAGE_COMMIT" "$TARGET_TREE" "$TARGET_REF" "$SOURCE_REPOSITORY_URL" "$MINER_UNIT"
     printf '  "mode": "%s",\n  "next_tournament_start_utc": "%s",\n  "fails": %d,\n  "warns": %d,\n  "checks": [\n' \
       "$MODE" "${NEXT_START_ISO:-unknown}" "$FAILS" "$WARNS"
     for i in "${!RESULT_IDS[@]}"; do

@@ -12,20 +12,15 @@ worktree. At the start of each new shell, enter it once:
 cd /Users/atulyashetty/Test/SN56-project/workspaces/worktrees/week9-release-wiring-codex
 ```
 
-## Checked-in state: HOLD fallback target, not a release
+## Checked-in state: unselected HOLD, not a release
 
 The three reviewed release artifacts have separate jobs:
 
-- `release/week9-release-manifest.json` is the exact target, rollback, changed
-  surface, source, ref, and production contract. Its checked-in HOLD target is
-  the owner-approved T-24 fallback science target
-  `40b831a0a0d36cbed2f8e49905ba548768680be4`, tree
-  `40f3a78a99f598d205edf76543ac792ccb7d28b1`, tree-record SHA-256
-  `14a2be335169db4fd954f60f323a7a21d460d53e4bc1f0224106279e880efc0c`.
-  It is a direct child of certified RC
-  `bd852dc0986b661983b70a8e2d225b6da0be971e`. The direct-child containment
-  delta changes only `forge/tasks/flux_kohya.py` and its three test files; it
-  adds no Qwen, Krea, Ideogram, or Z science change. HOLD is not authorization.
+- `release/week9-release-manifest.json` is the final-target template. Its
+  all-zero commit/tree fields, empty changed surface, and explicit
+  `/REQUIRED/FINAL/...` worktree are sentinels, not Git identities. Contract,
+  probe, rollback, and mutation modes all fail closed while those sentinels
+  remain. No science winner or fallback candidate is guessed in tooling.
 - `release/week9-docker-policy.json` is the immutable Docker-byte policy. It is
   anchored to the audited `bd852dc` tree
   `49124005aba5c9fa810814bbcec0c7664726cedf` and the exact bytes below:
@@ -37,8 +32,8 @@ The three reviewed release artifacts have separate jobs:
 
   Its reviewed file SHA-256 is
   `476ae3c34458ac547607e98c587d7f631bbc60263db3e83f75401b9454dab129`.
-  Do not edit, regenerate, or reformat this policy for the `40b831a` fallback
-  or a later science candidate. `bd852dc` remains the Docker certification
+  Do not edit, regenerate, or reformat this policy for a science candidate.
+  `bd852dc` remains the Docker certification
   source. A candidate with either Dockerfile byte changed is ineligible for
   this release contract and needs a new, separately scoped certification.
 - `release/week9-release-readiness.json` is a separate HOLD review receipt. It
@@ -46,14 +41,20 @@ The three reviewed release artifacts have separate jobs:
   allowed-change digest/count, and both Docker identities. It must be derived
   again from the eventual canonical READY manifest and independently reviewed
   before its own state can become exactly `ready`.
+- `release/week9-release-allowed-signers` is the fixed trust root for the
+  detached `week9-release-manifest.json.sig`. It intentionally contains no key
+  in the checked-in HOLD state. Add exactly one independently reviewed OpenSSH
+  allowed-signers entry for principal `sn56-week9-release`; live validation
+  requires a good signature in namespace `sn56-week9-final-manifest`.
 
-Changing only the manifest's `release_state` never authorizes a release: the
+Changing only the manifest's `release_state` never authorizes a release: its
+detached signature is missing/invalid, and the
 checked-in readiness receipt remains HOLD and/or fails the exact raw-manifest
 binding. Changing only the readiness state also cannot bless a different
 manifest or policy. Live mutation and the live probe require both exact READY
 artifacts; the CPU mock tests deliberately exercise the checked-in HOLD fixture.
 
-The immutable rollback stays
+The required live prestate and immutable rollback both stay
 `75a0a20c2deda82cfa727e082e60a95bea5befb3`. The fixed live surface stays
 `hetzner`, `gradients-miner.service`, unit user `miner`, working directory
 `/home/miner/god`, and exact `ExecStart`:
@@ -66,34 +67,35 @@ The ASGI module stays `/home/miner/god/miner/asgi.py`; the listener stays
 `65.108.77.230:7999`; the exact route stays `/training_repo/image`; source stays
 `/home/miner/god/miner/endpoints/training_repo.py`, bytecode
 `/home/miner/god/miner/endpoints/__pycache__/training_repo.cpython-312.pyc`,
-and TEXT pin `8f11684e30a556b305dec9dd8eec9794bdae8cde`. None is a command-line override.
+and TEXT pin `8f11684e30a556b305dec9dd8eec9794bdae8cde`. The endpoint mapping must contain
+exactly IMAGE and TEXT; ENVIRONMENT remains absent. None is a command-line
+override.
+
+Release tooling never deletes provider resources or persistent volumes. In
+particular, Hyperstack volume `47261` is preserve-forever state and is outside
+every release, rollback, cleanup, and cost-saving command in this runbook.
 
 ## T-24 target decision and preparation
 
 The lane cutoff is **2026-08-23 13:00:00 UTC**, exactly T-24 relative to the
-planned tournament start. If every proposed science lane is fully certified by
-that cutoff, the owner may select one exact clean candidate for the normal
-review flow. If not, freeze the Qwen/Krea/Ideogram/Z lanes and use the checked-in
-`40b831a0a0d36cbed2f8e49905ba548768680be4` fallback. The fallback still needs
-its remaining containment smokes, independent READY receipt, and separate
-merge/push/deploy/repoint authorizations; the T-24 choice authorizes none of
-those actions.
+planned tournament start. Select only one independently supported, integrated,
+clean candidate through the normal review flow. If none exists, leave
+production on exact prestate `75a0a20...`; do not turn a historical RC or the
+all-zero sentinel into a guessed release target.
 
 If integration needs a merge, stop for separate merge authorization first.
 Merge authorization does not authorize a push, deploy, or repoint. Preparation
 below is local only and keeps every generated artifact non-shippable until an
 independent review decision.
 
-For any later fully certified science candidate, supply its exact clean
+For the final fully certified science candidate, supply its exact clean
 worktree as data to `--regenerate-from`. Do not edit a target SHA into the
 validator, repoint, or probe scripts, and do not make a candidate depend on a
 manifest that names the candidate itself. The release manifest is a separate
 control artifact; the generator reads candidate `HEAD` and emits a new HOLD
 manifest. This is the only preparation interface: no script SHA edits and no
-commit/manifest self-reference. The checked-in HOLD manifest already encodes
-the `40b831a` fallback; use regeneration only when supplying a different,
-fully certified candidate. The output paths must not exist; both generators
-are create-only.
+commit/manifest self-reference. The checked-in manifest is only the unselected
+template. The output paths must not exist; both generators are create-only.
 
 ```bash
 set -euo pipefail
@@ -115,7 +117,8 @@ python3 scripts/sn56-release-contract.py \
   --output "$SN56_HOLD_MANIFEST"
 ```
 
-The generator recomputes the exact target commit/tree/tree-record digest and
+The generator replaces every sentinel and recomputes the exact target
+commit/tree/tree-record digest and
 rollback-to-target name/status entries and digest. It requires the clean
 candidate's two Dockerfiles to match the immutable policy, preserves the exact
 rollback/ref and production literals, and always emits HOLD.
@@ -124,10 +127,30 @@ Independently inspect every generated field and every allowed-change entry.
 Install it at `release/week9-release-manifest.json` through the normal reviewed
 patch/commit workflow. Only after that review, change exactly
 `release_state: "hold"` to `"ready"`, preserving the manifest's indent and
-trailing newline, and review that final canonical diff. Any candidate or
-manifest-byte change after this point returns preparation to HOLD.
+trailing newline, and review that final canonical diff. Configure exactly one
+reviewed signer in `release/week9-release-allowed-signers`, then sign those exact
+manifest bytes:
 
-From that exact canonical READY manifest, derive a new HOLD readiness receipt:
+```bash
+SN56_RELEASE_SIGNING_KEY=/absolute/path/to/reviewed-release-signing-key
+ssh-keygen -Y sign \
+  -f "$SN56_RELEASE_SIGNING_KEY" \
+  -n sn56-week9-final-manifest \
+  "$SN56_MANIFEST"
+test -s "$SN56_MANIFEST.sig"
+ssh-keygen -Y verify \
+  -f release/week9-release-allowed-signers \
+  -I sn56-week9-release \
+  -n sn56-week9-final-manifest \
+  -s "$SN56_MANIFEST.sig" < "$SN56_MANIFEST"
+```
+
+The private key is never checked in, copied to production, or named in the
+manifest. Any candidate or manifest-byte change after signing invalidates the
+signature and returns preparation to HOLD.
+
+From that exact signed canonical READY manifest, derive a new HOLD readiness
+receipt:
 
 ```bash
 python3 scripts/sn56-release-contract.py \
@@ -146,28 +169,18 @@ diff. Do not edit any binding field. Commit the reviewed release-wiring files
 locally and require a clean worktree. That local commit still authorizes no
 push, merge, deploy, or production action.
 
-## Pending real-container GPU containment evidence
+## Candidate evidence remains external to tooling
 
-The `40b831a` containment delta still needs three real-container GPU smokes.
-They are pending and require separate authorization; the CPU suite does not
-stand in for them:
-
-1. Run the as-shipped happy Kohya path successfully in the real release
-   container on a GPU.
-2. Inject a failure after `Popen` while a live escaped descendant exists, and
-   prove the leader and descendant are reaped before any ai-toolkit fallback.
-3. Inject unverified shutdown and prove execution stops without starting
-   ai-toolkit and without leaving a surviving trainer process.
-
-Until all three artifacts are reviewed green, keep the fallback HOLD. A failed
-smoke is a stop signal, not permission to weaken containment or switch science
-lanes after T-24.
+The final target must already carry its own independently reviewed science,
+runtime, and any required real-container evidence before manifest generation.
+The release scripts verify identity and operational safety; they do not infer a
+winner, waive a failed gate, or turn CPU tests into GPU evidence.
 
 ## CPU-only verification
 
-Run the focused release suite after every release-artifact or tooling change
-(current result: **84 passed**), then the full suite (current result:
-**804 passed, 1 skipped**). These tests use the HOLD fixture and local mocks;
+Run the focused release suite after every release-artifact or tooling change.
+Record the fresh result rather than copying a historical count. These tests use
+an explicit selected HOLD fixture and local mocks;
 they do not need a GPU, provider, endpoint, service, or public network.
 
 ```bash
@@ -177,6 +190,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" \
   tests/test_release_contract.py tests/test_release_probe.py
 python3 -c 'p="scripts/sn56-release-contract.py"; compile(open(p, encoding="utf-8").read(), p, "exec")'
 bash -n scripts/sn56-week6-repoint.sh \
+  scripts/sn56-week6-rollback.sh \
   scripts/sn56-monday-probe.sh \
   scripts/sn56-preentry-probe-v2.sh
 git diff --check
@@ -212,7 +226,8 @@ bash scripts/sn56-week6-repoint.sh \
   --manifest "$SN56_MANIFEST" --dry-run
 ```
 
-The full contract re-proves a clean exact local HEAD/tree, the immutable Docker
+The full contract first verifies the exact manifest's detached signature, then
+re-proves a clean exact local HEAD/tree, the immutable Docker
 bytes, the exact target and rollback full refs from a fresh anonymous
 zero-credential clone, the exact allowed-change surface, and fixed production
 literals. Readiness must print `READINESS PASS`. The repoint dry-run additionally
@@ -226,10 +241,9 @@ contract may validate and dry-run with a
 
 ## Deadline, balance, and installed-state gates
 
-- At **2026-08-23 13:00:00 UTC (T-24)**, lock the target decision. Uncertified
-  science lanes freeze; the fallback path is exact `40b831a`. It remains
-  subject to its pending containment smokes and the complete READY/authorization
-  flow.
+- At **2026-08-23 13:00:00 UTC (T-24)**, lock the target decision. If no exact
+  candidate has complete independent support, keep production unchanged at
+  `75a0a20...`; there is no implicit fallback release.
 - Forward repoint has a hard abort at **2026-08-24 12:30:00 UTC**. The script
   checks the clock initially and again immediately before backup and before
   apply. At or after the cutoff it refuses before a forward edit. Do not use
@@ -240,18 +254,20 @@ contract may validate and dry-run with a
   gate differs, stop and review; do not waive it with this runbook.
 - `entry.balance` must PASS. This runbook authorizes neither a TAO transfer nor
   a registration action.
-- The loaded `com.sn56.monday-probe` LaunchAgent still points to the untracked
-  external wrapper
+- Any loaded `com.sn56.monday-probe` LaunchAgent points to an external wrapper
   `/Users/atulyashetty/Test/SN56-project/scripts/sn56-monday-probe.sh`, which is
-  stale at `ced58e2e3db68f9ca094b4959de7e2f4a812c0ac`. This isolated commit does
-  not install, repair, verify, or re-arm that LaunchAgent. Do not rely on it.
+  not established by this isolated commit as matching the signed final
+  manifest. This work does not install, repair, verify, or re-arm that
+  LaunchAgent. Do not rely on it.
   Installing it needs separate deploy authorization; until then, run the
   tracked probe manually at every checkpoint.
 
 ## What the live probe proves
 
-Live mode accepts only the exact canonical READY manifest, immutable Docker
-policy, and independently bound READY receipt. It uses the tracked
+Live mode accepts only the exact signed canonical READY manifest, immutable
+Docker policy, and independently bound READY receipt. It re-proves the exact
+target commit/tree/ref, repository, clean reviewed worktree, rollback, changed
+surface, and Docker bytes before endpoint I/O. It uses the tracked
 `scripts/sn56-upstream-baseline.env` pin
 `f7caab6cb2786f4210036b0675123d6ba9633e8f`; upstream drift is a failure, and
 changing that baseline requires a new validator diff review.
@@ -289,10 +305,9 @@ of a signed validator request.
 ## Bare Sunday sequence
 
 Begin only after the T-24 target is locked, with a clean local release-wiring
-commit containing its reviewed canonical READY manifest and READY readiness
-receipt. If the target is `40b831a`, its three real-container GPU containment
-smokes must already be reviewed green. The selected target must already be
-integrated and certified; there is no hidden Sunday merge or lane-switch step.
+commit containing its reviewed signed canonical READY manifest and READY
+readiness receipt. The selected target must already be integrated and
+certified; there is no hidden Sunday merge or lane-switch step.
 
 ```bash
 set -euo pipefail
@@ -302,6 +317,7 @@ SN56_READINESS=release/week9-release-readiness.json
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["release_state"])' "$SN56_MANIFEST")" = ready
 test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["readiness_state"])' "$SN56_READINESS")" = ready
+test -s "$SN56_MANIFEST.sig"
 test "$(shasum -a 256 "$SN56_POLICY" | awk '{print $1}')" = \
   476ae3c34458ac547607e98c587d7f631bbc60263db3e83f75401b9454dab129
 SN56_TARGET_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target"]["commit"])' "$SN56_MANIFEST")"
@@ -354,7 +370,7 @@ test "$(git -C "$SN56_REVIEWED_WORKTREE" rev-parse HEAD)" = "$SN56_TARGET_SHA"
 
    Unless a separately authorized LaunchAgent installation has been verified,
    repeat this exact manual command at 06:00 and 07:15 CDT (11:00 and 12:15
-   UTC) on 2026-08-24. Do not substitute the stale loaded wrapper.
+   UTC) on 2026-08-24. Do not substitute an unverified external wrapper.
 
 On any mismatch, stop. Do not improvise a SHA, ref, Docker hash, readiness
 receipt, upstream baseline, route, service, or served pin.
@@ -390,10 +406,16 @@ and then requires the host to serve either the exact released target or the
 exact rollback no-op state. An unknown served pin fails closed.
 
 ```bash
-bash scripts/sn56-week6-repoint.sh \
-  --manifest release/week9-release-manifest.json --rollback
+# Preferred one-line form:
+bash scripts/sn56-week6-rollback.sh
+
+# Equivalent explicit form (use one form, never both):
+# bash scripts/sn56-week6-repoint.sh \
+#   --manifest release/week9-release-manifest.json --rollback
 ```
 
-Rollback is a separate explicit operator decision, not pre-authorized here.
-The checked-in HOLD fallback target cannot run live rollback; production
-already rests on its exact rollback pin.
+The wrapper is the preferred one-line form and asserts exact rollback
+`75a0a20c2deda82cfa727e082e60a95bea5befb3` before delegating. Rollback is a
+separate explicit operator decision, not pre-authorized here. The checked-in
+unselected HOLD cannot run live rollback; production already rests on its exact
+rollback pin.

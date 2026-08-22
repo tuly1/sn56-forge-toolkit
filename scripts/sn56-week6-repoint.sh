@@ -290,12 +290,18 @@ d=json.load(open(sys.argv[1], encoding='utf-8'))
 values={
     'RELEASE_STATE': d['release_state'],
     'RELEASE_SHA': d['target']['commit'],
+    'RELEASE_TREE': d['target']['tree'],
+    'RELEASE_REF': d['target']['ref'],
     'TARGET_DIGEST': d['target']['tree_records_sha256'],
     'ROLLBACK_SHA': d['rollback']['commit'],
+    'ROLLBACK_REF': d['rollback']['ref'],
     'ROLLBACK_DIGEST': d['rollback']['tree_records_sha256'],
     'REPO_URL': d['source']['repository_url'],
     'SSH_HOST': d['production']['ssh_host'],
     'SERVICE': d['production']['service'],
+    'SERVICE_USER': d['production']['service_user'],
+    'SERVICE_WORKING_DIRECTORY': d['production']['service_working_directory'],
+    'SERVICE_EXEC_START': d['production']['service_exec_start'],
     'EXT_IP': d['production']['endpoint_host'],
     'PORT': str(d['production']['endpoint_port']),
     'ENDPOINT_ROUTE': d['production']['endpoint_route'],
@@ -309,6 +315,8 @@ values={
     'DOCKER_1_PATH': d['dockerfiles'][1]['path'],
     'DOCKER_1_SHA256': d['dockerfiles'][1]['sha256'],
     'DOCKER_POLICY_SHA256': d['docker_policy']['sha256'],
+    'MANIFEST_SIGNATURE_STATE': d['manifest_signature']['state'],
+    'MANIFEST_SIGNATURE_SHA256': d['manifest_signature'].get('signature_sha256', 'mock-or-hold'),
 }
 for key,value in values.items():
     print(f'{key}={shlex.quote(value)}')
@@ -446,10 +454,46 @@ h_listener()  { # pid bound to PORT, or empty
                 else ssh -o BatchMode=yes "$SSH_HOST" "ss -tlnp 2>/dev/null | awk '/:$PORT /{print}' | grep -o 'pid=[0-9]*' | cut -d= -f2 | head -1"; fi; }
 h_restart()   { if [ "$MOCK" = 1 ]; then mock_restart
                 else ssh -o BatchMode=yes "$SSH_HOST" "systemctl restart $SERVICE"; fi; }
-h_probe()     { local host="$1" path="$2"
-                if [ "$MOCK" = 1 ]; then mock_probe "$path"
-                else ssh -o BatchMode=yes "$SSH_HOST" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 'http://$host:$PORT$path'"; fi; }
-h_probe_local_mac() { curl -s -o /dev/null -w '%{http_code}' --max-time 12 "http://$EXT_IP:$PORT$1" 2>/dev/null; }
+h_service_identity() {
+  if [ "$MOCK" = 1 ]; then
+    if [ -f "$MOCKROOT/service-contract.out" ]; then
+      cat "$MOCKROOT/service-contract.out"
+    else
+      printf '%s\n%s\n%s\n' "$SERVICE_USER" "$SERVICE_WORKING_DIRECTORY" "$SERVICE_EXEC_START"
+    fi
+  else
+    ssh -o BatchMode=yes "$SSH_HOST" "printf '%s\\n%s\\n%s\\n' \"\$(systemctl show '$SERVICE' -p User --value)\" \"\$(systemctl show '$SERVICE' -p WorkingDirectory --value)\" \"\$(systemctl show '$SERVICE' -p ExecStart --value)\""
+  fi
+}
+h_probe_code() { local host="$1" path="$2"
+                 if [ "$MOCK" = 1 ]; then mock_probe "$path"
+                 else ssh -o BatchMode=yes "$SSH_HOST" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 'http://$host:$PORT$path'"; fi; }
+h_probe_exchange() { local host="$1" path="$2" code
+  if [ "$MOCK" = 1 ]; then
+    code="$(mock_probe "$path")"
+    printf '%s\n' "$code"
+    if [ -f "$MOCKROOT/fiber-auth-body.json" ]; then
+      cat "$MOCKROOT/fiber-auth-body.json"
+    else
+      printf '%s\n' '{"detail":[{"type":"missing","loc":["header","validator-hotkey"]},{"type":"missing","loc":["header","signature"]},{"type":"missing","loc":["header","miner-hotkey"]},{"type":"missing","loc":["header","nonce"]}]}'
+    fi
+  else
+    ssh -o BatchMode=yes "$SSH_HOST" "body=\$(mktemp); code=\$(curl -sS -o \"\$body\" -w '%{http_code}' --max-time 10 'http://$host:$PORT$path' 2>/dev/null || printf 000); printf '%s\\n' \"\$code\"; cat \"\$body\"; rm -f \"\$body\""
+  fi
+}
+h_probe_local_exchange() { local path="$1" body code
+  if [ "$MOCK" = 1 ]; then
+    h_probe_exchange "$EXT_IP" "$path"
+  else
+    body="$(mktemp "${TMPDIR:-/tmp}/sn56-repoint-body.XXXXXX")" || return 1
+    code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 12 "http://$EXT_IP:$PORT$path" 2>/dev/null || printf 000)"
+    printf '%s\n' "$code"
+    cat "$body"
+    rm -f "$body"
+  fi
+}
+h_auth_probe() { h_probe_exchange "$1" "$2" | python3 "$RUNDIR/verify_fiber_auth.py"; }
+h_auth_probe_local() { h_probe_local_exchange "$1" | python3 "$RUNDIR/verify_fiber_auth.py"; }
 h_sync_count() { # completed live metagraph syncs attributed to PID since EPOCH
   local pid="$1" since="$2"
   if [ "$MOCK" = 1 ]; then grep -F "uvicorn[$pid]" "$M_JOURNAL" 2>/dev/null | grep -c "Successfully synced" | tr -d ' '
@@ -500,8 +544,54 @@ mock_probe() {
   [ "$ACTIVE" = "active" ] || { echo 000; return; }
   # the probe fault only exists after our restart; the baseline probe is healthy
   if [ "${RESTARTS:-0}" -ge 1 ] && mock_engaged probe "${RESTARTS:-0}"; then echo 500; return; fi
-  case "$1" in /openapi.json) echo 200 ;; *) echo 422 ;; esac
+  case "$1" in
+    /openapi.json) echo 200 ;;
+    *)
+      if [ -f "$MOCKROOT/fiber-auth-code" ]; then
+        sed -n '1p' "$MOCKROOT/fiber-auth-code"
+      else
+        echo 422
+      fi
+      ;;
+  esac
 }
+
+cat > "$RUNDIR/verify_fiber_auth.py" <<'PYEOF'
+import json
+import sys
+
+raw = sys.stdin.buffer.read()
+code_raw, separator, body_raw = raw.partition(b"\n")
+code = code_raw.decode("ascii", "replace").strip()
+if not separator or code != "422":
+    print(f"BAD: HTTP {code or 'unreadable'}, expected 422")
+    raise SystemExit(1)
+try:
+    payload = json.loads(body_raw.decode("utf-8"))
+except Exception as exc:
+    print(f"BAD: malformed Fiber validation JSON: {exc}")
+    raise SystemExit(1)
+detail = payload.get("detail") if isinstance(payload, dict) else None
+expected = {"validator-hotkey", "signature", "miner-hotkey", "nonce"}
+if not isinstance(detail, list) or len(detail) != len(expected):
+    print("BAD: Fiber validation detail must contain exactly four auth-header errors")
+    raise SystemExit(1)
+seen = set()
+for item in detail:
+    if not isinstance(item, dict) or item.get("type") != "missing":
+        print(f"BAD: non-missing Fiber validation error: {item!r}")
+        raise SystemExit(1)
+    loc = item.get("loc")
+    lowered = [str(part).lower() for part in loc] if isinstance(loc, list) else []
+    if len(lowered) != 2 or lowered[0] != "header" or lowered[1] not in expected:
+        print(f"BAD: unexpected Fiber validation location: {loc!r}")
+        raise SystemExit(1)
+    seen.add(lowered[1])
+if seen != expected:
+    print(f"BAD: auth headers {sorted(seen)!r}, expected {sorted(expected)!r}")
+    raise SystemExit(1)
+print("OK: exact Fiber auth-stage response")
+PYEOF
 
 # ============================================================================
 # THE AST EDITOR (written out at runtime; piped to the host, never installed)
@@ -541,6 +631,18 @@ for node in tree.body:
         for t in node.targets:
             if isinstance(t, ast.Name) and t.id == "_REPOS": repos = node.value
 if not isinstance(repos, ast.Dict): die("_REPOS dict literal not found")
+
+repo_names = []
+for key in repos.keys:
+    if not (
+        isinstance(key, ast.Attribute)
+        and isinstance(key.value, ast.Name)
+        and key.value.id == "TournamentType"
+    ):
+        die("_REPOS contains a non-literal TournamentType key")
+    repo_names.append(key.attr)
+if repo_names != ["IMAGE", "TEXT"]:
+    die("_REPOS keys are %r, expected exactly ['IMAGE', 'TEXT']; ENVIRONMENT must remain absent" % repo_names)
 
 def entry(name):
     for k, v in zip(repos.keys, repos.values):
@@ -623,7 +725,14 @@ if i2.get("commit_hash") != new_sha: die("post-parse: IMAGE pin is %r" % i2.get(
 if x2.get("commit_hash") != text_pin: die("post-parse: TEXT pin changed!")
 if i2.get("github_repo") != img_repo: die("post-parse: IMAGE repo url changed!")
 if x2.get("github_repo") != txt_repo: die("post-parse: TEXT repo url changed!")
-if len(r2.keys) != len(repos.keys): die("post-parse: _REPOS entry count changed")
+repo_names2 = [
+    key.attr
+    for key in r2.keys
+    if isinstance(key, ast.Attribute)
+    and isinstance(key.value, ast.Name)
+    and key.value.id == "TournamentType"
+]
+if repo_names2 != ["IMAGE", "TEXT"]: die("post-parse: _REPOS keys changed or ENVIRONMENT appeared")
 
 result = {
     "ok": True, "check_only": check_only, "line": node.lineno,
@@ -709,6 +818,11 @@ fi
 ok "target tree-record digest $TARGET_DIGEST"
 ok "rollback tree-record digest $ROLLBACK_DIGEST"
 ok "rollback-to-target surface digest $ALLOWED_CHANGES_DIGEST"
+if [ "$MANIFEST_SIGNATURE_STATE" = "verified" ]; then
+  ok "detached final-manifest signature $MANIFEST_SIGNATURE_SHA256 is verified"
+else
+  warn "manifest signature state is $MANIFEST_SIGNATURE_STATE (live mutation cannot use this state)"
+fi
 if [ "$MODE" = "rollback" ]; then
   ok "target Docker identities are bound to the immutable bd852dc policy"
 else
@@ -731,6 +845,38 @@ else
   ok "ssh to $SSH_HOST"
 fi
 
+SERVICE_IDENTITY="$(h_service_identity)"
+SERVICE_VERDICT="$(SN56_SERVICE_IDENTITY="$SERVICE_IDENTITY" python3 - \
+  "$SERVICE_USER" "$SERVICE_WORKING_DIRECTORY" "$SERVICE_EXEC_START" <<'PY'
+import os
+import re
+import sys
+
+expected_user, expected_working_directory, expected_exec = sys.argv[1:]
+lines = os.environ.get("SN56_SERVICE_IDENTITY", "").splitlines()
+if len(lines) != 3:
+    print(f"BAD: service identity returned {len(lines)} fields, expected 3")
+    raise SystemExit
+actual_user, actual_working_directory, exec_show = lines
+match = re.search(r"(?:^|;\s*)argv\[\]=(.*?)\s*;", exec_show)
+actual_exec = match.group(1).strip() if match else exec_show
+problems = []
+if actual_user != expected_user:
+    problems.append(f"User={actual_user!r}, expected {expected_user!r}")
+if actual_working_directory != expected_working_directory:
+    problems.append(
+        f"WorkingDirectory={actual_working_directory!r}, expected {expected_working_directory!r}"
+    )
+if actual_exec != expected_exec:
+    problems.append(f"ExecStart argv={actual_exec!r}, expected {expected_exec!r}")
+print("BAD: " + "; ".join(problems) if problems else "OK: exact service user/cwd/ExecStart")
+PY
+)"
+case "$SERVICE_VERDICT" in
+  OK:*) ok "${SERVICE_VERDICT#OK: }" ;;
+  *) bad "$SERVICE_VERDICT"; exit 5 ;;
+esac
+
 PRE_SHA="$(h_file_sha)"; PRE_SIZE="$(h_file_size)"; PRE_META="$(h_file_meta)"
 log "  file sha256   : $PRE_SHA"
 log "  file size     : $PRE_SIZE bytes   owner/mode: $PRE_META"
@@ -752,6 +898,7 @@ log "  current IMAGE : $CUR_IMAGE"
 if [ "$CUR_TEXT" != "1" ]; then bad "expected the TEXT pin $TEXT_PIN_EXPECTED exactly once, found $CUR_TEXT"; exit 5; fi
 ok "TEXT tournament pin present exactly once (will not be touched)"
 
+ROLLBACK_NOOP=0
 if [ "$MODE" = "repoint" ]; then
   if [ "$CUR_IMAGE" != "$ROLLBACK_SHA" ]; then
     bad "forward preflight requires the exact rollback pin $ROLLBACK_SHA"
@@ -760,25 +907,42 @@ if [ "$MODE" = "repoint" ]; then
   fi
 else
   if [ "$CUR_IMAGE" = "$ROLLBACK_SHA" ]; then
-    ok "IMAGE pin is already the exact rollback $ROLLBACK_SHA -- nothing to do."
-    log ""; log "${C_G}NO-OP: the endpoint already serves the rollback pin.${C_0}"
-    exit 0
-  fi
-  if [ "$CUR_IMAGE" != "$RELEASE_SHA" ]; then
+    ROLLBACK_NOOP=1
+  elif [ "$CUR_IMAGE" != "$RELEASE_SHA" ]; then
     bad "rollback preflight expected served release $RELEASE_SHA"
     bad "served IMAGE pin is $CUR_IMAGE -- refusing an unknown starting state"
     exit 5
   fi
 fi
-ok "IMAGE pin will change: $CUR_IMAGE  ->  $TARGET_SHA"
+
+PYC_CURRENT="$(h_count_pyc "$CUR_IMAGE")"
+PYC_TEXT="$(h_count_pyc "$TEXT_PIN_EXPECTED")"
+PYC_OTHER_SHA="$RELEASE_SHA"
+[ "$CUR_IMAGE" = "$RELEASE_SHA" ] && PYC_OTHER_SHA="$ROLLBACK_SHA"
+PYC_OTHER="$(h_count_pyc "$PYC_OTHER_SHA")"
+if [ "$PYC_CURRENT" != "1" ] || [ "$PYC_TEXT" != "1" ] || [ "$PYC_OTHER" != "0" ]; then
+  bad "running bytecode prestate differs: current $CUR_IMAGE x$PYC_CURRENT, other $PYC_OTHER_SHA x$PYC_OTHER, TEXT x$PYC_TEXT"
+  exit 5
+fi
+ok "running bytecode matches source prestate: IMAGE x1, alternate pin x0, TEXT x1"
+if [ "$ROLLBACK_NOOP" = "1" ]; then
+  ok "IMAGE source and bytecode are already the exact rollback $ROLLBACK_SHA"
+else
+  ok "IMAGE pin will change: $CUR_IMAGE  ->  $TARGET_SHA"
+fi
 
 ACT0="$(h_active)"; PID0="$(h_mainpid)"; LSN0="$(h_listener)"
 log "  service       : $ACT0  MainPID=$PID0  listener_pid=${LSN0:-none}"
 [ "$ACT0" = "active" ] || { bad "$SERVICE is not active before we start ($ACT0) -- fix that first"; exit 5; }
 [ -n "$LSN0" ] || { bad "nothing is listening on :$PORT before we start"; exit 5; }
-P0="$(h_probe 127.0.0.1 "$ENDPOINT_ROUTE")"
-[ "$P0" = "422" ] || { bad "baseline probe returned $P0, expected 422"; exit 5; }
-ok "baseline: active, listening, probe 422"
+P0="$(h_auth_probe 127.0.0.1 "$ENDPOINT_ROUTE")" || {
+  bad "baseline route did not reach the exact Fiber auth stage: $P0"; exit 5;
+}
+ok "baseline: active, listening, exact Fiber auth-stage route"
+if [ "$ROLLBACK_NOOP" = "1" ]; then
+  log ""; log "${C_G}NO-OP: active service, source, running bytecode, and Fiber route already serve the rollback pin.${C_0}"
+  exit 0
+fi
 
 step "PREFLIGHT  dry-run the edit (no write)"
 CHECK_JSON="$(h_edit "$CUR_IMAGE" "$TARGET_SHA" "$PRE_SHA" --check)" || { bad "edit pre-check refused:"; log "      $CHECK_JSON"; exit 5; }
@@ -888,13 +1052,18 @@ do_rollback() {
   n="$(h_count_src "$TARGET_SHA")"; o="$(h_count_src "$CUR_IMAGE")"
   [ "$n" = "0" ] && [ "$o" = "1" ] || { bad "post-rollback source pins wrong (target x$n, original x$o)"; return 1; }
   ok "source serves the ORIGINAL pin $CUR_IMAGE again"
-  local pc; pc="$(h_count_pyc "$CUR_IMAGE")"
-  if [ "$pc" = "1" ]; then ok "compiled bytecode carries the original pin"
-  elif [ "$pc" = "NOPYC" ]; then warn "no .pyc yet (source is authoritative)"
-  else bad "compiled bytecode does NOT carry the original pin (count=$pc)"; return 1; fi
-  p="$(h_probe 127.0.0.1 "$ENDPOINT_ROUTE")"
-  [ "$p" = "422" ] || { bad "post-rollback probe returned $p"; return 1; }
-  ok "probe 422 -- endpoint healthy on the ORIGINAL pin"
+  local pc pc_target pc_text
+  pc="$(h_count_pyc "$CUR_IMAGE")"
+  pc_target="$(h_count_pyc "$TARGET_SHA")"
+  pc_text="$(h_count_pyc "$TEXT_PIN_EXPECTED")"
+  [ "$pc" = "1" ] && [ "$pc_target" = "0" ] && [ "$pc_text" = "1" ] || {
+    bad "post-rollback running bytecode differs (original x$pc, target x$pc_target, TEXT x$pc_text)"; return 1;
+  }
+  ok "compiled bytecode carries only the original IMAGE pin and unchanged TEXT pin"
+  p="$(h_auth_probe 127.0.0.1 "$ENDPOINT_ROUTE")" || {
+    bad "post-rollback route did not reach the exact Fiber auth stage: $p"; return 1;
+  }
+  ok "endpoint reaches exact Fiber auth stage on the ORIGINAL pin"
   ROLLED_BACK=1
   ROLLBACK_ARMED=0
   ROLLBACK_IN_PROGRESS=0
@@ -1017,18 +1186,18 @@ ok "listening on :$PORT (pid $LSN)"
 # ============================================================================
 # VERIFY
 # ============================================================================
-step "VERIFY  1/5  endpoint responds 422"
-V="$(h_probe 127.0.0.1 "$ENDPOINT_ROUTE")"; [ "$V" = "422" ] || die_rollback "loopback $ENDPOINT_ROUTE returned $V, expected 422"
-ok "127.0.0.1 $ENDPOINT_ROUTE -> 422"
-V="$(h_probe 127.0.0.1 /training_repo/text)";  [ "$V" = "422" ] || die_rollback "loopback /training_repo/text returned $V, expected 422"
-ok "127.0.0.1 /training_repo/text  -> 422"
-V="$(h_probe 127.0.0.1 /openapi.json)";        [ "$V" = "200" ] || die_rollback "/openapi.json returned $V, expected 200 (route table not built)"
+step "VERIFY  1/5  exact Fiber auth-stage routes"
+V="$(h_auth_probe 127.0.0.1 "$ENDPOINT_ROUTE")" || die_rollback "loopback $ENDPOINT_ROUTE failed exact Fiber auth-stage validation: $V"
+ok "127.0.0.1 $ENDPOINT_ROUTE -> exact Fiber auth stage"
+V="$(h_auth_probe 127.0.0.1 /training_repo/text)" || die_rollback "loopback /training_repo/text failed exact Fiber auth-stage validation: $V"
+ok "127.0.0.1 /training_repo/text -> exact Fiber auth stage"
+V="$(h_probe_code 127.0.0.1 /openapi.json)"; [ "$V" = "200" ] || die_rollback "/openapi.json returned $V, expected 200 (route table not built)"
 ok "127.0.0.1 /openapi.json -> 200 (router registered)"
 if [ "$MOCK" != "1" ] && [ "$SKIP_EXT_PROBE" != "1" ]; then
-  V="$(h_probe "$EXT_IP" "$ENDPOINT_ROUTE")"; [ "$V" = "422" ] || die_rollback "external $EXT_IP probe returned $V, expected 422"
-  ok "$EXT_IP:$PORT $ENDPOINT_ROUTE -> 422 (validator-facing path)"
-  V="$(h_probe_local_mac "$ENDPOINT_ROUTE")"
-  [ "$V" = "422" ] && ok "off-host probe from this workstation -> 422" || warn "off-host probe returned '$V' (local network/egress, not necessarily the miner)"
+  V="$(h_auth_probe "$EXT_IP" "$ENDPOINT_ROUTE")" || die_rollback "external $EXT_IP route failed exact Fiber auth-stage validation: $V"
+  ok "$EXT_IP:$PORT $ENDPOINT_ROUTE -> exact Fiber auth stage (validator-facing path)"
+  V="$(h_auth_probe_local "$ENDPOINT_ROUTE")" || die_rollback "off-host route failed exact Fiber auth-stage validation: $V"
+  ok "off-host probe from this workstation -> exact Fiber auth stage"
 fi
 
 step "VERIFY  2/5  new pin appears exactly once, old pin absent (source)"
@@ -1122,8 +1291,15 @@ cat > "$EV" <<JSON
     "manifest": "$MANIFEST",
     "manifest_sha256": "$MANIFEST_SHA256",
     "release_state": "$RELEASE_STATE",
+    "manifest_signature_state": "$MANIFEST_SIGNATURE_STATE",
+    "manifest_signature_sha256": "$MANIFEST_SIGNATURE_SHA256",
     "repo": "$REPO_URL",
+    "target_commit": "$RELEASE_SHA",
+    "target_tree": "$RELEASE_TREE",
+    "target_ref": "$RELEASE_REF",
     "target_tree_digest": "$TARGET_DIGEST",
+    "rollback_commit": "$ROLLBACK_SHA",
+    "rollback_ref": "$ROLLBACK_REF",
     "rollback_tree_digest": "$ROLLBACK_DIGEST",
     "allowed_changes_name_status_sha256": "$ALLOWED_CHANGES_DIGEST",
     "docker_policy_sha256": "$DOCKER_POLICY_SHA256",
@@ -1132,8 +1308,8 @@ cat > "$EV" <<JSON
       {"path": "$DOCKER_1_PATH", "sha256": "$DOCKER_1_SHA256"}
     ]
   },
-  "service": { "unit": "$SERVICE", "pid_before": "$PID0", "pid_after": "$NEWPID", "listener_pid": "$LSN" },
-  "verified": ["probe_422","openapi_200","new_pin_x1_source","old_pin_absent_source",
+  "service": { "unit": "$SERVICE", "user": "$SERVICE_USER", "working_directory": "$SERVICE_WORKING_DIRECTORY", "exec_start": "$SERVICE_EXEC_START", "pid_before": "$PID0", "pid_after": "$NEWPID", "listener_pid": "$LSN" },
+  "verified": ["fiber_auth_stage_body","openapi_200","no_environment_repo_entry","new_pin_x1_source","old_pin_absent_source",
                "new_pin_x1_bytecode","old_pin_absent_bytecode","text_pin_intact","live_metagraph_sync"],
   "rollback_command": "$0 --rollback"
 }

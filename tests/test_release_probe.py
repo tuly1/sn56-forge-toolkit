@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PROBE = ROOT / "scripts" / "sn56-preentry-probe-v2.sh"
 WRAPPER = ROOT / "scripts" / "sn56-monday-probe.sh"
 MANIFEST_PATH = ROOT / "release" / "week9-release-manifest.json"
-MANIFEST = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+SELECTED_MANIFEST_PATH = ROOT / "tests" / "data" / "week9-release-selected-hold.json"
+MANIFEST = json.loads(SELECTED_MANIFEST_PATH.read_text(encoding="utf-8"))
 TARGET = MANIFEST["target"]["commit"]
 ROLLBACK = MANIFEST["rollback"]["commit"]
 TEXT_PIN = "8f11684e30a556b305dec9dd8eec9794bdae8cde"
@@ -40,7 +41,7 @@ def _write(path: Path, value: str) -> None:
 
 
 def _manifest() -> dict:
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    return json.loads(SELECTED_MANIFEST_PATH.read_text(encoding="utf-8"))
 
 
 def _fiber_v27_body() -> str:
@@ -62,6 +63,7 @@ def _fiber_v27_body() -> str:
 
 def _pin_evidence() -> dict:
     return {
+        "repo_keys": ["IMAGE", "TEXT"],
         "source_image_pin": TARGET,
         "source_image_repo": "https://github.com/tuly1/sn56-forge-toolkit",
         "source_text_pin": TEXT_PIN,
@@ -357,7 +359,7 @@ def test_probe_reuses_the_full_fixed_release_schema(
     manifest, fixtures, baseline = _green_case(tmp_path)
     doc = json.loads(manifest.read_text(encoding="utf-8"))
     if mutation == "rollback":
-        doc["rollback"]["commit"] = "ced58e2e3db68f9ca094b4959de7e2f4a812c0ac"
+        doc["rollback"]["commit"] = "1" * 40
         doc["allowed_changes"]["base_commit"] = doc["rollback"]["commit"]
     elif mutation == "repository":
         doc["source"]["repository_url"] = "https://example.invalid/unreviewed.git"
@@ -415,6 +417,7 @@ def test_live_probe_rejects_mock_only_escape_hatches_before_io(
         {"listener_bound": False},
         {"process_start_epoch": 1_786_999_000.0},
         {"source_image_repo": "https://github.com/example/wrong-repo"},
+        {"repo_keys": ["IMAGE", "TEXT", "ENVIRONMENT"]},
         {"service_user": "root"},
         {"service_working_directory": "/tmp/alternate-god"},
         {"service_exec_argv": "/usr/bin/python /tmp/fake.py"},
@@ -451,6 +454,7 @@ def test_live_probe_rejects_mock_only_escape_hatches_before_io(
         "listener-not-owned-by-service",
         "process-predates-installed-source",
         "wrong-served-repository",
+        "environment-route-present",
         "wrong-service-user",
         "wrong-unit-working-directory",
         "wrong-unit-exec-start",
@@ -721,7 +725,7 @@ def test_wrapper_retries_the_same_private_manifest_snapshot(tmp_path: Path) -> N
             break
 
     swapped = _manifest()
-    swapped["target"]["commit"] = "ced58e2e3db68f9ca094b4959de7e2f4a812c0ac"
+    swapped["target"]["commit"] = "1" * 40
     manifest.write_text(json.dumps(swapped), encoding="utf-8")
     _write(fixtures / "chain_uid.out", "UID=224\n")
     stdout_tail, stderr = proc.communicate(timeout=15)
@@ -733,4 +737,4 @@ def test_wrapper_retries_the_same_private_manifest_snapshot(tmp_path: Path) -> N
     receipt = json.loads(result_files[0].read_text())
     assert receipt["target_commit"] == TARGET
     assert f"target {TARGET[:12]}" in stdout
-    assert "ced58e2" not in stdout
+    assert ("1" * 12) not in stdout

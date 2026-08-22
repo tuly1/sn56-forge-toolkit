@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "readiness_state": "hold",
-  "manifest_sha256": "59777e297ba4b35b06bac7a876326b522df084ac35579a83f593ca89fe546e71",
+  "manifest_sha256": "ca8fe770a1eacd89060f00cfb13ae6cf1b2fa4f11a5cec726d94cfb582f7ab58",
   "docker_policy_sha256": "476ae3c34458ac547607e98c587d7f631bbc60263db3e83f75401b9454dab129",
   "target": {
-    "commit": "40b831a0a0d36cbed2f8e49905ba548768680be4",
-    "tree": "40f3a78a99f598d205edf76543ac792ccb7d28b1",
-    "tree_records_sha256": "14a2be335169db4fd954f60f323a7a21d460d53e4bc1f0224106279e880efc0c",
+    "commit": "0000000000000000000000000000000000000000",
+    "tree": "0000000000000000000000000000000000000000",
+    "tree_records_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "ref": "refs/heads/week9-rc"
   },
   "rollback": {
@@ -17,8 +17,8 @@
   },
   "allowed_changes": {
     "base_commit": "75a0a20c2deda82cfa727e082e60a95bea5befb3",
-    "name_status_sha256": "424e85fb4ce70ade6d5590ac2c3b9b3ec7c290fc904afd87d5a3ee44ffe16ade",
-    "count": 38
+    "name_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "count": 0
   },
   "dockerfiles": [
     {
