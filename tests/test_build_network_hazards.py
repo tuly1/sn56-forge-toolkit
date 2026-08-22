@@ -109,6 +109,36 @@ BASE_PULL_S = 272
 # Pinned so the week-10 build-reduction work has a target.
 LEGACY_SINGLE_STALL_DEFICIT_S = 406
 LEGACY_COLD_BASELINE_DEFICIT_S = 43
+# Exact 2026-08-22 classic `--no-cache` timing evidence from the same
+# production-class builder.  The 1872.77 s baseline had a warm ai-toolkit base
+# and cold Kohya base; it is explicitly not an empty-store measurement.  The
+# first consolidated experiment (7bad549) used the normal store and finished in
+# 1521.23 s.  Neither is the required disposable empty-store release gate.
+LEGACY_WARM_AI_COLD_KOHYA_CLASSIC_NO_CACHE_S = 1872.77
+LEGACY_CONSOLIDATED_NORMAL_STORE_EXPERIMENT_S = 1521.23
+# Exact 6f0d0d1 disposable empty-store build: the hard release gate stopped it
+# while classic Docker was copying the final ai-toolkit Python tree. All base
+# pulls, network installs, and lock verifiers had already passed.
+LEGACY_EMPTY_STORE_6F0_GATE_S = 1680.03
+# The optimized 80aa841 gate reached the merged offline verifier before its
+# hard stop. Its tiny cross-stage /opt copy cost 111.895 s. The next empty-store
+# gate (329eaed) proved that direct context sourcing in the same post-transplant
+# position still cost 109.946 s: source choice recovered only 1.949 s. The
+# measured root grew from 29.2 GB to 43.3 GB across the runtime transplants, so
+# the next repair moves both context layers before that growth without changing
+# their bytes or final paths.
+LEGACY_EMPTY_STORE_80AA841_GATE_S = 1680.005
+LEGACY_CROSS_STAGE_OPT_COPY_S = 111.895
+LEGACY_EMPTY_STORE_329EAED_GATE_S = 1680.005
+LEGACY_POST_TRANSPLANT_CONTEXT_OPT_COPY_S = 109.946
+LEGACY_SOURCE_ONLY_RECOVERY_S = 1.949
+LEGACY_KOHYA_ROOT_BEFORE_TRANSPLANTS_GB = 29.2
+LEGACY_FINAL_ROOT_AFTER_TRANSPLANTS_GB = 43.3
+LEGACY_PIP_WHEEL_COPY_COMMITS_S = 112 + 20 + 19 + 19
+LEGACY_REMOVABLE_OPT_COPY_COMMITS_S = 19 + 19
+LEGACY_REDUNDANT_WORKDIR_COMMIT_S = 22
+LEGACY_STAGING_RUN_ALLOWANCE_S = 20
+LEGACY_REQUIRED_COLD_MARGIN_S = 120
 # No single attempt may occupy more than a third of the validator's window.
 MAX_PER_ATTEMPT_CAP_S = 600
 
@@ -423,6 +453,144 @@ def test_legacy_cold_estimate_is_hold_not_a_claimed_pass() -> None:
     assert cold_estimate == 1843
     assert cold_estimate - VALIDATOR_BUILD_TIMEOUT_S == LEGACY_COLD_BASELINE_DEFICIT_S
     assert cold_estimate > VALIDATOR_BUILD_TIMEOUT_S
+
+
+def test_legacy_layer_consolidation_has_a_measured_timing_rationale() -> None:
+    """The empty-store gate is justified, not replaced, by measured overhead."""
+    removed = (
+        LEGACY_PIP_WHEEL_COPY_COMMITS_S
+        + LEGACY_REMOVABLE_OPT_COPY_COMMITS_S
+        + LEGACY_REDUNDANT_WORKDIR_COMMIT_S
+    )
+    projected = (
+        LEGACY_WARM_AI_COLD_KOHYA_CLASSIC_NO_CACHE_S
+        - removed
+        + LEGACY_STAGING_RUN_ALLOWANCE_S
+    )
+    assert removed == 230
+    assert projected == pytest.approx(1662.77)
+    assert LEGACY_CONSOLIDATED_NORMAL_STORE_EXPERIMENT_S <= projected
+    assert (
+        VALIDATOR_BUILD_TIMEOUT_S - LEGACY_CONSOLIDATED_NORMAL_STORE_EXPERIMENT_S
+        >= LEGACY_REQUIRED_COLD_MARGIN_S
+    )
+    assert LEGACY_EMPTY_STORE_6F0_GATE_S > 1680
+    assert LEGACY_EMPTY_STORE_6F0_GATE_S < VALIDATOR_BUILD_TIMEOUT_S
+    assert LEGACY_EMPTY_STORE_80AA841_GATE_S > 1680
+    assert (
+        LEGACY_CROSS_STAGE_OPT_COPY_S - LEGACY_POST_TRANSPLANT_CONTEXT_OPT_COPY_S
+        == pytest.approx(LEGACY_SOURCE_ONLY_RECOVERY_S)
+    )
+    assert LEGACY_SOURCE_ONLY_RECOVERY_S < 2
+    assert LEGACY_EMPTY_STORE_329EAED_GATE_S > 1680
+    assert (
+        LEGACY_FINAL_ROOT_AFTER_TRANSPLANTS_GB
+        - LEGACY_KOHYA_ROOT_BEFORE_TRANSPLANTS_GB
+        == pytest.approx(14.1)
+    )
+
+
+def test_legacy_layer_consolidation_preserves_exact_runtime_paths() -> None:
+    text = _read("legacy")
+    required_pairs = (
+        ("pip", "pip"),
+        ("pip-22.0.2.dist-info", "pip-22.0.2.dist-info"),
+        ("wheel", "wheel"),
+        ("wheel-0.37.1.egg-info", "wheel-0.37.1.egg-info"),
+    )
+    assert "site=/usr/local/lib/python3.10/dist-packages" in text
+    for source, target in required_pairs:
+        assert f'test ! -e "$site/{target}"' in text
+        assert (
+            f"cp -a /usr/lib/python3/dist-packages/{source} "
+            f'"$site/{target}"'
+        ) in text
+        assert (
+            "COPY --from=aitoolkit-runtime "
+            f"/usr/lib/python3/dist-packages/{source}/"
+        ) not in text
+    phase3 = next(
+        layer
+        for layer in _run_instructions(text)
+        if "--requirement /opt/sn56/image-runtime-lock.txt" in layer
+    )
+    assert "python3 /opt/sn56/verify-image-runtime.py" in phase3
+    for source, target in required_pairs:
+        assert (
+            f"cp -a /usr/lib/python3/dist-packages/{source} "
+            f'\"$site/{target}\"'
+        ) in phase3
+    assert text.count("COPY --from=aitoolkit-runtime") == 2
+    first_stage = text.split(
+        "FROM diagonalge/kohya_latest:latest@sha256:", maxsplit=1
+    )[0]
+    assert first_stage.count("\nCOPY ") == 1
+    assert first_stage.count("\nRUN ") == 1
+    assert "\nWORKDIR " not in first_stage
+    assert (
+        "COPY ops/docker/image-runtime-lock.txt \\\n"
+        "    ops/docker/image-runtime-phase1-constraints.txt \\\n"
+        "    ops/docker/verify_image_runtime.py \\\n"
+        "    /opt/sn56/"
+    ) in first_stage
+    ordered = (
+        "python3 /opt/sn56/verify-image-runtime.py",
+        "--files-only",
+        "retry_network 60 150 3 git fetch",
+        "--requirement requirements.txt",
+        "torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0",
+        "torchcodec==0.2.1 pyyaml Pillow numpy safetensors",
+        "--requirement /opt/sn56/image-runtime-lock.txt",
+        "cp -a /usr/lib/python3/dist-packages/pip",
+        'test "$(git rev-parse HEAD)"',
+    )
+    first_stage_run = _run_instructions(first_stage)[0]
+    offsets = [first_stage_run.index(token) for token in ordered]
+    lock_offset = offsets[-3]
+    locked_verify_offset = first_stage_run.index(
+        "python3 /opt/sn56/verify-image-runtime.py", lock_offset
+    )
+    offsets.insert(-2, locked_verify_offset)
+    assert offsets == sorted(offsets)
+    final_stage = text.split(
+        "FROM diagonalge/kohya_latest:latest@sha256:", maxsplit=1
+    )[1]
+    assert (
+        "COPY ops/docker/image-runtime-lock.txt \\\n"
+        "    ops/docker/image-runtime-phase1-constraints.txt \\\n"
+        "    ops/docker/verify_image_runtime.py \\\n"
+        "    /opt/sn56/"
+    ) in final_stage
+    assert "\nWORKDIR " not in final_stage
+    assert final_stage.count("\nRUN ") == 2
+    opt_copy = final_stage.index("COPY ops/docker/image-runtime-lock.txt")
+    forge_copy = final_stage.index("COPY forge/ /app/forge/")
+    source_copy = final_stage.index(
+        "COPY --from=aitoolkit-runtime /app/ai-toolkit/ /app/ai-toolkit/"
+    )
+    python_copy = final_stage.index(
+        "COPY --from=aitoolkit-runtime "
+        "/usr/local/lib/python3.10/dist-packages/ "
+        "/opt/sn56/ai-toolkit-python/"
+    )
+    assert opt_copy < forge_copy < source_copy < python_copy
+    final_verifier = next(
+        layer
+        for layer in _run_instructions(final_stage)
+        if "python3 -m forge.flux_kohya_tokenizers stage" in layer
+    )
+    final_order = (
+        "mv /opt/sn56/verify_image_runtime.py",
+        "python3 /opt/sn56/verify-image-runtime.py",
+        "sha256sum --check --strict",
+        "assert torch.__version__ == '2.1.2+cu121'",
+        "retry_network 90 120 2 env",
+        "python3 -m forge.flux_kohya_tokenizers stage",
+        "python3 -m forge.flux_kohya_tokenizers verify",
+        "python3 -m forge.verify_flux_kohya_runtime",
+    )
+    final_offsets = [final_verifier.index(token) for token in final_order]
+    assert final_offsets == sorted(final_offsets)
 
 
 def test_toolkit_absorbs_one_stalled_step_inside_the_validator_window() -> None:

@@ -222,6 +222,9 @@ def test_active_recipe_matches_the_scored_production_projection(
     train = process["train"]
     assert process["training_seed"] == 20260802
     assert process["datasets"][0]["cache_latents_to_disk"] is True
+    # Directly bind the emitted trainer config, not only the recipe/template
+    # source: the selected Ideogram lane demonstrated this exact floor.
+    assert train["min_denoising_steps"] == 250
     assert {
         key: train.get(key)
         for key in (

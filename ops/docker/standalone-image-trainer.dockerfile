@@ -5,15 +5,11 @@
 
 FROM diagonalge/ai-toolkit:latest@sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8 AS aitoolkit-runtime
 
-COPY ops/docker/image-runtime-lock.txt /opt/sn56/image-runtime-lock.txt
-COPY ops/docker/image-runtime-phase1-constraints.txt /opt/sn56/image-runtime-phase1-constraints.txt
-COPY ops/docker/verify_image_runtime.py /opt/sn56/verify-image-runtime.py
-RUN python3 /opt/sn56/verify-image-runtime.py \
-        --lock /opt/sn56/image-runtime-lock.txt \
-        --constraints /opt/sn56/image-runtime-phase1-constraints.txt \
-        --files-only
+COPY ops/docker/image-runtime-lock.txt \
+    ops/docker/image-runtime-phase1-constraints.txt \
+    ops/docker/verify_image_runtime.py \
+    /opt/sn56/
 
-WORKDIR /app/ai-toolkit
 # Reproduce the same pinned two-phase runtime used by the toolkit-named image.
 # WEEK-9 HAZARD-1 (evidence/week9-hazards-20260819/CHANGES.md + ADDENDUM).
 # retry_network <per-attempt seconds> <total budget seconds> <max attempts>.
@@ -26,7 +22,23 @@ WORKDIR /app/ai-toolkit
 # trainer/constants.py:41 DOCKER_BUILD_TIMEOUT_MINUTES = 30, no retry on a
 # failed build) -- NOT against what a slow link would like: above that wall a
 # slow-but-working build is a DNF too, so a large cap only spends the window.
-RUN export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
+# Classic Docker spent 170 s committing four separate Ubuntu pip/wheel COPY
+# layers after the site-packages transplant.  After the phase-3 verifier passes,
+# fold those exact absent destinations into that already-required tree so the
+# final stage commits it once.  The final verifier checks the merged result.
+# The empty-store 6f0d0d1 measurement also proved that classic intermediate
+# commits, not the commands, consume the remaining wall.  Keep the ordered
+# install/verify sequence and every cap in one layer so no partial runtime is
+# snapshotted between phases.
+RUN set -eu; \
+    test ! -e /opt/sn56/verify-image-runtime.py; \
+    mv /opt/sn56/verify_image_runtime.py /opt/sn56/verify-image-runtime.py; \
+    python3 /opt/sn56/verify-image-runtime.py \
+        --lock /opt/sn56/image-runtime-lock.txt \
+        --constraints /opt/sn56/image-runtime-phase1-constraints.txt \
+        --files-only; \
+    cd /app/ai-toolkit; \
+    export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
     retry_network() { \
         attempt_timeout_s=$1; \
         attempt_budget_s=$2; \
@@ -61,98 +73,26 @@ RUN export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
         --requirement requirements.txt && \
     retry_network 90 200 3 pip install --no-cache-dir \
         torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-        --index-url https://download.pytorch.org/whl/cu124
-
-# WEEK-9 HAZARD-1 (evidence/week9-hazards-20260819/CHANGES.md + ADDENDUM).
-# retry_network <per-attempt seconds> <total budget seconds> <max attempts>.
-# Every network attempt is bounded by an outer `timeout` (a hung TCP stream
-# becomes exit 124, which the retry loop can act on); a total per-command
-# budget bounds the all-attempts-stall case; and git's own stall detector is
-# exported for the git clones pip runs for the two `git+https` requirements,
-# which `timeout` alone could only kill wholesale.
-# Caps are sized against the VALIDATOR'S 1800 s build limit (upstream f7caab6c
-# trainer/constants.py:41 DOCKER_BUILD_TIMEOUT_MINUTES = 30, no retry on a
-# failed build) -- NOT against what a slow link would like: above that wall a
-# slow-but-working build is a DNF too, so a large cap only spends the window.
-RUN export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
-    retry_network() { \
-        attempt_timeout_s=$1; \
-        attempt_budget_s=$2; \
-        attempt_max=$3; \
-        shift 3; \
-        command -v timeout >/dev/null 2>&1 || { \
-            echo "SN56_NETWORK_TIMEOUT unavailable=timeout command=$1" >&2; \
-            return 127; \
-        }; \
-        budget_deadline=$(( $(date +%s) + attempt_budget_s )); \
-        attempt=1; \
-        while :; do \
-            timeout -k 30 "$attempt_timeout_s" "$@" && return 0; \
-            status=$?; \
-            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then \
-                echo "SN56_NETWORK_TIMEOUT attempt=$attempt timeout_seconds=$attempt_timeout_s command=$1 status=$status" >&2; \
-            fi; \
-            if [ "$attempt" -ge "$attempt_max" ] || [ "$(date +%s)" -ge "$budget_deadline" ]; then \
-                echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=$1 status=$status" >&2; \
-                return "$status"; \
-            fi; \
-            delay=$((attempt * 5)); \
-            echo "SN56_NETWORK_RETRY retry=$((attempt + 1))/$attempt_max delay_seconds=$delay command=$1 status=$status" >&2; \
-            sleep "$delay"; \
-            attempt=$((attempt + 1)); \
-        done; \
-    }; \
+        --index-url https://download.pytorch.org/whl/cu124 && \
     retry_network 90 200 3 pip install --no-cache-dir \
         --constraint /opt/sn56/image-runtime-phase1-constraints.txt \
-        torchcodec==0.2.1 pyyaml Pillow numpy safetensors
-
-# WEEK-9 HAZARD-1 (evidence/week9-hazards-20260819/CHANGES.md + ADDENDUM).
-# retry_network <per-attempt seconds> <total budget seconds> <max attempts>.
-# Every network attempt is bounded by an outer `timeout` (a hung TCP stream
-# becomes exit 124, which the retry loop can act on); a total per-command
-# budget bounds the all-attempts-stall case; and git's own stall detector is
-# exported for the git clones pip runs for the two `git+https` requirements,
-# which `timeout` alone could only kill wholesale.
-# Caps are sized against the VALIDATOR'S 1800 s build limit (upstream f7caab6c
-# trainer/constants.py:41 DOCKER_BUILD_TIMEOUT_MINUTES = 30, no retry on a
-# failed build) -- NOT against what a slow link would like: above that wall a
-# slow-but-working build is a DNF too, so a large cap only spends the window.
-RUN export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
-    retry_network() { \
-        attempt_timeout_s=$1; \
-        attempt_budget_s=$2; \
-        attempt_max=$3; \
-        shift 3; \
-        command -v timeout >/dev/null 2>&1 || { \
-            echo "SN56_NETWORK_TIMEOUT unavailable=timeout command=$1" >&2; \
-            return 127; \
-        }; \
-        budget_deadline=$(( $(date +%s) + attempt_budget_s )); \
-        attempt=1; \
-        while :; do \
-            timeout -k 30 "$attempt_timeout_s" "$@" && return 0; \
-            status=$?; \
-            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then \
-                echo "SN56_NETWORK_TIMEOUT attempt=$attempt timeout_seconds=$attempt_timeout_s command=$1 status=$status" >&2; \
-            fi; \
-            if [ "$attempt" -ge "$attempt_max" ] || [ "$(date +%s)" -ge "$budget_deadline" ]; then \
-                echo "SN56_NETWORK_RETRY exhausted attempts=$attempt command=$1 status=$status" >&2; \
-                return "$status"; \
-            fi; \
-            delay=$((attempt * 5)); \
-            echo "SN56_NETWORK_RETRY retry=$((attempt + 1))/$attempt_max delay_seconds=$delay command=$1 status=$status" >&2; \
-            sleep "$delay"; \
-            attempt=$((attempt + 1)); \
-        done; \
-    }; \
+        torchcodec==0.2.1 pyyaml Pillow numpy safetensors && \
     retry_network 180 220 2 python3 -m pip install --no-cache-dir --no-deps \
         --extra-index-url https://download.pytorch.org/whl/cu124 \
         --requirement /opt/sn56/image-runtime-lock.txt && \
     python3 /opt/sn56/verify-image-runtime.py \
         --lock /opt/sn56/image-runtime-lock.txt \
         --constraints /opt/sn56/image-runtime-phase1-constraints.txt && \
+    site=/usr/local/lib/python3.10/dist-packages && \
+    test ! -e "$site/pip" && \
+    test ! -e "$site/pip-22.0.2.dist-info" && \
+    test ! -e "$site/wheel" && \
+    test ! -e "$site/wheel-0.37.1.egg-info" && \
+    cp -a /usr/lib/python3/dist-packages/pip "$site/pip" && \
+    cp -a /usr/lib/python3/dist-packages/pip-22.0.2.dist-info "$site/pip-22.0.2.dist-info" && \
+    cp -a /usr/lib/python3/dist-packages/wheel "$site/wheel" && \
+    cp -a /usr/lib/python3/dist-packages/wheel-0.37.1.egg-info "$site/wheel-0.37.1.egg-info" && \
     test "$(git rev-parse HEAD)" = 99be3d96a2468d3a5228a4eb05ba67e63c586b4e
-
 
 FROM diagonalge/kohya_latest:latest@sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e
 
@@ -250,53 +190,26 @@ ENV PYTHONUNBUFFERED=1 \
 # Kohya base's graph remains intact under /home/.local and is substituted only
 # in the standalone child process; the two incompatible Torch stacks never
 # share one interpreter.
+# Copy exactly the three reviewed lock/verifier sources directly from the
+# build context; the merged verifier below restores the runtime basename.
+# Empty-store 329eaed showed that placing the first context COPY after the two
+# runtime transplants still cost 109.946 s (versus 111.895 s cross-stage): the
+# 43.3 GB root position, not the source, was the bottleneck.  Keep both context
+# copies on the 29.2 GB Kohya root before growing it with the frozen runtimes.
+COPY ops/docker/image-runtime-lock.txt \
+    ops/docker/image-runtime-phase1-constraints.txt \
+    ops/docker/verify_image_runtime.py \
+    /opt/sn56/
+COPY forge/ /app/forge/
 COPY --from=aitoolkit-runtime /app/ai-toolkit/ /app/ai-toolkit/
 COPY --from=aitoolkit-runtime /usr/local/lib/python3.10/dist-packages/ /opt/sn56/ai-toolkit-python/
-# pip and wheel come from Ubuntu's dist-packages in the ai-toolkit stage, not
-# /usr/local.  Carry their code and metadata into the isolated graph as well;
-# otherwise the Kohya base's pip/wheel metadata leaks into `pip freeze` even
-# though every application distribution is loaded from the transplanted tree.
-COPY --from=aitoolkit-runtime /usr/lib/python3/dist-packages/pip/ /opt/sn56/ai-toolkit-python/pip/
-COPY --from=aitoolkit-runtime /usr/lib/python3/dist-packages/pip-22.0.2.dist-info/ /opt/sn56/ai-toolkit-python/pip-22.0.2.dist-info/
-COPY --from=aitoolkit-runtime /usr/lib/python3/dist-packages/wheel/ /opt/sn56/ai-toolkit-python/wheel/
-COPY --from=aitoolkit-runtime /usr/lib/python3/dist-packages/wheel-0.37.1.egg-info/ /opt/sn56/ai-toolkit-python/wheel-0.37.1.egg-info/
-COPY --from=aitoolkit-runtime /opt/sn56/image-runtime-lock.txt /opt/sn56/image-runtime-lock.txt
-COPY --from=aitoolkit-runtime /opt/sn56/image-runtime-phase1-constraints.txt /opt/sn56/image-runtime-phase1-constraints.txt
-COPY --from=aitoolkit-runtime /opt/sn56/verify-image-runtime.py /opt/sn56/verify-image-runtime.py
 
-WORKDIR /app
-COPY forge/ /app/forge/
+# The pinned Kohya base already declares /app as its working directory.  Do not
+# add a redundant metadata-only layer (22 s on the measured classic builder).
 
-# Prove the copied ai-toolkit graph still has the certified metadata and entry
-# surface when loaded by the final image's ABI-compatible Python 3.10 runtime.
-RUN test -f /app/ai-toolkit/run.py && \
-    LD_PRELOAD= \
-    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb \
-    PYTHONPATH=/opt/sn56/ai-toolkit-python \
-    python3 /opt/sn56/verify-image-runtime.py \
-        --lock /opt/sn56/image-runtime-lock.txt \
-        --constraints /opt/sn56/image-runtime-phase1-constraints.txt && \
-    cd /app/ai-toolkit && \
-    LD_PRELOAD= \
-    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb \
-    PYTHONPATH=/opt/sn56/ai-toolkit-python \
-    python3 -c "import os, toolkit, torch; assert torch.__version__ == '2.6.0+cu124'; assert torch.version.cuda == '12.4'; assert os.path.realpath(torch.__file__).startswith('/opt/sn56/ai-toolkit-python/')"
-
-# Separately prove the original Kohya source, dependency graph, support assets,
-# config parser, and checkpoint naming contract. These public weights are baked
-# into the pinned Kohya base; no credential or runtime download is involved.
-RUN test -f /app/sd-scripts/flux_train_network.py && \
-    printf '%s  %s\n' \
-      afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38 /app/flux/ae.safetensors \
-      660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd /app/flux/clip_l.safetensors \
-      6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635 /app/flux/t5xxl_fp16.safetensors \
-      | sha256sum --check --strict && \
-    LD_PRELOAD=libtcmalloc.so \
-    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64 \
-    PYTHONPATH=/home/.local/lib/python3.10/site-packages \
-    python3 -c "import os, accelerate, lion_pytorch, PIL, safetensors, toml, torch, yaml; assert torch.__version__ == '2.1.2+cu121'; assert torch.version.cuda == '12.1'; assert os.path.realpath(torch.__file__).startswith('/home/.local/lib/python3.10/site-packages/')"
-
+# Prove both isolated runtime graphs and stage/verify the pinned tokenizers in
+# one layer.  This preserves every command and timeout while avoiding one more
+# full classic-Docker snapshot of the 43.3 GB final filesystem.
 # WEEK-9 HAZARD-1 (evidence/week9-hazards-20260819/CHANGES.md + ADDENDUM).
 # retry_network <per-attempt seconds> <total budget seconds> <max attempts>.
 # Every network attempt is bounded by an outer `timeout` (a hung TCP stream
@@ -308,7 +221,34 @@ RUN test -f /app/sd-scripts/flux_train_network.py && \
 # trainer/constants.py:41 DOCKER_BUILD_TIMEOUT_MINUTES = 30, no retry on a
 # failed build) -- NOT against what a slow link would like: above that wall a
 # slow-but-working build is a DNF too, so a large cap only spends the window.
-RUN export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
+RUN set -eu; \
+    test ! -e /opt/sn56/verify-image-runtime.py; \
+    mv /opt/sn56/verify_image_runtime.py /opt/sn56/verify-image-runtime.py; \
+    test -f /app/ai-toolkit/run.py && \
+    LD_PRELOAD= \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb \
+    PYTHONPATH=/opt/sn56/ai-toolkit-python \
+    python3 /opt/sn56/verify-image-runtime.py \
+        --lock /opt/sn56/image-runtime-lock.txt \
+        --constraints /opt/sn56/image-runtime-phase1-constraints.txt && \
+    cd /app/ai-toolkit && \
+    LD_PRELOAD= \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb \
+    PYTHONPATH=/opt/sn56/ai-toolkit-python \
+    python3 -c "import os, toolkit, torch; assert torch.__version__ == '2.6.0+cu124'; assert torch.version.cuda == '12.4'; assert os.path.realpath(torch.__file__).startswith('/opt/sn56/ai-toolkit-python/')" && \
+    cd /app && \
+    test -f /app/sd-scripts/flux_train_network.py && \
+    printf '%s  %s\n' \
+      afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38 /app/flux/ae.safetensors \
+      660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd /app/flux/clip_l.safetensors \
+      6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635 /app/flux/t5xxl_fp16.safetensors \
+      | sha256sum --check --strict && \
+    LD_PRELOAD=libtcmalloc.so \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64 \
+    PYTHONPATH=/home/.local/lib/python3.10/site-packages \
+    python3 -c "import os, accelerate, lion_pytorch, PIL, safetensors, toml, torch, yaml; assert torch.__version__ == '2.1.2+cu121'; assert torch.version.cuda == '12.1'; assert os.path.realpath(torch.__file__).startswith('/home/.local/lib/python3.10/site-packages/')" && \
+    export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=120; \
     retry_network() { \
         attempt_timeout_s=$1; \
         attempt_budget_s=$2; \

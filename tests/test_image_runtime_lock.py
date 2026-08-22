@@ -145,10 +145,58 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
         ("wheel-0.37.1.egg-info", "wheel-0.37.1.egg-info"),
     ):
         assert (
-            "COPY --from=aitoolkit-runtime "
-            f"/usr/lib/python3/dist-packages/{system_distribution}/ "
-            f"/opt/sn56/ai-toolkit-python/{target_name}/"
+            f"cp -a /usr/lib/python3/dist-packages/{system_distribution} "
+            f'"$site/{target_name}"'
         ) in contents
+        assert (
+            "COPY --from=aitoolkit-runtime "
+            f"/usr/lib/python3/dist-packages/{system_distribution}/"
+        ) not in contents
+    assert "site=/usr/local/lib/python3.10/dist-packages" in contents
+    assert contents.count("COPY --from=aitoolkit-runtime") == 2
+    first_stage = contents.split(
+        "FROM diagonalge/kohya_latest:latest@sha256:", maxsplit=1
+    )[0]
+    assert first_stage.count("\nCOPY ") == 1
+    assert first_stage.count("\nRUN ") == 1
+    assert "\nWORKDIR " not in first_stage
+    assert (
+        "COPY ops/docker/image-runtime-lock.txt \\\n"
+        "    ops/docker/image-runtime-phase1-constraints.txt \\\n"
+        "    ops/docker/verify_image_runtime.py \\\n"
+        "    /opt/sn56/"
+    ) in first_stage
+    final_stage = contents.split(
+        "FROM diagonalge/kohya_latest:latest@sha256:", maxsplit=1
+    )[1]
+    assert (
+        "COPY ops/docker/image-runtime-lock.txt \\\n"
+        "    ops/docker/image-runtime-phase1-constraints.txt \\\n"
+        "    ops/docker/verify_image_runtime.py \\\n"
+        "    /opt/sn56/"
+    ) in final_stage
+    assert "\nWORKDIR " not in final_stage
+    assert final_stage.count("\nRUN ") == 2
+    opt_copy = final_stage.index("COPY ops/docker/image-runtime-lock.txt")
+    forge_copy = final_stage.index("COPY forge/ /app/forge/")
+    source_copy = final_stage.index(
+        "COPY --from=aitoolkit-runtime /app/ai-toolkit/ /app/ai-toolkit/"
+    )
+    python_copy = final_stage.index(
+        "COPY --from=aitoolkit-runtime "
+        "/usr/local/lib/python3.10/dist-packages/ "
+        "/opt/sn56/ai-toolkit-python/"
+    )
+    assert opt_copy < forge_copy < source_copy < python_copy
+    assert "mv /opt/sn56/verify_image_runtime.py " in final_stage
+    assert final_stage.count("retry_network()") == 1
+    ai_toolkit_cwd = final_stage.index("cd /app/ai-toolkit")
+    restored_app_cwd = final_stage.index("cd /app &&", ai_toolkit_cwd)
+    kohya_import = final_stage.index("assert torch.__version__ == '2.1.2+cu121'")
+    tokenizer_stage = final_stage.index(
+        "python3 -m forge.flux_kohya_tokenizers stage"
+    )
+    assert ai_toolkit_cwd < restored_app_cwd < kohya_import < tokenizer_stage
     assert contents.count("99be3d96a2468d3a5228a4eb05ba67e63c586b4e") == 3
     assert "--requirement /opt/sn56/image-runtime-lock.txt" in contents
     assert "python3 /opt/sn56/verify-image-runtime.py" in contents
@@ -199,9 +247,9 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
     ("dockerfile", "helper_count", "retry_loop_count"),
     [
         (TOOLKIT_DOCKERFILE, 3, 3),
-        # The legacy image has the four ordinary helpers plus the independent
-        # apt cache-reset loop used for its Debian C toolchain.
-        (LEGACY_FLUX_DOCKERFILE, 4, 5),
+        # The legacy first stage uses one ordered helper layer; its tokenizer
+        # layer uses the other. The Debian C-toolchain loop is independent.
+        (LEGACY_FLUX_DOCKERFILE, 2, 3),
     ],
 )
 def test_image_build_network_access_has_bounded_retries(
