@@ -96,17 +96,81 @@ RUN set -eu; \
 
 FROM diagonalge/kohya_latest:latest@sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e
 
+# WEEK-9: FORGE_HOLDOUT_SELECTION_TYPES removed (promotion blocked by gates;
+# see evidence/week9-gpu-campaign-20260819/alpha). No shadow tax.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONNOUSERSITE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    FORGE_FLUX_BACKEND=kohya \
+    AI_TOOLKIT_DIR=/app/ai-toolkit \
+    FORGE_TEMPLATES_DIR=/app/forge/templates \
+    FORGE_KOHYA_PYTHONPATH=/home/.local/lib/python3.10/site-packages \
+    FORGE_KOHYA_LD_LIBRARY_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64 \
+    FORGE_KOHYA_LD_PRELOAD=libtcmalloc.so \
+    FORGE_KOHYA_PROTOBUF_IMPLEMENTATION=python \
+    FORGE_KOHYA_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64:/home//.local/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    SD_SCRIPTS_DIR=/app/sd-scripts \
+    PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONPATH=/opt/sn56/ai-toolkit-python \
+    LD_LIBRARY_PATH= \
+    LD_PRELOAD= \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb
+
+# The final process uses the frozen ai-toolkit package graph by default. The
+# Kohya base's graph remains intact under /home/.local and is substituted only
+# in the standalone child process; the two incompatible Torch stacks never
+# share one interpreter.
+# Copy exactly the three reviewed lock/verifier sources directly from the
+# build context; the merged verifier below restores the runtime basename.
+# Empty-store 329eaed showed that placing the first context COPY after the two
+# runtime transplants still cost 109.946 s (versus 111.895 s cross-stage): the
+# 43.3 GB root position, not the source, was the bottleneck.  Keep both context
+# copies on the 29.2 GB Kohya root before growing it with the frozen runtimes.
+COPY ops/docker/image-runtime-lock.txt \
+    ops/docker/image-runtime-phase1-constraints.txt \
+    ops/docker/verify_image_runtime.py \
+    /opt/sn56/
+COPY forge/ /app/forge/
+COPY --from=aitoolkit-runtime /app/ai-toolkit/ /app/ai-toolkit/
+COPY --from=aitoolkit-runtime /usr/local/lib/python3.10/dist-packages/ /opt/sn56/ai-toolkit-python/
+
+# The pinned Kohya base already declares /app as its working directory.  Do not
+# add a redundant metadata-only layer (22 s on the measured classic builder).
+
 # The default ai-toolkit graph imports bitsandbytes, whose Triton backend JITs
 # a tiny CUDA driver helper on first use.  The pinned Kohya base deliberately
-# omits every C toolchain component, so merely transplanting the Python graph
-# is insufficient for snapshot-directory FLUX caches.  Install the minimal
-# pinned Debian compiler/header surface here; the standalone Kohya child still
-# uses its isolated Python/Torch graph below.  HTTPS is required because the
-# provider's HTTP path has returned hash-mismatched package bodies in practice.
-# WEEK-9 HAZARD-1: this hand-rolled apt loop retries on FAILURE only, exactly
-# like retry_network did.  Bound each network apt call so a wedged mirror
-# connection becomes a retryable non-zero status instead of an endless build.
+# omits every C toolchain component. Install the exact pinned Debian surface
+# after the four final-stage COPYs and verify both isolated runtime graphs in
+# the same layer. This preserves the final paths and removes one full classic-
+# Docker snapshot. Presence/absence guards make the commuting surfaces explicit.
+# HTTPS is required because the provider's HTTP path has returned hash-mismatched
+# package bodies in practice. The apt loop retries on FAILURE only and keeps its
+# original timeout, retry, inventory, and cleanup commands.
+# Then stage/verify the pinned tokenizers without another filesystem snapshot.
+# WEEK-9 HAZARD-1 (evidence/week9-hazards-20260819/CHANGES.md + ADDENDUM).
+# retry_network <per-attempt seconds> <total budget seconds> <max attempts>.
+# Every network attempt is bounded by an outer `timeout` (a hung TCP stream
+# becomes exit 124, which the retry loop can act on); a total per-command
+# budget bounds the all-attempts-stall case; and git's own stall detector is
+# exported for the git clones pip runs for the two `git+https` requirements,
+# which `timeout` alone could only kill wholesale.
+# Caps are sized against the VALIDATOR'S 1800 s build limit (upstream f7caab6c
+# trainer/constants.py:41 DOCKER_BUILD_TIMEOUT_MINUTES = 30, no retry on a
+# failed build) -- NOT against what a slow link would like: above that wall a
+# slow-but-working build is a DNF too, so a large cap only spends the window.
 RUN set -eu; \
+    test -f /opt/sn56/image-runtime-lock.txt; \
+    test -f /opt/sn56/image-runtime-phase1-constraints.txt; \
+    test -f /opt/sn56/verify_image_runtime.py; \
+    test -f /app/ai-toolkit/run.py; \
+    test -d /app/forge; \
+    test -d /opt/sn56/ai-toolkit-python; \
+    test ! -e /opt/sn56/legacy-aitoolkit-toolchain-lock.txt; \
+    test ! -e /opt/sn56/legacy-os-package-inventory.txt; \
+    test ! -e /opt/sn56/legacy-os-package-inventory.sha256; \
     command -v timeout >/dev/null 2>&1 || { \
       echo "SN56_NETWORK_TIMEOUT unavailable=timeout command=apt-toolchain" >&2; \
       exit 127; \
@@ -161,67 +225,7 @@ RUN set -eu; \
       LC_ALL=C sort >/opt/sn56/legacy-os-package-inventory.txt; \
     sha256sum /opt/sn56/legacy-os-package-inventory.txt \
       >/opt/sn56/legacy-os-package-inventory.sha256; \
-    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-
-# WEEK-9: FORGE_HOLDOUT_SELECTION_TYPES removed (promotion blocked by gates;
-# see evidence/week9-gpu-campaign-20260819/alpha). No shadow tax.
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONNOUSERSITE=1 \
-    HF_HUB_DISABLE_TELEMETRY=1 \
-    HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
-    TOKENIZERS_PARALLELISM=false \
-    FORGE_FLUX_BACKEND=kohya \
-    AI_TOOLKIT_DIR=/app/ai-toolkit \
-    FORGE_TEMPLATES_DIR=/app/forge/templates \
-    FORGE_KOHYA_PYTHONPATH=/home/.local/lib/python3.10/site-packages \
-    FORGE_KOHYA_LD_LIBRARY_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64 \
-    FORGE_KOHYA_LD_PRELOAD=libtcmalloc.so \
-    FORGE_KOHYA_PROTOBUF_IMPLEMENTATION=python \
-    FORGE_KOHYA_PATH=/usr/local/cuda/lib:/usr/local/cuda/lib64:/home//.local/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    SD_SCRIPTS_DIR=/app/sd-scripts \
-    PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    PYTHONPATH=/opt/sn56/ai-toolkit-python \
-    LD_LIBRARY_PATH= \
-    LD_PRELOAD= \
-    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb
-
-# The final process uses the frozen ai-toolkit package graph by default. The
-# Kohya base's graph remains intact under /home/.local and is substituted only
-# in the standalone child process; the two incompatible Torch stacks never
-# share one interpreter.
-# Copy exactly the three reviewed lock/verifier sources directly from the
-# build context; the merged verifier below restores the runtime basename.
-# Empty-store 329eaed showed that placing the first context COPY after the two
-# runtime transplants still cost 109.946 s (versus 111.895 s cross-stage): the
-# 43.3 GB root position, not the source, was the bottleneck.  Keep both context
-# copies on the 29.2 GB Kohya root before growing it with the frozen runtimes.
-COPY ops/docker/image-runtime-lock.txt \
-    ops/docker/image-runtime-phase1-constraints.txt \
-    ops/docker/verify_image_runtime.py \
-    /opt/sn56/
-COPY forge/ /app/forge/
-COPY --from=aitoolkit-runtime /app/ai-toolkit/ /app/ai-toolkit/
-COPY --from=aitoolkit-runtime /usr/local/lib/python3.10/dist-packages/ /opt/sn56/ai-toolkit-python/
-
-# The pinned Kohya base already declares /app as its working directory.  Do not
-# add a redundant metadata-only layer (22 s on the measured classic builder).
-
-# Prove both isolated runtime graphs and stage/verify the pinned tokenizers in
-# one layer.  This preserves every command and timeout while avoiding one more
-# full classic-Docker snapshot of the 43.3 GB final filesystem.
-# WEEK-9 HAZARD-1 (evidence/week9-hazards-20260819/CHANGES.md + ADDENDUM).
-# retry_network <per-attempt seconds> <total budget seconds> <max attempts>.
-# Every network attempt is bounded by an outer `timeout` (a hung TCP stream
-# becomes exit 124, which the retry loop can act on); a total per-command
-# budget bounds the all-attempts-stall case; and git's own stall detector is
-# exported for the git clones pip runs for the two `git+https` requirements,
-# which `timeout` alone could only kill wholesale.
-# Caps are sized against the VALIDATOR'S 1800 s build limit (upstream f7caab6c
-# trainer/constants.py:41 DOCKER_BUILD_TIMEOUT_MINUTES = 30, no retry on a
-# failed build) -- NOT against what a slow link would like: above that wall a
-# slow-but-working build is a DNF too, so a large cap only spends the window.
-RUN set -eu; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     test ! -e /opt/sn56/verify-image-runtime.py; \
     mv /opt/sn56/verify_image_runtime.py /opt/sn56/verify-image-runtime.py; \
     test -f /app/ai-toolkit/run.py && \

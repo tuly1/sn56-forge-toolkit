@@ -176,7 +176,7 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
         "    /opt/sn56/"
     ) in final_stage
     assert "\nWORKDIR " not in final_stage
-    assert final_stage.count("\nRUN ") == 2
+    assert final_stage.count("\nRUN ") == 1
     opt_copy = final_stage.index("COPY ops/docker/image-runtime-lock.txt")
     forge_copy = final_stage.index("COPY forge/ /app/forge/")
     source_copy = final_stage.index(
@@ -187,8 +187,29 @@ def test_legacy_flux_image_carries_two_pinned_isolated_runtimes():
         "/usr/local/lib/python3.10/dist-packages/ "
         "/opt/sn56/ai-toolkit-python/"
     )
-    assert opt_copy < forge_copy < source_copy < python_copy
+    final_run = final_stage.index("RUN set -eu;")
+    assert opt_copy < forge_copy < source_copy < python_copy < final_run
+    for copied_input in (
+        "/opt/sn56/image-runtime-lock.txt",
+        "/opt/sn56/image-runtime-phase1-constraints.txt",
+        "/opt/sn56/verify_image_runtime.py",
+        "/app/ai-toolkit/run.py",
+        "/app/forge",
+        "/opt/sn56/ai-toolkit-python",
+    ):
+        assert f"test -{'d' if copied_input in {'/app/forge', '/opt/sn56/ai-toolkit-python'} else 'f'} {copied_input}" in final_stage
+    for generated_output in (
+        "/opt/sn56/legacy-aitoolkit-toolchain-lock.txt",
+        "/opt/sn56/legacy-os-package-inventory.txt",
+        "/opt/sn56/legacy-os-package-inventory.sha256",
+    ):
+        assert f"test ! -e {generated_output}" in final_stage
+    apt_toolchain = final_stage.index(
+        "SN56_NETWORK_TIMEOUT unavailable=timeout command=apt-toolchain"
+    )
     assert "mv /opt/sn56/verify_image_runtime.py " in final_stage
+    verifier_rename = final_stage.index("mv /opt/sn56/verify_image_runtime.py")
+    assert final_run < apt_toolchain < verifier_rename
     assert final_stage.count("retry_network()") == 1
     ai_toolkit_cwd = final_stage.index("cd /app/ai-toolkit")
     restored_app_cwd = final_stage.index("cd /app &&", ai_toolkit_cwd)

@@ -562,7 +562,7 @@ def test_legacy_layer_consolidation_preserves_exact_runtime_paths() -> None:
         "    /opt/sn56/"
     ) in final_stage
     assert "\nWORKDIR " not in final_stage
-    assert final_stage.count("\nRUN ") == 2
+    assert final_stage.count("\nRUN ") == 1
     opt_copy = final_stage.index("COPY ops/docker/image-runtime-lock.txt")
     forge_copy = final_stage.index("COPY forge/ /app/forge/")
     source_copy = final_stage.index(
@@ -573,13 +573,23 @@ def test_legacy_layer_consolidation_preserves_exact_runtime_paths() -> None:
         "/usr/local/lib/python3.10/dist-packages/ "
         "/opt/sn56/ai-toolkit-python/"
     )
-    assert opt_copy < forge_copy < source_copy < python_copy
+    final_run_offset = final_stage.index("RUN set -eu;")
+    assert opt_copy < forge_copy < source_copy < python_copy < final_run_offset
     final_verifier = next(
         layer
         for layer in _run_instructions(final_stage)
         if "python3 -m forge.flux_kohya_tokenizers stage" in layer
     )
     final_order = (
+        "test -f /opt/sn56/image-runtime-lock.txt",
+        "test ! -e /opt/sn56/legacy-aitoolkit-toolchain-lock.txt",
+        "SN56_NETWORK_TIMEOUT unavailable=timeout command=apt-toolchain",
+        "timeout -k 30 60 apt-get",
+        "timeout -k 30 150 apt-get",
+        ">/opt/sn56/legacy-aitoolkit-toolchain-lock.txt",
+        ">/opt/sn56/legacy-os-package-inventory.txt",
+        ">/opt/sn56/legacy-os-package-inventory.sha256",
+        "rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*",
         "mv /opt/sn56/verify_image_runtime.py",
         "python3 /opt/sn56/verify-image-runtime.py",
         "sha256sum --check --strict",
