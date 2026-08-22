@@ -441,8 +441,8 @@ h_pyc_aside() {  # move the stale bytecode into the backup dir (derived artifact
 
 h_edit() {  # AST-precise pin swap. args: OLD NEW EXPECTED_PREIMAGE_SHA [--check]
   local old="$1" new="$2" expected_preimage="$3" chk="${4:-}"
-  if [ "$MOCK" = 1 ]; then python3 -B "$RUNDIR/edit_pin.py" "$M_FILE" "$old" "$new" "$REPO_URL" "$expected_preimage" $chk
-  else ssh -o BatchMode=yes "$SSH_HOST" "python3 -B - '$R_FILE' '$old' '$new' '$REPO_URL' '$expected_preimage' $chk" < "$RUNDIR/edit_pin.py"; fi
+  if [ "$MOCK" = 1 ]; then python3 -B "$RUNDIR/edit_pin.py" "$M_FILE" "$old" "$new" "$REPO_URL" "$TEXT_PIN_EXPECTED" "$expected_preimage" $chk
+  else ssh -o BatchMode=yes "$SSH_HOST" "python3 -B - '$R_FILE' '$old' '$new' '$REPO_URL' '$TEXT_PIN_EXPECTED' '$expected_preimage' $chk" < "$RUNDIR/edit_pin.py"; fi
 }
 
 h_mainpid()   { if [ "$MOCK" = 1 ]; then . "$M_STATE"; echo "$MAINPID"
@@ -602,10 +602,10 @@ import ast, hashlib, json, os, sys
 def die(msg, **kw):
     kw.update({"ok": False, "error": msg}); print(json.dumps(kw)); sys.exit(9)
 
-if len(sys.argv) < 6:
-    die("usage: edit_pin.py PATH OLD NEW EXPECTED_IMAGE_REPO EXPECTED_PREIMAGE_SHA [--check]")
-path, old_sha, new_sha, expected_image_repo, expected_preimage_sha = sys.argv[1:6]
-check_only = "--check" in sys.argv[6:]
+if len(sys.argv) < 7:
+    die("usage: edit_pin.py PATH OLD NEW EXPECTED_IMAGE_REPO EXPECTED_TEXT_PIN EXPECTED_PREIMAGE_SHA [--check]")
+path, old_sha, new_sha, expected_image_repo, expected_text_pin, expected_preimage_sha = sys.argv[1:7]
+check_only = "--check" in sys.argv[7:]
 HEX = set("0123456789abcdef")
 for s in (old_sha, new_sha):
     if len(s) != 40 or not set(s) <= HEX: die("sha not 40 lowercase hex: %r" % s)
@@ -682,6 +682,10 @@ if img_repo != expected_image_repo:
     die("IMAGE github_repo is %r, expected reviewed repository %r -- refusing" %
         (img_repo, expected_image_repo), actual_image_repo=img_repo,
         expected_image_repo=expected_image_repo)
+if text_pin != expected_text_pin:
+    die("TEXT commit_hash is %r, expected reviewed pin %r -- refusing" %
+        (text_pin, expected_text_pin), actual_text_pin=text_pin,
+        expected_text_pin=expected_text_pin)
 if text_pin == old_sha: die("TEXT pin equals the IMAGE pin being replaced -- ambiguous, refusing")
 
 # ---- rewrite exactly one literal, by byte offset --------------------------
@@ -939,16 +943,18 @@ P0="$(h_auth_probe 127.0.0.1 "$ENDPOINT_ROUTE")" || {
   bad "baseline route did not reach the exact Fiber auth stage: $P0"; exit 5;
 }
 ok "baseline: active, listening, exact Fiber auth-stage route"
-if [ "$ROLLBACK_NOOP" = "1" ]; then
-  log ""; log "${C_G}NO-OP: active service, source, running bytecode, and Fiber route already serve the rollback pin.${C_0}"
-  exit 0
-fi
 
-step "PREFLIGHT  dry-run the edit (no write)"
-CHECK_JSON="$(h_edit "$CUR_IMAGE" "$TARGET_SHA" "$PRE_SHA" --check)" || { bad "edit pre-check refused:"; log "      $CHECK_JSON"; exit 5; }
+step "PREFLIGHT  read-only source semantic/AST contract"
+CHECK_TARGET_SHA="$TARGET_SHA"
+[ "$ROLLBACK_NOOP" = "1" ] && CHECK_TARGET_SHA="$RELEASE_SHA"
+CHECK_JSON="$(h_edit "$CUR_IMAGE" "$CHECK_TARGET_SHA" "$PRE_SHA" --check)" || { bad "source semantic/AST pre-check refused:"; log "      $CHECK_JSON"; exit 5; }
 log "  $CHECK_JSON"
 printf '%s' "$CHECK_JSON" | grep -q '"ok": *true' || { bad "edit pre-check did not report ok"; exit 5; }
-ok "AST located the IMAGE pin; edit is 1 line, length-preserving, TEXT pin provably untouched"
+ok "AST proves exact IMAGE/TEXT mapping, reviewed IMAGE repository, and pins with ENVIRONMENT absent"
+if [ "$ROLLBACK_NOOP" = "1" ]; then
+  log ""; log "${C_G}NO-OP: active service, exact source contract, running bytecode, and Fiber route already serve the rollback pin.${C_0}"
+  exit 0
+fi
 
 if [ "$DRY_RUN" = "1" ]; then
   log ""; log "${C_G}DRY RUN COMPLETE -- nothing was modified.${C_0}"

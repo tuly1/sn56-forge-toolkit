@@ -818,9 +818,82 @@ def test_manual_rollback_is_a_proven_noop_at_exact_source_and_pyc_prestate(
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (
-        "active service, source, running bytecode, and Fiber route already serve the rollback pin"
+        "active service, exact source contract, running bytecode, and Fiber route already serve the rollback pin"
         in proc.stdout
     )
+    assert (
+        "AST proves exact IMAGE/TEXT mapping, reviewed IMAGE repository, and pins"
+        in proc.stdout
+    )
+    assert endpoint.read_text(encoding="utf-8") == before
+    assert not list((mockroot / "backups").glob("*.bak"))
+
+
+def test_manual_rollback_noop_rejects_environment_repo_entry(
+    manifest: dict, isolated_release: tuple[Path, Path], tmp_path: Path
+):
+    _, reviewed = isolated_release
+    ready_manifest, readiness = write_ready_release(tmp_path, manifest)
+    mockroot = tmp_path / "host"
+    mockroot.mkdir()
+    before = training_repo_source(ROLLBACK)
+    before = before.replace(
+        '    TEXT = "text"\n',
+        '    TEXT = "text"\n    ENVIRONMENT = "environment"\n',
+    ).replace(
+        "\n}\n",
+        '\n    TournamentType.ENVIRONMENT: TrainingRepoResponse(\n'
+        '        github_repo="https://example.invalid/environment.git",\n'
+        f'        commit_hash="{UNRELATED}",\n'
+        "    ),\n}\n",
+        1,
+    )
+    endpoint = mockroot / "training_repo.py"
+    endpoint.write_text(before, encoding="utf-8")
+
+    proc = run_repoint(
+        ready_manifest,
+        tmp_path / "offline.git",
+        reviewed,
+        mockroot,
+        "--readiness-receipt",
+        str(readiness),
+        "--rollback",
+    )
+
+    assert proc.returncode == 5
+    assert "ENVIRONMENT must remain absent" in proc.stdout
+    assert endpoint.read_text(encoding="utf-8") == before
+    assert not list((mockroot / "backups").glob("*.bak"))
+
+
+def test_manual_rollback_noop_rejects_wrong_repo(
+    manifest: dict,
+    isolated_release: tuple[Path, Path],
+    tmp_path: Path,
+):
+    _, reviewed = isolated_release
+    ready_manifest, readiness = write_ready_release(tmp_path, manifest)
+    mockroot = tmp_path / "host"
+    mockroot.mkdir()
+    before = training_repo_source(
+        ROLLBACK, "https://example.invalid/wrong-image.git"
+    )
+    endpoint = mockroot / "training_repo.py"
+    endpoint.write_text(before, encoding="utf-8")
+
+    proc = run_repoint(
+        ready_manifest,
+        tmp_path / "offline.git",
+        reviewed,
+        mockroot,
+        "--readiness-receipt",
+        str(readiness),
+        "--rollback",
+    )
+
+    assert proc.returncode == 5
+    assert "IMAGE github_repo is" in proc.stdout
     assert endpoint.read_text(encoding="utf-8") == before
     assert not list((mockroot / "backups").glob("*.bak"))
 
