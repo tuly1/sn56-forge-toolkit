@@ -17,9 +17,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 PROBE = ROOT / "scripts" / "sn56-preentry-probe-v2.sh"
 WRAPPER = ROOT / "scripts" / "sn56-monday-probe.sh"
-MANIFEST_PATH = ROOT / "release" / "week9-release-manifest.json"
-DOCKER_POLICY_PATH = ROOT / "release" / "week9-docker-policy.json"
-READINESS_PATH = ROOT / "release" / "week9-release-readiness.json"
+DEFAULT_MANIFEST_PATH = ROOT / "release" / "week10-release-manifest.json"
+DEFAULT_DOCKER_POLICY_PATH = ROOT / "release" / "week10-candidate-docker-policy.json"
+DEFAULT_READINESS_PATH = ROOT / "release" / "week10-release-readiness.json"
+HOLD_DOCKER_POLICY_PATH = ROOT / "release" / "week9-docker-policy.json"
+HOLD_READINESS_PATH = ROOT / "release" / "week9-release-readiness.json"
 SELECTED_MANIFEST_PATH = ROOT / "tests" / "data" / "week9-release-selected-hold.json"
 MANIFEST = json.loads(SELECTED_MANIFEST_PATH.read_text(encoding="utf-8"))
 TARGET = MANIFEST["target"]["commit"]
@@ -181,6 +183,10 @@ def _run_probe(tmp_path: Path) -> subprocess.CompletedProcess[str]:
             str(PROBE),
             "--manifest",
             str(manifest),
+            "--docker-policy",
+            str(HOLD_DOCKER_POLICY_PATH),
+            "--readiness-receipt",
+            str(HOLD_READINESS_PATH),
             "--mode",
             "mock",
             "--fixtures",
@@ -723,6 +729,10 @@ def test_wrapper_forwards_manifest_target_without_sha_override(tmp_path: Path) -
             str(WRAPPER),
             "--manifest",
             str(manifest),
+            "--docker-policy",
+            str(HOLD_DOCKER_POLICY_PATH),
+            "--readiness-receipt",
+            str(HOLD_READINESS_PATH),
             "--mode",
             "mock",
             "--fixtures",
@@ -760,9 +770,12 @@ def test_wrapper_live_mode_allows_empty_optional_args_under_nounset(
     release.mkdir()
     wrapper = scripts / WRAPPER.name
     shutil.copyfile(WRAPPER, wrapper)
-    shutil.copyfile(SELECTED_MANIFEST_PATH, release / "week9-release-manifest.json")
-    shutil.copyfile(DOCKER_POLICY_PATH, release / "week9-docker-policy.json")
-    shutil.copyfile(READINESS_PATH, release / "week9-release-readiness.json")
+    shutil.copyfile(DEFAULT_MANIFEST_PATH, release / "week10-release-manifest.json")
+    shutil.copyfile(
+        DEFAULT_DOCKER_POLICY_PATH,
+        release / "week10-candidate-docker-policy.json",
+    )
+    shutil.copyfile(DEFAULT_READINESS_PATH, release / "week10-release-readiness.json")
     stub = scripts / "sn56-preentry-probe-v2.sh"
     _write(
         stub,
@@ -797,14 +810,15 @@ printf '%s\n' '{"warns":0,"mode":"live"}' > "$json"
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "RESULT: GREEN (live)" in result.stdout
+    assert "manifest target 59e0698c952e" in result.stdout
 
 
 def test_wrapper_retries_the_same_private_manifest_snapshot(tmp_path: Path) -> None:
     manifest, fixtures, baseline = _green_case(tmp_path)
     policy = tmp_path / "docker-policy.json"
     readiness = tmp_path / "release-readiness.json"
-    shutil.copyfile(DOCKER_POLICY_PATH, policy)
-    shutil.copyfile(READINESS_PATH, readiness)
+    shutil.copyfile(HOLD_DOCKER_POLICY_PATH, policy)
+    shutil.copyfile(HOLD_READINESS_PATH, readiness)
     _write(fixtures / "chain_uid.out", "UID=NONE\n")
     outdir = tmp_path / "wrapper-evidence"
     proc = subprocess.Popen(

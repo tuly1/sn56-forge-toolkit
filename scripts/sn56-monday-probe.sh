@@ -4,9 +4,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MANIFEST="$SCRIPT_DIR/../release/week9-release-manifest.json"
-DOCKER_POLICY="$SCRIPT_DIR/../release/week9-docker-policy.json"
-READINESS_RECEIPT="$SCRIPT_DIR/../release/week9-release-readiness.json"
+MANIFEST="$SCRIPT_DIR/../release/week10-release-manifest.json"
+DOCKER_POLICY="$SCRIPT_DIR/../release/week10-candidate-docker-policy.json"
+READINESS_RECEIPT="$SCRIPT_DIR/../release/week10-release-readiness.json"
 PROBE="$SCRIPT_DIR/sn56-preentry-probe-v2.sh"
 OUTDIR="${SN56_PROBE_OUTDIR:-/Users/atulyashetty/Test/SN56-project/evidence/monday-probe-20260824}"
 ATTEMPTS="${SN56_PROBE_ATTEMPTS:-3}"
