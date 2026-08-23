@@ -623,7 +623,7 @@ for key,value in zip(repos[0].keys,repos[0].values):
         if kw.arg in (\"commit_hash\",\"github_repo\") and isinstance(kw.value,ast.Constant) and isinstance(kw.value.value,str):
             fields[kw.arg]=kw.value.value
     entries[name]=fields
-if repo_names != [\"IMAGE\",\"TEXT\"] or set(entries)!={\"IMAGE\",\"TEXT\"} or \"commit_hash\" not in entries[\"IMAGE\"] or \"commit_hash\" not in entries[\"TEXT\"]:
+if len(repo_names) != 2 or set(repo_names)!={\"IMAGE\",\"TEXT\"} or set(entries)!={\"IMAGE\",\"TEXT\"} or \"commit_hash\" not in entries[\"IMAGE\"] or \"commit_hash\" not in entries[\"TEXT\"]:
     raise SystemExit(5)
 pyc=Path(pyc_path).read_bytes()
 enc=lambda value:value.encode(\"ascii\")
@@ -723,7 +723,6 @@ except Exception as exc:
     print(f"BAD\tendpoint source/pyc evidence unreadable: {exc}")
     raise SystemExit
 wanted = {
-    "repo_keys": ["IMAGE", "TEXT"],
     "source_image_pin": target,
     "source_text_pin": text_pin,
     "source_target_count": 1,
@@ -743,6 +742,15 @@ wanted = {
 }
 wrong = [f"{key}={value.get(key)!r} (want {expected!r})"
          for key, expected in wanted.items() if value.get(key) != expected]
+repo_keys = value.get("repo_keys")
+if (
+    not isinstance(repo_keys, list)
+    or len(repo_keys) != 2
+    or set(repo_keys) != {"IMAGE", "TEXT"}
+):
+    wrong.append(
+        f"repo_keys={repo_keys!r} (want exactly IMAGE and TEXT in either order)"
+    )
 expected_argv = shlex.split(expected_exec)
 expected_python = os.path.join(os.path.dirname(expected_argv[0]), "python")
 process_cmdline = value.get("process_cmdline")

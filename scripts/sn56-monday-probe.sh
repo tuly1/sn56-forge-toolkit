@@ -140,11 +140,21 @@ rc=1
 attempt=1
 while [ "$attempt" -le "$ATTEMPTS" ]; do
   echo "--- attempt $attempt/$ATTEMPTS ---" | tee -a "$LOG"
-  bash "$PROBE" \
-    --manifest "$MANIFEST_SNAPSHOT" \
-    --docker-policy "$DOCKER_POLICY_SNAPSHOT" \
-    --readiness-receipt "$READINESS_SNAPSHOT" \
-    --json "$JSON" "${PROBE_ARGS[@]}" >>"$LOG" 2>&1
+  if [ "${#PROBE_ARGS[@]}" -eq 0 ]; then
+    # Bash 3.2 raises an unbound-variable error for an empty array expansion
+    # under `set -u`; live mode legitimately has no optional probe arguments.
+    bash "$PROBE" \
+      --manifest "$MANIFEST_SNAPSHOT" \
+      --docker-policy "$DOCKER_POLICY_SNAPSHOT" \
+      --readiness-receipt "$READINESS_SNAPSHOT" \
+      --json "$JSON" >>"$LOG" 2>&1
+  else
+    bash "$PROBE" \
+      --manifest "$MANIFEST_SNAPSHOT" \
+      --docker-policy "$DOCKER_POLICY_SNAPSHOT" \
+      --readiness-receipt "$READINESS_SNAPSHOT" \
+      --json "$JSON" "${PROBE_ARGS[@]}" >>"$LOG" 2>&1
+  fi
   rc=$?
   [ "$rc" -eq 0 ] && break
   # Retry only the known-flaky chain lookup. Manifest, route, pin, host, and

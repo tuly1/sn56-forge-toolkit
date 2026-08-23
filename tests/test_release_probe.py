@@ -545,6 +545,18 @@ def test_observed_duplicate_validator_hotkey_is_exact_route_success(
     assert "validator-hotkey': 2" in result.stdout
 
 
+def test_text_first_repo_order_is_accepted(tmp_path: Path) -> None:
+    manifest, fixtures, baseline = _green_case(tmp_path)
+    pin_evidence = _pin_evidence()
+    pin_evidence["repo_keys"] = ["TEXT", "IMAGE"]
+    _write(fixtures / "endpoint_pin.out", json.dumps(pin_evidence))
+
+    result = _run_existing_case(manifest, fixtures, baseline)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _state(result.stdout, "endpoint.pin") == "PASS"
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["obsolete-four", "wrong-header-duplicate", "third-validator-hotkey"],
@@ -736,6 +748,55 @@ def test_wrapper_forwards_manifest_target_without_sha_override(tmp_path: Path) -
     logs = list(outdir.glob("probe-*.log"))
     assert len(logs) == 1
     assert "RESULT: GREEN" in logs[0].read_text()
+
+
+def test_wrapper_live_mode_allows_empty_optional_args_under_nounset(
+    tmp_path: Path,
+) -> None:
+    probe_root = tmp_path / "probe-root"
+    scripts = probe_root / "scripts"
+    release = probe_root / "release"
+    scripts.mkdir(parents=True)
+    release.mkdir()
+    wrapper = scripts / WRAPPER.name
+    shutil.copyfile(WRAPPER, wrapper)
+    shutil.copyfile(SELECTED_MANIFEST_PATH, release / "week9-release-manifest.json")
+    shutil.copyfile(DOCKER_POLICY_PATH, release / "week9-docker-policy.json")
+    shutil.copyfile(READINESS_PATH, release / "week9-release-readiness.json")
+    stub = scripts / "sn56-preentry-probe-v2.sh"
+    _write(
+        stub,
+        """#!/usr/bin/env bash
+set -eu
+json=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json) json="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$json" ]
+printf '%s\n' '{"warns":0,"mode":"live"}' > "$json"
+""",
+    )
+    outdir = tmp_path / "live-wrapper-evidence"
+
+    result = subprocess.run(
+        ["bash", str(wrapper)],
+        cwd=probe_root,
+        env={
+            **os.environ,
+            "SN56_PROBE_OUTDIR": str(outdir),
+            "SN56_PROBE_ATTEMPTS": "1",
+            "SN56_DISABLE_NOTIFICATION": "1",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RESULT: GREEN (live)" in result.stdout
 
 
 def test_wrapper_retries_the_same_private_manifest_snapshot(tmp_path: Path) -> None:
