@@ -118,7 +118,20 @@ def validate(contract, manifest_path: Path, remote: Path, reviewed: Path):
 def training_repo_source(
     image_pin: str,
     image_repo: str = "https://github.com/tuly1/sn56-forge-toolkit.git",
+    *,
+    text_first: bool = False,
 ) -> str:
+    image_entry = f'''    TournamentType.IMAGE: TrainingRepoResponse(
+        github_repo="{image_repo}",
+        commit_hash="{image_pin}",
+    ),
+'''
+    text_entry = f'''    TournamentType.TEXT: TrainingRepoResponse(
+        github_repo="https://github.com/rayonlabs/G.O.D.git",
+        commit_hash="{TEXT_PIN}",
+    ),
+'''
+    entries = text_entry + image_entry if text_first else image_entry + text_entry
     return f'''from enum import Enum
 
 class TournamentType(Enum):
@@ -131,14 +144,7 @@ class TrainingRepoResponse:
         self.commit_hash = commit_hash
 
 _REPOS = {{
-    TournamentType.IMAGE: TrainingRepoResponse(
-        github_repo="{image_repo}",
-        commit_hash="{image_pin}",
-    ),
-    TournamentType.TEXT: TrainingRepoResponse(
-        github_repo="https://github.com/rayonlabs/G.O.D.git",
-        commit_hash="{TEXT_PIN}",
-    ),
+{entries}
 }}
 '''
 
@@ -1203,6 +1209,32 @@ def test_forward_dry_run_accepts_only_observed_validator_hotkey_duplicate(
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "exact Fiber auth-stage route" in proc.stdout
+    assert "DRY RUN COMPLETE -- nothing was modified" in proc.stdout
+    assert endpoint.read_text(encoding="utf-8") == before
+
+
+def test_forward_dry_run_accepts_live_text_first_repo_order_without_git_suffix(
+    isolated_release: tuple[Path, Path], tmp_path: Path
+):
+    remote, reviewed = isolated_release
+    mockroot = tmp_path / "host"
+    mockroot.mkdir()
+    endpoint = mockroot / "training_repo.py"
+    before = training_repo_source(
+        ROLLBACK,
+        "https://github.com/tuly1/sn56-forge-toolkit",
+        text_first=True,
+    )
+    endpoint.write_text(before, encoding="utf-8")
+    (mockroot / "fiber-auth-body.json").write_text(
+        fiber_auth_body(),
+        encoding="utf-8",
+    )
+
+    proc = run_repoint(SELECTED_MANIFEST_PATH, remote, reviewed, mockroot, "--dry-run")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "AST proves exact IMAGE/TEXT mapping" in proc.stdout
     assert "DRY RUN COMPLETE -- nothing was modified" in proc.stdout
     assert endpoint.read_text(encoding="utf-8") == before
 

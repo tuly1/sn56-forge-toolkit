@@ -674,8 +674,8 @@ for key in repos.keys:
     ):
         die("_REPOS contains a non-literal TournamentType key")
     repo_names.append(key.attr)
-if repo_names != ["IMAGE", "TEXT"]:
-    die("_REPOS keys are %r, expected exactly ['IMAGE', 'TEXT']; ENVIRONMENT must remain absent" % repo_names)
+if len(repo_names) != 2 or set(repo_names) != {"IMAGE", "TEXT"}:
+    die("_REPOS keys are %r, expected exactly IMAGE and TEXT in either order; ENVIRONMENT must remain absent" % repo_names)
 
 def entry(name):
     for k, v in zip(repos.keys, repos.values):
@@ -711,7 +711,9 @@ if node.value != old_sha:
 text_pin = txt["commit_hash"].value
 img_repo = img["github_repo"].value if "github_repo" in img else None
 txt_repo = txt["github_repo"].value if "github_repo" in txt else None
-if img_repo != expected_image_repo:
+def canonical_git_repo_url(value):
+    return value[:-4] if isinstance(value, str) and value.endswith(".git") else value
+if canonical_git_repo_url(img_repo) != canonical_git_repo_url(expected_image_repo):
     die("IMAGE github_repo is %r, expected reviewed repository %r -- refusing" %
         (img_repo, expected_image_repo), actual_image_repo=img_repo,
         expected_image_repo=expected_image_repo)
@@ -769,7 +771,7 @@ repo_names2 = [
     and isinstance(key.value, ast.Name)
     and key.value.id == "TournamentType"
 ]
-if repo_names2 != ["IMAGE", "TEXT"]: die("post-parse: _REPOS keys changed or ENVIRONMENT appeared")
+if repo_names2 != repo_names: die("post-parse: _REPOS key order changed or ENVIRONMENT appeared")
 
 result = {
     "ok": True, "check_only": check_only, "line": node.lineno,
