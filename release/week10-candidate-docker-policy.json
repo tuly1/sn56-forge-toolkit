@@ -1,0 +1,63 @@
+{
+  "schema_version": 2,
+  "policy_state": "reviewed",
+  "certification_source": {
+    "commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "tree": "613a1cc2d750731df007cc9b2b49e461d0ae368f"
+  },
+  "dockerfiles": [
+    {
+      "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+      "sha256": "3b98fb1cf2b8ec92218bf30848a0f16c8a3ec48c9034bb5984309d67100663a4"
+    },
+    {
+      "path": "ops/docker/standalone-image-trainer.dockerfile",
+      "sha256": "746fbb5084e2bd09fb3cfa01aef0070835571752cc762c9124e222a7d3a48cce"
+    }
+  ],
+  "release_evidence": {
+    "rollback_commit": "75a0a20c2deda82cfa727e082e60a95bea5befb3",
+    "allowed_changes_name_status_sha256": "c123df8f8c2543e46b5e5e11d289de962e9ea9f27c9cbe5bdce861543f8492d9",
+    "context_manifest_sha256": "4f753bb90bd5b4cfb3dcb7c4c4a7b562422a9c0b0b36504aefae105a078127e4",
+    "image_digest": "sha256:fc319058b098e569fe177c0f21f8c65beafed45e391211061fd0c61c1362cf0a",
+    "base_images": [
+      {
+        "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+        "image": "diagonalge/ai-toolkit:latest",
+        "digest": "sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8"
+      },
+      {
+        "path": "ops/docker/standalone-image-trainer.dockerfile",
+        "image": "diagonalge/ai-toolkit:latest",
+        "digest": "sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8"
+      },
+      {
+        "path": "ops/docker/standalone-image-trainer.dockerfile",
+        "image": "diagonalge/kohya_latest:latest",
+        "digest": "sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e"
+      }
+    ],
+    "build": {
+      "empty_store_log_sha256": "6df490d371a92659078e02517b62d5f7ebb8817f2406ab26ad4acaf838653795",
+      "empty_store_seconds": 1680.005,
+      "empty_store_result": "timeout-after-verified-step10",
+      "continuation_log_sha256": "5df657fed00f20f904b58ce3b281ec2fdc691d97b51177e263d068302ae7e648",
+      "continuation_seconds": 18.81,
+      "combined_seconds": 1698.815,
+      "portfolio_classification": "infrastructure-retry-completed",
+      "repaired_rebuild_log_sha256": "e4208ab0a5a388c82e36b10975a431f84cb0a95a1cf3e4e42df3cad1edbed8b7",
+      "repaired_rebuild_seconds": 1208.145,
+      "repaired_rebuild_result": "pass"
+    },
+    "parity": {
+      "authority": "four-runtime-roots-plus-bounded-os-toolchain",
+      "old_rootfs_manifest_sha256": "c82ba106c78c6109118d13554f0cd657be00d84b91793e9a284e8143626cc940",
+      "new_rootfs_manifest_sha256": "8591d6a9f36c3c4d52c73d60367d490c474b5ff056bc1c530a390b9b7b53adc1",
+      "config_sha256": "d5c11679b029557967526faf4a064682d22972eeea8a383694447ba52fcb3354",
+      "runtime_provenance_sha256": "6c569746febd99fe091410959f34aad0f52c413122e1bd3e145941e1ac1cd8ae",
+      "pyc_payload_manifest_sha256": "5c2e1ff491091a3553a279df5322b6b72c3388dee0442c884b32645ace82d993",
+      "git_logical_receipt_sha256": "236773a98fb69051e375113ca6454298460d65b18238ea16ee9501370863408f",
+      "entrypoint_smoke_sha256": "36e0c73b9133637fb452dadfb21d385405a6832f4837a4700d129732394dcc5e"
+    }
+  }
+}

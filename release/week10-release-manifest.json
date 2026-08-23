@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "release_state": "hold",
+  "target": {
+    "commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "tree": "613a1cc2d750731df007cc9b2b49e461d0ae368f",
+    "tree_records_sha256": "3ea4b92e0f2a90537527a3809b6615a97122eb69b497282f4ecacc267bf382d4",
+    "ref": "refs/heads/week10-trainer-candidate"
+  },
+  "rollback": {
+    "commit": "75a0a20c2deda82cfa727e082e60a95bea5befb3",
+    "tree": "bdf44638853e4cd96f0bd0e420d17bcd519c1d0b",
+    "tree_records_sha256": "b158fae4fcf155cf754ce8056df28ae0eae247dd7300f132f29de92fd47006ad",
+    "ref": "refs/heads/claude/week8-mse-revert"
+  },
+  "source": {
+    "repository_url": "https://github.com/tuly1/sn56-forge-toolkit.git",
+    "reviewed_worktree": "/Users/atulyashetty/Test/SN56-project/workspaces/worktrees/week10-release-recovery-codex"
+  },
+  "dockerfiles": [
+    {
+      "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+      "sha256": "3b98fb1cf2b8ec92218bf30848a0f16c8a3ec48c9034bb5984309d67100663a4"
+    },
+    {
+      "path": "ops/docker/standalone-image-trainer.dockerfile",
+      "sha256": "746fbb5084e2bd09fb3cfa01aef0070835571752cc762c9124e222a7d3a48cce"
+    }
+  ],
+  "allowed_changes": {
+    "base_commit": "75a0a20c2deda82cfa727e082e60a95bea5befb3",
+    "name_status_sha256": "c123df8f8c2543e46b5e5e11d289de962e9ea9f27c9cbe5bdce861543f8492d9",
+    "entries": [
+      {
+        "status": "M",
+        "path": "forge/config.py"
+      },
+      {
+        "status": "M",
+        "path": "forge/ideogram_release_policy.py"
+      },
+      {
+        "status": "M",
+        "path": "forge/recipe.py"
+      },
+      {
+        "status": "M",
+        "path": "forge/templates/base_diffusion_ideogram4.yaml"
+      },
+      {
+        "status": "M",
+        "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile"
+      },
+      {
+        "status": "M",
+        "path": "ops/docker/standalone-image-trainer.dockerfile"
+      },
+      {
+        "status": "A",
+        "path": "tests/test_build_network_hazards.py"
+      },
+      {
+        "status": "M",
+        "path": "tests/test_holdout.py"
+      },
+      {
+        "status": "M",
+        "path": "tests/test_ideogram_release_policy.py"
+      },
+      {
+        "status": "M",
+        "path": "tests/test_image_runtime_lock.py"
+      },
+      {
+        "status": "M",
+        "path": "tests/test_loss_and_ema_policy.py"
+      },
+      {
+        "status": "M",
+        "path": "tests/test_units.py"
+      },
+      {
+        "status": "M",
+        "path": "tests/test_week6_depth_geometry.py"
+      },
+      {
+        "status": "M",
+        "path": "tests/test_week6_ideogram_depth.py"
+      },
+      {
+        "status": "M",
+        "path": "tests/test_week6_ideogram_ema_horizon.py"
+      }
+    ]
+  },
+  "production": {
+    "ssh_host": "hetzner",
+    "service": "gradients-miner.service",
+    "service_user": "miner",
+    "service_working_directory": "/home/miner/god",
+    "service_exec_start": "/home/miner/.venv/bin/uvicorn miner.asgi:app --host 0.0.0.0 --port 7999 --env-file /home/miner/god/.1.env --log-level info",
+    "service_asgi_module": "/home/miner/god/miner/asgi.py",
+    "endpoint_host": "65.108.77.230",
+    "endpoint_port": 7999,
+    "endpoint_route": "/training_repo/image",
+    "endpoint_source": "/home/miner/god/miner/endpoints/training_repo.py",
+    "endpoint_pyc": "/home/miner/god/miner/endpoints/__pycache__/training_repo.cpython-312.pyc",
+    "text_pin": "8f11684e30a556b305dec9dd8eec9794bdae8cde"
+  }
+}

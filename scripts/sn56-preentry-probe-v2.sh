@@ -81,6 +81,8 @@ usage() { sed -n '2,30p' "${BASH_SOURCE[0]}"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --manifest)  MANIFEST="${2:-}"; shift 2 ;;
+    --docker-policy) DOCKER_POLICY="${2:-}"; shift 2 ;;
+    --readiness-receipt) READINESS_RECEIPT="${2:-}"; shift 2 ;;
     --mode)      MODE="${2:-}"; shift 2 ;;
     --fixtures)  FIXTURES="${2:-}"; shift 2 ;;
     --json)      JSON_OUT="${2:-}"; shift 2 ;;
@@ -91,6 +93,9 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+[ -f "$DOCKER_POLICY" ] || { echo "Docker policy not found: $DOCKER_POLICY" >&2; exit 2; }
+[ -f "$READINESS_RECEIPT" ] || { echo "readiness receipt not found: $READINESS_RECEIPT" >&2; exit 2; }
 
 case "$MODE" in
   live|mock) ;;

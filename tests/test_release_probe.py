@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -17,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PROBE = ROOT / "scripts" / "sn56-preentry-probe-v2.sh"
 WRAPPER = ROOT / "scripts" / "sn56-monday-probe.sh"
 MANIFEST_PATH = ROOT / "release" / "week9-release-manifest.json"
+DOCKER_POLICY_PATH = ROOT / "release" / "week9-docker-policy.json"
+READINESS_PATH = ROOT / "release" / "week9-release-readiness.json"
 SELECTED_MANIFEST_PATH = ROOT / "tests" / "data" / "week9-release-selected-hold.json"
 MANIFEST = json.loads(SELECTED_MANIFEST_PATH.read_text(encoding="utf-8"))
 TARGET = MANIFEST["target"]["commit"]
@@ -737,6 +740,10 @@ def test_wrapper_forwards_manifest_target_without_sha_override(tmp_path: Path) -
 
 def test_wrapper_retries_the_same_private_manifest_snapshot(tmp_path: Path) -> None:
     manifest, fixtures, baseline = _green_case(tmp_path)
+    policy = tmp_path / "docker-policy.json"
+    readiness = tmp_path / "release-readiness.json"
+    shutil.copyfile(DOCKER_POLICY_PATH, policy)
+    shutil.copyfile(READINESS_PATH, readiness)
     _write(fixtures / "chain_uid.out", "UID=NONE\n")
     outdir = tmp_path / "wrapper-evidence"
     proc = subprocess.Popen(
@@ -745,6 +752,10 @@ def test_wrapper_retries_the_same_private_manifest_snapshot(tmp_path: Path) -> N
             str(WRAPPER),
             "--manifest",
             str(manifest),
+            "--docker-policy",
+            str(policy),
+            "--readiness-receipt",
+            str(readiness),
             "--mode",
             "mock",
             "--fixtures",
@@ -777,6 +788,8 @@ def test_wrapper_retries_the_same_private_manifest_snapshot(tmp_path: Path) -> N
     swapped = _manifest()
     swapped["target"]["commit"] = "1" * 40
     manifest.write_text(json.dumps(swapped), encoding="utf-8")
+    policy.write_text("source policy replaced after snapshot\n", encoding="utf-8")
+    readiness.write_text("source readiness replaced after snapshot\n", encoding="utf-8")
     _write(fixtures / "chain_uid.out", "UID=224\n")
     stdout_tail, stderr = proc.communicate(timeout=15)
     stdout = "".join(seen) + stdout_tail
@@ -788,3 +801,6 @@ def test_wrapper_retries_the_same_private_manifest_snapshot(tmp_path: Path) -> N
     assert receipt["target_commit"] == TARGET
     assert f"target {TARGET[:12]}" in stdout
     assert ("1" * 12) not in stdout
+    wrapper = WRAPPER.read_text(encoding="utf-8")
+    assert '--docker-policy "$DOCKER_POLICY_SNAPSHOT"' in wrapper
+    assert '--readiness-receipt "$READINESS_SNAPSHOT"' in wrapper

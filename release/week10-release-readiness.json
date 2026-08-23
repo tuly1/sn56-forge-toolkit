@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "readiness_state": "hold",
+  "manifest_sha256": "80e3ff978fe323a126df345df1be7f49dad9d42046304fd743dc7646847becd0",
+  "docker_policy_sha256": "4aa745e5cfb07cfa74d33e85d6f9cefd98de7de21149e5699e91be7fa5c01805",
+  "target": {
+    "commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "tree": "613a1cc2d750731df007cc9b2b49e461d0ae368f",
+    "tree_records_sha256": "3ea4b92e0f2a90537527a3809b6615a97122eb69b497282f4ecacc267bf382d4",
+    "ref": "refs/heads/week10-trainer-candidate"
+  },
+  "rollback": {
+    "commit": "75a0a20c2deda82cfa727e082e60a95bea5befb3",
+    "tree": "bdf44638853e4cd96f0bd0e420d17bcd519c1d0b",
+    "tree_records_sha256": "b158fae4fcf155cf754ce8056df28ae0eae247dd7300f132f29de92fd47006ad",
+    "ref": "refs/heads/claude/week8-mse-revert"
+  },
+  "allowed_changes": {
+    "base_commit": "75a0a20c2deda82cfa727e082e60a95bea5befb3",
+    "name_status_sha256": "c123df8f8c2543e46b5e5e11d289de962e9ea9f27c9cbe5bdce861543f8492d9",
+    "count": 15
+  },
+  "dockerfiles": [
+    {
+      "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+      "sha256": "3b98fb1cf2b8ec92218bf30848a0f16c8a3ec48c9034bb5984309d67100663a4"
+    },
+    {
+      "path": "ops/docker/standalone-image-trainer.dockerfile",
+      "sha256": "746fbb5084e2bd09fb3cfa01aef0070835571752cc762c9124e222a7d3a48cce"
+    }
+  ]
+}

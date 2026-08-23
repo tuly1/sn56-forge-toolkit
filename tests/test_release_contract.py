@@ -22,6 +22,9 @@ MANIFEST_PATH = ROOT / "release" / "week9-release-manifest.json"
 SELECTED_MANIFEST_PATH = ROOT / "tests" / "data" / "week9-release-selected-hold.json"
 DOCKER_POLICY_PATH = ROOT / "release" / "week9-docker-policy.json"
 READINESS_PATH = ROOT / "release" / "week9-release-readiness.json"
+CANDIDATE_MANIFEST_PATH = ROOT / "release" / "week10-release-manifest.json"
+CANDIDATE_DOCKER_POLICY_PATH = ROOT / "release" / "week10-candidate-docker-policy.json"
+CANDIDATE_READINESS_PATH = ROOT / "release" / "week10-release-readiness.json"
 
 MANIFEST = json.loads(SELECTED_MANIFEST_PATH.read_text(encoding="utf-8"))
 DOCKER_POLICY = json.loads(DOCKER_POLICY_PATH.read_text(encoding="utf-8"))
@@ -49,6 +52,12 @@ def git(repo: Path, *args: str) -> str:
     proc = run(["git", "-C", repo, *args])
     assert proc.returncode == 0, proc.stderr
     return proc.stdout.strip()
+
+
+def public_key_material(private_key: Path) -> str:
+    fields = private_key.with_suffix(".pub").read_text(encoding="utf-8").split()
+    assert len(fields) >= 2
+    return " ".join(fields[:2])
 
 
 @pytest.fixture(scope="session")
@@ -266,6 +275,41 @@ def test_checked_in_manifest_is_an_explicit_unselected_hold(contract):
         contract.validate_contract(MANIFEST_PATH)
 
 
+def test_checked_in_candidate_policy_and_hold_receipt_bind_exact_target(contract):
+    candidate, candidate_raw = contract.load_manifest(CANDIDATE_MANIFEST_PATH)
+    contract.validate_schema(candidate)
+    policy = contract.verify_docker_policy(candidate, CANDIDATE_DOCKER_POLICY_PATH)
+    readiness, readiness_raw = contract._load_json_object(
+        CANDIDATE_READINESS_PATH, "candidate readiness receipt"
+    )
+
+    assert candidate["release_state"] == "hold"
+    assert candidate["target"]["commit"] == "59e0698c952edaf1bf34a117ecad41bce87517cf"
+    assert candidate["target"]["ref"] == "refs/heads/week10-trainer-candidate"
+    assert policy["schema_version"] == 2
+    assert policy["certification_source"] == {
+        "commit": candidate["target"]["commit"],
+        "tree": candidate["target"]["tree"],
+    }
+    assert policy["release_evidence"]["image_digest"] == (
+        "sha256:fc319058b098e569fe177c0f21f8c65beafed45e391211061fd0c61c1362cf0a"
+    )
+    assert readiness["readiness_state"] == "hold"
+    assert readiness["manifest_sha256"] == __import__("hashlib").sha256(
+        candidate_raw
+    ).hexdigest()
+    assert readiness["docker_policy_sha256"] == policy["sha256"]
+    assert readiness["target"] == candidate["target"]
+    assert readiness_raw == contract.canonical_json_bytes(readiness)
+
+
+def test_unselected_template_identity_is_not_tied_to_one_target_ref(contract):
+    placeholder = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    placeholder["target"]["ref"] = "refs/heads/week10-trainer-candidate"
+    contract.validate_schema(placeholder)
+    assert contract.target_is_unselected(placeholder)
+
+
 def test_unselected_target_cannot_be_flipped_ready(contract):
     placeholder = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     placeholder["release_state"] = "ready"
@@ -285,7 +329,7 @@ def test_ready_manifest_requires_exact_trusted_detached_signature(
     assert proc.returncode == 0, proc.stderr
     allowed = tmp_path / "allowed-signers"
     allowed.write_text(
-        f"{contract.SIGNING_PRINCIPAL} {key.with_suffix('.pub').read_text(encoding='utf-8').strip()}\n",
+        f"{contract.SIGNING_PRINCIPAL} {public_key_material(key)}\n",
         encoding="utf-8",
     )
     proc = run(
@@ -325,6 +369,155 @@ def test_ready_manifest_requires_exact_trusted_detached_signature(
         )
 
 
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="ssh-keygen unavailable")
+def test_ready_readiness_requires_distinct_trusted_detached_signature(
+    contract,
+    manifest: dict,
+    isolated_release: tuple[Path, Path],
+    tmp_path: Path,
+):
+    remote, reviewed = isolated_release
+    ready_manifest, readiness = write_ready_release(tmp_path, manifest)
+    manifest_key = tmp_path / "manifest-key"
+    readiness_key = tmp_path / "readiness-key"
+    for key in (manifest_key, readiness_key):
+        proc = run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key])
+        assert proc.returncode == 0, proc.stderr
+    manifest_allowed = tmp_path / "manifest-allowed-signers"
+    manifest_allowed.write_text(
+        f"{contract.SIGNING_PRINCIPAL} {public_key_material(manifest_key)}\n",
+        encoding="utf-8",
+    )
+    proc = run(
+        [
+            "ssh-keygen",
+            "-Y",
+            "sign",
+            "-f",
+            manifest_key,
+            "-n",
+            contract.SIGNING_NAMESPACE,
+            ready_manifest,
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr
+    contract_data = validate(contract, ready_manifest, remote, reviewed)
+    contract_data["manifest_signature"] = contract.verify_manifest_signature(
+        ready_manifest,
+        json.loads(ready_manifest.read_text(encoding="utf-8")),
+        ready_manifest.read_bytes(),
+        mock=False,
+        allowed_signers_path=manifest_allowed,
+    )
+    contract_receipt = write_manifest(
+        tmp_path,
+        contract_data,
+        "validated-contract.json",
+    )
+
+    with pytest.raises(contract.ContractError, match="cannot read final-readiness signature authority"):
+        contract.validate_readiness_receipt(readiness, contract_receipt)
+
+    allowed = tmp_path / "readiness-allowed-signers"
+    allowed.write_text(
+        f"{contract.READINESS_SIGNING_PRINCIPAL} {public_key_material(readiness_key)}\n",
+        encoding="utf-8",
+    )
+
+    wrong_key_readiness = tmp_path / "wrong-key-readiness.json"
+    shutil.copyfile(readiness, wrong_key_readiness)
+    proc = run(
+        [
+            "ssh-keygen",
+            "-Y",
+            "sign",
+            "-f",
+            manifest_key,
+            "-n",
+            contract.READINESS_SIGNING_NAMESPACE,
+            wrong_key_readiness,
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr
+    with pytest.raises(contract.ContractError, match="signature verification failed"):
+        contract.validate_readiness_receipt(
+            wrong_key_readiness,
+            contract_receipt,
+            allowed_signers_path=allowed,
+        )
+
+    wrong_namespace_readiness = tmp_path / "wrong-namespace-readiness.json"
+    shutil.copyfile(readiness, wrong_namespace_readiness)
+    proc = run(
+        [
+            "ssh-keygen",
+            "-Y",
+            "sign",
+            "-f",
+            readiness_key,
+            "-n",
+            contract.SIGNING_NAMESPACE,
+            wrong_namespace_readiness,
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr
+    with pytest.raises(contract.ContractError, match="signature verification failed"):
+        contract.validate_readiness_receipt(
+            wrong_namespace_readiness,
+            contract_receipt,
+            allowed_signers_path=allowed,
+        )
+
+    same_key_readiness = tmp_path / "same-key-readiness.json"
+    shutil.copyfile(readiness, same_key_readiness)
+    same_key_allowed = tmp_path / "same-key-readiness-allowed-signers"
+    same_key_allowed.write_text(
+        f"{contract.READINESS_SIGNING_PRINCIPAL} {public_key_material(manifest_key)}\n",
+        encoding="utf-8",
+    )
+    proc = run(
+        [
+            "ssh-keygen",
+            "-Y",
+            "sign",
+            "-f",
+            manifest_key,
+            "-n",
+            contract.READINESS_SIGNING_NAMESPACE,
+            same_key_readiness,
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr
+    with pytest.raises(contract.ContractError, match="must differ from the final-manifest"):
+        contract.validate_readiness_receipt(
+            same_key_readiness,
+            contract_receipt,
+            allowed_signers_path=same_key_allowed,
+        )
+
+    proc = run(
+        [
+            "ssh-keygen",
+            "-Y",
+            "sign",
+            "-f",
+            readiness_key,
+            "-n",
+            contract.READINESS_SIGNING_NAMESPACE,
+            readiness,
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr
+    proof = contract.validate_readiness_receipt(
+        readiness,
+        contract_receipt,
+        allowed_signers_path=allowed,
+    )
+    assert proof["signature"]["state"] == "verified"
+    assert proof["signature"]["principal"] == contract.READINESS_SIGNING_PRINCIPAL
+    assert proof["signature"]["namespace"] == contract.READINESS_SIGNING_NAMESPACE
+
+
 def test_positional_target_is_not_an_interface():
     proc = run(["bash", REPOINT_PATH, UNRELATED, "--contract-only"], cwd=ROOT)
     assert proc.returncode == 2
@@ -337,9 +530,24 @@ def test_one_line_rollback_and_current_runbook_bind_exact_prestate():
     assert os.access(ROLLBACK_PATH, os.X_OK)
     assert f'EXPECTED_ROLLBACK="{ROLLBACK}"' in wrapper
     assert "084ea914c6c5cbac4fa26a2138bd7195ebd71488" not in wrapper
-    assert 'exec "$REPOINT" --manifest "$MANIFEST" --rollback "$@"' in wrapper
+    assert 'exec "$REPOINT" --manifest "$MANIFEST" --rollback "${FORWARD_ARGS[@]}"' in wrapper
     assert ROLLBACK in runbook
     assert "ced58e2" not in runbook
+    assert "SN56_MANIFEST=release/week10-release-manifest.json" in runbook
+    assert "SN56_POLICY=release/week10-candidate-docker-policy.json" in runbook
+    assert "SN56_READINESS=release/week10-release-readiness.json" in runbook
+    assert '''bash scripts/sn56-week6-repoint.sh \\
+  --manifest "$SN56_MANIFEST" \\
+  --docker-policy "$SN56_POLICY" \\
+  --readiness-receipt "$SN56_READINESS" \\
+  --contract-only''' in runbook
+    assert '''bash scripts/sn56-week6-repoint.sh \\
+  --manifest "$SN56_MANIFEST" \\
+  --docker-policy "$SN56_POLICY" \\
+  --readiness-receipt "$SN56_READINESS" \\
+  --dry-run''' in runbook
+    assert "sn56-release-readiness" in runbook
+    assert "sn56-final-readiness" in runbook
     assert "47261" in runbook and "preserve-forever" in runbook
     assert "optional) delete" not in runbook.lower()
     assert "orphan volume" not in runbook.lower()
@@ -503,6 +711,23 @@ def test_exact_independent_ready_receipt_unlocks_mock_only_mutation(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "READINESS PASS" in proc.stdout
     assert TARGET in endpoint.read_text(encoding="utf-8")
+    rollback_line = next(
+        line for line in proc.stdout.splitlines() if "ONE-LINE ROLLBACK:" in line
+    )
+    assert f"--manifest {ready_manifest}" in rollback_line
+    assert "--docker-policy" in rollback_line
+    assert "week9-docker-policy.json" in rollback_line
+    assert f"--readiness-receipt {readiness}" in rollback_line
+    assert rollback_line.endswith("--rollback")
+    evidence_paths = list(mockroot.glob("evidence-*.json"))
+    assert len(evidence_paths) == 1
+    rollback_command = json.loads(evidence_paths[0].read_text(encoding="utf-8"))[
+        "rollback_command"
+    ]
+    assert f"--manifest {ready_manifest}" in rollback_command
+    assert "--docker-policy" in rollback_command
+    assert f"--readiness-receipt {readiness}" in rollback_command
+    assert rollback_command.endswith("--rollback")
 
 
 @pytest.mark.parametrize("drift", ["target-ref", "dirty-worktree"])
@@ -1211,9 +1436,10 @@ def test_prepare_readiness_derives_exact_hold_bindings_for_independent_review(
         "validated-contract-receipt.json",
     )
     proof = contract.validate_readiness_receipt(
-        reviewed_readiness, contract_receipt
+        reviewed_readiness, contract_receipt, mock=True
     )
     assert proof["readiness_state"] == "ready"
+    assert proof["signature"] == {"state": "mock-bypassed", "live_usable": False}
 
 
 def test_regeneration_from_clean_candidate_recomputes_and_forces_hold(
@@ -1291,6 +1517,85 @@ def test_regeneration_cannot_derive_or_bless_changed_docker_hashes(
             coordinated_policy,
         )
     assert not (tmp_path / "must-not-exist.json").exists()
+
+
+def test_versioned_policy_is_target_specific_and_regenerates_hold(
+    contract, isolated_release: tuple[Path, Path], manifest: dict, tmp_path: Path
+):
+    _, reviewed = isolated_release
+    policy = {
+        "schema_version": 2,
+        "policy_state": "reviewed",
+        "certification_source": copy.deepcopy(manifest["target"]),
+        "dockerfiles": copy.deepcopy(manifest["dockerfiles"]),
+        "release_evidence": {
+            "rollback_commit": manifest["rollback"]["commit"],
+            "allowed_changes_name_status_sha256": manifest["allowed_changes"][
+                "name_status_sha256"
+            ],
+            "context_manifest_sha256": "1" * 64,
+            "image_digest": "sha256:" + "2" * 64,
+            "base_images": [
+                {
+                    "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+                    "image": "diagonalge/ai-toolkit:latest",
+                    "digest": "sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8",
+                },
+                {
+                    "path": "ops/docker/standalone-image-trainer.dockerfile",
+                    "image": "diagonalge/ai-toolkit:latest",
+                    "digest": "sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8",
+                },
+                {
+                    "path": "ops/docker/standalone-image-trainer.dockerfile",
+                    "image": "diagonalge/kohya_latest:latest",
+                    "digest": "sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e",
+                },
+            ],
+            "build": {
+                "empty_store_log_sha256": "3" * 64,
+                "empty_store_seconds": 1680.005,
+                "empty_store_result": "timeout-after-verified-step10",
+                "continuation_log_sha256": "4" * 64,
+                "continuation_seconds": 18.81,
+                "combined_seconds": 1698.815,
+                "portfolio_classification": "infrastructure-retry-completed",
+                "repaired_rebuild_log_sha256": "5" * 64,
+                "repaired_rebuild_seconds": 1208.145,
+                "repaired_rebuild_result": "pass",
+            },
+            "parity": {
+                "authority": "four-runtime-roots-plus-bounded-os-toolchain",
+                "old_rootfs_manifest_sha256": "6" * 64,
+                "new_rootfs_manifest_sha256": "7" * 64,
+                "config_sha256": "8" * 64,
+                "runtime_provenance_sha256": "9" * 64,
+                "pyc_payload_manifest_sha256": "a" * 64,
+                "git_logical_receipt_sha256": "b" * 64,
+                "entrypoint_smoke_sha256": "c" * 64,
+            },
+        },
+    }
+    policy["certification_source"] = {
+        "commit": manifest["target"]["commit"],
+        "tree": manifest["target"]["tree"],
+    }
+    policy_path = write_manifest(tmp_path, policy, "versioned-policy.json")
+    output = tmp_path / "versioned-candidate.json"
+
+    generated = contract.regenerate_manifest(
+        MANIFEST_PATH, reviewed, output, policy_path
+    )
+
+    assert generated["release_state"] == "hold"
+    assert generated["target"]["commit"] == manifest["target"]["commit"]
+    assert contract.verify_docker_policy(generated, policy_path)["schema_version"] == 2
+
+    wrong = copy.deepcopy(policy)
+    wrong["release_evidence"]["allowed_changes_name_status_sha256"] = "d" * 64
+    wrong_path = write_manifest(tmp_path, wrong, "wrong-surface-policy.json")
+    with pytest.raises(contract.ContractError, match="changed-surface binding"):
+        contract.verify_docker_policy(generated, wrong_path)
 
 
 def test_regeneration_accepts_flux_only_successor_with_fixed_docker_policy_and_stays_hold(

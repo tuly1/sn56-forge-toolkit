@@ -12,7 +12,155 @@ worktree. At the start of each new shell, enter it once:
 cd /Users/atulyashetty/Test/SN56-project/workspaces/worktrees/week9-release-wiring-codex
 ```
 
-## Checked-in state: unselected HOLD, not a release
+## Week 10 exact candidate overlay — build READY, release artifacts HOLD
+
+The historical Week-9 manifest, policy, readiness receipt, and their hashes
+remain unchanged. They are not the Week-10 candidate authority. The reviewed
+Week-10 artifact set is versioned separately:
+
+```text
+release/week10-release-manifest.json
+release/week10-candidate-docker-policy.json
+release/week10-release-readiness.json
+release/sn56-readiness-allowed-signers
+```
+
+The target is exact commit
+`59e0698c952edaf1bf34a117ecad41bce87517cf`, tree
+`613a1cc2d750731df007cc9b2b49e461d0ae368f`, and future durable ref
+`refs/heads/week10-trainer-candidate`. The rollback remains exact
+`75a0a20c2deda82cfa727e082e60a95bea5befb3`. The rollback-to-target
+name/status digest is
+`c123df8f8c2543e46b5e5e11d289de962e9ea9f27c9cbe5bdce861543f8492d9`
+across the 15 listed paths. The exact Docker SHA-256 values are:
+
+```text
+ops/docker/standalone-image-toolkit-trainer.dockerfile  3b98fb1cf2b8ec92218bf30848a0f16c8a3ec48c9034bb5984309d67100663a4
+ops/docker/standalone-image-trainer.dockerfile          746fbb5084e2bd09fb3cfa01aef0070835571752cc762c9124e222a7d3a48cce
+```
+
+The schema-2 Docker policy is the candidate build/parity receipt. It binds the
+Git-index-normalized context manifest
+`4f753bb90bd5b4cfb3dcb7c4c4a7b562422a9c0b0b36504aefae105a078127e4`
+and completed image
+`sha256:fc319058b098e569fe177c0f21f8c65beafed45e391211061fd0c61c1362cf0a`.
+It also re-proves the exact pinned base digests `c24f8bb9...3447db8`
+(ai-toolkit) and `d34dd575...1beb84e` (Kohya) from the target Dockerfile bytes.
+The first empty-store phase reached and verified Step 10 before its strict
+1680-second wrapper stopped at final metadata (`1680.005s`); the exact cached
+continuation completed that metadata in `18.810s`, for a portfolio-classified
+upper bound of `1698.815s` under the validator's 1800-second wall. After the
+archive-context mode defect was identified, a fresh context normalized every
+tracked file from the Git index and every directory to non-writable canonical
+modes. The cache-preserving repaired build passed in `1208.145s` and produced
+the image above.
+
+Runtime equivalence authority is deliberately bounded, not whole-rootfs:
+exact path/type/mode/uid/gid/symlink/file SHA across `/app/ai-toolkit`,
+`/app/forge`, `/opt/sn56/ai-toolkit-python`, and `/opt/sn56`; exact Config
+`Entrypoint`, `WorkingDir`, and ordered Env; exact asset hashes; exact dpkg
+inventory and pinned toolchain probes. The only raw manifest differences are
+narrowly classified `.pyc` headers and Git storage housekeeping; compiled
+payload and logical Git receipts are exact. The real entrypoint smoke passed.
+
+These build/runtime gates make the candidate build READY. The checked-in
+Week-10 release manifest and readiness receipt remain exactly `hold`, so they
+are NON-SHIPPABLE. Do not flip them merely because the build passed. The target
+ref is still unpublished, and neither final authority has a reviewed detached
+signature. Push, manifest signing, independent readiness review/signing,
+deploy, and production repoint each remain separate actions.
+
+Use the three paths together; never pair the Week-10 manifest with the
+historical Week-9 policy or receipt:
+
+```bash
+SN56_MANIFEST=release/week10-release-manifest.json
+SN56_POLICY=release/week10-candidate-docker-policy.json
+SN56_READINESS=release/week10-release-readiness.json
+SN56_VALIDATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sn56-week10-contract.XXXXXX")"
+SN56_CONTRACT_RECEIPT="$SN56_VALIDATE_DIR/contract.json"
+
+python3 scripts/sn56-release-contract.py \
+  --manifest "$SN56_MANIFEST" \
+  --docker-policy "$SN56_POLICY" \
+  --contract-only \
+  --receipt "$SN56_CONTRACT_RECEIPT"
+bash scripts/sn56-week6-repoint.sh \
+  --manifest "$SN56_MANIFEST" \
+  --docker-policy "$SN56_POLICY" \
+  --readiness-receipt "$SN56_READINESS" \
+  --contract-only
+```
+
+Both commands currently fail closed because the selected manifest is HOLD and
+the ref is unpublished. Do not use the historical Week-9 preparation section
+below for this candidate. After separately authorized publication, review the
+one-field manifest transition from `hold` to `ready`, configure exactly one
+reviewed manifest key in `release/week9-release-allowed-signers`, and sign the
+exact Week-10 manifest bytes with the mechanism's fixed manifest authority:
+
+```bash
+SN56_RELEASE_SIGNING_KEY=/absolute/path/to/reviewed-manifest-signing-key
+ssh-keygen -Y sign \
+  -f "$SN56_RELEASE_SIGNING_KEY" \
+  -n sn56-week9-final-manifest \
+  "$SN56_MANIFEST"
+ssh-keygen -Y verify \
+  -f release/week9-release-allowed-signers \
+  -I sn56-week9-release \
+  -n sn56-week9-final-manifest \
+  -s "$SN56_MANIFEST.sig" < "$SN56_MANIFEST"
+```
+
+The manifest transition invalidates the checked-in HOLD readiness binding.
+Derive a new create-only HOLD receipt from the exact signed READY manifest and
+the exact candidate policy; independently review it, install it at
+`$SN56_READINESS`, and review its sole state transition to `ready`:
+
+```bash
+SN56_READY_PREP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sn56-week10-ready.XXXXXX")"
+SN56_REVIEW_READINESS="$SN56_READY_PREP_DIR/week10-readiness.hold.json"
+python3 scripts/sn56-release-contract.py \
+  --prepare-readiness \
+  --manifest "$SN56_MANIFEST" \
+  --docker-policy "$SN56_POLICY" \
+  --output "$SN56_REVIEW_READINESS"
+```
+
+Configure exactly one option-free entry in
+`release/sn56-readiness-allowed-signers` for a key whose public key differs
+from the manifest authority. The validator enforces that distinction. Sign and
+verify the exact reviewed READY receipt:
+
+```bash
+SN56_READINESS_SIGNING_KEY=/absolute/path/to/independent-readiness-signing-key
+ssh-keygen -Y sign \
+  -f "$SN56_READINESS_SIGNING_KEY" \
+  -n sn56-final-readiness \
+  "$SN56_READINESS"
+ssh-keygen -Y verify \
+  -f release/sn56-readiness-allowed-signers \
+  -I sn56-release-readiness \
+  -n sn56-final-readiness \
+  -s "$SN56_READINESS.sig" < "$SN56_READINESS"
+```
+
+After those separately reviewed steps, the same explicit paths are used for
+dry-run, probe, repoint, and rollback:
+
+```bash
+bash scripts/sn56-week6-repoint.sh \
+  --manifest "$SN56_MANIFEST" --docker-policy "$SN56_POLICY" \
+  --readiness-receipt "$SN56_READINESS" --dry-run
+bash scripts/sn56-monday-probe.sh \
+  --manifest "$SN56_MANIFEST" --docker-policy "$SN56_POLICY" \
+  --readiness-receipt "$SN56_READINESS"
+bash scripts/sn56-week6-rollback.sh \
+  --manifest "$SN56_MANIFEST" --docker-policy "$SN56_POLICY" \
+  --readiness-receipt "$SN56_READINESS"
+```
+
+## Historical Week-9 checked-in state: unselected HOLD, not a release
 
 The three reviewed release artifacts have separate jobs:
 
@@ -46,13 +194,18 @@ The three reviewed release artifacts have separate jobs:
   in the checked-in HOLD state. Add exactly one independently reviewed OpenSSH
   allowed-signers entry for principal `sn56-week9-release`; live validation
   requires a good signature in namespace `sn56-week9-final-manifest`.
+- `release/sn56-readiness-allowed-signers` is the separate, candidate-agnostic
+  trust root for the exact READY receipt. It also contains no key while HOLD.
+  Live validation requires principal `sn56-release-readiness`, namespace
+  `sn56-final-readiness`, and the detached `$SN56_READINESS.sig` bytes.
 
 Changing only the manifest's `release_state` never authorizes a release: its
 detached signature is missing/invalid, and the
 checked-in readiness receipt remains HOLD and/or fails the exact raw-manifest
 binding. Changing only the readiness state also cannot bless a different
-manifest or policy. Live mutation and the live probe require both exact READY
-artifacts; the CPU mock tests deliberately exercise the checked-in HOLD fixture.
+manifest or policy because an exact independently trusted signature is required.
+Live mutation and the live probe require both exact signed READY artifacts; the
+CPU mock tests deliberately exercise the checked-in HOLD fixture.
 
 The required live prestate and immutable rollback both stay
 `75a0a20c2deda82cfa727e082e60a95bea5befb3`. The fixed live surface stays
@@ -75,13 +228,13 @@ Release tooling never deletes provider resources or persistent volumes. In
 particular, Hyperstack volume `47261` is preserve-forever state and is outside
 every release, rollback, cleanup, and cost-saving command in this runbook.
 
-## T-24 target decision and preparation
+## Historical Week-9 fallback preparation — not the Week-10 Sunday path
 
-The lane cutoff is **2026-08-23 13:00:00 UTC**, exactly T-24 relative to the
-planned tournament start. Select only one independently supported, integrated,
-clean candidate through the normal review flow. If none exists, leave
-production on exact prestate `75a0a20...`; do not turn a historical RC or the
-all-zero sentinel into a guessed release target.
+This retained block documents how the old all-zero Week-9 template could be
+regenerated for a separately chosen fallback. It is not the preparation path
+for the selected Week-10 candidate above. Do not run it during the Week-10
+Sunday sequence. If the Week-10 authority cannot become exact signed READY,
+leave production on exact prestate `75a0a20...`.
 
 If integration needs a merge, stop for separate merge authorization first.
 Merge authorization does not authorize a push, deploy, or repoint. Preparation
@@ -165,9 +318,28 @@ immutable policy: exact manifest/policy SHA-256 values, target, rollback,
 allowed-change base/digest/count, and Docker list. Install it at
 `release/week9-release-readiness.json`; only after that independent decision,
 change exactly `readiness_state: "hold"` to `"ready"` and review the final
-diff. Do not edit any binding field. Commit the reviewed release-wiring files
-locally and require a clean worktree. That local commit still authorizes no
-push, merge, deploy, or production action.
+diff. Do not edit any binding field. Configure exactly one separately reviewed
+key in `release/sn56-readiness-allowed-signers`, then sign the exact READY
+receipt bytes under the distinct readiness principal and namespace:
+
+```bash
+SN56_READINESS_SIGNING_KEY=/absolute/path/to/reviewed-readiness-signing-key
+ssh-keygen -Y sign \
+  -f "$SN56_READINESS_SIGNING_KEY" \
+  -n sn56-final-readiness \
+  "$SN56_READINESS"
+test -s "$SN56_READINESS.sig"
+ssh-keygen -Y verify \
+  -f release/sn56-readiness-allowed-signers \
+  -I sn56-release-readiness \
+  -n sn56-final-readiness \
+  -s "$SN56_READINESS.sig" < "$SN56_READINESS"
+```
+
+The readiness signer must be independent of the manifest-signing authority.
+Its signature authenticates the exact policy hash and all receipt bindings.
+Commit the reviewed release-wiring files locally and require a clean worktree.
+That local commit still authorizes no push, merge, deploy, or production action.
 
 ## Candidate evidence remains external to tooling
 
@@ -221,9 +393,15 @@ python3 scripts/sn56-release-contract.py \
   --readiness-receipt "$SN56_READINESS" \
   --validated-contract-receipt "$SN56_CONTRACT_RECEIPT"
 bash scripts/sn56-week6-repoint.sh \
-  --manifest "$SN56_MANIFEST" --contract-only
+  --manifest "$SN56_MANIFEST" \
+  --docker-policy "$SN56_POLICY" \
+  --readiness-receipt "$SN56_READINESS" \
+  --contract-only
 bash scripts/sn56-week6-repoint.sh \
-  --manifest "$SN56_MANIFEST" --dry-run
+  --manifest "$SN56_MANIFEST" \
+  --docker-policy "$SN56_POLICY" \
+  --readiness-receipt "$SN56_READINESS" \
+  --dry-run
 ```
 
 The full contract first verifies the exact manifest's detached signature, then
@@ -313,15 +491,16 @@ certified; there is no hidden Sunday merge or lane-switch step.
 
 ```bash
 set -euo pipefail
-SN56_MANIFEST=release/week9-release-manifest.json
-SN56_POLICY=release/week9-docker-policy.json
-SN56_READINESS=release/week9-release-readiness.json
+SN56_MANIFEST=release/week10-release-manifest.json
+SN56_POLICY=release/week10-candidate-docker-policy.json
+SN56_READINESS=release/week10-release-readiness.json
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["release_state"])' "$SN56_MANIFEST")" = ready
 test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["readiness_state"])' "$SN56_READINESS")" = ready
 test -s "$SN56_MANIFEST.sig"
+test -s "$SN56_READINESS.sig"
 test "$(shasum -a 256 "$SN56_POLICY" | awk '{print $1}')" = \
-  476ae3c34458ac547607e98c587d7f631bbc60263db3e83f75401b9454dab129
+  4aa745e5cfb07cfa74d33e85d6f9cefd98de7de21149e5699e91be7fa5c01805
 SN56_TARGET_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target"]["commit"])' "$SN56_MANIFEST")"
 SN56_TARGET_REF="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target"]["ref"])' "$SN56_MANIFEST")"
 SN56_REPO_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["source"]["repository_url"])' "$SN56_MANIFEST")"
@@ -359,7 +538,9 @@ test "$(git -C "$SN56_REVIEWED_WORKTREE" rev-parse HEAD)" = "$SN56_TARGET_SHA"
    the printed manifest, target, rollback, host, route, and remaining runway:
 
    ```bash
-   bash scripts/sn56-week6-repoint.sh --manifest "$SN56_MANIFEST"
+   bash scripts/sn56-week6-repoint.sh \
+     --manifest "$SN56_MANIFEST" --docker-policy "$SN56_POLICY" \
+     --readiness-receipt "$SN56_READINESS"
    ```
 
 5. Immediately run the tracked live probe. Require `RESULT: GREEN (live)`, zero
@@ -367,7 +548,9 @@ test "$(git -C "$SN56_REVIEWED_WORKTREE" rev-parse HEAD)" = "$SN56_TARGET_SHA"
    and `endpoint.pin` must each PASS:
 
    ```bash
-   bash scripts/sn56-monday-probe.sh --manifest "$SN56_MANIFEST"
+   bash scripts/sn56-monday-probe.sh \
+     --manifest "$SN56_MANIFEST" --docker-policy "$SN56_POLICY" \
+     --readiness-receipt "$SN56_READINESS"
    ```
 
    Unless a separately authorized LaunchAgent installation has been verified,
@@ -392,12 +575,12 @@ requires the preserved canonical READY manifest, immutable policy, and exact
 READY readiness receipt:
 
 ```bash
-SN56_ROLLBACK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sn56-week9-rollback.XXXXXX")"
+SN56_ROLLBACK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sn56-week10-rollback.XXXXXX")"
 python3 scripts/sn56-release-contract.py \
-  --manifest release/week9-release-manifest.json \
-  --docker-policy release/week9-docker-policy.json \
+  --manifest "$SN56_MANIFEST" \
+  --docker-policy "$SN56_POLICY" \
   --rollback-contract-only \
-  --readiness-receipt release/week9-release-readiness.json \
+  --readiness-receipt "$SN56_READINESS" \
   --receipt "$SN56_ROLLBACK_DIR/rollback-contract.json"
 ```
 
@@ -409,15 +592,18 @@ exact rollback no-op state. An unknown served pin fails closed.
 
 ```bash
 # Preferred one-line form:
-bash scripts/sn56-week6-rollback.sh
+bash scripts/sn56-week6-rollback.sh \
+  --manifest "$SN56_MANIFEST" --docker-policy "$SN56_POLICY" \
+  --readiness-receipt "$SN56_READINESS"
 
 # Equivalent explicit form (use one form, never both):
 # bash scripts/sn56-week6-repoint.sh \
-#   --manifest release/week9-release-manifest.json --rollback
+#   --manifest "$SN56_MANIFEST" --docker-policy "$SN56_POLICY" \
+#   --readiness-receipt "$SN56_READINESS" --rollback
 ```
 
 The wrapper is the preferred one-line form and asserts exact rollback
 `75a0a20c2deda82cfa727e082e60a95bea5befb3` before delegating. Rollback is a
 separate explicit operator decision, not pre-authorized here. The checked-in
-unselected HOLD cannot run live rollback; production already rests on its exact
+Week-10 HOLD cannot run live rollback; production already rests on its exact
 rollback pin.

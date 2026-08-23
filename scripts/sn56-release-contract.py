@@ -29,13 +29,19 @@ from urllib.parse import urlparse
 
 
 SCHEMA_VERSION = 1
+DOCKER_POLICY_SCHEMA_V2 = 2
 DEFAULT_MANIFEST = Path(__file__).resolve().parent.parent / "release" / "week9-release-manifest.json"
 DEFAULT_DOCKER_POLICY = Path(__file__).resolve().parent.parent / "release" / "week9-docker-policy.json"
 DEFAULT_READINESS_RECEIPT = Path(__file__).resolve().parent.parent / "release" / "week9-release-readiness.json"
 DEFAULT_ALLOWED_SIGNERS = Path(__file__).resolve().parent.parent / "release" / "week9-release-allowed-signers"
+DEFAULT_READINESS_ALLOWED_SIGNERS = (
+    Path(__file__).resolve().parent.parent / "release" / "sn56-readiness-allowed-signers"
+)
 
 SIGNING_PRINCIPAL = "sn56-week9-release"
 SIGNING_NAMESPACE = "sn56-week9-final-manifest"
+READINESS_SIGNING_PRINCIPAL = "sn56-release-readiness"
+READINESS_SIGNING_NAMESPACE = "sn56-final-readiness"
 
 EXPECTED_REPOSITORY_URL = "https://github.com/tuly1/sn56-forge-toolkit.git"
 EXPECTED_ROLLBACK = {
@@ -169,7 +175,15 @@ def canonical_name_status(entries: list[dict[str, str]]) -> bytes:
 
 
 def target_is_unselected(data: dict[str, Any]) -> bool:
-    return data.get("target") == UNSELECTED_TARGET
+    target = data.get("target")
+    return isinstance(target, dict) and all(
+        target.get(key) == value
+        for key, value in {
+            "commit": "0" * 40,
+            "tree": "0" * 40,
+            "tree_records_sha256": "0" * 64,
+        }.items()
+    )
 
 
 def validate_schema(data: dict[str, Any]) -> None:
@@ -275,13 +289,29 @@ def validate_schema(data: dict[str, Any]) -> None:
 
 def load_docker_policy(path: Path) -> tuple[dict[str, Any], bytes]:
     policy, raw = _load_json_object(path.resolve(), "Docker policy")
-    _expect_keys(
-        policy,
-        {"schema_version", "policy_state", "certification_source", "dockerfiles"},
-        "Docker policy",
-    )
-    if policy["schema_version"] != SCHEMA_VERSION:
-        raise ContractError(f"Docker policy schema_version must be {SCHEMA_VERSION}")
+    policy_schema = policy.get("schema_version")
+    if policy_schema == SCHEMA_VERSION:
+        _expect_keys(
+            policy,
+            {"schema_version", "policy_state", "certification_source", "dockerfiles"},
+            "Docker policy",
+        )
+    elif policy_schema == DOCKER_POLICY_SCHEMA_V2:
+        _expect_keys(
+            policy,
+            {
+                "schema_version",
+                "policy_state",
+                "certification_source",
+                "dockerfiles",
+                "release_evidence",
+            },
+            "Docker policy",
+        )
+    else:
+        raise ContractError(
+            f"Docker policy schema_version must be {SCHEMA_VERSION} or {DOCKER_POLICY_SCHEMA_V2}"
+        )
     if policy["policy_state"] != "reviewed":
         raise ContractError("Docker policy policy_state must be exactly 'reviewed'")
     certification_source = _expect_keys(
@@ -309,14 +339,126 @@ def load_docker_policy(path: Path) -> tuple[dict[str, Any], bytes]:
         _require_hex(row["sha256"], HEX64, f"Docker policy dockerfiles[{index}].sha256")
     if tuple(seen) != EXPECTED_DOCKER_PATHS:
         raise ContractError(f"Docker policy paths/order must be exactly {EXPECTED_DOCKER_PATHS}")
-    if policy["certification_source"] != EXPECTED_DOCKER_CERTIFICATION_SOURCE:
-        raise ContractError(
-            "Docker policy must stay anchored to the exact bd852dc audited fixture"
+    if policy_schema == SCHEMA_VERSION:
+        if policy["certification_source"] != EXPECTED_DOCKER_CERTIFICATION_SOURCE:
+            raise ContractError(
+                "historical Docker policy must stay anchored to the exact bd852dc audited fixture"
+            )
+        if policy["dockerfiles"] != EXPECTED_DOCKERFILES:
+            raise ContractError(
+                "historical Docker policy hashes are immutable; Docker-byte changes require a versioned schema-2 policy"
+            )
+    else:
+        evidence = _expect_keys(
+            policy["release_evidence"],
+            {
+                "rollback_commit",
+                "allowed_changes_name_status_sha256",
+                "context_manifest_sha256",
+                "image_digest",
+                "base_images",
+                "build",
+                "parity",
+            },
+            "Docker policy release_evidence",
         )
-    if policy["dockerfiles"] != EXPECTED_DOCKERFILES:
-        raise ContractError(
-            "Docker policy hashes are immutable for this release; Docker-byte changes are forbidden"
+        _require_hex(evidence["rollback_commit"], HEX40, "release_evidence.rollback_commit")
+        for key in ("allowed_changes_name_status_sha256", "context_manifest_sha256"):
+            _require_hex(evidence[key], HEX64, f"release_evidence.{key}")
+        image_digest = evidence["image_digest"]
+        if not isinstance(image_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
+            raise ContractError("release_evidence.image_digest must be sha256:<64 lowercase hex>")
+        base_images = evidence["base_images"]
+        if not isinstance(base_images, list) or not base_images:
+            raise ContractError("release_evidence.base_images must be a non-empty list")
+        base_keys: list[tuple[str, str, str]] = []
+        for index, row in enumerate(base_images):
+            row = _expect_keys(
+                row,
+                {"path", "image", "digest"},
+                f"release_evidence.base_images[{index}]",
+            )
+            path = _require_repo_path(row["path"], f"release_evidence.base_images[{index}].path")
+            if path not in EXPECTED_DOCKER_PATHS:
+                raise ContractError(f"release_evidence.base_images[{index}].path is not a Dockerfile")
+            image = row["image"]
+            if (
+                not isinstance(image, str)
+                or not image
+                or "@" in image
+                or any(character.isspace() for character in image)
+            ):
+                raise ContractError(f"release_evidence.base_images[{index}].image is not canonical")
+            digest = row["digest"]
+            if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise ContractError(
+                    f"release_evidence.base_images[{index}].digest must be sha256:<64 lowercase hex>"
+                )
+            base_keys.append((path, image, digest))
+        if len(base_keys) != len(set(base_keys)):
+            raise ContractError("release_evidence.base_images contains duplicate bindings")
+        build = _expect_keys(
+            evidence["build"],
+            {
+                "empty_store_log_sha256",
+                "empty_store_seconds",
+                "empty_store_result",
+                "continuation_log_sha256",
+                "continuation_seconds",
+                "combined_seconds",
+                "portfolio_classification",
+                "repaired_rebuild_log_sha256",
+                "repaired_rebuild_seconds",
+                "repaired_rebuild_result",
+            },
+            "Docker policy release_evidence.build",
         )
+        for key in (
+            "empty_store_log_sha256",
+            "continuation_log_sha256",
+            "repaired_rebuild_log_sha256",
+        ):
+            _require_hex(build[key], HEX64, f"release_evidence.build.{key}")
+        for key in (
+            "empty_store_seconds",
+            "continuation_seconds",
+            "combined_seconds",
+            "repaired_rebuild_seconds",
+        ):
+            value = build[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ContractError(f"release_evidence.build.{key} must be a positive number")
+        if abs(
+            build["combined_seconds"]
+            - (build["empty_store_seconds"] + build["continuation_seconds"])
+        ) > 0.001:
+            raise ContractError("release_evidence.build.combined_seconds is not the exact phase sum")
+        if build["combined_seconds"] > 1800 or build["repaired_rebuild_seconds"] > 1800:
+            raise ContractError("release_evidence.build exceeds the 1800-second validator wall")
+        if build["empty_store_result"] != "timeout-after-verified-step10":
+            raise ContractError("release_evidence.build.empty_store_result is not the reviewed result")
+        if build["portfolio_classification"] != "infrastructure-retry-completed":
+            raise ContractError("release_evidence.build.portfolio_classification is not reviewed")
+        if build["repaired_rebuild_result"] != "pass":
+            raise ContractError("release_evidence.build.repaired_rebuild_result must be pass")
+        parity = _expect_keys(
+            evidence["parity"],
+            {
+                "authority",
+                "old_rootfs_manifest_sha256",
+                "new_rootfs_manifest_sha256",
+                "config_sha256",
+                "runtime_provenance_sha256",
+                "pyc_payload_manifest_sha256",
+                "git_logical_receipt_sha256",
+                "entrypoint_smoke_sha256",
+            },
+            "Docker policy release_evidence.parity",
+        )
+        if parity["authority"] != "four-runtime-roots-plus-bounded-os-toolchain":
+            raise ContractError("release_evidence.parity.authority is not the reviewed bounded scope")
+        for key in set(parity) - {"authority"}:
+            _require_hex(parity[key], HEX64, f"release_evidence.parity.{key}")
     return policy, raw
 
 
@@ -328,17 +470,129 @@ def verify_docker_policy(
         raise ContractError(
             "manifest Docker hashes differ from the independent reviewed Docker policy"
         )
-    return {
+    if policy["schema_version"] == DOCKER_POLICY_SCHEMA_V2:
+        if policy["certification_source"] != {
+            "commit": manifest["target"]["commit"],
+            "tree": manifest["target"]["tree"],
+        }:
+            raise ContractError(
+                "versioned Docker policy certification_source must equal the exact manifest target"
+            )
+        evidence = policy["release_evidence"]
+        if evidence["rollback_commit"] != manifest["rollback"]["commit"]:
+            raise ContractError("versioned Docker policy rollback binding differs from manifest")
+        if evidence["allowed_changes_name_status_sha256"] != manifest["allowed_changes"]["name_status_sha256"]:
+            raise ContractError("versioned Docker policy changed-surface binding differs from manifest")
+    receipt = {
         "path": str(docker_policy_path.resolve()),
         "sha256": hashlib.sha256(raw).hexdigest(),
+        "schema_version": policy["schema_version"],
         "policy_state": policy["policy_state"],
         "certification_source": copy.deepcopy(policy["certification_source"]),
         "dockerfiles": copy.deepcopy(policy["dockerfiles"]),
     }
+    if policy["schema_version"] == DOCKER_POLICY_SCHEMA_V2:
+        receipt["release_evidence"] = copy.deepcopy(policy["release_evidence"])
+    return receipt
 
 
 def manifest_signature_path(manifest_path: Path) -> Path:
     return Path(f"{manifest_path}.sig")
+
+
+def readiness_signature_path(readiness_path: Path) -> Path:
+    return Path(f"{readiness_path}.sig")
+
+
+def _verify_detached_ssh_signature(
+    *,
+    payload_raw: bytes,
+    signature_path: Path,
+    allowed_signers_path: Path,
+    principal: str,
+    namespace: str,
+    label: str,
+) -> dict[str, Any]:
+    allowed = allowed_signers_path.resolve()
+    signature = signature_path.resolve()
+    if allowed_signers_path.is_symlink() or signature_path.is_symlink():
+        raise ContractError(f"{label} signer policy and detached signature must not be symlinks")
+    try:
+        allowed_raw = allowed.read_bytes()
+        signature_raw = signature.read_bytes()
+    except OSError as exc:
+        raise ContractError(f"cannot read {label} signature authority: {exc}") from exc
+    try:
+        allowed_text = allowed_raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise ContractError(f"{label} signer policy is not valid UTF-8: {exc}") from exc
+    lines = [
+        line.split()
+        for line in allowed_text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    key_type_prefixes = ("ssh-", "ecdsa-", "sk-")
+    if (
+        len(lines) != 1
+        or len(lines[0]) < 3
+        or lines[0][0] != principal
+        or not lines[0][1].startswith(key_type_prefixes)
+    ):
+        raise ContractError(
+            f"{label} signer policy must contain exactly one option-free reviewed entry "
+            f"for principal {principal!r}"
+        )
+    try:
+        # The key identity excludes an optional trailing .pub comment. Options
+        # before the key type are forbidden by the prefix check above.
+        public_key_material = " ".join(lines[0][1:3]).encode("ascii", "strict")
+    except UnicodeEncodeError as exc:
+        raise ContractError(f"{label} signer public key is not ASCII") from exc
+    public_key_sha256 = hashlib.sha256(public_key_material).hexdigest()
+    ssh_keygen = shutil.which("ssh-keygen")
+    if ssh_keygen is None:
+        raise ContractError(f"ssh-keygen is required to verify the {label} signature")
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "LC_ALL": "C",
+        "LANG": "C",
+    }
+    try:
+        proc = subprocess.run(
+            [
+                ssh_keygen,
+                "-Y",
+                "verify",
+                "-f",
+                str(allowed),
+                "-I",
+                principal,
+                "-n",
+                namespace,
+                "-s",
+                str(signature),
+            ],
+            input=payload_raw,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+    except OSError as exc:
+        raise ContractError(f"could not execute ssh-keygen {label} signature verifier: {exc}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        raise ContractError(f"{label} signature verification failed: {detail}")
+    return {
+        "state": "verified",
+        "principal": principal,
+        "namespace": namespace,
+        "signature_path": str(signature),
+        "signature_sha256": hashlib.sha256(signature_raw).hexdigest(),
+        "allowed_signers_path": str(allowed),
+        "allowed_signers_sha256": hashlib.sha256(allowed_raw).hexdigest(),
+        "public_key_sha256": public_key_sha256,
+    }
 
 
 def verify_manifest_signature(
@@ -363,76 +617,22 @@ def verify_manifest_signature(
     if target_is_unselected(manifest):
         raise ContractError("final target is unselected; regenerate a selected HOLD manifest first")
 
-    allowed = allowed_signers_path.resolve()
-    signature = manifest_signature_path(manifest_path).resolve()
-    if allowed_signers_path.is_symlink() or manifest_signature_path(manifest_path).is_symlink():
-        raise ContractError("release signer policy and detached signature must not be symlinks")
-    try:
-        allowed_raw = allowed.read_bytes()
-        signature_raw = signature.read_bytes()
-    except OSError as exc:
-        raise ContractError(f"cannot read final-manifest signature authority: {exc}") from exc
-    try:
-        allowed_text = allowed_raw.decode("utf-8", "strict")
-    except UnicodeDecodeError as exc:
-        raise ContractError(f"release signer policy is not valid UTF-8: {exc}") from exc
-    lines = [
-        line.split()
-        for line in allowed_text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    if len(lines) != 1 or len(lines[0]) < 3 or lines[0][0] != SIGNING_PRINCIPAL:
-        raise ContractError(
-            "release signer policy must contain exactly one reviewed entry for "
-            f"principal {SIGNING_PRINCIPAL!r}"
-        )
-    ssh_keygen = shutil.which("ssh-keygen")
-    if ssh_keygen is None:
-        raise ContractError("ssh-keygen is required to verify the final-manifest signature")
-    env = {
-        "PATH": os.environ.get("PATH", os.defpath),
-        "LC_ALL": "C",
-        "LANG": "C",
-    }
-    try:
-        proc = subprocess.run(
-            [
-                ssh_keygen,
-                "-Y",
-                "verify",
-                "-f",
-                str(allowed),
-                "-I",
-                SIGNING_PRINCIPAL,
-                "-n",
-                SIGNING_NAMESPACE,
-                "-s",
-                str(signature),
-            ],
-            input=manifest_raw,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            check=False,
-        )
-    except OSError as exc:
-        raise ContractError(f"could not execute ssh-keygen signature verifier: {exc}") from exc
-    if proc.returncode != 0:
-        detail = proc.stderr.decode("utf-8", "replace").strip()
-        raise ContractError(f"final-manifest signature verification failed: {detail}")
-    return {
-        "state": "verified",
-        "principal": SIGNING_PRINCIPAL,
-        "namespace": SIGNING_NAMESPACE,
-        "signature_path": str(signature),
-        "signature_sha256": hashlib.sha256(signature_raw).hexdigest(),
-        "allowed_signers_path": str(allowed),
-        "allowed_signers_sha256": hashlib.sha256(allowed_raw).hexdigest(),
-    }
+    return _verify_detached_ssh_signature(
+        payload_raw=manifest_raw,
+        signature_path=manifest_signature_path(manifest_path),
+        allowed_signers_path=allowed_signers_path,
+        principal=SIGNING_PRINCIPAL,
+        namespace=SIGNING_NAMESPACE,
+        label="final-manifest",
+    )
 
 
 def _validate_readiness_against_contract(
-    readiness_path: Path, contract: dict[str, Any]
+    readiness_path: Path,
+    contract: dict[str, Any],
+    *,
+    mock: bool = False,
+    allowed_signers_path: Path = DEFAULT_READINESS_ALLOWED_SIGNERS,
 ) -> dict[str, Any]:
     readiness, readiness_raw = _load_json_object(readiness_path.resolve(), "readiness receipt")
     _expect_keys(
@@ -485,21 +685,55 @@ def _validate_readiness_against_contract(
         raise ContractError("validated manifest release_state is not ready")
     if readiness["readiness_state"] != "ready":
         raise ContractError("independent readiness receipt state is not ready")
+    if mock:
+        signature = {"state": "mock-bypassed", "live_usable": False}
+    else:
+        signature = _verify_detached_ssh_signature(
+            payload_raw=readiness_raw,
+            signature_path=readiness_signature_path(readiness_path),
+            allowed_signers_path=allowed_signers_path,
+            principal=READINESS_SIGNING_PRINCIPAL,
+            namespace=READINESS_SIGNING_NAMESPACE,
+            label="final-readiness",
+        )
+        manifest_signature = contract.get("manifest_signature")
+        if (
+            not isinstance(manifest_signature, dict)
+            or manifest_signature.get("state") != "verified"
+            or not isinstance(manifest_signature.get("public_key_sha256"), str)
+        ):
+            raise ContractError(
+                "validated live contract lacks a verified manifest-signing key identity"
+            )
+        if signature["public_key_sha256"] == manifest_signature["public_key_sha256"]:
+            raise ContractError(
+                "final-readiness signing key must differ from the final-manifest signing key"
+            )
     return {
         "path": str(readiness_path.resolve()),
         "sha256": hashlib.sha256(readiness_raw).hexdigest(),
         "readiness_state": "ready",
+        "signature": signature,
         **expected,
     }
 
 
 def validate_readiness_receipt(
-    readiness_path: Path, validated_contract_receipt_path: Path
+    readiness_path: Path,
+    validated_contract_receipt_path: Path,
+    *,
+    mock: bool = False,
+    allowed_signers_path: Path = DEFAULT_READINESS_ALLOWED_SIGNERS,
 ) -> dict[str, Any]:
     contract, _ = _load_json_object(
         validated_contract_receipt_path.resolve(), "validated contract receipt"
     )
-    return _validate_readiness_against_contract(readiness_path, contract)
+    return _validate_readiness_against_contract(
+        readiness_path,
+        contract,
+        mock=mock,
+        allowed_signers_path=allowed_signers_path,
+    )
 
 
 def _git_env(*, anonymous: bool = False, home: Path | None = None) -> dict[str, str]:
@@ -658,8 +892,10 @@ def verify_repo_objects(
         )
 
     verified_docker: list[dict[str, str]] = []
+    target_docker_bytes: dict[str, bytes] = {}
     for row in manifest["dockerfiles"]:
         raw = object_file(repo, target["commit"], row["path"])
+        target_docker_bytes[row["path"]] = raw
         actual = hashlib.sha256(raw).hexdigest()
         if actual != row["sha256"]:
             raise ContractError(
@@ -678,10 +914,26 @@ def verify_repo_objects(
                 )
         verified_docker.append({"path": row["path"], "sha256": actual})
 
-    # The immutable hashes are not trusted merely because they appear in a
-    # policy file. Re-prove them from the audited bd852dc certification source
-    # in every repository used by the contract, then require the candidate
-    # target blobs above to be byte-identical to that independently proven base.
+    verified_base_images: list[dict[str, str]] = []
+    if docker_policy["schema_version"] == DOCKER_POLICY_SCHEMA_V2:
+        for row in docker_policy["release_evidence"]["base_images"]:
+            expected_from = f"FROM {row['image']}@{row['digest']}".encode("ascii")
+            pattern = re.compile(
+                rb"^" + re.escape(expected_from) + rb"(?: AS [^\r\n]+)?\r?$",
+                re.MULTILINE,
+            )
+            occurrences = len(pattern.findall(target_docker_bytes[row["path"]]))
+            if occurrences != 1:
+                raise ContractError(
+                    f"reviewed base image binding occurs {occurrences} times in {row['path']}: "
+                    f"{row['image']}@{row['digest']}"
+                )
+            verified_base_images.append(copy.deepcopy(row))
+
+    # Docker hashes are not trusted merely because they appear in a policy
+    # file. Re-prove them from the policy's exact certification source in every
+    # repository used by the contract, then require the candidate target blobs
+    # above to be byte-identical to that source.
     certification_source = docker_policy["certification_source"]
     source_commit = certification_source["commit"]
     source_type = _git_text(repo, "cat-file", "-t", source_commit)
@@ -715,6 +967,7 @@ def verify_repo_objects(
         "allowed_changes_name_status_sha256": actual_surface_digest,
         "allowed_changes_count": len(actual_entries),
         "dockerfiles": verified_docker,
+        "base_images": verified_base_images,
         "docker_certification_source": {
             "commit": source_commit,
             "tree": source_tree,
@@ -1003,7 +1256,11 @@ def validate_rollback_contract(
         "dockerfiles": copy.deepcopy(manifest["dockerfiles"]),
         "docker_policy": docker_policy,
     }
-    readiness = _validate_readiness_against_contract(readiness_path, receipt)
+    readiness = _validate_readiness_against_contract(
+        readiness_path,
+        receipt,
+        mock=mock,
+    )
     receipt["readiness"] = readiness
     return receipt
 
@@ -1166,10 +1423,18 @@ def main(argv: list[str] | None = None) -> int:
                 or args.candidate_worktree
                 or args.output
                 or args.receipt
+                or args.repository_url
+                or args.reviewed_worktree
+                or args.target_ref
+                or args.rollback_ref
             ):
-                raise ContractError("readiness-only cannot be combined with validation/regeneration output")
+                raise ContractError(
+                    "readiness-only cannot be combined with validation/regeneration or Git overrides"
+                )
             readiness = validate_readiness_receipt(
-                args.readiness_receipt, args.validated_contract_receipt
+                args.readiness_receipt,
+                args.validated_contract_receipt,
+                mock=args.mock,
             )
             print("READINESS PASS")
             print(f"  receipt: {readiness['path']}")

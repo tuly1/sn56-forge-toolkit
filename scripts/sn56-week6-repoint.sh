@@ -45,8 +45,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTRACT="$SCRIPT_DIR/sn56-release-contract.py"
 DEFAULT_MANIFEST="$SCRIPT_DIR/../release/week9-release-manifest.json"
-DOCKER_POLICY="$SCRIPT_DIR/../release/week9-docker-policy.json"
-READINESS_RECEIPT="$SCRIPT_DIR/../release/week9-release-readiness.json"
+DEFAULT_DOCKER_POLICY="$SCRIPT_DIR/../release/week9-docker-policy.json"
+DEFAULT_READINESS_RECEIPT="$SCRIPT_DIR/../release/week9-release-readiness.json"
 R_BACKUP_DIR="/home/miner/sn56-endpoint-backups"
 
 # Hard abort: Monday 2026-08-24 12:30:00 UTC. Precomputed to avoid BSD/GNU
@@ -58,6 +58,8 @@ EVIDENCE_DIR="${SN56_EVIDENCE_DIR:-/Users/atulyashetty/Test/SN56-project}"
 
 # ------------------------------ arg parsing ---------------------------------
 MANIFEST="$DEFAULT_MANIFEST"
+DOCKER_POLICY="$DEFAULT_DOCKER_POLICY"
+READINESS_RECEIPT="$DEFAULT_READINESS_RECEIPT"
 MODE="repoint"
 DRY_RUN=0
 CONTRACT_ONLY=0
@@ -67,7 +69,6 @@ MOCK_REPOSITORY_URL=""
 MOCK_REVIEWED_WORKTREE=""
 MOCK_TARGET_REF=""
 MOCK_ROLLBACK_REF=""
-READINESS_OVERRIDE=0
 RECEIPT_OUT=""
 ASSUME_YES=0
 SYNC_TIMEOUT=420
@@ -81,13 +82,14 @@ while [ $# -gt 0 ]; do
     --dry-run)       DRY_RUN=1 ;;
     --contract-only) CONTRACT_ONLY=1 ;;
     --manifest)      MANIFEST="${2:-}"; shift ;;
+    --docker-policy) DOCKER_POLICY="${2:-}"; shift ;;
     --receipt)       RECEIPT_OUT="${2:-}"; shift ;;
     --mock)          MOCK=1; MOCKROOT="${2:-}"; shift ;;
     --repository-url) MOCK_REPOSITORY_URL="${2:-}"; shift ;;
     --reviewed-worktree) MOCK_REVIEWED_WORKTREE="${2:-}"; shift ;;
     --target-ref)    MOCK_TARGET_REF="${2:-}"; shift ;;
     --rollback-ref)  MOCK_ROLLBACK_REF="${2:-}"; shift ;;
-    --readiness-receipt) READINESS_RECEIPT="${2:-}"; READINESS_OVERRIDE=1; shift ;;
+    --readiness-receipt) READINESS_RECEIPT="${2:-}"; shift ;;
     --yes|-y)        ASSUME_YES=1 ;;
     --sync-timeout)  SYNC_TIMEOUT="${2:-}"; shift ;;
     --no-ext-probe)  SKIP_EXT_PROBE=1 ;;
@@ -112,9 +114,17 @@ fi
 if [ "$ASSUME_YES" = "1" ] && [ "$MOCK" != "1" ]; then
   echo "FATAL: --yes is a mock-only test hook; live mutation always requires interactive YES" >&2; exit 2
 fi
-if [ "$READINESS_OVERRIDE" = "1" ] && [ "$MOCK" != "1" ]; then
-  echo "FATAL: --readiness-receipt override is mock-only; live runs use the reviewed fixed receipt" >&2; exit 2
-fi
+[ -f "$DOCKER_POLICY" ] || { echo "FATAL: Docker policy missing: $DOCKER_POLICY" >&2; exit 2; }
+[ -f "$READINESS_RECEIPT" ] || { echo "FATAL: readiness receipt missing: $READINESS_RECEIPT" >&2; exit 2; }
+
+printf -v ROLLBACK_COMMAND '%q ' \
+  "$0" \
+  --manifest "$MANIFEST" \
+  --docker-policy "$DOCKER_POLICY" \
+  --readiness-receipt "$READINESS_RECEIPT" \
+  --rollback
+ROLLBACK_COMMAND="${ROLLBACK_COMMAND% }"
+ROLLBACK_COMMAND_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$ROLLBACK_COMMAND")" || exit 2
 
 # ------------------------------ plumbing ------------------------------------
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -128,11 +138,23 @@ snapshot_reviewed_file() {
   python3 - "$source" "$destination" <<'PY'
 import os, pathlib, sys
 source, destination = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+if source.is_symlink():
+    raise SystemExit(f"reviewed release artifact must not be a symlink: {source}")
 raw = source.read_bytes()
 with destination.open("xb") as handle:
     handle.write(raw)
     handle.flush()
     os.fsync(handle.fileno())
+signature_source = pathlib.Path(f"{source}.sig")
+if signature_source.exists() or signature_source.is_symlink():
+    if signature_source.is_symlink():
+        raise SystemExit(f"reviewed detached signature must not be a symlink: {signature_source}")
+    signature_destination = pathlib.Path(f"{destination}.sig")
+    signature_raw = signature_source.read_bytes()
+    with signature_destination.open("xb") as handle:
+        handle.write(signature_raw)
+        handle.flush()
+        os.fsync(handle.fileno())
 PY
 }
 
@@ -201,10 +223,13 @@ PY
 }
 
 validate_ready_snapshot() {
-  python3 "$CONTRACT" \
-    --readiness-only \
-    --readiness-receipt "$1" \
+  local args=(
+    --readiness-only
+    --readiness-receipt "$1"
     --validated-contract-receipt "$2"
+  )
+  [ "$MOCK" = "1" ] && args+=(--mock)
+  python3 "$CONTRACT" "${args[@]}"
 }
 
 CONTRACT_RECEIPT="$RUNDIR/contract-receipt.json"
@@ -809,7 +834,7 @@ if [ "$NOW_EPOCH" -ge "$HARD_ABORT_EPOCH" ]; then
   else
     bad "current UTC time is past the hard abort $HARD_ABORT_HUMAN."
     bad "a forward repoint this close to (or after) the 13:00 snapshot is unrecoverable."
-    bad "REFUSING. If the miner is on the new pin and you want out, run:  $0 --rollback"
+    bad "REFUSING. If the miner is on the new pin and you want out, run:  $ROLLBACK_COMMAND"
     exit 3
   fi
 else
@@ -1325,7 +1350,7 @@ cat > "$EV" <<JSON
   "service": { "unit": "$SERVICE", "user": "$SERVICE_USER", "working_directory": "$SERVICE_WORKING_DIRECTORY", "exec_start": "$SERVICE_EXEC_START", "pid_before": "$PID0", "pid_after": "$NEWPID", "listener_pid": "$LSN" },
   "verified": ["fiber_auth_stage_body","openapi_200","no_environment_repo_entry","new_pin_x1_source","old_pin_absent_source",
                "new_pin_x1_bytecode","old_pin_absent_bytecode","text_pin_intact","live_metagraph_sync"],
-  "rollback_command": "$0 --rollback"
+  "rollback_command": $ROLLBACK_COMMAND_JSON
 }
 JSON
 
@@ -1337,7 +1362,7 @@ log "  file sha256   : $PRE_SHA -> $FINAL_SHA"
 log "  backup        : $BK_PATH"
 log "  evidence      : $EV"
 log ""
-log "  ${C_B}ONE-LINE ROLLBACK:${C_0}  $0 --rollback"
+log "  ${C_B}ONE-LINE ROLLBACK:${C_0}  $ROLLBACK_COMMAND"
 log ""
 h_recent_log | sed 's/^/  | /'
 exit 0

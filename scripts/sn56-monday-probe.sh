@@ -5,6 +5,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST="$SCRIPT_DIR/../release/week9-release-manifest.json"
+DOCKER_POLICY="$SCRIPT_DIR/../release/week9-docker-policy.json"
+READINESS_RECEIPT="$SCRIPT_DIR/../release/week9-release-readiness.json"
 PROBE="$SCRIPT_DIR/sn56-preentry-probe-v2.sh"
 OUTDIR="${SN56_PROBE_OUTDIR:-/Users/atulyashetty/Test/SN56-project/evidence/monday-probe-20260824}"
 ATTEMPTS="${SN56_PROBE_ATTEMPTS:-3}"
@@ -14,6 +16,7 @@ declare -a PROBE_ARGS=()
 usage() {
   cat <<'EOF'
 Usage: sn56-monday-probe.sh [--manifest PATH]
+       sn56-monday-probe.sh [--docker-policy PATH] [--readiness-receipt PATH]
        sn56-monday-probe.sh --manifest PATH --mode mock --fixtures DIR [--now ISO]
 
 The target commit and production literals come only from the release manifest.
@@ -25,6 +28,12 @@ while [ $# -gt 0 ]; do
     --manifest)
       [ $# -ge 2 ] || { echo "--manifest requires PATH" >&2; exit 2; }
       MANIFEST="$2"; shift 2 ;;
+    --docker-policy)
+      [ $# -ge 2 ] || { echo "$1 requires PATH" >&2; exit 2; }
+      DOCKER_POLICY="$2"; shift 2 ;;
+    --readiness-receipt)
+      [ $# -ge 2 ] || { echo "$1 requires PATH" >&2; exit 2; }
+      READINESS_RECEIPT="$2"; shift 2 ;;
     --mode|--fixtures|--now)
       [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }
       PROBE_ARGS+=("$1" "$2"); shift 2 ;;
@@ -40,30 +49,54 @@ done
 RUNDIR="$(mktemp -d "${TMPDIR:-/tmp}/sn56-monday-probe.XXXXXX")"
 trap 'rm -rf "$RUNDIR"' EXIT
 MANIFEST_SOURCE="$MANIFEST"
+DOCKER_POLICY_SOURCE="$DOCKER_POLICY"
+READINESS_SOURCE="$READINESS_RECEIPT"
 MANIFEST_SNAPSHOT="$RUNDIR/release-manifest.json"
-MANIFEST_SHA256="$(python3 - "$MANIFEST_SOURCE" "$MANIFEST_SNAPSHOT" <<'PY'
+DOCKER_POLICY_SNAPSHOT="$RUNDIR/docker-policy.json"
+READINESS_SNAPSHOT="$RUNDIR/release-readiness.json"
+SNAPSHOT_SHA256S="$(python3 - \
+  "$MANIFEST_SOURCE" "$MANIFEST_SNAPSHOT" \
+  "$DOCKER_POLICY_SOURCE" "$DOCKER_POLICY_SNAPSHOT" \
+  "$READINESS_SOURCE" "$READINESS_SNAPSHOT" <<'PY'
 import hashlib
 import os
 import pathlib
 import sys
 
-source, destination = map(pathlib.Path, sys.argv[1:])
 try:
-    raw = source.read_bytes()
-    with destination.open("xb") as handle:
-        handle.write(raw)
-        handle.flush()
-        os.fsync(handle.fileno())
+    pairs = list(zip(map(pathlib.Path, sys.argv[1::2]), map(pathlib.Path, sys.argv[2::2])))
+    hashes = []
+    for source, destination in pairs:
+        if source.is_symlink():
+            raise ValueError(f"reviewed release artifact must not be a symlink: {source}")
+        raw = source.read_bytes()
+        with destination.open("xb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        hashes.append(hashlib.sha256(raw).hexdigest())
+    for source, destination in (pairs[0], pairs[2]):
+        signature_source = pathlib.Path(f"{source}.sig")
+        if signature_source.exists() or signature_source.is_symlink():
+            if signature_source.is_symlink():
+                raise ValueError(f"reviewed detached signature must not be a symlink: {signature_source}")
+            signature_raw = signature_source.read_bytes()
+            signature_destination = pathlib.Path(f"{destination}.sig")
+            with signature_destination.open("xb") as handle:
+                handle.write(signature_raw)
+                handle.flush()
+                os.fsync(handle.fileno())
 except Exception as exc:
-    print(f"manifest snapshot error: {exc}", file=sys.stderr)
+    print(f"release artifact snapshot error: {exc}", file=sys.stderr)
     raise SystemExit(2)
-print(hashlib.sha256(raw).hexdigest())
+print(" ".join(hashes))
 PY
 )" || exit 2
+read -r MANIFEST_SHA256 DOCKER_POLICY_SHA256 READINESS_SHA256 <<< "$SNAPSHOT_SHA256S"
 
-# Every retry consumes this one private byte snapshot. The operator-facing
-# banner, probe checks, and JSON therefore cannot describe different manifests
-# if the source path is replaced while the wrapper is running.
+# Every retry consumes this one private three-artifact snapshot. The banner,
+# probe checks, and JSON therefore cannot consume a different manifest, policy,
+# or readiness receipt if a source path is replaced during the wrapper run.
 TARGET_COMMIT="$(python3 - "$MANIFEST_SNAPSHOT" <<'PY'
 import json
 import re
@@ -100,12 +133,18 @@ LOG="$OUTDIR/probe-$STAMP.log"
 
 echo "SN56 MONDAY PROBE — $STAMP (manifest target ${TARGET_COMMIT:0:12})" | tee "$LOG"
 echo "manifest source: $MANIFEST_SOURCE (sha256 $MANIFEST_SHA256; private snapshot for all attempts)" | tee -a "$LOG"
+echo "Docker policy source: $DOCKER_POLICY_SOURCE (sha256 $DOCKER_POLICY_SHA256; private snapshot for all attempts)" | tee -a "$LOG"
+echo "readiness source: $READINESS_SOURCE (sha256 $READINESS_SHA256; private snapshot for all attempts)" | tee -a "$LOG"
 
 rc=1
 attempt=1
 while [ "$attempt" -le "$ATTEMPTS" ]; do
   echo "--- attempt $attempt/$ATTEMPTS ---" | tee -a "$LOG"
-  bash "$PROBE" --manifest "$MANIFEST_SNAPSHOT" --json "$JSON" "${PROBE_ARGS[@]}" >>"$LOG" 2>&1
+  bash "$PROBE" \
+    --manifest "$MANIFEST_SNAPSHOT" \
+    --docker-policy "$DOCKER_POLICY_SNAPSHOT" \
+    --readiness-receipt "$READINESS_SNAPSHOT" \
+    --json "$JSON" "${PROBE_ARGS[@]}" >>"$LOG" 2>&1
   rc=$?
   [ "$rc" -eq 0 ] && break
   # Retry only the known-flaky chain lookup. Manifest, route, pin, host, and
