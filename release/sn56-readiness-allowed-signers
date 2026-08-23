@@ -1,3 +1,1 @@
-# HOLD: replace this comment with exactly one independently reviewed OpenSSH
-# allowed_signers entry for principal sn56-release-readiness before signing an
-# exact final readiness receipt. Live validation fails with no trusted key.
+sn56-release-readiness ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILp4EiOI1MExR4EgQRbv/JwY1KV6BpZCNGw1RiR91iOU

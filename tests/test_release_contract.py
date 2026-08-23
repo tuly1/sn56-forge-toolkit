@@ -275,7 +275,7 @@ def test_checked_in_manifest_is_an_explicit_unselected_hold(contract):
         contract.validate_contract(MANIFEST_PATH)
 
 
-def test_checked_in_candidate_policy_and_hold_receipt_bind_exact_target(contract):
+def test_checked_in_candidate_policy_and_ready_receipt_bind_exact_target(contract):
     candidate, candidate_raw = contract.load_manifest(CANDIDATE_MANIFEST_PATH)
     contract.validate_schema(candidate)
     policy = contract.verify_docker_policy(candidate, CANDIDATE_DOCKER_POLICY_PATH)
@@ -283,7 +283,7 @@ def test_checked_in_candidate_policy_and_hold_receipt_bind_exact_target(contract
         CANDIDATE_READINESS_PATH, "candidate readiness receipt"
     )
 
-    assert candidate["release_state"] == "hold"
+    assert candidate["release_state"] == "ready"
     assert candidate["target"]["commit"] == "59e0698c952edaf1bf34a117ecad41bce87517cf"
     assert candidate["target"]["ref"] == "refs/heads/week10-trainer-candidate"
     assert policy["schema_version"] == 2
@@ -294,7 +294,7 @@ def test_checked_in_candidate_policy_and_hold_receipt_bind_exact_target(contract
     assert policy["release_evidence"]["image_digest"] == (
         "sha256:fc319058b098e569fe177c0f21f8c65beafed45e391211061fd0c61c1362cf0a"
     )
-    assert readiness["readiness_state"] == "hold"
+    assert readiness["readiness_state"] == "ready"
     assert readiness["manifest_sha256"] == __import__("hashlib").sha256(
         candidate_raw
     ).hexdigest()

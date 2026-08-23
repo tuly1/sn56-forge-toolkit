@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release_state": "hold",
+  "release_state": "ready",
   "target": {
     "commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
     "tree": "613a1cc2d750731df007cc9b2b49e461d0ae368f",

@@ -1,3 +1,1 @@
-# HOLD: replace this comment with one independently reviewed OpenSSH
-# allowed_signers entry for principal sn56-week9-release before signing a final
-# manifest. Live validation fails while no trusted key is configured.
+sn56-week9-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBPDuQKd4jeFISRl4NV2H6zuEFJS+d8JakI/lR9mu9/1
