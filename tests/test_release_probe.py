@@ -91,7 +91,7 @@ def _pin_evidence() -> dict:
         "service_exec_argv": PRODUCTION["service_exec_start"],
         "process_cwd": PRODUCTION["service_working_directory"],
         "process_cmdline": [
-            SERVICE_PYTHON,
+            f"{SERVICE_PYTHON}3",
             *shlex.split(PRODUCTION["service_exec_start"]),
         ],
         "reviewed_python": SERVICE_PYTHON,

@@ -760,7 +760,11 @@ if not isinstance(process_cmdline, list) or not all(
     wrong.append(f"process_cmdline={process_cmdline!r} is unreadable")
 else:
     reviewed_python_realpath = value.get("reviewed_python_realpath")
-    allowed_interpreters = {expected_python}
+    # A venv installs equivalent `python` and `python3` entry-point aliases.
+    # The kernel records the shebang-selected alias in /proc/cmdline, while
+    # process_exe_realpath below independently proves the running executable
+    # resolves to the reviewed interpreter.  Admit only those two exact paths.
+    allowed_interpreters = {expected_python, f"{expected_python}3"}
     if isinstance(reviewed_python_realpath, str) and reviewed_python_realpath:
         allowed_interpreters.add(reviewed_python_realpath)
     if (
