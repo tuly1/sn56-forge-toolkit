@@ -39,6 +39,14 @@ CLIP_L_PATH = "/app/flux/clip_l.safetensors"
 T5XXL_PATH = "/app/flux/t5xxl_fp16.safetensors"
 TOKENIZER_CACHE_DIR = "/app/flux/tokenizers"
 
+# Week-11 matched discovery and confirmation validated one exact production
+# projection for snapshot-shaped FLUX bases.  Keep it separate from the legacy
+# standalone checkpoint policy above: standalone tasks retain their existing
+# deadline-calibrated step count and seed 2, while an eligible snapshot either
+# runs these exact values or falls back to ai-toolkit.
+WEEK11_SNAPSHOT_TRAIN_STEPS = 94
+WEEK11_SNAPSHOT_SEED = 1
+
 
 def build_config(
     *,
@@ -48,6 +56,7 @@ def build_config(
     output_name: str,
     config_file: str,
     steps: int = MAX_TRAIN_STEPS,
+    seed: int = 2,
 ) -> dict[str, Any]:
     """Return the frozen operational FLUX recipe.
 
@@ -144,8 +153,28 @@ def build_config(
         ],
         # Runtime determinism.
         "max_data_loader_n_workers": 4,
-        "seed": 2,
+        "seed": int(seed),
     }
+
+
+def build_week11_snapshot_config(
+    *,
+    base_model: str,
+    train_data_dir: str,
+    output_dir: str,
+    output_name: str,
+    config_file: str,
+) -> dict[str, Any]:
+    """Return the exact seed-1 / 94-step Week-11 promoted projection."""
+    return build_config(
+        base_model=base_model,
+        train_data_dir=train_data_dir,
+        output_dir=output_dir,
+        output_name=output_name,
+        config_file=config_file,
+        steps=WEEK11_SNAPSHOT_TRAIN_STEPS,
+        seed=WEEK11_SNAPSHOT_SEED,
+    )
 
 
 def budgeted_train_steps(

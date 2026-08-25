@@ -1,4 +1,4 @@
-"""Shape-aware legacy FLUX backend with deadline-safe Kohya support.
+"""Shape-aware FLUX backend with deadline-safe Kohya support.
 
 The validator routes FLUX through the legacy-named Dockerfile.  Its downloader
 normalizes a standalone FLUX repository to exactly one root ``.safetensors``
@@ -7,13 +7,23 @@ understands the former shape; ai-toolkit understands the latter. Forge chooses
 between them from the trusted, read-only cache shape while retaining the same
 run scope, telemetry, kill-safe checkpoint promotion, publication scrub, and
 never-forfeit fallback.
+
+Week 11 validated the same Kohya family on two closed snapshot-shaped tasks at
+exactly 94 optimizer steps and training seed 1.  A snapshot takes that route
+only when one direct, regular, non-sharded file over 10 GiB has a safetensors
+header carrying BFL ``double_blocks.*`` tensors.  Every ineligible or safely
+contained failed attempt falls back to the unchanged ai-toolkit path.  The
+legacy standalone-checkpoint route below remains unchanged.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
+import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -24,6 +34,7 @@ from forge.clock import Deadline
 from forge.data import dataset
 from forge.data.schema import ImageSpec
 from forge.tasks import checkpoints, holdout
+from forge.tasks.integrity import valid_safetensors
 
 
 _SD_SCRIPTS_DIR = os.environ.get("SD_SCRIPTS_DIR", "/app/sd-scripts")
@@ -49,22 +60,29 @@ _DIFFUSERS_COMPONENT_DIRS = {
 }
 _WEIGHT_INDEX_SUFFIXES = (".bin.index.json", ".safetensors.index.json")
 _SHARDED_CHECKPOINT_PATTERN = re.compile(r"-\d{5}-of-\d{5}\.safetensors$")
+_SNAPSHOT_MIN_CHECKPOINT_BYTES = 10 * 1024**3
+_MAX_SAFETENSORS_HEADER_BYTES = 256 * 1024 * 1024
+
+
+class _SnapshotFinalizationError(RuntimeError):
+    """A validated final may have been published; a second trainer is unsafe."""
 
 
 def run(spec: ImageSpec, deadline: Deadline) -> None:
-    layout, standalone_model = resolve_flux_cache_layout(spec.cached_model_dir)
-    if layout == _SNAPSHOT_LAYOUT:
-        telemetry.set_meta(backend="aitoolkit", base_model_layout=layout)
+    try:
+        layout, standalone_model = resolve_flux_cache_layout(spec.cached_model_dir)
+    except (FileNotFoundError, OSError, RuntimeError) as exc:
         telemetry.event(
-            "flux_backend_selected",
-            backend="aitoolkit",
-            cache_layout=layout,
+            "flux_snapshot_kohya_skipped",
+            reason="cache_inspection_failed",
+            error=f"{type(exc).__name__}: {exc}",
         )
-        # Import lazily: the Kohya image contains both runtimes, while this
-        # module must remain importable in unit tests without ai-toolkit deps.
-        from forge.tasks import aitoolkit
-
-        aitoolkit.run(spec, deadline)
+        _run_aitoolkit(spec, deadline, cache_layout="unresolved")
+        return
+    if layout == _SNAPSHOT_LAYOUT:
+        if _attempt_snapshot_kohya(spec, deadline):
+            return
+        _run_aitoolkit(spec, deadline, cache_layout=layout)
         return
 
     telemetry.event(
@@ -73,6 +91,309 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         cache_layout=layout,
     )
     _run_standalone_kohya(spec, deadline, standalone_model)
+
+
+def _run_aitoolkit(
+    spec: ImageSpec,
+    deadline: Deadline,
+    *,
+    cache_layout: str,
+) -> None:
+    telemetry.set_meta(backend="aitoolkit", base_model_layout=cache_layout)
+    telemetry.event(
+        "flux_backend_selected",
+        backend="aitoolkit",
+        cache_layout=cache_layout,
+    )
+    # Import lazily: the Kohya image contains both runtimes, while this module
+    # must remain importable in unit tests without ai-toolkit dependencies.
+    from forge.tasks import aitoolkit
+
+    aitoolkit.run(spec, deadline)
+
+
+def _attempt_snapshot_kohya(spec: ImageSpec, deadline: Deadline) -> bool:
+    """Run the exact Week-11 snapshot recipe or safely decline to ai-toolkit."""
+    checkpoint = resolve_snapshot_kohya_checkpoint(spec.cached_model_dir)
+    if checkpoint is None:
+        telemetry.event(
+            "flux_snapshot_kohya_skipped",
+            reason="no_single_eligible_bfl_checkpoint",
+        )
+        return False
+
+    ready, reason = _kohya_runtime_ready()
+    if not ready:
+        telemetry.event("flux_snapshot_kohya_skipped", reason=reason)
+        return False
+
+    remaining_soft_s = deadline.remaining()
+    planned = flux_kohya_config.budgeted_train_steps(
+        remaining_soft_s,
+        boundary_margin_s=_STOP_MARGIN_S,
+        max_steps=flux_kohya_config.WEEK11_SNAPSHOT_TRAIN_STEPS,
+    )
+    if planned != flux_kohya_config.WEEK11_SNAPSHOT_TRAIN_STEPS:
+        telemetry.event(
+            "flux_snapshot_kohya_skipped",
+            reason="insufficient_budget_for_exact_week11_recipe",
+            planned_steps=planned,
+            required_steps=flux_kohya_config.WEEK11_SNAPSHOT_TRAIN_STEPS,
+            remaining_soft_s=round(remaining_soft_s, 1),
+        )
+        return False
+
+    try:
+        telemetry.event(
+            "flux_backend_selected",
+            backend="kohya",
+            cache_layout=_SNAPSHOT_LAYOUT,
+            checkpoint=os.path.basename(checkpoint),
+        )
+        _run_snapshot_kohya(
+            spec,
+            deadline,
+            checkpoint,
+            remaining_soft_s=remaining_soft_s,
+        )
+        return True
+    except _SnapshotFinalizationError:
+        # finalize may already have atomically replaced the public candidate.
+        # Starting another trainer in that ambiguity is less safe than letting
+        # the outer no-artifact fallback handle the task.
+        raise
+    except Exception as exc:
+        # Move this attempt's partials before begin_run: begin_run deliberately
+        # promotes the highest visible repo-prefixed checkpoint to a kill-safe
+        # last.safetensors, which would otherwise make an unvalidated Kohya
+        # periodic eligible if the ai-toolkit fallback also failed.
+        try:
+            _quarantine_failed_snapshot_attempt(spec)
+            checkpoints.begin_run(spec.save_root, spec.expected_repo_name)
+        except Exception as reset_exc:
+            raise RuntimeError(
+                "failed snapshot Kohya attempt could not be isolated for "
+                "ai-toolkit fallback"
+            ) from reset_exc
+        telemetry.event(
+            "flux_snapshot_kohya_fallback",
+            reason="kohya_attempt_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return False
+
+
+def _quarantine_failed_snapshot_attempt(spec: ImageSpec) -> None:
+    """Recoverably isolate current Kohya outputs before ai-toolkit replans."""
+    scope = checkpoints.load_run(spec.save_root)
+    if scope is None:
+        raise RuntimeError("snapshot Kohya fallback lost its checkpoint scope")
+    paths = checkpoints.current_loras(spec.save_root, scope)
+    for name in ("optimizer.pt", "learnable_snr.json"):
+        path = os.path.join(spec.save_root, name)
+        if os.path.lexists(path):
+            paths.append(path)
+    if not paths:
+        return
+
+    quarantine = os.path.join(
+        os.path.dirname(os.path.abspath(spec.save_root)),
+        f".forge-failed-snapshot-kohya-{os.getpid()}-{time.time_ns()}",
+    )
+    os.makedirs(quarantine, mode=0o700)
+    moved: list[str] = []
+    try:
+        for source in sorted(set(paths)):
+            if os.path.islink(source) or not os.path.isfile(source):
+                raise RuntimeError(
+                    f"unsafe failed snapshot Kohya output: {source!r}"
+                )
+            destination = os.path.join(quarantine, os.path.basename(source))
+            os.replace(source, destination)
+            moved.append(destination)
+        _fsync_dir(quarantine)
+        _fsync_dir(spec.save_root)
+    except BaseException:
+        # Best-effort rollback keeps the failed attempt visible under its
+        # original names; the caller will refuse to start ai-toolkit.
+        for destination in reversed(moved):
+            source = os.path.join(spec.save_root, os.path.basename(destination))
+            try:
+                os.replace(destination, source)
+            except OSError:
+                pass
+        raise
+
+
+def _fsync_dir(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def resolve_snapshot_kohya_checkpoint(cached_model_dir: str) -> str | None:
+    """Return one direct >10-GiB BFL safetensors file, otherwise ``None``."""
+    try:
+        safetensors: list[str] = []
+        for entry in os.scandir(cached_model_dir):
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                continue
+            if not entry.name.endswith(".safetensors"):
+                continue
+            safetensors.append(entry.path)
+            if _SHARDED_CHECKPOINT_PATTERN.search(entry.name):
+                return None
+        if len(safetensors) != 1:
+            return None
+        checkpoint = safetensors[0]
+        return checkpoint if _is_bfl_flux_checkpoint(checkpoint) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _is_bfl_flux_checkpoint(path: str) -> bool:
+    """Read only the bounded safetensors header and prove BFL tensor names."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size <= _SNAPSHOT_MIN_CHECKPOINT_BYTES
+        ):
+            return False
+        raw_length = os.read(fd, 8)
+        if len(raw_length) != 8:
+            return False
+        (header_length,) = struct.unpack("<Q", raw_length)
+        if not 0 < header_length <= _MAX_SAFETENSORS_HEADER_BYTES:
+            return False
+        raw_header = bytearray()
+        while len(raw_header) < header_length:
+            chunk = os.read(fd, header_length - len(raw_header))
+            if not chunk:
+                return False
+            raw_header.extend(chunk)
+        header = json.loads(raw_header.decode("utf-8"))
+        return isinstance(header, dict) and any(
+            isinstance(name, str) and name.startswith("double_blocks.")
+            for name in header
+        )
+    except (OSError, ValueError, UnicodeDecodeError, struct.error):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _kohya_runtime_ready() -> tuple[bool, str]:
+    """Preflight the baked Kohya runtime before spending the training clock."""
+    if not os.path.isfile(os.path.join(_SD_SCRIPTS_DIR, "flux_train_network.py")):
+        return False, "kohya_script_missing"
+    for asset in (
+        flux_kohya_config.AE_PATH,
+        flux_kohya_config.CLIP_L_PATH,
+        flux_kohya_config.T5XXL_PATH,
+    ):
+        if not os.path.isfile(asset):
+            return False, "kohya_flux_asset_missing"
+    if not os.path.isdir(flux_kohya_config.TOKENIZER_CACHE_DIR):
+        return False, "kohya_tokenizer_cache_missing"
+    return True, "ready"
+
+
+def _run_snapshot_kohya(
+    spec: ImageSpec,
+    deadline: Deadline,
+    base_model: str,
+    *,
+    remaining_soft_s: float,
+) -> None:
+    """Train and accept only the natural exact 94-step Week-11 final."""
+    os.makedirs(spec.save_root, exist_ok=True)
+    os.makedirs(spec.training_folder, exist_ok=True)
+    scope = checkpoints.ensure_run(spec.save_root, spec.expected_repo_name)
+    train_data_dir, pairs = dataset.prepare_kohya_flux_dataset(
+        spec.cached_zip_path,
+        images_root=spec.dataset_images_dir,
+        trigger_word=spec.trigger_word,
+    )
+    steps = flux_kohya_config.WEEK11_SNAPSHOT_TRAIN_STEPS
+    scope = checkpoints.set_planned_steps(
+        spec.save_root,
+        scope,
+        steps,
+        model_type=spec.model_type,
+    )
+    config_path = _config_path(spec)
+    config = flux_kohya_config.build_week11_snapshot_config(
+        base_model=base_model,
+        train_data_dir=train_data_dir,
+        output_dir=spec.save_root,
+        output_name=spec.expected_repo_name,
+        config_file=config_path,
+    )
+    flux_kohya_config.write_config(config, config_path)
+    telemetry.event(
+        "kohya_step_budgeted",
+        max_steps=steps,
+        planned_steps=steps,
+        remaining_soft_s=round(remaining_soft_s, 1),
+        boundary_margin_s=_STOP_MARGIN_S,
+        recipe="week11_matched_seed1",
+    )
+    telemetry.set_meta(
+        model_type=spec.model_type,
+        backend="kohya",
+        base_model_layout=_SNAPSHOT_LAYOUT,
+        pairs=pairs,
+        base_model=os.path.basename(base_model),
+        steps=steps,
+        save_every=config["save_every_n_steps"],
+        trigger_word=spec.trigger_word,
+        training_seed=flux_kohya_config.WEEK11_SNAPSHOT_SEED,
+    )
+    telemetry.event("dataset_ready", pairs=pairs)
+
+    rc, stopped_by_deadline = _run_kohya(config_path, deadline, spec, scope)
+    if rc != 0 or stopped_by_deadline:
+        raise RuntimeError(
+            "snapshot Kohya did not exit naturally after the exact 94 steps"
+        )
+    exact_final = os.path.join(spec.save_root, f"{spec.expected_repo_name}.safetensors")
+    if (
+        exact_final not in checkpoints.current_loras(spec.save_root, scope)
+        or not valid_safetensors(exact_final)
+    ):
+        raise RuntimeError("snapshot Kohya produced no valid natural 94-step final")
+    try:
+        record = checkpoints.finalize(
+            spec.save_root,
+            spec.expected_repo_name,
+            scope,
+            context="flux_kohya_week11_snapshot_training",
+        )
+    except Exception as exc:
+        raise _SnapshotFinalizationError(
+            "snapshot Kohya exact final could not be published safely"
+        ) from exc
+    if (
+        record is None
+        or record.get("source") != "exact_final"
+        or record.get("selected_step") != steps
+    ):
+        raise _SnapshotFinalizationError(
+            "snapshot Kohya finalization did not bind the exact 94-step final"
+        )
+    telemetry.event(
+        "checkpoint_finalized",
+        status=record["status"],
+        source=record["source"],
+        selected_step=record["selected_step"],
+    )
 
 
 def _run_standalone_kohya(
@@ -302,10 +623,10 @@ def _run_kohya(
     deadline: Deadline,
     spec: ImageSpec,
     scope: dict,
-) -> None:
+) -> tuple[int | None, bool]:
     if deadline.remaining() <= _STOP_MARGIN_S:
         telemetry.event("kohya_skipped", reason="insufficient_soft_deadline")
-        return
+        return None, True
     script = os.path.join(_SD_SCRIPTS_DIR, "flux_train_network.py")
     if not os.path.isfile(script):
         raise FileNotFoundError(f"Kohya FLUX trainer not found: {script!r}")
@@ -368,6 +689,7 @@ def _run_kohya(
     ):
         _tail_log(log_path)
         raise RuntimeError(f"Kohya failed (rc={rc}) with no current checkpoint")
+    return rc, stopped_by_deadline
 
 
 def _command(config_path: str, *, script: str | None = None) -> list[str]:
