@@ -1,0 +1,4 @@
+# HOLD: install exactly one independently reviewed OpenSSH allowed_signers
+# entry for principal sn56-week11-release before signing an exact final
+# manifest in namespace sn56-week11-final-manifest. Live validation fails closed
+# while no trusted key is configured.

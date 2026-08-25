@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "readiness_state": "hold",
+  "manifest_sha256": "c2bc4780be7eb07b8462d0ba0a248b911ebc7dbaa50bd04da6e6b3d9526ee7de",
+  "docker_policy_sha256": "272651e0725df451c1dba3c4371a8304ce6f3398d1625dc3336e57de7d9fbc60",
+  "target": {
+    "commit": "0000000000000000000000000000000000000000",
+    "tree": "0000000000000000000000000000000000000000",
+    "tree_records_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "ref": "refs/heads/codex/week11-flux-release"
+  },
+  "rollback": {
+    "commit": "fe9749c027df511b7566b474e6f8524f86b01f83",
+    "tree": "c7e79fb326e3bc3ef7b573d2d0144e82e0e24a25",
+    "tree_records_sha256": "c5362ef488af54c7729cba91279b0287b382eee05c5739e802bd894ef72ee582",
+    "ref": "refs/heads/week11-ideogram-content-product"
+  },
+  "allowed_changes": {
+    "base_commit": "fe9749c027df511b7566b474e6f8524f86b01f83",
+    "name_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "count": 0
+  },
+  "dockerfiles": [
+    {
+      "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+      "sha256": "3b98fb1cf2b8ec92218bf30848a0f16c8a3ec48c9034bb5984309d67100663a4"
+    },
+    {
+      "path": "ops/docker/standalone-image-trainer.dockerfile",
+      "sha256": "746fbb5084e2bd09fb3cfa01aef0070835571752cc762c9124e222a7d3a48cce"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+# HOLD: install exactly one independently reviewed OpenSSH allowed_signers
+# entry for principal sn56-week11-readiness before signing an exact final
+# readiness receipt in namespace sn56-week11-final-readiness. It must use a key
+# distinct from the final-manifest signer; live validation fails closed here.

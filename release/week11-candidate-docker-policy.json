@@ -1,0 +1,53 @@
+{
+  "schema_version": 2,
+  "policy_state": "hold-pending-exact-h100-canary",
+  "certification_source": {
+    "commit": "3f7737c4045c3877e3c9f100a0341fe2566b1db6",
+    "tree": "42001148b7b8342d9837dcb7e2b532b23892aeee"
+  },
+  "dockerfiles": [
+    {
+      "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+      "sha256": "3b98fb1cf2b8ec92218bf30848a0f16c8a3ec48c9034bb5984309d67100663a4"
+    },
+    {
+      "path": "ops/docker/standalone-image-trainer.dockerfile",
+      "sha256": "746fbb5084e2bd09fb3cfa01aef0070835571752cc762c9124e222a7d3a48cce"
+    }
+  ],
+  "release_evidence": {
+    "rollback_commit": "fe9749c027df511b7566b474e6f8524f86b01f83",
+    "secondary_rollback_commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "allowed_changes_name_status_sha256": "416c825bb8ccb840b2039a3052bffe946b4edc37fed22a5a1bd14824ac07e4f7",
+    "science_decision_sha256": "3c192338b0e31ec09d42160a0353588f0c883975990cd7633e351b5494693366",
+    "execution_identity_correction_sha256": "6ecd8a1c9a746c4c5e760fad7b440c2299aa58a443d67c2fa95717126eccc39b",
+    "base_images": [
+      {
+        "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+        "image": "diagonalge/ai-toolkit:latest",
+        "digest": "sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8"
+      },
+      {
+        "path": "ops/docker/standalone-image-trainer.dockerfile",
+        "image": "diagonalge/ai-toolkit:latest",
+        "digest": "sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8"
+      },
+      {
+        "path": "ops/docker/standalone-image-trainer.dockerfile",
+        "image": "diagonalge/kohya_latest:latest",
+        "digest": "sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e"
+      }
+    ],
+    "production_entrypoint_canary": {
+      "result": "PENDING",
+      "required_mode": "offline-one-h100-controlled-stop-after-first-optimizer-step",
+      "required_entrypoint": [
+        "dumb-init",
+        "--",
+        "python3",
+        "-m",
+        "forge.cli"
+      ]
+    }
+  }
+}
