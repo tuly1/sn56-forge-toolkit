@@ -1,0 +1,47 @@
+{
+  "schema_version": 2,
+  "policy_state": "reviewed",
+  "certification_source": {
+    "commit": "fe9749c027df511b7566b474e6f8524f86b01f83",
+    "tree": "c7e79fb326e3bc3ef7b573d2d0144e82e0e24a25"
+  },
+  "dockerfiles": [
+    {
+      "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+      "sha256": "3b98fb1cf2b8ec92218bf30848a0f16c8a3ec48c9034bb5984309d67100663a4"
+    },
+    {
+      "path": "ops/docker/standalone-image-trainer.dockerfile",
+      "sha256": "746fbb5084e2bd09fb3cfa01aef0070835571752cc762c9124e222a7d3a48cce"
+    }
+  ],
+  "release_evidence": {
+    "rollback_commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "allowed_changes_name_status_sha256": "d15197e9bac0369efc71c35c3f7ded8e0e1bf47397f594cd5a2d4b877f397e05",
+    "image_id": "sha256:987fa5c8964d04bb8aa2ad0fbc485aecafe63b1f85dae1da65cc960e917c8cd8",
+    "base_images": [
+      {
+        "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+        "image": "diagonalge/ai-toolkit:latest",
+        "digest": "sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8"
+      },
+      {
+        "path": "ops/docker/standalone-image-trainer.dockerfile",
+        "image": "diagonalge/ai-toolkit:latest",
+        "digest": "sha256:c24f8bb95bf1dc8da7cd6158a763f2c9782783ad7648dc4047c5757ef3447db8"
+      },
+      {
+        "path": "ops/docker/standalone-image-trainer.dockerfile",
+        "image": "diagonalge/kohya_latest:latest",
+        "digest": "sha256:d34dd5750e1018455e111f63c03bb2a4e16204607e00ba5af870dd7c71beb84e"
+      }
+    ],
+    "offline_canary": {
+      "result": "PASS",
+      "receipt_sha256": "4020d7a9ef90992b97c637b794d86e143bddaf61a95a47fc16ea55aace97e6de",
+      "history_sha256": "3044dca1bafa2c68e5dc99dc2b526b75af9f5a1a19a6f8e8b38c2f996d2a9209",
+      "runtime_inventory_sha256": "9c4c15130508c547c67d891f559ca1a513cd62bd5a4b695eb25ceafccd0b850b",
+      "product_projection_sha256": "ce226348ca641932de4a0f27d59a69ad8a124825068a4f1e9e9d134166eba4cd"
+    }
+  }
+}

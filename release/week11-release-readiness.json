@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "readiness_state": "hold",
+  "manifest_sha256": "4ed701e9a57992663ad841fe457be5aaa1a19d4af85e1d92607ea54c3a51f999",
+  "docker_policy_sha256": "a11ddb1731856ff643b1b1e72439584b4cd753117400d31449b70a0c78b375f2",
+  "target": {
+    "commit": "0000000000000000000000000000000000000000",
+    "tree": "0000000000000000000000000000000000000000",
+    "tree_records_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "ref": "refs/heads/week11-ideogram-content-product"
+  },
+  "rollback": {
+    "commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "tree": "613a1cc2d750731df007cc9b2b49e461d0ae368f",
+    "tree_records_sha256": "3ea4b92e0f2a90537527a3809b6615a97122eb69b497282f4ecacc267bf382d4",
+    "ref": "refs/heads/week10-trainer-candidate"
+  },
+  "allowed_changes": {
+    "base_commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "name_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "count": 0
+  },
+  "dockerfiles": [
+    {
+      "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+      "sha256": "3b98fb1cf2b8ec92218bf30848a0f16c8a3ec48c9034bb5984309d67100663a4"
+    },
+    {
+      "path": "ops/docker/standalone-image-trainer.dockerfile",
+      "sha256": "746fbb5084e2bd09fb3cfa01aef0070835571752cc762c9124e222a7d3a48cce"
+    }
+  ]
+}

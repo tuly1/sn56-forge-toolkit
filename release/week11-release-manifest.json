@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "release_state": "hold",
+  "candidate_source_evidence": {
+    "state": "sealed-source-hold",
+    "repository_url": "https://github.com/tuly1/sn56-forge-toolkit.git",
+    "base_commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "target": {
+      "commit": "fe9749c027df511b7566b474e6f8524f86b01f83",
+      "tree": "c7e79fb326e3bc3ef7b573d2d0144e82e0e24a25",
+      "tree_records_sha256": "c5362ef488af54c7729cba91279b0287b382eee05c5739e802bd894ef72ee582",
+      "ref": "refs/heads/week11-ideogram-content-product"
+    },
+    "allowed_changes": {
+      "base_commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+      "name_status_sha256": "d15197e9bac0369efc71c35c3f7ded8e0e1bf47397f594cd5a2d4b877f397e05",
+      "entries": [
+        {
+          "status": "M",
+          "path": "forge/config.py"
+        },
+        {
+          "status": "A",
+          "path": "forge/ideogram_content_policy.py"
+        },
+        {
+          "status": "M",
+          "path": "forge/tasks/aitoolkit.py"
+        },
+        {
+          "status": "A",
+          "path": "tests/test_ideogram_content_policy.py"
+        }
+      ]
+    }
+  },
+  "target": {
+    "commit": "0000000000000000000000000000000000000000",
+    "tree": "0000000000000000000000000000000000000000",
+    "tree_records_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "ref": "refs/heads/week11-ideogram-content-product"
+  },
+  "rollback": {
+    "commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "tree": "613a1cc2d750731df007cc9b2b49e461d0ae368f",
+    "tree_records_sha256": "3ea4b92e0f2a90537527a3809b6615a97122eb69b497282f4ecacc267bf382d4",
+    "ref": "refs/heads/week10-trainer-candidate"
+  },
+  "source": {
+    "repository_url": "https://github.com/tuly1/sn56-forge-toolkit.git",
+    "reviewed_worktree": "/REQUIRED/FINAL/CLEAN/CANDIDATE/WORKTREE"
+  },
+  "dockerfiles": [
+    {
+      "path": "ops/docker/standalone-image-toolkit-trainer.dockerfile",
+      "sha256": "3b98fb1cf2b8ec92218bf30848a0f16c8a3ec48c9034bb5984309d67100663a4"
+    },
+    {
+      "path": "ops/docker/standalone-image-trainer.dockerfile",
+      "sha256": "746fbb5084e2bd09fb3cfa01aef0070835571752cc762c9124e222a7d3a48cce"
+    }
+  ],
+  "allowed_changes": {
+    "base_commit": "59e0698c952edaf1bf34a117ecad41bce87517cf",
+    "name_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "entries": []
+  },
+  "production": {
+    "ssh_host": "hetzner",
+    "service": "gradients-miner.service",
+    "service_user": "miner",
+    "service_working_directory": "/home/miner/god",
+    "service_exec_start": "/home/miner/.venv/bin/uvicorn miner.asgi:app --host 0.0.0.0 --port 7999 --env-file /home/miner/god/.1.env --log-level info",
+    "service_asgi_module": "/home/miner/god/miner/asgi.py",
+    "endpoint_host": "65.108.77.230",
+    "endpoint_port": 7999,
+    "endpoint_route": "/training_repo/image",
+    "endpoint_source": "/home/miner/god/miner/endpoints/training_repo.py",
+    "endpoint_pyc": "/home/miner/god/miner/endpoints/__pycache__/training_repo.cpython-312.pyc",
+    "text_pin": "8f11684e30a556b305dec9dd8eec9794bdae8cde"
+  }
+}
