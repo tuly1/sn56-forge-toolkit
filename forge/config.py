@@ -15,7 +15,13 @@ import os
 
 import yaml
 
-from forge import geometry, ideogram_release_policy, recipe, telemetry
+from forge import (
+    geometry,
+    ideogram_content_policy,
+    ideogram_release_policy,
+    recipe,
+    telemetry,
+)
 
 # Templates are shipped INSIDE the package (forge/templates/*.yaml) so they are
 # present under any deployment (source COPY, `pip install .` wheel, or local test)
@@ -78,7 +84,13 @@ def resolve_base_model(cached_model_dir: str) -> str:
     return cached_model_dir
 
 
-def build_config(spec, num_images, hours_to_complete) -> dict:
+def build_config(
+    spec,
+    num_images,
+    hours_to_complete,
+    *,
+    dataset_category: str | None = None,
+) -> dict:
     cfg = load_template(spec.model_type)  # may raise → caller wraps
     try:
         resolved = _apply_overrides(cfg, spec, num_images, hours_to_complete)
@@ -123,7 +135,7 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
         return cfg
 
     try:
-        return ideogram_release_policy.apply(resolved, spec.model_type)
+        production = ideogram_release_policy.apply(resolved, spec.model_type)
     except Exception as exc:
         # Never emit a partial candidate.  An invalid release binding preserves
         # the already-built Week-4 config and records why it stayed inactive.
@@ -133,6 +145,22 @@ def build_config(spec, num_images, hours_to_complete) -> dict:
             error_type=type(exc).__name__,
         )
         return resolved
+
+    try:
+        return ideogram_content_policy.apply(
+            production,
+            spec.model_type,
+            dataset_category,
+            num_images=num_images,
+            hours_to_complete=hours_to_complete,
+        )
+    except Exception as exc:
+        telemetry.event(
+            "ideogram_content_policy_inactive",
+            reason="application_failed",
+            error_type=type(exc).__name__,
+        )
+        return production
 
 
 def _apply_overrides(cfg, spec, num_images, hours_to_complete) -> dict:

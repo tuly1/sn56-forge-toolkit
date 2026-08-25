@@ -23,7 +23,12 @@ import sys
 import threading
 import time
 
-from forge import ideogram_release_policy, recipe, telemetry
+from forge import (
+    ideogram_content_policy,
+    ideogram_release_policy,
+    recipe,
+    telemetry,
+)
 from forge.clock import Deadline
 from forge.config import build_config, resolve_base_model, write_config
 from forge.tasks import checkpoints, holdout
@@ -58,6 +63,11 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
         spec.cached_zip_path,
         images_dir=spec.dataset_images_dir,
         trigger_word=spec.trigger_word,
+    )
+    dataset_category = (
+        ideogram_content_policy.detect_category(images_dir, spec.trigger_word)
+        if spec.model_type == "ideogram4"
+        else None
     )
     holdout_feature_ready = holdout.budget_allows(
         spec.model_type,
@@ -101,20 +111,31 @@ def run(spec: ImageSpec, deadline: Deadline) -> None:
     # explicitly reserved for checkpoint scoring. It already accounts for the
     # ordinary export reserve itself.
     hours = _recipe_hours(deadline, scoring_reserve_s)
-    cfg = build_config(spec, num_images=pairs, hours_to_complete=hours)
+    cfg = build_config(
+        spec,
+        num_images=pairs,
+        hours_to_complete=hours,
+        dataset_category=dataset_category,
+    )
     p = cfg["config"]["process"][0]
     steps = p["train"]["steps"]
-    production_checkpoint = ideogram_release_policy.checkpoint_control(cfg)
+    content_checkpoint = ideogram_content_policy.checkpoint_control(cfg)
+    production_checkpoint = (
+        None
+        if content_checkpoint is not None
+        else ideogram_release_policy.checkpoint_control(cfg)
+    )
+    checkpoint_control = content_checkpoint or production_checkpoint
     scope = checkpoints.set_planned_steps(
         spec.save_root,
         scope,
         steps,
         model_type=spec.model_type,
         checkpoint_target=(
-            production_checkpoint[0] if production_checkpoint is not None else None
+            checkpoint_control[0] if checkpoint_control is not None else None
         ),
         checkpoint_selected_step=(
-            production_checkpoint[1] if production_checkpoint is not None else None
+            checkpoint_control[1] if checkpoint_control is not None else None
         ),
     )
     telemetry.set_meta(
