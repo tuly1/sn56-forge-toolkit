@@ -95,7 +95,7 @@ CANDIDATE_SOURCE_EVIDENCE = {
 # wrapper.  It is retained only as the documented second-line recovery anchor.
 SECONDARY_BREAK_GLASS_COMMIT = "59e0698c952edaf1bf34a117ecad41bce87517cf"
 EXPECTED_CANDIDATE_DOCKER_POLICY_SHA256 = (
-    "272651e0725df451c1dba3c4371a8304ce6f3398d1625dc3336e57de7d9fbc60"
+    "ed4537573f6166ce137483b2d3a67a5d4117aeb876e33511b6267a708ca4e25e"
 )
 
 
@@ -153,11 +153,9 @@ def load_docker_policy(path: Path) -> tuple[dict[str, Any], bytes]:
     The Week-10 schema-2 build/parity fields describe a different image and are
     deliberately not inherited. Week-11 instead binds the exact Flux candidate,
     unchanged Docker/base-image identities, causal decision, execution-identity
-    correction, and the still-pending production-entrypoint H100 canary.
+    correction, and the completed production-entrypoint H100 canary.
     Canonical parsing rejects duplicate keys and non-canonical serialization;
-    the fixed payload digest rejects every field substitution or addition. The
-    pending state is then rejected so these preparatory bytes cannot authorize a
-    forward contract, dry-run, or production mutation.
+    the fixed payload digest rejects every field substitution or addition.
     """
 
     policy, raw = _core._load_json_object(path.resolve(), "Week-11 Docker policy")
@@ -177,8 +175,7 @@ def load_docker_policy(path: Path) -> tuple[dict[str, Any], bytes]:
         )
     if policy.get("policy_state") != "reviewed":
         raise _core.ContractError(
-            "Week-11 Flux candidate policy remains HOLD pending the exact "
-            "production-entrypoint H100 canary"
+            "Week-11 Flux candidate policy_state must remain exactly reviewed"
         )
     return policy, raw
 

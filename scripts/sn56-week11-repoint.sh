@@ -45,9 +45,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTRACT="$SCRIPT_DIR/sn56-week11-release-contract.py"
 DEFAULT_MANIFEST="$SCRIPT_DIR/../release/week11-release-manifest.json"
-# Byte-exact schema-2 policy for the sealed candidate. The checked-in policy is
-# HOLD pending the exact H100 canary, so the contract rejects forward use until
-# its reviewed replacement is sealed.
+# Byte-exact schema-2 policy for the sealed candidate and completed controlled
+# H100 production-entrypoint canary. The contract rejects every substitution.
 DEFAULT_DOCKER_POLICY="$SCRIPT_DIR/../release/week11-candidate-docker-policy.json"
 DEFAULT_READINESS_RECEIPT="$SCRIPT_DIR/../release/week11-release-readiness.json"
 R_BACKUP_DIR="/home/miner/sn56-endpoint-backups"

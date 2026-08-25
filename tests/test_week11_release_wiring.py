@@ -35,7 +35,7 @@ TARGET_RECORDS = "cdb54ba614daa58d075d9049ee48a00ebed487f12fcd05e2eda5da929d987f
 TARGET_SURFACE = "416c825bb8ccb840b2039a3052bffe946b4edc37fed22a5a1bd14824ac07e4f7"
 TEXT_PIN = "8f11684e30a556b305dec9dd8eec9794bdae8cde"
 HARD_ABORT_EPOCH = 1787761800
-PENDING_POLICY_SHA256 = "272651e0725df451c1dba3c4371a8304ce6f3398d1625dc3336e57de7d9fbc60"
+POLICY_SHA256 = "ed4537573f6166ce137483b2d3a67a5d4117aeb876e33511b6267a708ca4e25e"
 
 
 def run(
@@ -67,21 +67,12 @@ def write_json(path: Path, data: dict) -> Path:
 
 
 def mock_reviewed_policy(contract, tmp_path: Path, monkeypatch) -> Path:
-    """Promote only a temp policy so CPU tests can exercise the ready mechanics."""
+    """Add only the explicit mock marker needed by subprocess dry-runs."""
 
     policy, _ = contract._core._load_json_object(
         CANDIDATE_DOCKER_POLICY_PATH, "Week-11 Docker policy"
     )
-    policy["policy_state"] = "reviewed"
-    policy["release_evidence"]["production_entrypoint_canary"] = {
-        "result": "PASS",
-        "image_id": "sha256:" + "1" * 64,
-        "receipt_sha256": "2" * 64,
-        "runtime_identity_sha256": "3" * 64,
-        "first_optimizer_step_sha256": "4" * 64,
-        "entrypoint": ["dumb-init", "--", "python3", "-m", "forge.cli"],
-        "mock_only": True,
-    }
+    policy["release_evidence"]["production_entrypoint_canary"]["mock_only"] = True
     policy_path = write_json(tmp_path / "mock-reviewed-docker-policy.json", policy)
     monkeypatch.setattr(
         contract,
@@ -296,7 +287,7 @@ def test_sealed_candidate_has_exact_local_ref_tree_and_changed_surface(contract)
     assert surface == TARGET_SURFACE
 
 
-def test_candidate_docker_policy_is_canonical_pending_and_rejects_drift(
+def test_candidate_docker_policy_is_canonical_reviewed_and_rejects_drift(
     contract, tmp_path: Path
 ):
     policy, raw = contract._core._load_json_object(
@@ -306,11 +297,12 @@ def test_candidate_docker_policy_is_canonical_pending_and_rejects_drift(
     repoint = REPOINT_PATH.read_text(encoding="utf-8")
     assert "week11-candidate-docker-policy.json" in repoint
     assert "week10-candidate-docker-policy.json" not in repoint
-    assert hashlib.sha256(raw).hexdigest() == PENDING_POLICY_SHA256
-    assert PENDING_POLICY_SHA256 == contract.EXPECTED_CANDIDATE_DOCKER_POLICY_SHA256
+    assert hashlib.sha256(raw).hexdigest() == POLICY_SHA256
+    assert POLICY_SHA256 == contract.EXPECTED_CANDIDATE_DOCKER_POLICY_SHA256
     assert raw == contract.canonical_json_bytes(policy)
-    with pytest.raises(contract.ContractError, match="HOLD pending"):
-        contract.load_docker_policy(CANDIDATE_DOCKER_POLICY_PATH)
+    loaded, loaded_raw = contract.load_docker_policy(CANDIDATE_DOCKER_POLICY_PATH)
+    assert loaded == policy
+    assert loaded_raw == raw
 
     assert set(policy) == {
         "schema_version",
@@ -320,7 +312,7 @@ def test_candidate_docker_policy_is_canonical_pending_and_rejects_drift(
         "release_evidence",
     }
     assert policy["schema_version"] == 2
-    assert policy["policy_state"] == "hold-pending-exact-h100-canary"
+    assert policy["policy_state"] == "reviewed"
     assert policy["certification_source"] == {"commit": TARGET, "tree": TARGET_TREE}
     assert policy["dockerfiles"] == json.loads(
         MANIFEST_PATH.read_text(encoding="utf-8")
@@ -362,14 +354,27 @@ def test_candidate_docker_policy_is_canonical_pending_and_rejects_drift(
         },
     ]
     assert evidence["production_entrypoint_canary"] == {
-        "result": "PENDING",
-        "required_mode": "offline-one-h100-controlled-stop-after-first-optimizer-step",
-        "required_entrypoint": ["dumb-init", "--", "python3", "-m", "forge.cli"],
+        "result": "PASS",
+        "image_id": "sha256:4405735f2a97a1dd63789eaf0833ce9b318971c537c40877b50701e0b2382ce0",
+        "receipt_sha256": "a0c235c52ab7f04db3831e5c9a673a9632a278a2d1b033c01c8e747c6dfd0929",
+        "off_host_evidence_manifest_sha256": "2d6be82154bc0ac4245b8c88b0e467cc2f71d3e0fcf311301c9979081be18187",
+        "static_canary_stdout_sha256": "99a52241af76c3176c8434399e2ab084af38849e1f9904269c096dfe3e238148",
+        "config_sha256": "b8068336a5a16678398599cca6f9c612d6cbadd9153b7057390f8a92c1a49706",
+        "log_sha256": "383495d4d78e8b23cafefd5cc6b1008a71eb9f120e0bf872a15fd2edf7d768d6",
+        "process_tree_sha256": "73f4b5664cb028206d4b3d44ab93a68beb0838938a470da96d6249579784146",
+        "container_exit_code": 143,
+        "container_exit_classification": "deliberate-controlled-stop",
+        "fallback_observed": False,
+        "h100_process": {"pid": 7903, "resident_mib": 56858},
+        "source": {"commit": TARGET, "tree": TARGET_TREE},
+        "off_host_path": "/root/sn56-week11-flux-release/candidate-3f7737c/canary-evidence-20260825T115441Z",
     }
 
     substitutions = []
     wrong_canary = copy.deepcopy(policy)
-    wrong_canary["release_evidence"]["production_entrypoint_canary"]["result"] = "PASS"
+    wrong_canary["release_evidence"]["production_entrypoint_canary"][
+        "receipt_sha256"
+    ] = "0" * 64
     substitutions.append(wrong_canary)
     wrong_base = copy.deepcopy(policy)
     wrong_base["release_evidence"]["base_images"][0]["digest"] = "sha256:" + "0" * 64

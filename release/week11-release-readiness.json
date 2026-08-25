@@ -2,7 +2,7 @@
   "schema_version": 1,
   "readiness_state": "hold",
   "manifest_sha256": "c2bc4780be7eb07b8462d0ba0a248b911ebc7dbaa50bd04da6e6b3d9526ee7de",
-  "docker_policy_sha256": "272651e0725df451c1dba3c4371a8304ce6f3398d1625dc3336e57de7d9fbc60",
+  "docker_policy_sha256": "ed4537573f6166ce137483b2d3a67a5d4117aeb876e33511b6267a708ca4e25e",
   "target": {
     "commit": "0000000000000000000000000000000000000000",
     "tree": "0000000000000000000000000000000000000000",

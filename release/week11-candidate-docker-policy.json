@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "policy_state": "hold-pending-exact-h100-canary",
+  "policy_state": "reviewed",
   "certification_source": {
     "commit": "3f7737c4045c3877e3c9f100a0341fe2566b1db6",
     "tree": "42001148b7b8342d9837dcb7e2b532b23892aeee"
@@ -39,15 +39,26 @@
       }
     ],
     "production_entrypoint_canary": {
-      "result": "PENDING",
-      "required_mode": "offline-one-h100-controlled-stop-after-first-optimizer-step",
-      "required_entrypoint": [
-        "dumb-init",
-        "--",
-        "python3",
-        "-m",
-        "forge.cli"
-      ]
+      "result": "PASS",
+      "image_id": "sha256:4405735f2a97a1dd63789eaf0833ce9b318971c537c40877b50701e0b2382ce0",
+      "receipt_sha256": "a0c235c52ab7f04db3831e5c9a673a9632a278a2d1b033c01c8e747c6dfd0929",
+      "off_host_evidence_manifest_sha256": "2d6be82154bc0ac4245b8c88b0e467cc2f71d3e0fcf311301c9979081be18187",
+      "static_canary_stdout_sha256": "99a52241af76c3176c8434399e2ab084af38849e1f9904269c096dfe3e238148",
+      "config_sha256": "b8068336a5a16678398599cca6f9c612d6cbadd9153b7057390f8a92c1a49706",
+      "log_sha256": "383495d4d78e8b23cafefd5cc6b1008a71eb9f120e0bf872a15fd2edf7d768d6",
+      "process_tree_sha256": "73f4b5664cb028206d4b3d44ab93a68beb0838938a470da96d6249579784146",
+      "container_exit_code": 143,
+      "container_exit_classification": "deliberate-controlled-stop",
+      "fallback_observed": false,
+      "h100_process": {
+        "pid": 7903,
+        "resident_mib": 56858
+      },
+      "source": {
+        "commit": "3f7737c4045c3877e3c9f100a0341fe2566b1db6",
+        "tree": "42001148b7b8342d9837dcb7e2b532b23892aeee"
+      },
+      "off_host_path": "/root/sn56-week11-flux-release/candidate-3f7737c/canary-evidence-20260825T115441Z"
     }
   }
 }

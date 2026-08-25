@@ -1,9 +1,9 @@
 # SN56 Week-11 Flux Kohya release — HOLD
 
 State: `HOLD / UNSELECTED`. The causal Flux grid is `PROMOTE`, the source
-candidate is sealed, and CPU release wiring is fail-closed. No H100 canary PASS,
-signature, readiness authorization, push, repoint, deployment, or production
-mutation is claimed by these checked-in bytes.
+candidate is sealed, and the controlled production-entrypoint H100 canary is
+`PASS`. No signature, readiness authorization, push, repoint, deployment, or
+production mutation is claimed by these checked-in bytes.
 
 ## Sealed source candidate
 
@@ -37,21 +37,24 @@ The four Ideogram CONTENT files remain byte-identical to live `fe...`:
 
 ## Candidate image gate
 
-`release/week11-candidate-docker-policy.json` is intentionally
-`hold-pending-exact-h100-canary`. It binds the candidate, rollback chain,
-unchanged Dockerfiles/base images, science verdict, and corrected execution
-identity, but contains no invented image or canary receipt.
+`release/week11-candidate-docker-policy.json` is reviewed and binds:
 
-The remaining gate is one offline H100 controlled-stop canary through the
-candidate image's default production entrypoint, exactly
-`["dumb-init","--","python3","-m","forge.cli"]`. It must prove the production
-entrypoint emits the frozen 94-step seed-1 Kohya TOML, starts
-`/app/sd-scripts/flux_train_network.py`, reaches one finite optimizer step on
-the H100, never enters ai-toolkit fallback, stops the owned container cleanly,
-and syncs the exact image/runtime/config/process/GPU receipts off-host.
+- Immutable candidate image
+  `sha256:4405735f2a97a1dd63789eaf0833ce9b318971c537c40877b50701e0b2382ce0`.
+- Controlled-canary receipt SHA-256
+  `a0c235c52ab7f04db3831e5c9a673a9632a278a2d1b033c01c8e747c6dfd0929`.
+- Off-host evidence manifest SHA-256
+  `2d6be82154bc0ac4245b8c88b0e467cc2f71d3e0fcf311301c9979081be18187`.
+- Exact emitted config `b8068336...`, trainer log `383495d4...`, process tree
+  `73f4b566...`, and static canary stdout `99a52241...`.
+- H100 trainer PID `7903` at `56858` MiB, followed by deliberate container
+  exit `143`, with no fallback observed.
 
-Until those facts replace the pending policy and its fixed digest, the Week-11
-contract rejects candidate preparation and forward dry-run. This is deliberate.
+The canonical evidence is retained off-host at
+`/root/sn56-week11-flux-release/candidate-3f7737c/canary-evidence-20260825T115441Z`.
+Before/after container inspections are transitively bound by the exact canary
+receipt and off-host manifest; shortened hash prefixes are not elevated into
+new release identities.
 
 ## Recovery identities
 
@@ -63,12 +66,9 @@ contract rejects candidate preparation and forward dry-run. This is deliberate.
   `59e0698c952edaf1bf34a117ecad41bce87517cf`. It is documented and tested as
   rejected from the primary rollback field and wrapper.
 
-## Post-canary release sequence
+## Remaining release sequence
 
-After the exact H100 receipt is sealed, update only the candidate image policy,
-its fixed SHA-256 in `scripts/sn56-week11-release-contract.py`, and the HOLD
-readiness binding; then rerun the focused contract suite and full repository
-tests. The create-only target selection command is:
+The create-only target selection command is:
 
 ```bash
 python3 scripts/sn56-week11-release-contract.py \
